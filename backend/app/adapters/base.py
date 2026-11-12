@@ -42,6 +42,16 @@ class TruthExtractionResult:
     observation_source: str = "static_ast"
     # Plain-language notes about what the adapter could not check (shown in reports).
     notes: list[str] = field(default_factory=list)
+    # ORM class name -> dotted modules that define it. When non-empty, manipulation adapters
+    # resolve a class symbol to its table only if the consumer imports it from one of these
+    # modules (a same-named schema/dataclass is not the table), and stop treating plain
+    # identifiers that merely equal a table name as table access.
+    class_modules: dict[str, set[str]] = field(default_factory=dict)
+    # Dotted modules that hold ORM models or table objects (for `from <models> import some_table`).
+    model_modules: set[str] = field(default_factory=set)
+    # Database-side readers of a table: node id -> {reader node id: (evidence path, edge kind, note)}.
+    # Filled from SQL function bodies (`fn:*` reads) and foreign keys (`t:*` references).
+    db_readers: dict[str, dict[str, tuple[str, str, str]]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

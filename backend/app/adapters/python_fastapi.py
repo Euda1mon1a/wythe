@@ -34,6 +34,42 @@ def _compile_route_regex(full_path: str) -> str:
     return rf"^(?:/api/v\d+)?{escaped}/?$"
 
 
+def _sql_table_id(truth: TruthExtractionResult, sym: str) -> str | None:
+    """Table node for a table name taken from SQL text (`public.` is the default schema)."""
+    bare = sym.split(".", 1)[1] if sym.startswith("public.") else sym
+    return truth.table_symbol_map.get(sym) or truth.table_symbol_map.get(bare)
+
+
+def _ast_table_id(
+    truth: TruthExtractionResult, pm: ParsedPythonModule, sym: str, model_modules: frozenset[str]
+) -> str | None:
+    """Table node for a Python identifier.
+
+    With class provenance from the truth adapter, only an ORM class name counts, and only when
+    the module imports it from a module that defines it (or a package above that module), or
+    defines it itself. A same-named class imported from elsewhere (a response schema, a
+    dataclass) is not the table, and a variable or attribute that happens to equal a table
+    name is not table access. Without provenance, keep the name-only lookup.
+    """
+    if not truth.class_modules:
+        return _sql_table_id(truth, sym)
+    defining = truth.class_modules.get(sym)
+    if not defining:
+        # A table object imported by name from a models module (e.g. an association `Table`).
+        sources = pm.imported_names.get(sym)
+        if sources and any(m == s or m.startswith(f"{s}.") for s in sources for m in model_modules):
+            return _sql_table_id(truth, sym)
+        return None
+    if pm.module_name not in defining:
+        sources = pm.imported_names.get(sym)
+        if sources:
+            if not any(m == s or m.startswith(f"{s}.") for s in sources for m in defining):
+                return None
+        elif sym in pm.defined:
+            return None
+    return truth.table_symbol_map.get(sym)
+
+
 def _classify_manipulator(rel_inside_app: str) -> tuple[str, str]:
     parts = Path(rel_inside_app).parts
     head = parts[0] if parts else ""
@@ -120,6 +156,8 @@ class PythonFastApiAdapter:
         findings: list[RawCandidateFinding] = []
         table_readers: dict[str, set[str]] = {}
         table_writers: dict[str, set[str]] = {}
+        precise = bool(truth.class_modules)
+        model_modules = frozenset(truth.model_modules) | frozenset().union(*truth.class_modules.values())
 
         def add_edge(src: str, dst: str, kind: str, path: str, note: str) -> None:
             key = (src, dst, kind)
@@ -144,17 +182,29 @@ class PythonFastApiAdapter:
 
             # 1. Manipulate -> Truth (ORM + SQL reads & writes)
             matched_reads: set[str] = set()
-            matched_writes: set[str] = set()
-            for sym in pm.reads | pm.sql_reads:
-                bare = sym.split(".", 1)[1] if sym.startswith("public.") else sym
-                tid = truth.table_symbol_map.get(sym) or truth.table_symbol_map.get(bare)
+            write_line: dict[str, int] = {}
+            for sym in pm.sql_reads:
+                tid = _sql_table_id(truth, sym)
                 if tid:
                     matched_reads.add(tid)
-            for sym in pm.writes | pm.sql_writes:
-                bare = sym.split(".", 1)[1] if sym.startswith("public.") else sym
-                tid = truth.table_symbol_map.get(sym) or truth.table_symbol_map.get(bare)
+            for sym in pm.reads:
+                tid = _ast_table_id(truth, pm, sym, model_modules)
                 if tid:
-                    matched_writes.add(tid)
+                    matched_reads.add(tid)
+            ast_writes = (
+                pm.persisted | (pm.constructed if pm.has_session_writes else frozenset())
+                if precise
+                else pm.writes
+            )
+            for sym, resolver in (
+                *((s, _sql_table_id) for s in pm.sql_writes),
+                *((s, None) for s in ast_writes),
+            ):
+                tid = resolver(truth, sym) if resolver else _ast_table_id(truth, pm, sym, model_modules)
+                if tid:
+                    line = pm.write_lines.get(sym, 1)
+                    write_line[tid] = min(write_line.get(tid, line), line)
+            matched_writes = set(write_line)
 
             for tid in sorted(matched_reads):
                 table_readers.setdefault(tid, set()).add(nid)
@@ -168,7 +218,7 @@ class PythonFastApiAdapter:
                             rule_code="TRUTH-003",
                             node_id=nid,
                             source_file=pm.rel_path,
-                            line=1,
+                            line=write_line[tid],
                             title=f"HTTP route `{node.label}` writes `{tid.removeprefix('t:')}` directly",
                             detail=f"{pm.rel_path} mutates `{tid.removeprefix('t:')}` inside the route layer rather than delegating to a transactional service door.",
                             remediation="Move persistence mutations into an audited domain service or SQL write-lane function.",
@@ -255,7 +305,23 @@ class PythonFastApiAdapter:
                         )
                     )
 
-        # 5. Update truth read/write counts & TRUTH-001 (orphaned input tables)
+        # 5. Database-side readers (SQL function bodies, foreign keys) also consume a table.
+        # A foreign key only consumes its target when the referencing table is itself in use
+        # (touched by code or read by a SQL function); a chain of unused tables stays unused.
+        in_use = set(table_readers) | set(table_writers)
+        in_use |= {
+            tid
+            for tid, readers in truth.db_readers.items()
+            if any(r.startswith("fn:") for r in readers)
+        }
+        for tid, db_readers in sorted(truth.db_readers.items()):
+            for reader_id, (evidence, kind, note) in sorted(db_readers.items()):
+                if reader_id.startswith("t:") and reader_id not in in_use:
+                    continue
+                table_readers.setdefault(tid, set()).add(reader_id)
+                add_edge(reader_id, tid, kind, evidence, note)
+
+        # 6. Update truth read/write counts & TRUTH-001 (orphaned input tables)
         for tnode in truth.nodes:
             if tnode.subkind != "table":
                 continue
@@ -277,7 +343,7 @@ class PythonFastApiAdapter:
                     )
                 )
 
-        # 6. MANIP-003 (inert service/solver mechanisms with zero inbound callers)
+        # 7. MANIP-003 (inert service/solver mechanisms with zero inbound callers)
         inbound_callers: dict[str, int] = {}
         for edge in edges:
             if edge.kind == "calls_helper":
