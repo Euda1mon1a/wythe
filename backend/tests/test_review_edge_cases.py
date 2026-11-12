@@ -723,4 +723,42 @@ def test_rebound_injected_param_excludes_post_rebind_attributes(tmp_path: Path) 
     assert ("m:route:api.routes.rebind", "m:service:services.worker_only") in pairs
 
 
+def test_kwarg_injected_param_calls_and_sql_array_column_defaults(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "backend/schema.sql",
+        "CREATE TABLE feature_flags (\n"
+        "    id INT,\n"
+        "    flags BOOLEAN[] DEFAULT ARRAY[false, false, false],\n"
+        "    title TEXT\n"
+        ");\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert by_id["t:feature_flags"].columns == ["id", "flags", "title"]
+
+    _write(
+        tmp_path,
+        "backend/app/services/dispatcher_worker.py",
+        "class DispatcherWorker:\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/dispatch.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "def send(**kwargs):\n"
+        "    return kwargs\n\n"
+        "@router.post('/api/v1/dispatch')\n"
+        "def run_dispatch(worker):\n"
+        "    return send(result=worker.execute_tasks())\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.dispatch", "m:service:services.dispatcher_worker") in pairs
+
+
+
 

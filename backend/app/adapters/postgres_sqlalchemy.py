@@ -314,6 +314,7 @@ def _extract_create_columns_at(cleaned_sql: str, pos: int) -> list[str]:
     if i >= n or cleaned_sql[i] != "(":
         return []
     depth = 1
+    bracket_depth = 0
     start = i + 1
     j = start
     quote: str | None = None
@@ -340,6 +341,10 @@ def _extract_create_columns_at(cleaned_sql: str, pos: int) -> list[str]:
                 if end >= 0:
                     j = end + len(tag)
                     continue
+        elif c == "[":
+            bracket_depth += 1
+        elif c == "]" and bracket_depth > 0:
+            bracket_depth -= 1
         elif c == "(":
             depth += 1
         elif c == ")":
@@ -347,7 +352,7 @@ def _extract_create_columns_at(cleaned_sql: str, pos: int) -> list[str]:
             if depth == 0:
                 top_parts.append(cleaned_sql[seg_start:j])
                 break
-        elif c == "," and depth == 1:
+        elif c == "," and depth == 1 and bracket_depth == 0:
             top_parts.append(cleaned_sql[seg_start:j])
             seg_start = j + 1
         j += 1

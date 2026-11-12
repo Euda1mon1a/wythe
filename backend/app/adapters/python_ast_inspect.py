@@ -406,6 +406,7 @@ def _live_param_expr_nodes(
         outer_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] | None = None,
     ) -> None:
         local_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = dict(outer_defs or {})
+        dead_refs: set[int] = set()
 
         def activate_def(name: str) -> None:
             fn_def = local_defs.get(name)
@@ -512,6 +513,24 @@ def _live_param_expr_nodes(
                     out.append(expr)
                     if expr.id in local_defs:
                         activate_def(expr.id)
+                elif expr.id in local_defs:
+                    dead_refs.add(id(local_defs[expr.id]))
+                return live
+            if isinstance(expr, ast.Call):
+                if live:
+                    out.append(expr)
+                live = walk_expr(expr.func, live)
+                for arg_e in expr.args:
+                    live = walk_expr(arg_e, live)
+                for kw in expr.keywords:
+                    live = walk_expr(kw.value, live)
+                return live
+            if isinstance(expr, ast.Dict):
+                if live:
+                    out.append(expr)
+                for k_e, v_e in zip(expr.keys, expr.values, strict=False):
+                    live = walk_expr(k_e, live)
+                    live = walk_expr(v_e, live)
                 return live
             if live:
                 out.append(expr)
@@ -593,6 +612,11 @@ def _live_param_expr_nodes(
                     local_defs.pop(s.name, None)
                     if s.name == nm:
                         live = False
+                elif isinstance(s, ast.TypeAlias):
+                    if isinstance(s.name, ast.Name):
+                        local_defs.pop(s.name.id, None)
+                        if s.name.id == nm:
+                            live = False
                 elif isinstance(s, ast.If):
                     live = walk_expr(s.test, live)
                     lb, fb = walk_stmts(s.body, live, loop_breaks, loop_continues)
@@ -695,7 +719,11 @@ def _live_param_expr_nodes(
             return live, True
 
         if isinstance(body, list):
-            walk_stmts(body, True)
+            end_live, _ = walk_stmts(body, True)
+            if end_live:
+                for fn_name, fn_node in list(local_defs.items()):
+                    if id(fn_node) not in dead_refs:
+                        activate_def(fn_name)
         else:
             walk_expr(body, True)
 
