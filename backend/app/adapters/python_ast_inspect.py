@@ -175,7 +175,7 @@ class ParsedPythonModule:
     sql_calls: frozenset[str]
     imported_modules: frozenset[str]
     router_prefix: str
-    router_includes: tuple[tuple[str, str], ...]  # (module_attr, prefix)
+    router_includes: tuple[tuple[str, str], ...]  # (included module stem, prefix)
     route_handlers: tuple[ParsedRouteHandler, ...]
     policy_literals: tuple[tuple[str, int, str], ...]  # (const_name, lineno, sample)
     raw_clock_calls: tuple[tuple[str, int], ...]  # (expr, lineno)
@@ -191,6 +191,9 @@ class ParsedPythonModule:
     imported_names: dict[str, frozenset[str]] = field(default_factory=dict)
     # First line of write evidence per symbol (constructors, session writes, SQL write targets).
     write_lines: dict[str, int] = field(default_factory=dict)
+    # Includes made into this module's own `APIRouter` (`router.include_router(sub)`): the
+    # included routes live under wherever this module's router is mounted.
+    nested_router_includes: tuple[tuple[str, str], ...] = ()
 
 
 def _dotted(node: ast.AST) -> str | None:
@@ -202,6 +205,34 @@ def _dotted(node: ast.AST) -> str | None:
         parts.append(node.id)
         return ".".join(reversed(parts))
     return None
+
+
+def _included_router_module(
+    inc_target: str,
+    aliases: dict[str, str],
+    import_sources: dict[str, str],
+    router_vars: set[str],
+) -> str | None:
+    """Stem of the module whose router `include_router(<inc_target>)` mounts, or None.
+
+    `users.router` / `pkg.users.router` -> `users`; `users_router` imported with
+    `from app.api.users import router as users_router` -> `users` (the defining module,
+    not the imported attribute name); a router defined in this same module -> None.
+    """
+    if not inc_target:
+        return None
+    if "." in inc_target:
+        owner = inc_target.rsplit(".", 1)[0]
+        head, _, rest = owner.partition(".")
+        resolved = aliases.get(head, head)
+        full = f"{resolved}.{rest}" if rest else resolved
+        return full.rsplit(".", 1)[-1]
+    if inc_target in router_vars:
+        return None
+    source = import_sources.get(inc_target)
+    if source:
+        return source.rsplit(".", 1)[-1]
+    return aliases.get(inc_target, inc_target)
 
 
 def _excluded_ids(tree: ast.AST) -> set[int]:
@@ -412,6 +443,7 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
 
     local_pkg = module_name.split(".", 1)[0]
     aliases: dict[str, str] = {}
+    import_sources: dict[str, str] = {}  # local name -> module it came from
     imported_modules: set[str] = set()
     external_roots: set[str] = set()
     imported_names: dict[str, set[str]] = {}
@@ -430,6 +462,7 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                 imported_names.setdefault(alias.name, set()).add(abs_module)
                 local_name = alias.asname or alias.name
                 aliases[local_name] = alias.name
+                import_sources[local_name] = n.module
                 if is_ext:
                     external_roots.add(local_name)
         elif isinstance(n, ast.Import):
@@ -458,11 +491,14 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     raw_clocks: list[tuple[str, int]] = []
     router_prefix = ""
     router_includes: list[tuple[str, str]] = []
+    nested_router_includes: list[tuple[str, str]] = []
+    router_vars: set[str] = set()
 
     for stmt in tree.body:
         if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
             fn = _dotted(stmt.value.func) or ""
             if fn.endswith("APIRouter"):
+                router_vars.update(t.id for t in stmt.targets if isinstance(t, ast.Name))
                 for kw in stmt.value.keywords:
                     if kw.arg == "prefix" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
                         router_prefix = kw.value.value
@@ -480,8 +516,11 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             for kw in n.keywords:
                 if kw.arg == "prefix" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
                     inc_prefix = kw.value.value
-            if inc_target:
-                router_includes.append((resolve(inc_target.split(".")[0]), inc_prefix))
+            child = _included_router_module(inc_target, aliases, import_sources, router_vars)
+            if child:
+                router_includes.append((child, inc_prefix))
+                if dotted.rsplit(".", 1)[0] in router_vars:
+                    nested_router_includes.append((child, inc_prefix))
 
         if dotted in ("date.today", "datetime.date.today", "datetime.utcnow", "datetime.datetime.utcnow") or dotted in ("datetime.now", "datetime.datetime.now") and not n.args and not n.keywords:
             raw_clocks.append((f"{dotted}()", n.lineno))
@@ -636,6 +675,7 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         imported_modules=frozenset(imported_modules),
         router_prefix=router_prefix,
         router_includes=tuple(router_includes),
+        nested_router_includes=tuple(nested_router_includes),
         route_handlers=tuple(handlers),
         policy_literals=tuple(policy_literals),
         raw_clock_calls=tuple(raw_clocks),

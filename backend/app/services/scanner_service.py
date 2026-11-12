@@ -25,6 +25,7 @@ from app.adapters.base import (
 )
 from app.adapters.legacy_snapshot_bridge import apply_legacy_snapshot_bridge
 from app.adapters.redis_ephemeral import augment_redis_ephemeral_lineage
+from app.adapters.typescript_nextjs import _skip_template_expr
 from app.core.clock import utc_now, valid_until_from
 from app.core.policy_context import policy_tokens_scope
 from app.models import PolicyVocabulary, ScanSnapshot, StackProfile, TargetProject
@@ -48,16 +49,56 @@ def _strip_api_version_prefix(path: str) -> str:
     return _API_VERSION_PREFIX_RE.sub("", path.rstrip("/")) or "/"
 
 
-def _call_segment_matches(call_seg: str, route_seg: str) -> bool:
+_WRAPPER_CALL_RE = re.compile(r"^(?:encodeURIComponent|encodeURI|String)\((?P<inner>.*)\)$", re.DOTALL)
+_MEMBER_PATH_RE = re.compile(r"^[A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*$")
+_ID_SUFFIX_RE = re.compile(r"(?:[a-z0-9](?:Id|ID|Uuid|UUID)|_(?:id|ID|uuid|UUID))$")
+
+
+def _is_id_valued_expr(expr: str) -> bool:
+    """True when a `${...}` URL expression evidently holds a record identifier (`id`, `userId`,
+    `row.item_id`, `encodeURIComponent(id ?? '')`), i.e. a value for a route *parameter*."""
+    core = expr.strip()
+    for _ in range(3):
+        m = _WRAPPER_CALL_RE.match(core)
+        if not m:
+            break
+        core = m.group("inner").strip()
+    core = re.split(r"\?\?|\|\||\s+as\s+", core, maxsplit=1)[0].strip().rstrip("!")
+    if not _MEMBER_PATH_RE.match(core):
+        return False
+    last = re.split(r"\??\.", core)[-1]
+    return last.lower() in ("id", "uuid", "guid") or bool(_ID_SUFFIX_RE.search(last))
+
+
+def _path_template_exprs(raw_path: str) -> list[str]:
+    """`${...}` expressions of a call URL's path part, in order (aligned with `{param}`)."""
+    exprs: list[str] = []
+    i, n = 0, len(raw_path)
+    while i < n:
+        ch = raw_path[i]
+        if ch in ("?", "#"):
+            break
+        if ch == "$" and i + 1 < n and raw_path[i + 1] == "{":
+            j = _skip_template_expr(raw_path, i + 2)
+            exprs.append(raw_path[i + 2 : j - 1])
+            i = j
+            continue
+        i += 1
+    return exprs
+
+
+def _call_segment_matches(call_seg: str, route_seg: str, id_valued: bool = False) -> bool:
     """Only the call's runtime `{param}` parts are wildcards; its literal words must match literally.
 
     A literal call segment such as `balance` matching a route parameter `{absence_id}` is
     exactly the comparison that already failed, so it must not make the call "unresolved".
+    Likewise a whole segment filled by an id-valued expression (`${userId}`) can only fill a
+    route parameter, never a literal segment such as `activity-log`.
     """
     route_is_param = bool(_ROUTE_PARAM_SEG_RE.match(route_seg))
     if "{param}" in call_seg:
         if call_seg == "{param}":
-            return True
+            return route_is_param or not id_valued
         if route_is_param:
             return False
         pattern = "".join(
@@ -75,13 +116,20 @@ def _wildcard_route_candidates(
     if "{param}" not in call.normalized_path:
         return []
     call_segs = _strip_api_version_prefix(call.normalized_path).strip("/").split("/")
+    id_flags = [_is_id_valued_expr(e) for e in _path_template_exprs(call.raw_path)]
+    seg_id_valued: list[bool] = []
+    k = 0
+    for seg in call_segs:
+        count = seg.count("{param}")
+        seg_id_valued.append(seg == "{param}" and k < len(id_flags) and id_flags[k])
+        k += count
     found: list[RouteDescriptor] = []
     for route in routes:
         if route.http_method != call.http_method:
             continue
         route_segs = _strip_api_version_prefix(route.full_path).strip("/").split("/")
         if len(route_segs) == len(call_segs) and all(
-            _call_segment_matches(c, r) for c, r in zip(call_segs, route_segs)
+            _call_segment_matches(c, r, v) for c, r, v in zip(call_segs, route_segs, seg_id_valued)
         ):
             found.append(route)
     return found

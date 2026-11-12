@@ -11,7 +11,11 @@ from app.adapters.base import (
     FrontendHttpCall,
     RawCandidateFinding,
 )
-from app.adapters.treesitter_engine import blank_comments_cst, extract_ts_http_calls_cst
+from app.adapters.treesitter_engine import (
+    blank_comments_cst,
+    extract_ts_http_calls_cst,
+    resolve_url_const_head,
+)
 from app.adapters.ts_reachability import (
     MODULE_SYMBOL,
     ReachabilityIndex,
@@ -47,9 +51,40 @@ _TAURI_INVOKE_RE = re.compile(
 _TAURI_READ_CMD_PREFIXES = ("get_", "list_", "fetch_", "load_", "find_", "query_", "read_", "detect_", "estimate_", "scope_")
 
 
+_URL_CONST_RE = re.compile(
+    r"""^[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
+    r"""(?P<q>['"`])(?P<val>(?:/|\$\{)[^'"`\n]*)(?P=q)\s*(?:as\s+const\s*)?;?[ \t]*$""",
+    re.MULTILINE,
+)
+_TEMPLATE_HEAD_CONST_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
+_URL_CALL_IDENT_RE = re.compile(
+    r"""\b(?:api\.|axios\.|http\.|client\.|ky\.)?(?P<verb>get|post|put|patch|del|delete|fetch|apiRequest|request|httpClient|ofetch)\s*(?:<[^;()]{0,220}?>)?\s*\(\s*(?P<ident>[A-Za-z_$][\w$]*)\s*[,)]"""
+)
+
+
+def _collect_url_consts(txt: str) -> dict[str, str]:
+    """Same-file `const NAME = '/path'` (or `` `${OTHER}/path` ``) values usable as URL prefixes.
+
+    A name declared twice with different values is ambiguous and dropped. Chains such as
+    `` const B = `${A}/b` `` resolve through earlier constants.
+    """
+    seen: dict[str, str | None] = {}
+    for m in _URL_CONST_RE.finditer(txt):
+        name, val = m.group("name"), m.group("val")
+        if m.group("q") != "`" and "${" in val:
+            continue
+        seen[name] = val if seen.get(name, val) == val else None
+    consts = {k: v for k, v in seen.items() if v is not None}
+    for _ in range(3):
+        for name, val in list(consts.items()):
+            consts[name] = resolve_url_const_head(val, {k: v for k, v in consts.items() if k != name})
+    return {k: v for k, v in consts.items() if v.startswith("/")}
+
+
 def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
     """Extract (verb, raw_url, lineno) via Tree-sitter TSX CST (with character-scanner fallback)."""
-    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True)
+    url_consts = _collect_url_consts(txt)
+    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True, url_consts=url_consts)
     if cst_calls is not None:
         results = list(cst_calls)
         if "createApi" in txt and "builder." in txt:
@@ -75,9 +110,14 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
             verb = "DELETE"
         quote = m.group("quote")
         i = m.end()
-        if i >= n or txt[i] != "/":
-            continue
         buf: list[str] = []
+        if quote == "`":
+            hm = _TEMPLATE_HEAD_CONST_RE.match(txt, i)
+            if hm and hm.group("name") in url_consts:
+                buf.append(url_consts[hm.group("name")])
+                i = hm.end()
+        if i >= n or (not buf and txt[i] != "/"):
+            continue
         if quote != "`":
             while i < n and txt[i] not in (quote, "\n"):
                 buf.append(txt[i])
@@ -121,6 +161,11 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
         if raw_url.startswith("/"):
             lineno = txt.count("\n", 0, m.start()) + 1
             results.append((verb, raw_url, lineno))
+    for im in _URL_CALL_IDENT_RE.finditer(txt):
+        if im.group("ident") in url_consts:
+            iverb = im.group("verb").upper()
+            iverb = "DELETE" if iverb == "DEL" else ("GET" if iverb in _FETCH_LIKE_VERBS else iverb)
+            results.append((iverb, url_consts[im.group("ident")], txt.count("\n", 0, im.start()) + 1))
     if "createApi" in txt and "builder." in txt:
         bm = _RTK_BASE_URL_RE.search(txt)
         rtk_base = ("/" + bm.group("base").strip("/")) if bm and not bm.group("base").startswith("http") else ""
@@ -143,6 +188,19 @@ _TS_POLICY_CONST_RE = re.compile(
 )
 _UTC_SLICE_RE = re.compile(r"""\.toISOString\(\)\s*\.\s*(?:slice\(\s*0\s*,\s*10\s*\)|split\(\s*['"]T['"]\s*\))""")
 _RAW_NEW_DATE_RE = re.compile(r"""\bnew\s+Date\s*\((?P<args>[^)\n]{0,80})\)""")
+# `new Date().toISOString()` / `.getTime()` serialize the current *instant* (UTC `Z` or epoch
+# ms): zone-free, so not a calendar "today". A sliced ISO string is caught by _UTC_SLICE_RE.
+_INSTANT_ONLY_TAIL_RE = re.compile(
+    r"""\s*\.\s*(?:toISOString\(\)(?!\s*\.\s*(?:slice|split|substring|substr)\b)|getTime\(\)|valueOf\(\))"""
+)
+
+
+def _is_raw_clock_read(txt: str, m: re.Match[str]) -> bool:
+    """True when a `new Date(...)` match reads the device clock or copies an unknown date."""
+    args_str = m.group("args").strip()
+    if args_str == "":
+        return not _INSTANT_ONLY_TAIL_RE.match(txt, m.end())
+    return "," not in args_str and "Date." not in args_str
 
 _TS_POLICY_TOKENS = (
     "CAPACITY",
@@ -162,6 +220,19 @@ _TS_POLICY_TOKENS = (
 )
 _UI_SAFE_TOKENS = ("COLOR", "STYLE", "WIDTH", "HEIGHT", "TIMEOUT", "SETTLE", "DELAY", "CAMERA", "ZOOM")
 _CLOCK_UTIL_FILES = ("date-utils.ts", "clock.ts", "time.ts", "programTime.ts")
+
+
+# Directories never scanned as display code: build output, server-only code, and tests,
+# mocks or fixtures (matched against the path inside the frontend directory only).
+_SKIP_DIR_PARTS = frozenset(
+    {
+        "node_modules", ".next", "out", "ui_dist", "dist", "build", "prisma", "drizzle", "server",
+        "__tests__", "__mocks__", "mocks", "__fixtures__", "fixtures", "test-utils", "testing", "e2e",
+        "stories", "__snapshots__",
+    }
+)
+_GENERIC_STEMS = frozenset({"hooks", "api", "client", "types", "constants", "utils", "helpers", "index"})
+_HOOK_STEM_RE = re.compile(r"^use[A-Z0-9]")
 
 
 def _strip_ts_comments(source: str) -> str:
@@ -213,6 +284,8 @@ _QUERY_SUFFIX_NAMES = frozenset(
 )
 _QUERY_SUFFIX_CALL_RE = re.compile(r"^[\w$.]*?(?:query|querystring|searchparams)[\w$]*\s*\(", re.IGNORECASE)
 _QUOTED_QUESTION_RE = re.compile(r"""[`'"]\?""")
+# `${...}` glued onto a literal segment (`/preview${suffix}`) at the end of the URL.
+_GLUED_SUFFIX_RE = re.compile(r"(?i)(?:suffix|query|qs|params?|search)\s*$")
 
 
 def _skip_template_expr(raw_url: str, start: int) -> int:
@@ -271,7 +344,8 @@ def _normalize_ts_url(raw_url: str) -> str:
             j = _skip_template_expr(raw_url, i + 2)
             expr = raw_url[i + 2 : j - 1]
             at_end = j >= n or raw_url[j] in ("?", "#")
-            if at_end and _is_query_suffix_expr(expr):
+            glued = bool(out) and out[-1] != "/"
+            if at_end and (_is_query_suffix_expr(expr) or (glued and _GLUED_SUFFIX_RE.search(expr))):
                 break
             out.append("{param}")
             i = j
@@ -337,10 +411,8 @@ class TypeScriptNextJsAdapter:
             for fpath in sorted(sroot.rglob("*")):
                 if not fpath.is_file() or fpath.suffix not in (".ts", ".tsx"):
                     continue
-                if any(
-                    p in fpath.parts
-                    for p in ("node_modules", ".next", "out", "ui_dist", "dist", "build", "prisma", "drizzle", "server")
-                ):
+                fe_parts = fpath.relative_to(fe_dir).parts if fpath.is_relative_to(fe_dir) else fpath.parts
+                if any(p in _SKIP_DIR_PARTS for p in fe_parts[:-1]):
                     continue
                 resolved = fpath.resolve()
                 if resolved in seen_resolved:
@@ -352,9 +424,9 @@ class TypeScriptNextJsAdapter:
                     else resolved.relative_to(fe_dir).as_posix()
                 )
                 if (
-                    "__tests__" in fpath.parts
-                    or ".test." in fpath.name
+                    ".test." in fpath.name
                     or ".spec." in fpath.name
+                    or ".stories." in fpath.name
                     or fpath.name.endswith(".d.ts")
                     or rel_src.endswith(("/route.ts", "types/api-generated.ts"))
                     or rel_src.startswith("pages/api/")
@@ -416,6 +488,12 @@ class TypeScriptNextJsAdapter:
                 subkind, label, cluster, role = "api_client", fpath.stem, "api_clients", "surface"
             elif head in ("components", "app"):
                 subkind, label, cluster, role = "component", fpath.stem, head, "surface"
+            elif len(parts) >= 2:
+                # Feature folders, lib/, utils/, constants/ ...: same rules, named by role.
+                label = f"{fpath.parent.name}/{fpath.stem}" if fpath.stem in _GENERIC_STEMS else fpath.stem
+                is_hook = fpath.stem == "hooks" or bool(_HOOK_STEM_RE.match(fpath.stem))
+                subkind = "hook" if is_hook else "component"
+                cluster, role = head, "surface"
             else:
                 continue
 
@@ -566,7 +644,7 @@ class TypeScriptNextJsAdapter:
                     )
                 for m in _RAW_NEW_DATE_RE.finditer(txt):
                     args_str = m.group("args").strip()
-                    if args_str == "" or ("," not in args_str and "Date." not in args_str):
+                    if _is_raw_clock_read(txt, m):
                         lineno = txt.count("\n", 0, m.start()) + 1
                         if node.status == "clean":
                             node.status = "gray_zone"

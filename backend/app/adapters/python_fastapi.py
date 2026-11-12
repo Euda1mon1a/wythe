@@ -28,10 +28,57 @@ def _join_http_path(*parts: str) -> str:
     return "/" + "/".join(cleaned) if cleaned else "/"
 
 
+_VERSION_HEAD_RE = re.compile(r"^/api/v\d+(?=/)")
+
+
 def _compile_route_regex(full_path: str) -> str:
+    """Route matcher where the API version head is optional, as clients usually prepend it.
+
+    A route mounted under an explicit `/api/vN` keeps that exact version optional, so both
+    `/api/v1/items` and a base-URL-relative `/items` match it.
+    """
     norm = full_path.rstrip("/") or "/"
+    version = r"/api/v\d+"
+    head = _VERSION_HEAD_RE.match(norm)
+    if head:
+        version = re.escape(head.group(0))
+        norm = norm[head.end():]
     escaped = re.sub(r"\{[^/{}]+\}", r"[^/?#]+", norm)
-    return rf"^(?:/api/v\d+)?{escaped}/?$"
+    return rf"^(?:{version})?{escaped}/?$"
+
+
+def _resolve_router_mounts(modules: list[tuple[str, ParsedPythonModule]]) -> dict[str, list[str]]:
+    """Mount prefixes per module stem, composing nested `router.include_router(sub)` chains.
+
+    An include made by an aggregator (`app` or a module with no route handlers of its own)
+    mounts the child at the include prefix, as before. An include made into a route module's
+    own router mounts the child under every prefix that module is itself mounted at, plus that
+    module's `APIRouter(prefix=...)` and the include prefix.
+    """
+    mounts: dict[str, list[str]] = {}
+    nested_edges: list[tuple[str, str, str]] = []
+    for stem, pm in modules:
+        nested = set(pm.nested_router_includes) if pm.route_handlers else set()
+        for child, prefix in pm.router_includes:
+            if (child, prefix) in nested:
+                nested_edges.append((stem, child, _join_http_path(pm.router_prefix, prefix)))
+            else:
+                bucket = mounts.setdefault(child, [])
+                if prefix not in bucket:
+                    bucket.append(prefix)
+    for _ in range(8):  # bounded: include chains are shallow and cycles must not loop
+        changed = False
+        for parent, child, via in nested_edges:
+            for parent_mount in list(mounts.get(parent) or [""]):
+                joined = _join_http_path(parent_mount, via)
+                full = "" if joined == "/" else joined
+                bucket = mounts.setdefault(child, [])
+                if full not in bucket:
+                    bucket.append(full)
+                    changed = True
+        if not changed:
+            break
+    return mounts
 
 
 def _sql_table_id(truth: TruthExtractionResult, sym: str) -> str | None:
@@ -98,7 +145,7 @@ class PythonFastApiAdapter:
             return ManipulatorExtractionResult(nodes=[], edges=[], routes=[], findings=[])
 
         parsed_modules: dict[str, ParsedPythonModule] = {}
-        router_mounts: dict[str, list[str]] = {}
+        all_parsed: list[tuple[str, ParsedPythonModule]] = []
 
         for py_file in sorted(app_dir.rglob("*.py")):
             rel_app = py_file.relative_to(app_dir).as_posix()
@@ -116,13 +163,14 @@ class PythonFastApiAdapter:
             parsed = parse_python_module(text, rel_repo, mod_name)
             if parsed is None:
                 continue
-            for inc_stem, inc_prefix in parsed.router_includes:
-                router_mounts.setdefault(inc_stem, []).append(inc_prefix)
+            all_parsed.append((Path(rel_app).stem, parsed))
             if Path(rel_app).name == "__init__.py" and not parsed.route_handlers:
                 continue
             if rel_app in ("core/config.py", "db/base.py", "db/session.py"):
                 continue
             parsed_modules[rel_app] = parsed
+
+        router_mounts = _resolve_router_mounts(all_parsed)
 
         nodes_by_rel: dict[str, AtlasNode] = {}
         mod_name_to_node_id: dict[str, str] = {}
