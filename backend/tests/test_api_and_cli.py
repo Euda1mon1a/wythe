@@ -21,15 +21,27 @@ def test_http_api_surface_end_to_end(isolated_db_url: str) -> None:
 
         slots = client.get("/api/v1/adapters/slots")
         assert slots.status_code == 200
-        slot_names = {s["name"] for s in slots.json()}
-        assert {"postgres-sqlalchemy", "python-fastapi", "typescript-nextjs"} <= slot_names
+        slots_by_name = {s["name"]: s["implementation_status"] for s in slots.json()}
+        assert slots_by_name["postgres-sqlalchemy"] == "implemented"
+        assert slots_by_name["python-fastapi"] == "implemented"
+        assert slots_by_name["typescript-nextjs"] == "implemented"
+        assert slots_by_name["prisma-schema"] == "experimental"
+        assert slots_by_name["go-http"] == "experimental"
+        assert slots_by_name["rust-wasm"] == "experimental"
+        assert slots_by_name["swift-vapor"] == "planned"
 
         profiles = client.get("/api/v1/adapters/profiles")
         assert profiles.status_code == 200
-        assert any(
-            p["slug"] == "fastapi-sqlalchemy-nextjs" and p["is_enabled"]
-            for p in profiles.json()
+        profiles_by_slug = {p["slug"]: p for p in profiles.json()}
+        assert profiles_by_slug["fastapi-sqlalchemy-nextjs"]["implementation_status"] == "implemented"
+        assert profiles_by_slug["fastapi-sqlalchemy-nextjs"]["is_enabled"] is True
+        assert profiles_by_slug["nextjs-prisma"]["implementation_status"] == "experimental"
+        assert profiles_by_slug["rust-fullstack-wasm"]["implementation_status"] == "experimental"
+        assert profiles_by_slug["postgres-swift-swiftui"]["implementation_status"] == "planned"
+        exp_count = sum(
+            1 for p in profiles.json() if p["implementation_status"] == "experimental"
         )
+        assert exp_count == 16
 
         targets = client.get("/api/v1/targets")
         assert targets.status_code == 200

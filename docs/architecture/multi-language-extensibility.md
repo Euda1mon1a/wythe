@@ -19,39 +19,41 @@ Because `StackProfile` rows compose any `(truth_adapter, manipulator_adapter, di
 
 ---
 
-## 2. Popularity-Ranked Tier Matrix (Developer Survey / Octoverse / DB-Engines)
+## 2. Popularity-Ranked Tier Matrix & Maturity Classification
+
+Only the dogfooded `fastapi-sqlalchemy-nextjs` trio (`postgres-sqlalchemy`, `python-fastapi`, `typescript-nextjs`) is marked **`Implemented`** in `atlas_stack_profiles` and `/api/v1/adapters/slots`. All 13 secondary polyglot adapters (and their 16 composed stack profiles) are marked **`Experimental`** so operators know to start with `wythe diff` or ratchets before strict gating.
 
 ### Tier 1 — Database & Schema/ORM Truth
 
 | Adapter Key | Target Databases | Schema & ORM Sources | Status |
 | :--- | :--- | :--- | :--- |
-| `postgres-sqlalchemy` | PostgreSQL, MySQL, SQLite | SQLAlchemy 1.x/2.0 models, `schema.sql`, Alembic `op.create_table` + live read-only catalog probe | Implemented |
-| `prisma-schema` | PostgreSQL, MySQL, SQLite, SQL Server, CockroachDB | `schema.prisma` (`model`, `@@map`, `@@schema`), `prisma/migrations/**/*.sql`, live catalog probe | Implemented |
-| `drizzle-orm` | PostgreSQL, MySQL, SQLite | Drizzle `pgTable` / `mysqlTable` / `sqliteTable` TS schemas, `drizzle/**/*.sql`, live catalog probe | Implemented |
-| `django-orm` | PostgreSQL, MySQL, SQLite | Django `models.Model` AST (`Meta.db_table` or `<app>_<model>`), `migrations/*.py` (`CreateModel`, `RunSQL`), live catalog probe | Implemented |
-| `sql-ddl` | PostgreSQL, MySQL, SQLite | Raw `schema.sql` / `migrations/**/*.sql` (`golang-migrate`, `goose`, `Flyway`, `sqlx`) + `sqlc` `-- name:` query-to-table bindings + live catalog probe | Implemented |
-| `rust-sql` | PostgreSQL, MySQL, SQLite | Rust `sqlx` (`migrations/*.sql` + `query_file!` SQL bindings), `Diesel` (`diesel::table!` in `schema.rs` + `up.sql`), `SeaORM` (`#[sea_orm(table_name)]` entities) + live catalog probe | Implemented |
+| `postgres-sqlalchemy` | PostgreSQL, MySQL, SQLite | SQLAlchemy 1.x/2.0 models, `schema.sql`, Alembic `op.create_table` + live read-only catalog probe | **Implemented** |
+| `prisma-schema` | PostgreSQL, MySQL, SQLite, SQL Server, CockroachDB | `schema.prisma` (`model`, `@@map`, `@@schema`), `prisma/migrations/**/*.sql`, live catalog probe | Experimental |
+| `drizzle-orm` | PostgreSQL, MySQL, SQLite | Drizzle `pgTable` / `mysqlTable` / `sqliteTable` TS schemas, `drizzle/**/*.sql`, live catalog probe | Experimental |
+| `django-orm` | PostgreSQL, MySQL, SQLite | Django `models.Model` AST (`Meta.db_table` or `<app>_<model>`), `migrations/*.py` (`CreateModel`, `RunSQL`), live catalog probe | Experimental |
+| `sql-ddl` | PostgreSQL, MySQL, SQLite | Raw `schema.sql` / `migrations/**/*.sql` (`golang-migrate`, `goose`, `Flyway`, `sqlx`) + `sqlc` `-- name:` query-to-table bindings + live catalog probe | Experimental |
+| `rust-sql` | PostgreSQL, MySQL, SQLite | Rust `sqlx` (`migrations/*.sql` + `query_file!` SQL bindings), `Diesel` (`diesel::table!` in `schema.rs` + `up.sql`), `SeaORM` (`#[sea_orm(table_name)]` entities) + live catalog probe | Experimental |
 
 ### Tier 2 — Backend Manipulation
 
 | Adapter Key | Languages & Frameworks | Route & Truth-Door Extraction | Status |
 | :--- | :--- | :--- | :--- |
-| `python-fastapi` | Python · FastAPI, SQLAlchemy, Celery/CLI | `APIRouter` mount + decorator synthesis, Python AST ORM/SQL read vs. write, helper call graph | Implemented |
-| `typescript-node` | TypeScript / JS · Next.js Route Handlers (`route.ts`), Express, Hono, Fastify, NestJS | File-convention & router/decorator URL synthesis; Prisma, Drizzle, and raw SQL read vs. write; TS service graph | Implemented |
-| `python-django` | Python · Django, Django REST Framework (`ViewSet`/routers), Django Ninja | `urls.py` (`path`, `re_path`, `include`, DRF `router.register`), `Model.objects` read vs. write AST, service/view split | Implemented |
-| `go-http` | Go · `net/http` (Go 1.22+ ServeMux), `chi`, `gin`, `echo`, `fiber` + `sqlc` / `pgx` / `GORM` | Router group + verb handler synthesis, `sqlc` query symbol binding, GORM & SQL `Query` vs. `Exec`, package call graph | Implemented |
-| `rust-http` | Rust · `axum`, `actix-web`, `rocket`, `Tauri v2` (`#[tauri::command]`) + `sqlx` / `Diesel` / `SeaORM` | `Router::route`/`nest`, `#[get]`/`#[post]`, and `#[tauri::command]` IPC synthesis; `sqlx::query!`/`query_file!`, Diesel, & SeaORM read vs. write; crate call graph | Implemented |
+| `python-fastapi` | Python · FastAPI, SQLAlchemy, Celery/CLI | `APIRouter` mount + decorator synthesis, Python AST ORM/SQL read vs. write, helper call graph | **Implemented** |
+| `typescript-node` | TypeScript / JS · Next.js Route Handlers (`route.ts`), Express, Hono, Fastify, NestJS | File-convention & router/decorator URL synthesis; Prisma (`prisma.*` & `prisma.client.*`), Drizzle, and raw SQL read vs. write; TS service/query graph | Experimental |
+| `python-django` | Python · Django, Django REST Framework (`ViewSet`/routers), Django Ninja | `urls.py` (`path`, `re_path`, `include`, DRF `router.register`), `Model.objects` read vs. write AST, service/view split | Experimental |
+| `go-http` | Go · `net/http` (Go 1.22+ ServeMux), `chi`, `gin`, `echo`, `fiber` + `sqlc` / `pgx` / `GORM` | Router group + verb handler synthesis, `sqlc` query symbol binding, GORM & SQL `Query` vs. `Exec`, package call graph | Experimental |
+| `rust-http` | Rust · `axum`, `actix-web`, `rocket`, `Tauri v2` (`#[tauri::command]`) + `sqlx` / `Diesel` / `SeaORM` | `Router::route`/`nest`, `#[get]`/`#[post]`, and `#[tauri::command]` IPC synthesis; `sqlx::query!`/`query_file!`, Diesel, & SeaORM read vs. write; crate call graph | Experimental |
 | `swift-vapor` | Swift · Vapor | Typed route handlers, Fluent ORM doors, & SwiftUI contract bindings | Planned |
 
 ### Tier 3 — Frontend Display
 
 | Adapter Key | Languages & Frameworks | Surface & Contract Extraction | Status |
 | :--- | :--- | :--- | :--- |
-| `typescript-nextjs` | TypeScript / TSX · Next.js App Router & Pages Router + Tauri `invoke()` | `app/**/page.tsx` & `pages/**/*.tsx`, hooks, API clients, OpenAPI/schema type check, WCAG `DISP-005` | Implemented |
-| `typescript-react` | TypeScript / TSX · React SPA, Vite, React Router, TanStack Router, Remix + Tauri `invoke()` | `src/pages/**`, `src/routes/**`, `src/views/**`, `App.tsx`, hooks, `fetch`/`axios`/Tauri `invoke`, WCAG `DISP-005` | Implemented |
-| `vue-sfc` | Vue 3 / TypeScript · Vue Router & Nuxt 3 (`.vue` SFCs + composables + Tauri `invoke()`) | Line-accurate `<script setup>` / `<script>` & `<template>` extraction, `pages/**/*.vue`, `$fetch`/`useFetch`, WCAG `DISP-005` | Implemented |
-| `sveltekit` | Svelte 5 / TypeScript · SvelteKit (`.svelte` + `$lib` + `+page.server.ts` + Tauri `invoke()`) | `src/routes/**/+page.svelte` & `+page.ts`, `$lib` alias resolution, line-accurate `<script>` & markup `DISP-005` | Implemented |
-| `rust-wasm` | Rust (WASM) · `Leptos`, `Dioxus`, `Yew` + `gloo-net` / `reqwest` / Tauri WASM `invoke()` | `<Route path=.../>`, `#[route]`, `#[at]`, `Request::get/post/...`, WASM `DISP-001..005` checks | Implemented |
+| `typescript-nextjs` | TypeScript / TSX · Next.js App Router & Pages Router + Tauri `invoke()` | `app/**/page.tsx` & `pages/**/*.tsx`, hooks, API clients, OpenAPI/schema type check, WCAG `DISP-005` | **Implemented** |
+| `typescript-react` | TypeScript / TSX · React SPA, Vite, React Router, TanStack Router, Remix + Tauri `invoke()` | `src/pages/**`, `src/routes/**`, `src/views/**`, `App.tsx`, hooks, `fetch`/`axios`/Tauri `invoke`, WCAG `DISP-005` | Experimental |
+| `vue-sfc` | Vue 3 / TypeScript · Vue Router & Nuxt 3 (`.vue` SFCs + composables + Tauri `invoke()`) | Line-accurate `<script setup>` / `<script>` & `<template>` extraction, `pages/**/*.vue`, `$fetch`/`useFetch`, WCAG `DISP-005` | Experimental |
+| `sveltekit` | Svelte 5 / TypeScript · SvelteKit (`.svelte` + `$lib` + `+page.server.ts` + Tauri `invoke()`) | `src/routes/**/+page.svelte` & `+page.ts`, `$lib` alias resolution, line-accurate `<script>` & markup `DISP-005` | Experimental |
+| `rust-wasm` | Rust (WASM) · `Leptos`, `Dioxus`, `Yew` + `gloo-net` / `reqwest` / Tauri WASM `invoke()` | `<Route path=.../>`, `#[route]`, `#[at]`, `Request::get/post/...`, WASM `DISP-001..005` checks | Experimental |
 
 ---
 
@@ -78,3 +80,22 @@ Storing Wythe's own rules, ratchets, or audit rulings in Redis would violate the
 3. **PR Diff Slicer, SARIF 2.1.0 & Git-Portable Config (`diff_and_sarif_service.py`, `portable_config_service.py`)**:
    - `wythe diff <target> --base origin/main --sarif results.sarif` gates **only newly introduced violations on changed hunks** while computing directional upstream/downstream 3-tier blast radius.
    - `wythe export-config` / `sync-config` (`gate --sync-config`) round-trip `.wythe/governance.json` so ephemeral CI runners hydrate DB rule policies, vocabularies, ratchets, and rulings from Git.
+
+---
+
+## 5. Wild Open-Source Corpus Benchmarks & Known Transport Boundaries
+
+Every adapter family is evaluated on synthetic regression suites (`backend/tests/test_multilang_*.py`, `test_rust_stacks.py`) and benchmarked against real open-source full-stack repositories:
+
+| Repository (`git rev-parse --short HEAD`) | Detected Profile | Tier-1 Truth | Tier-2 Manipulate | Tier-3 Display | Verified Edges / E2E Chains | Observed Parser & Transport Boundaries |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`Euda1mon1a/wythe`** | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 7 tables, 1 SQL fn | 51 modules | 15 modules | **213 / 29** | `PASS --strict` (0 blocking, 0 warnings) |
+| **Production scheduling system** | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 294 tables, 30 SQL guards, 15 Redis | 1,362 modules | 630 modules | **10,056 / 300** | Multi-thousand-file production target |
+| **`umami-software/umami`** (`d3c62a805bed`) | `nextjs-prisma` (Experimental) | 41 Prisma tables | 156 routes, 189 query/service modules | 64 pages, 758 hooks/components | **3,162 / 294** | Resolves Next.js `(group)` route dirs, `[[...slug]]` catch-alls, `/api`-stripped `useApi` calls, and `prisma.client.<model>.*` wrappers |
+| **`sadmann7/shadcn-table`** (`f4438fda7864`) | `postgres-drizzle-nextjs` (Experimental) | 1 Drizzle table | 3 routes, 5 query/db modules | 8 pages, 88 hooks/components | **140 / 1** | `0` `DISP-004`; Next.js `"use server"` Server Actions bypass HTTP REST routes |
+| **`vintasoftware/django-react-boilerplate`** (`340e19b11249`) | `django-react` (Experimental) | 1 Django table, 1 Redis | 3 route modules, 14 services | 5 React modules | **13 / 0** | `PASS --strict` (`0` blocking); generated OpenAPI SDK abstracts raw fetch URLs |
+| **`usememos/memos`** (`9ee06fdc4722`) | `postgres-go-react` (Experimental) | 13 SQL tables | 5 Go route modules, 2 services | 17 pages, 307 UI modules | **1,224 / 0** | Intra-tier Go + React graphs resolve; Connect-RPC / gRPC (`proto/`) is non-REST |
+| **`lldap/lldap`** (`99c510a7a603`) | `rust-fullstack-wasm` (Experimental) | 12 SeaORM tables | 64 Rust backend modules | 2 Yew WASM pages, 47 components | **412 / 0** | Multi-crate SeaORM + root `app/` Yew WASM resolve; GraphQL (`schema.graphql`) is non-REST |
+
+### Known Non-REST Transport Limitations
+`_solve_cross_tier_lineage` currently bridges HTTP REST paths (`RouteDescriptor.path_regex` ↔ `FrontendHttpCall.normalized_path`) and Tauri IPC (`#[tauri::command]` ↔ `invoke()`). Repositories using **GraphQL**, **gRPC / Connect-RPC**, **tRPC**, or **React Server Actions (`"use server"`)** still receive Tier-1 schema drift checks (`TRUTH-002`, `TRUTH-004`), Tier-2/3 clock & policy-literal checks (`MANIP-001/002`, `DISP-001/002`), and Tier-3 WCAG accessibility checks (`DISP-005`), but cross-tier REST chains will report `0` and rules assuming HTTP route entrypoints (`TRUTH-001`, `MANIP-003`, `DISP-004`) should be ratcheted or disabled in `.wythe/governance.json`.

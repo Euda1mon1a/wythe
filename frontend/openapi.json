@@ -1566,6 +1566,7 @@
             "type": "string",
             "enum": [
               "implemented",
+              "experimental",
               "planned"
             ],
             "title": "Implementation Status"
@@ -4142,6 +4143,16 @@
           "stack_profile": {
             "type": "string",
             "title": "Stack Profile"
+          },
+          "stack_profile_status": {
+            "type": "string",
+            "enum": [
+              "implemented",
+              "experimental",
+              "planned"
+            ],
+            "title": "Stack Profile Status",
+            "default": "implemented"
           },
           "source_commit": {
             "type": "string",

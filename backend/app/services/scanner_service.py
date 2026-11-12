@@ -411,11 +411,17 @@ def run_target_scan(
         warning_findings=sum(1 for f in findings if not f.blocks_gate),
     )
 
+    profile_maturity = (
+        profile.implementation_status
+        if profile.implementation_status in ("implemented", "experimental", "planned")
+        else "experimental"
+    )
     report = TruthAtlasReport(
         target_slug=target.slug,
         target_name=target.name,
         repo_path=str(repo_root),
         stack_profile=target.stack_profile_slug,
+        stack_profile_status=profile_maturity,  # type: ignore[arg-type]
         source_commit=commit_sha,
         observed_at=observed,
         valid_until=valid_until_from(observed),

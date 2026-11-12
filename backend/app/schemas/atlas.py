@@ -198,6 +198,7 @@ class TruthAtlasReport(StrictSchema):
     target_name: str
     repo_path: str
     stack_profile: str
+    stack_profile_status: Literal["implemented", "experimental", "planned"] = "implemented"
     source_commit: str
     observed_at: datetime
     valid_until: datetime
@@ -229,7 +230,7 @@ class AdapterSlotSchema(StrictSchema):
     tier: TierKind
     language: str
     frameworks: list[str]
-    implementation_status: Literal["implemented", "planned"]
+    implementation_status: Literal["implemented", "experimental", "planned"]
     capabilities: list[str]
 
 

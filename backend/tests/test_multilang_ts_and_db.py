@@ -198,3 +198,58 @@ export function InvoicesPage() {
         assert resp.status_code == 200
         # Falls back to next enabled Drizzle+Node profile (`postgres-drizzle-nextjs`) from DB truth!
         assert resp.json()["recommended_profile_slug"] == "postgres-drizzle-nextjs"
+
+
+def test_nextjs_route_groups_prisma_wrapper_and_experimental_cli_banner(
+    isolated_db_url: str, tmp_path: Path, capsys
+) -> None:
+    """Verify Next.js `(main)` route groups, `prisma.client.*`, `queries/` doors, and `[experimental]` CLI banner."""
+    assert isolated_db_url.startswith("sqlite:")
+    repo = tmp_path / "umami_style_app"
+    (repo / "prisma" / "migrations" / "001_init").mkdir(parents=True)
+    (repo / "src" / "queries" / "prisma").mkdir(parents=True)
+    (repo / "src" / "app" / "api" / "websites" / "[websiteId]" / "[[...slug]]").mkdir(parents=True)
+    (repo / "src" / "app" / "(main)" / "websites").mkdir(parents=True)
+
+    (repo / "package.json").write_text(
+        '{"dependencies": {"next": "15.0.0", "@prisma/client": "6.0.0"}}',
+        encoding="utf-8",
+    )
+    (repo / "next.config.mjs").write_text("export default {};\n", encoding="utf-8")
+    (repo / "prisma" / "schema.prisma").write_text(
+        'model Website {\n  id String @id\n  @@map("website")\n}\n',
+        encoding="utf-8",
+    )
+    (repo / "prisma" / "migrations" / "001_init" / "migration.sql").write_text(
+        "CREATE TABLE website (id TEXT PRIMARY KEY);\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "queries" / "prisma" / "website.ts").write_text(
+        "import prisma from './client';\n"
+        "export async function getWebsite(id: string) {\n"
+        "  return prisma.client.website.findUnique({ where: { id } });\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "app" / "api" / "websites" / "[websiteId]" / "[[...slug]]" / "route.ts").write_text(
+        "import { getWebsite } from '@/queries/prisma/website';\n"
+        "export async function GET(_req: Request) {\n"
+        "  const row = await getWebsite('w1');\n"
+        "  return Response.json(row);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "app" / "(main)" / "websites" / "page.tsx").write_text(
+        "import type { paths } from '@/types/api-generated';\n"
+        "export default function WebsitesPage() {\n"
+        "  fetch('/websites/abc-123');\n"
+        "  return <main><h1>Websites</h1></main>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    rc = cli_main(["gate", "--strict", str(repo)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "nextjs-prisma [experimental]" in out
+    assert "1 end-to-end 3-tier chains" in out
