@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import app.models
+from app import __version__
 from app.api.routes import api_router
 from app.core.config import load_settings
 from app.db.base import Base
@@ -39,7 +40,7 @@ def create_app() -> FastAPI:
     settings = load_settings()
     application = FastAPI(
         title="Wythe API",
-        version="0.1.1",
+        version=__version__,
         description=(
             "Why -> Therefore: 3-tier architecture & lineage verifier. "
             "PostgreSQL holds truth, Backend manipulates truth, UI displays truth."
