@@ -266,7 +266,7 @@ INITIAL_RULE_POLICIES: tuple[dict[str, object], ...] = (
         "category": "raw_host_clock",
         "title": "Direct host date.today() or naive datetime.utcnow() in manipulation code",
         "rationale": "Domain manipulation must read time from a single program/database clock authority.",
-        "severity": "warning",
+        "severity": "blocking",
         "enabled": True,
         "blocks_gate": True,
     },

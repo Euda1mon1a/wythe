@@ -60,7 +60,7 @@ Only the dogfooded `fastapi-sqlalchemy-nextjs` trio (`postgres-sqlalchemy`, `pyt
 ## 3. Read-Only Multi-Database & Ephemeral Redis Verification (`--dsn`, `--redis-dsn`)
 
 All six Tier-1 Truth adapters share `probe_live_catalog_tables(dsn)` (`backend/app/adapters/db_catalog_probe.py`), performing **metadata-only** catalog reflection with zero table-row or PII reads:
-- **PostgreSQL (`postgresql://` / `postgres://`)**: Read-only session querying `information_schema.tables`.
+- **PostgreSQL (`postgresql://` / `postgres://`)**: One autocommit read-only statement over `pg_catalog.pg_class` (ordinary and partitioned tables, partitions excluded). `information_schema.tables` is not used: it lists only tables the connecting role holds a privilege on.
 - **MySQL / MariaDB (`mysql://`)**: Read-only metadata query against `information_schema.tables WHERE table_schema = DATABASE()`.
 - **SQLite (`sqlite:///path/to/file.db`)**: Read-only URI connection (`mode=ro`) querying `sqlite_master WHERE type = 'table'`.
 
