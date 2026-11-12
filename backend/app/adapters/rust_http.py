@@ -28,7 +28,7 @@ from app.adapters.rust_inspect import (
     extract_rust_routes,
     strip_rust_comments,
 )
-from app.core.policy_context import get_active_policy_tokens
+from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _SKIP_DIRS = ("target", "node_modules", ".git", "tests", "benches", "examples", "entity", "entities")
@@ -312,7 +312,7 @@ class RustHttpAdapter:
             active_tokens = get_active_policy_tokens()
             for pm in _RUST_POLICY_RE.finditer(txt):
                 cname = pm.group("name")
-                if any(tok in cname for tok in active_tokens):
+                if name_has_policy_token(cname, active_tokens):
                     lineno = txt.count("\n", 0, pm.start()) + 1
                     node.status = "policy_in_code"
                     findings.append(
