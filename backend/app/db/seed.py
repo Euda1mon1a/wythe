@@ -264,7 +264,7 @@ INITIAL_RULE_POLICIES: tuple[dict[str, object], ...] = (
         "rule_code": "MANIP-002",
         "tier": "manipulate",
         "category": "raw_host_clock",
-        "title": "Direct host date.today() or naive datetime.utcnow() in manipulation code",
+        "title": "Direct host date.today() or naive datetime.now()/utcnow() in manipulation code",
         "rationale": "Domain manipulation must read time from a single program/database clock authority.",
         "severity": "blocking",
         "enabled": True,

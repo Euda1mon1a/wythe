@@ -69,7 +69,7 @@ Rule severity, enablement, gate-blocking behavior, and effective-date windows li
 | `TRUTH-004` | `truth` | Warning | Unbounded Redis `SET`/`HSET` write without TTL risks volatile shadow truth |
 | `TRUTH-005` | `truth` | Warning | A model's table exists in the live DB (`--dsn`) but no `schema.sql`/migration creates it |
 | `MANIP-001` | `manipulate` | Blocking | Mutable domain policy/threshold constant hardcoded in code (`atlas_policy_vocabularies`) |
-| `MANIP-002` | `manipulate` | Blocking | Direct host `date.today()` or naive `datetime.utcnow()` call |
+| `MANIP-002` | `manipulate` | Blocking | Direct host `date.today()` or naive `datetime.now()` / `datetime.utcnow()` call |
 | `MANIP-003` | `manipulate` | Warning | Service/solver module has zero verified inbound route, CLI, or worker callers |
 | `DISP-001` | `display` | Blocking | Display tier defines domain policy threshold shadows in frontend code |
 | `DISP-002` | `display` | Blocking | Raw `new Date()` or UTC `.toISOString().slice(0, 10)` date slicing |
