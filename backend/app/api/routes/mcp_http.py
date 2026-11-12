@@ -20,7 +20,7 @@ def get_mcp_http_manifest_route() -> dict[str, Any]:
     """Return Streamable HTTP MCP discovery manifest & read-only tool schemas."""
     return {
         "name": "wythe",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "transport": "streamable-http",
         "protocolVersion": "2025-03-26",
         "endpoint": "/api/v1/mcp",

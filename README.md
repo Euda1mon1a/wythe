@@ -17,7 +17,7 @@ Wythe supports **18 full-stack profiles** via `--profile auto` (**1 production-d
 
 > [!IMPORTANT]
 > **Status, Maturity & Zero-Maintenance Notice (`"AS IS"`)**
-> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.0` or `wythe==0.1.0`) and fork freely.
+> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.1` or `wythe==0.1.1`) and fork freely.
 > - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **16 polyglot profiles** (`nextjs-prisma`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, `django-react`, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
 
 ---
@@ -48,7 +48,7 @@ Pin an explicit release tag (do not track unpinned branches if you want zero-sur
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0
-- uses: Euda1mon1a/wythe@v0.1.0
+- uses: Euda1mon1a/wythe@v0.1.1
   with:
     mode: diff
     base-ref: origin/main

@@ -173,7 +173,7 @@ def dispatch_mcp_request(session: Session, msg: dict[str, Any]) -> dict[str, Any
             "result": {
                 "protocolVersion": proto,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "wythe", "version": "0.1.0"},
+                "serverInfo": {"name": "wythe", "version": "0.1.1"},
             },
         }
     if method == "ping":
