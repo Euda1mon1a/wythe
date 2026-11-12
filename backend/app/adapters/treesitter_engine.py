@@ -189,8 +189,30 @@ def extract_ts_backend_routes_cst(source: str, mount_prefix: str = "") -> list[t
     return found
 
 
-def extract_ts_http_calls_cst(source: str, *, is_tsx: bool = True) -> list[tuple[str, str, int]] | None:
-    """Extract `(http_method, raw_url, lineno)` from TS/TSX CST `call_expression` nodes."""
+_TEMPLATE_HEAD_CONST_RE = re.compile(r"^\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
+
+
+def resolve_url_const_head(url_val: str, url_consts: dict[str, str] | None) -> str:
+    """Expand a leading `${NAME}` when NAME is a same-file string constant holding a path."""
+    if not url_consts or not url_val.startswith("${"):
+        return url_val
+    m = _TEMPLATE_HEAD_CONST_RE.match(url_val)
+    if m and m.group("name") in url_consts:
+        return url_consts[m.group("name")] + url_val[m.end() :]
+    return url_val
+
+
+def extract_ts_http_calls_cst(
+    source: str,
+    *,
+    is_tsx: bool = True,
+    url_consts: dict[str, str] | None = None,
+) -> list[tuple[str, str, int]] | None:
+    """Extract `(http_method, raw_url, lineno)` from TS/TSX CST `call_expression` nodes.
+
+    `url_consts` maps same-file string constants (`const BASE = '/things'`) to their values so
+    `` get(`${BASE}/${id}`) `` and `get(BASE)` resolve to a path instead of being dropped.
+    """
     if not has_treesitter():
         return None
     parser = _get_parser("tsx" if is_tsx else "ts")
@@ -222,8 +244,12 @@ def extract_ts_http_calls_cst(source: str, *, is_tsx: bool = True) -> list[tuple
                     if cmd:
                         tverb = "GET" if cmd.startswith(_TAURI_READ_PREFIXES) else "POST"
                         found.append((tverb, f"/tauri/{cmd}", fn_node.start_point[0] + 1))
-                elif first_arg is not None and first_arg.type in ("string", "template_string"):
-                    url_val = _unquote_node(raw, first_arg)
+                elif first_arg is not None and first_arg.type in ("string", "template_string", "identifier"):
+                    if first_arg.type == "identifier":
+                        ident = raw[first_arg.start_byte : first_arg.end_byte].decode("utf-8", errors="replace")
+                        url_val = (url_consts or {}).get(ident, "")
+                    else:
+                        url_val = resolve_url_const_head(_unquote_node(raw, first_arg), url_consts)
                     if url_val.startswith("/"):
                         upper_c = "DELETE" if callee_name.lower() == "del" else callee_name.upper()
                         if upper_c in _HTTP_VERBS:

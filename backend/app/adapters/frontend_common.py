@@ -15,6 +15,7 @@ from app.adapters.typescript_nextjs import (
     _UI_SAFE_TOKENS,
     _UTC_SLICE_RE,
     _extract_ts_http_calls,
+    _is_raw_clock_read,
     _normalize_ts_url,
     _strip_ts_comments,
 )
@@ -183,7 +184,7 @@ def scan_display_module_semantics(
             )
         for m in _RAW_NEW_DATE_RE.finditer(cleaned_txt):
             args_str = m.group("args").strip()
-            if args_str == "" or ("," not in args_str and "Date." not in args_str):
+            if _is_raw_clock_read(cleaned_txt, m):
                 lineno = cleaned_txt.count("\n", 0, m.start()) + 1
                 if node.status == "clean":
                     node.status = "gray_zone"

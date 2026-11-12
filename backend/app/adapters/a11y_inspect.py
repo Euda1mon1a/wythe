@@ -6,24 +6,115 @@ import re
 
 from app.adapters.base import RawCandidateFinding
 
-# Match opening tags (<img ...>, <div ...>, <span ...>, <input ...>) without stopping early on JSX `=>` arrows
-_IMG_TAG_RE = re.compile(r"<img\b(?P<attrs>(?:=>|[^>\"']|\"[^\"]*\"|'[^']*')*)>", re.IGNORECASE)
-_NON_INTERACTIVE_CLICK_RE = re.compile(
-    r"<(?P<tag>div|span)\b(?P<attrs>(?:=>|[^>\"']|\"[^\"]*\"|'[^']*'){0,500}?"
-    r"\b(?:onClick|on:click|@click|onclick)\s*=[\s\S]{0,240}?)>",
-)
-_INPUT_TAG_RE = re.compile(
-    r"<(?P<tag>input|select|textarea)\b(?P<attrs>(?:=>|[^>\"']|\"[^\"]*\"|'[^']*')*)>",
-)
-_EMPTY_BUTTON_RE = re.compile(
-    r"<button\b(?P<attrs>(?:=>|[^>\"']|\"[^\"]*\"|'[^']*')*)>\s*"
-    r"(?:<[A-Z][A-Za-z0-9_.]*\b[^>]*/\s*>\s*|<(?:svg|i)\b[\s\S]{0,400}?/\s*>\s*|<(?:svg|i)\b[\s\S]{0,400}?</(?:svg|i)>\s*)+"
+_IMG_OPEN_RE = re.compile(r"<img\b", re.IGNORECASE)
+_CLICKABLE_OPEN_RE = re.compile(r"<(?P<tag>div|span)\b")
+_INPUT_OPEN_RE = re.compile(r"<(?P<tag>input|select|textarea)\b")
+_BUTTON_OPEN_RE = re.compile(r"<button\b")
+_LABEL_TOKEN_RE = re.compile(r"<label\b|</label\s*>")
+_CLICK_ATTR_RE = re.compile(r"\b(?:onClick|on:click|@click|onclick)\s*=")
+# Children of an icon-only button: self-closing components, or inline <svg>/<i> glyphs.
+_ICON_ONLY_CHILDREN_RE = re.compile(
+    r"\s*(?:<[A-Z][A-Za-z0-9_.]*\b[^>]*/\s*>\s*|<(?:svg|i)\b[\s\S]{0,400}?/\s*>\s*|<(?:svg|i)\b[\s\S]{0,400}?</(?:svg|i)>\s*)+"
     r"</button>",
 )
-_LABEL_FOR_RE = re.compile(r"""<label\b[^>]*?\b(?:htmlFor|for)\s*=\s*(?:['"](?P<id>[^'"]+)['"]|\{(?P<expr>[^}]+)\})""")
-_WRAPPING_LABEL_RE = re.compile(r"<label\b(?:(?!</label>)[\s\S]){0,1500}?</label>")
-_ID_ATTR_RE = re.compile(r"""\bid\s*=\s*(?:['"](?P<id>[^'"]+)['"]|\{(?P<expr>[^}]+)\})""")
+_LABEL_FOR_ATTR_RE = re.compile(r"""\b(?:htmlFor|for)\s*=\s*(?:['"](?P<id>[^'"]+)['"]|\{(?P<expr>[^}]+)\})""")
+_ID_ATTR_RE = re.compile(r"""(?<![\w-])id\s*=\s*(?:['"](?P<id>[^'"]+)['"]|\{(?P<expr>[^}]+)\})""")
 _HIDDEN_INPUT_RE = re.compile(r"""\btype\s*=\s*['"](?:hidden|submit|reset|button)['"]""", re.IGNORECASE)
+_OPEN_TAG_SCAN_LIMIT = 8000
+
+
+def scan_open_tag_end(src: str, pos: int) -> int | None:
+    """Index just past the `>` that closes the opening tag whose attributes start at `pos`.
+
+    A `>` inside a `{...}` expression (arrow `=>`, TS generic `as Ref<T>`, comparison `a > b`),
+    a quoted attribute value, a template literal, or a comment does not end the tag. Returns
+    None for markup that never closes within the scan limit.
+    """
+    n = min(len(src), pos + _OPEN_TAG_SCAN_LIMIT)
+    stack: list[str] = []  # "{" for an expression, "`" for a template literal inside one
+    i = pos
+    while i < n:
+        ch = src[i]
+        top = stack[-1] if stack else ""
+        if top == "`":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "`":
+                stack.pop()
+            elif src.startswith("${", i):
+                stack.append("{")
+                i += 2
+                continue
+            i += 1
+            continue
+        if top == "{":
+            if src.startswith("//", i):
+                nl = src.find("\n", i)
+                i = n if nl < 0 else nl
+                continue
+            if src.startswith("/*", i):
+                close = src.find("*/", i + 2)
+                i = n if close < 0 else close + 2
+                continue
+            if ch in ("'", '"'):
+                j = i + 1
+                while j < n and src[j] not in (ch, "\n"):
+                    j += 2 if src[j] == "\\" else 1
+                i = j + 1
+                continue
+            if ch == "`" or ch == "{":
+                stack.append(ch)
+            elif ch == "}":
+                stack.pop()
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            close = src.find(ch, i + 1, n)
+            if close < 0:
+                return None
+            i = close + 1
+            continue
+        if ch == "{":
+            stack.append("{")
+        elif ch == ">":
+            return i + 1
+        elif ch == "<":
+            return None
+        i += 1
+    return None
+
+
+def _open_tags(src: str, pattern: re.Pattern[str]) -> list[tuple[re.Match[str], str, int]]:
+    """(match, attribute text, end index) for every complete opening tag `pattern` finds."""
+    tags: list[tuple[re.Match[str], str, int]] = []
+    for m in pattern.finditer(src):
+        end = scan_open_tag_end(src, m.end())
+        if end is not None:
+            tags.append((m, src[m.end() : end - 1], end))
+    return tags
+
+
+def _label_spans_and_targets(src: str) -> tuple[list[tuple[int, int]], set[str]]:
+    """Balanced `<label>...</label>` spans (any length, nested-safe) and their `htmlFor` ids."""
+    spans: list[tuple[int, int]] = []
+    targets: set[str] = set()
+    open_starts: list[int] = []
+    for m in _LABEL_TOKEN_RE.finditer(src):
+        if m.group(0).startswith("</"):
+            if open_starts:
+                spans.append((open_starts.pop(), m.end()))
+            continue
+        end = scan_open_tag_end(src, m.end())
+        if end is None:
+            continue
+        attrs = src[m.end() : end - 1]
+        fm = _LABEL_FOR_ATTR_RE.search(attrs)
+        if fm:
+            targets.add((fm.group("id") or fm.group("expr") or "").strip())
+        if not attrs.rstrip().endswith("/"):
+            open_starts.append(m.start())
+    return spans, targets
 
 
 def scan_a11y_markup_findings(
@@ -52,8 +143,7 @@ def scan_a11y_markup_findings(
         )
 
     # 1. <img> without alt attribute (unless decorative aria-hidden="true" or role="presentation"/"none")
-    for m in _IMG_TAG_RE.finditer(raw_source):
-        attrs = m.group("attrs")
+    for m, attrs, _end in _open_tags(raw_source, _IMG_OPEN_RE):
         if re.search(r"\balt\s*=", attrs) or re.search(r"""\baria-hidden\s*=\s*['"]true['"]""", attrs):
             continue
         if re.search(r"""\brole\s*=\s*['"](?:presentation|none)['"]""", attrs):
@@ -70,9 +160,10 @@ def scan_a11y_markup_findings(
         )
 
     # 2. Click handlers on non-interactive <div>/<span> without role + keyboard focusability
-    for m in _NON_INTERACTIVE_CLICK_RE.finditer(raw_source):
+    for m, attrs, _end in _open_tags(raw_source, _CLICKABLE_OPEN_RE):
         tag = m.group("tag")
-        attrs = m.group("attrs")
+        if not _CLICK_ATTR_RE.search(attrs):
+            continue
         if re.search(r"""\baria-hidden\s*=\s*['"]true['"]""", attrs):
             continue
         has_role = bool(re.search(r"\brole\s*=", attrs))
@@ -89,8 +180,9 @@ def scan_a11y_markup_findings(
         )
 
     # 3. Icon-only <button> without aria-label / aria-labelledby / title
-    for m in _EMPTY_BUTTON_RE.finditer(raw_source):
-        attrs = m.group("attrs")
+    for m, attrs, end in _open_tags(raw_source, _BUTTON_OPEN_RE):
+        if not _ICON_ONLY_CHILDREN_RE.match(raw_source, end):
+            continue
         if re.search(r"\b(?:aria-label|aria-labelledby|title)\s*=", attrs) or "{..." in attrs:
             continue
         lineno = raw_source.count("\n", 0, m.start()) + 1
@@ -103,19 +195,14 @@ def scan_a11y_markup_findings(
         )
 
     # 4. Orphaned form controls (<input>/<select>/<textarea> without label[for], wrapping <label>, or aria-label)
-    labeled_ids = {
-        (lm.group("id") or lm.group("expr") or "").strip()
-        for lm in _LABEL_FOR_RE.finditer(raw_source)
-    }
-    wrapped_spans = [wm.span() for wm in _WRAPPING_LABEL_RE.finditer(raw_source)]
-    for m in _INPUT_TAG_RE.finditer(raw_source):
+    wrapped_spans, labeled_ids = _label_spans_and_targets(raw_source)
+    for m, attrs, end in _open_tags(raw_source, _INPUT_OPEN_RE):
         tag = m.group("tag")
-        attrs = m.group("attrs")
         if _HIDDEN_INPUT_RE.search(attrs) or "{..." in attrs:
             continue
         if re.search(r"\b(?:aria-label|aria-labelledby|title)\s*=", attrs):
             continue
-        if any(ws <= m.start() and m.end() <= we for ws, we in wrapped_spans):
+        if any(ws <= m.start() and end <= we for ws, we in wrapped_spans):
             continue
         idm = _ID_ATTR_RE.search(attrs)
         if idm:
