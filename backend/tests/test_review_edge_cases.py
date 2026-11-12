@@ -514,3 +514,71 @@ def test_fallback_param_defaults_and_jsx_postfix_division(
     assert ("GET", "/api/v1/calc") in calls
     a11y = [f for f in res.findings if f.rule_code == "DISP-005"]
     assert len(a11y) == 2
+
+
+
+def test_try_handler_row_bindings_inherited_method_profiles_and_local_migration_helpers(
+    tmp_path: Path,
+) -> None:
+    try_pm = parse_python_module(
+        "def recover_row(db):\n"
+        "    row = None\n"
+        "    try:\n"
+        "        row = db.get(Widget, 1)\n"
+        "        raise RuntimeError('boom')\n"
+        "    except RuntimeError:\n"
+        "        if row is not None:\n"
+        "            row.state = 'failed'\n"
+        "            db.commit()\n",
+        "backend/app/services/recover.py",
+        "app.services.recover",
+    )
+    assert try_pm is not None
+    assert "Widget" in try_pm.persisted
+
+    _write(
+        tmp_path,
+        "backend/app/services/base_runner.py",
+        "class BaseRunner:\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/services/runner.py",
+        "from app.services.base_runner import BaseRunner\n\n"
+        "class Runner(BaseRunner):\n"
+        "    def __init__(self):\n"
+        "        self.config = {}\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/run.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/run')\n"
+        "def trigger(runner):\n"
+        "    _ = runner.config\n"
+        "    return runner.execute_tasks()\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.run", "m:service:services.base_runner") in pairs
+    assert ("m:route:api.routes.run", "m:service:services.runner") in pairs
+
+    _write(
+        tmp_path,
+        "backend/alembic/versions/004_nested.py",
+        "from alembic import op\n"
+        "import sqlalchemy as sa\n\n"
+        "def upgrade():\n"
+        "    def _create_live():\n"
+        "        op.create_table('nested_live', sa.Column('id', sa.Integer()))\n\n"
+        "    def _uncalled_dead():\n"
+        "        op.create_table('nested_dead', sa.Column('id', sa.Integer()))\n\n"
+        "    _create_live()\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert "t:nested_live" in by_id
+    assert "t:nested_dead" not in by_id

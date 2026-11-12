@@ -621,10 +621,13 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                     names.append(col.lower())
         return names
 
-    active_fns: set[str] = set()
+    active_fns: set[int] = set()
 
-    def walk_node(sub: ast.AST, ctx: tuple) -> None:
+    def walk_node(
+        sub: ast.AST, ctx: tuple, scope_fns: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]
+    ) -> None:
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope_fns[sub.name] = sub
             return
         order = (*ctx, (getattr(sub, "lineno", 0), getattr(sub, "col_offset", 0)))
         if isinstance(sub, ast.Call):
@@ -661,8 +664,8 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 effects.creates_all_metadata = True
             elif callee in ("add_column", "drop_column", "alter_column"):
                 effects.touches_ddl = True
-            elif isinstance(sub.func, ast.Name) and sub.func.id in functions:
-                visit(functions[sub.func.id], order)
+            elif isinstance(sub.func, ast.Name) and sub.func.id in scope_fns:
+                visit(scope_fns[sub.func.id], order, scope_fns)
         elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in consts:
             cleaned_u = _blank_sql_comments(consts[sub.id]).upper()
             if "ALTER TABLE" in cleaned_u:
@@ -679,19 +682,24 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                     absorb_sql(text, getattr(sub, "lineno", 1), order)
                 return
         for child in ast.iter_child_nodes(sub):
-            walk_node(child, ctx)
+            walk_node(child, ctx, scope_fns)
 
-    def visit(fn: ast.FunctionDef, ctx: tuple) -> None:
-        if fn.name in active_fns:
+    def visit(
+        fn: ast.FunctionDef | ast.AsyncFunctionDef,
+        ctx: tuple,
+        outer_fns: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+    ) -> None:
+        if id(fn) in active_fns:
             return
-        active_fns.add(fn.name)
+        active_fns.add(id(fn))
+        local_fns = dict(outer_fns)
         try:
             for stmt in fn.body:
-                walk_node(stmt, ctx)
+                walk_node(stmt, ctx, local_fns)
         finally:
-            active_fns.discard(fn.name)
+            active_fns.discard(id(fn))
 
-    visit(upgrade, ())
+    visit(upgrade, (), functions)
     if (
         effects.table_events
         or effects.created_functions

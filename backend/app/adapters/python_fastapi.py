@@ -304,6 +304,7 @@ class PythonFastApiAdapter:
         mod_name_to_node_id: dict[str, str] = {}
         symbol_to_defining_nodes: dict[str, list[str]] = {}
         raw_class_attrs: dict[tuple[str, str], set[str]] = {}
+        raw_class_methods: dict[tuple[str, str], dict[str, str]] = {}
         raw_class_bases: dict[tuple[str, str], tuple[str, ...]] = {}
         classes_by_name: dict[str, list[tuple[str, str]]] = {}
 
@@ -318,6 +319,9 @@ class PythonFastApiAdapter:
             for cname, cattrs in pm.class_attrs.items():
                 key = (node_id, cname)
                 raw_class_attrs[key] = set(cattrs)
+                raw_class_methods[key] = {
+                    m: node_id for m in cattrs if len(m) > 3 and not m.startswith("_") and m in pm.method_defs
+                }
                 raw_class_bases[key] = pm.class_bases.get(cname, ())
                 classes_by_name.setdefault(cname, []).append(key)
 
@@ -340,15 +344,16 @@ class PythonFastApiAdapter:
                     bkeys = classes_by_name.get(bname, ())
                     if len(bkeys) == 1:
                         raw_class_attrs[key].update(raw_class_attrs[bkeys[0]])
+                        for mname, def_nid in raw_class_methods[bkeys[0]].items():
+                            raw_class_methods[key].setdefault(mname, def_nid)
 
-        method_to_class_profiles: dict[str, list[tuple[str, frozenset[str]]]] = {}
+        method_to_class_profiles: dict[str, list[tuple[str, str, frozenset[str]]]] = {}
         for rel_app, pm in parsed_modules.items():
             nid = nodes_by_rel[rel_app].id
             for cname in pm.class_attrs:
                 full_attrs = frozenset(raw_class_attrs[(nid, cname)])
-                for mname in full_attrs:
-                    if len(mname) > 3 and not mname.startswith("_") and mname in pm.method_defs:
-                        method_to_class_profiles.setdefault(mname, []).append((nid, full_attrs))
+                for mname, def_nid in raw_class_methods[(nid, cname)].items():
+                    method_to_class_profiles.setdefault(mname, []).append((def_nid, nid, full_attrs))
 
         import_resolver = _ImportResolver(
             mod_name_to_node_id,
@@ -446,15 +451,18 @@ class PythonFastApiAdapter:
                 if len(defs) == 1:
                     add_edge(nid, defs[0], "calls_helper", pm.rel_path, f"Calls `{called_sym}()` across manipulation tier.")
             for called_sym, req_attrs in pm.param_method_calls:
-                compat = {
-                    cand_nid
-                    for cand_nid, cattrs in method_to_class_profiles.get(called_sym, ())
+                matches = [
+                    (def_nid, own_nid)
+                    for def_nid, own_nid, cattrs in method_to_class_profiles.get(called_sym, ())
                     if req_attrs <= cattrs
-                }
-                if len(compat) == 1:
+                ]
+                definers = {def_nid for def_nid, _ in matches}
+                owners = {own_nid for _, own_nid in matches}
+                targets = (*(definers if len(definers) == 1 else ()), *(owners if len(owners) == 1 else ()))
+                for target_cand in dict.fromkeys(targets):
                     add_edge(
                         nid,
-                        next(iter(compat)),
+                        target_cand,
                         "calls_helper",
                         pm.rel_path,
                         f"Calls `{called_sym}()` across manipulation tier.",

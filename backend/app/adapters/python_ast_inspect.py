@@ -637,15 +637,26 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                     if isinstance(item.optional_vars, ast.Name):
                         bind_var(item.optional_vars.id, item.context_expr, rows, made)
                 rows, made = walk_block(s.body, rows, made)
-            elif isinstance(s, ast.Try):
+            elif isinstance(s, (ast.Try, ast.TryStar)):
                 branches_r: list[dict[str, set[str]]] = []
                 branches_m: list[dict[str, set[str]]] = []
-                rb, mb = walk_block(s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()})
-                rb, mb = walk_block(s.orelse, rb, mb)
+                r_try, m_try = walk_block(
+                    s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
+                )
+                rb, mb = walk_block(
+                    s.orelse, {k: set(v) for k, v in r_try.items()}, {k: set(v) for k, v in m_try.items()}
+                )
                 branches_r.append(rb)
                 branches_m.append(mb)
+                h_in_r = _merge_binding_maps(rows, r_try)
+                h_in_m = _merge_binding_maps(made, m_try)
                 for h in s.handlers:
-                    rh, mh = walk_block(h.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()})
+                    hr = {k: set(v) for k, v in h_in_r.items()}
+                    hm = {k: set(v) for k, v in h_in_m.items()}
+                    if h.name:
+                        hr.pop(h.name, None)
+                        hm.pop(h.name, None)
+                    rh, mh = walk_block(h.body, hr, hm)
                     branches_r.append(rh)
                     branches_m.append(mh)
                 rows = _merge_binding_maps(*branches_r)
