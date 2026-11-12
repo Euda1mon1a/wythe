@@ -851,6 +851,60 @@ def test_zero_iteration_loop_preserves_injected_param_liveness(tmp_path: Path) -
     assert ("m:route:api.routes.zero_iter_comp", "m:service:services.zero_iter_worker") in pairs
 
 
+def test_migration_helper_defaults_closures_and_asi_arrow_scopes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(
+        tmp_path,
+        "backend/alembic/versions/007_defaults_and_closures.py",
+        "from alembic import op\n\n"
+        "CREATE_DEFAULT = 'CREATE TABLE default_widgets (id INT PRIMARY KEY);'\n"
+        "CREATE_KW = 'CREATE TABLE kw_widgets (id INT PRIMARY KEY);'\n"
+        "CREATE_NESTED = 'CREATE TABLE nested_widgets (id INT PRIMARY KEY);'\n"
+        "CREATE_SKIPPED = 'CREATE TABLE skipped_widgets (id INT PRIMARY KEY);'\n\n"
+        "def run_default(sql=CREATE_DEFAULT, *, extra=CREATE_KW):\n"
+        "    op.execute(sql)\n"
+        "    op.execute(extra)\n\n"
+        "def run_skipped(sql=CREATE_SKIPPED):\n"
+        "    op.execute(sql)\n\n"
+        "def run_nested(sql):\n"
+        "    def inner():\n"
+        "        op.execute(sql)\n"
+        "    inner()\n\n"
+        "def upgrade():\n"
+        "    run_default()\n"
+        "    run_skipped(None)\n"
+        "    run_nested(CREATE_NESTED)\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert "t:default_widgets" in by_id
+    assert "t:kw_widgets" in by_id
+    assert "t:nested_widgets" in by_id
+    assert "t:skipped_widgets" not in by_id
+
+    _write(
+        tmp_path,
+        "frontend/src/app/items/page.tsx",
+        "const URL = '/api/v1/items'\n"
+        "const identity = URL => URL\n"
+        "const chained = URL =>\n"
+        "  fetch(URL)\n"
+        "    .then(r => r.json())\n"
+        "export function ItemsPage() {\n"
+        "  identity('/shadow')\n"
+        "  chained('/shadow-2')\n"
+        "  fetch(URL)\n"
+        "  return <div />\n"
+        "}\n",
+    )
+    monkeypatch.setattr(typescript_nextjs, "extract_ts_http_calls_cst", lambda *a, **kw: None)
+    disp = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    calls = {(c.http_method, c.normalized_path) for c in disp.http_calls}
+    assert ("GET", "/api/v1/items") in calls
+
+
+
 
 
 

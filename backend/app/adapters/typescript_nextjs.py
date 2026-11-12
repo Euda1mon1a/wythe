@@ -75,7 +75,7 @@ def _collect_url_consts(txt: str) -> dict[str, str]:
 
 
 _FN_PARAM_HEAD_RE = re.compile(
-    r"""(?:\bfunction\b[A-Za-z0-9_$\s]*(?:<[^>{}()]*>)?\s*\((?P<fparams>[^)]*)\)\s*(?::[^{=]+)?\s*\{|\((?P<aparams>[^()]*)\)\s*(?::[^=]+)?=>|(?P<sparam>[A-Za-z_$][\w$]*)\s*=>)"""
+    r"""(?:\bfunction\b[A-Za-z0-9_$\s]*(?:<[^>{}()]*>)?\s*\((?P<fparams>[^)]*)\)\s*(?::[^{=]+)?\s*\{|\((?P<aparams>[^()]*)\)\s*(?::[^=;\r\n)]+)?\s*=>|(?P<sparam>[A-Za-z_$][\w$]*)\s*=>)"""
 )
 _LOCAL_BIND_RE = re.compile(r"""\b(?:const|let|var|function)\s+(?P<name>[A-Za-z_$][\w$]*)\b""")
 _PARAM_MODIFIER_RE = re.compile(r"^(?:(?:public|private|protected|readonly|override)\s+)+")
@@ -180,6 +180,36 @@ def _find_matching_delim(txt: str, open_idx: int, open_ch: str, close_ch: str) -
     return i
 
 
+_ARROW_CONT_TRAILING_KW_RE = re.compile(
+    r"\b(?:await|typeof|void|delete|new|in|instanceof|as|satisfies|keyof|readonly|yield)$"
+)
+_ARROW_GENERIC_TAIL_RE = re.compile(r"<[^<>=\r\n]+>$")
+_ARROW_CONT_LEADING_RE = re.compile(
+    r"^(?:\.|\?|:|\|\||&&|\?\?|[|&^*%/=>]|!=|\+(?!\+)|-(?!-)|<=|<<|<(?=\s)|(?:as|satisfies|instanceof|in)\b)"
+)
+
+
+def _arrow_continues_across_newline(txt: str, body_start: int, nl_pos: int) -> bool:
+    prefix = txt[body_start:nl_pos].rstrip(" \t")
+    if not prefix:
+        return True
+    last = prefix[-1]
+    if not prefix.endswith(("++", "--")):
+        if last in "+-*/%=&|^?:.~<":
+            return True
+        if last == ">" and (prefix.endswith("=>") or not _ARROW_GENERIC_TAIL_RE.search(prefix)):
+            return True
+    if _ARROW_CONT_TRAILING_KW_RE.search(prefix):
+        return True
+    k = nl_pos
+    n = len(txt)
+    while k < n and txt[k].isspace():
+        k += 1
+    if k >= n:
+        return False
+    return bool(_ARROW_CONT_LEADING_RE.match(txt, k))
+
+
 def _find_arrow_expr_end(txt: str, start: int) -> int:
     n = len(txt)
     i = start
@@ -187,6 +217,7 @@ def _find_arrow_expr_end(txt: str, start: int) -> int:
         i += 1
     if i < n and txt[i] == "{":
         return _find_matching_delim(txt, i, "{", "}")
+    body_start = i
     pdepth = bdepth = cdepth = 0
     quote: str | None = None
     while i < n:
@@ -217,8 +248,11 @@ def _find_arrow_expr_end(txt: str, start: int) -> int:
             if cdepth == 0:
                 break
             cdepth -= 1
-        elif ch in (";", ",") and pdepth == 0 and bdepth == 0 and cdepth == 0:
-            break
+        elif pdepth == 0 and bdepth == 0 and cdepth == 0:
+            if ch in (";", ","):
+                break
+            if ch in ("\n", "\r") and not _arrow_continues_across_newline(txt, body_start, i):
+                break
         i += 1
     return i
 
