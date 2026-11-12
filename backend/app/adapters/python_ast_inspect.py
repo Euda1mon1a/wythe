@@ -600,14 +600,20 @@ def _live_param_expr_nodes(
             defs: DefsMap,
             loop_breaks: list[tuple[bool, DefsMap]] | None = None,
             loop_continues: list[tuple[bool, DefsMap]] | None = None,
+            abrupt_returns: list[tuple[bool, DefsMap]] | None = None,
+            abrupt_raises: list[tuple[bool, DefsMap]] | None = None,
         ) -> tuple[bool, DefsMap, bool]:
             for s in stmts:
                 if isinstance(s, ast.Return):
                     live, defs = walk_expr(s.value, live, defs)
+                    if abrupt_returns is not None:
+                        abrupt_returns.append((live, _copy_defs(defs)))
                     return live, defs, False
                 if isinstance(s, ast.Raise):
                     live, defs = walk_expr(s.exc, live, defs)
                     live, defs = walk_expr(s.cause, live, defs)
+                    if abrupt_raises is not None:
+                        abrupt_raises.append((live, _copy_defs(defs)))
                     return live, defs, False
                 if isinstance(s, ast.Break):
                     if loop_breaks is not None:
@@ -681,8 +687,12 @@ def _live_param_expr_nodes(
                             live = False
                 elif isinstance(s, ast.If):
                     live, defs = walk_expr(s.test, live, defs)
-                    lb, db, fb = walk_stmts(s.body, live, _copy_defs(defs), loop_breaks, loop_continues)
-                    le, de, fe = walk_stmts(s.orelse, live, _copy_defs(defs), loop_breaks, loop_continues)
+                    lb, db, fb = walk_stmts(
+                        s.body, live, _copy_defs(defs), loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                    )
+                    le, de, fe = walk_stmts(
+                        s.orelse, live, _copy_defs(defs), loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                    )
                     if not fb and not fe:
                         return (lb or le), _merge_defs(db, de), False
                     live = (lb if fb else False) or (le if fe else False)
@@ -693,7 +703,7 @@ def _live_param_expr_nodes(
                     body_in, body_defs = walk_target(s.target, live, _copy_defs(defs))
                     brk: list[tuple[bool, DefsMap]] = []
                     cnt: list[tuple[bool, DefsMap]] = []
-                    lb, db, fb = walk_stmts(s.body, body_in, body_defs, brk, cnt)
+                    lb, db, fb = walk_stmts(s.body, body_in, body_defs, brk, cnt, abrupt_returns, abrupt_raises)
                     iter_end_l = (lb if fb else False) or any(cl for cl, _ in cnt)
                     iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd in cnt]))
                     if fb or cnt:
@@ -702,7 +712,9 @@ def _live_param_expr_nodes(
                         if merged_body_defs != body_defs:
                             brk = []
                             cnt = []
-                            lb, db, fb = walk_stmts(s.body, body_in or body2_in, merged_body_defs, brk, cnt)
+                            lb, db, fb = walk_stmts(
+                                s.body, body_in or body2_in, merged_body_defs, brk, cnt, abrupt_returns, abrupt_raises
+                            )
                             iter_end_l = (lb if fb else False) or any(cl for cl, _ in cnt)
                             iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd in cnt]))
                     zero_iter = False if nonempty_iter else live
@@ -715,7 +727,9 @@ def _live_param_expr_nodes(
                             if nonempty_iter
                             else (_merge_defs(defs, iter_end_d) if (fb or cnt) else _copy_defs(defs))
                         )
-                        le, de, fe = walk_stmts(s.orelse, else_in_l, else_in_d, loop_breaks, loop_continues)
+                        le, de, fe = walk_stmts(
+                            s.orelse, else_in_l, else_in_d, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                        )
                     if not fe and not brk:
                         return le, de, False
                     live = (le if fe else False) or any(bl for bl, _ in brk)
@@ -725,7 +739,7 @@ def _live_param_expr_nodes(
                     always_true = isinstance(s.test, ast.Constant) and bool(s.test.value) is True
                     brk = []
                     cnt = []
-                    lb, db, fb = walk_stmts(s.body, live, _copy_defs(defs), brk, cnt)
+                    lb, db, fb = walk_stmts(s.body, live, _copy_defs(defs), brk, cnt, abrupt_returns, abrupt_raises)
                     iter_end_l = (lb if fb else False) or any(cl for cl, _ in cnt)
                     iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd in cnt]))
                     zero_iter = False if always_true else live
@@ -733,7 +747,15 @@ def _live_param_expr_nodes(
                         le, de, fe = False, {}, False
                     else:
                         else_in_d = iter_end_d if always_true else _merge_defs(defs, iter_end_d)
-                        le, de, fe = walk_stmts(s.orelse, zero_iter or iter_end_l, else_in_d, loop_breaks, loop_continues)
+                        le, de, fe = walk_stmts(
+                            s.orelse,
+                            zero_iter or iter_end_l,
+                            else_in_d,
+                            loop_breaks,
+                            loop_continues,
+                            abrupt_returns,
+                            abrupt_raises,
+                        )
                     if not fe and not brk:
                         return le, de, False
                     live = (le if fe else False) or any(bl for bl, _ in brk)
@@ -743,15 +765,27 @@ def _live_param_expr_nodes(
                         live, defs = walk_expr(item.context_expr, live, defs)
                         if item.optional_vars is not None:
                             live, defs = walk_target(item.optional_vars, live, defs)
-                    live, defs, fw = walk_stmts(s.body, live, defs, loop_breaks, loop_continues)
+                    live, defs, fw = walk_stmts(
+                        s.body, live, defs, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                    )
                     if not fw:
                         return live, defs, False
                 elif isinstance(s, (ast.Try, ast.TryStar)):
                     entry_live = live
                     entry_defs = _copy_defs(defs)
-                    lt, dt, ft = walk_stmts(s.body, entry_live, _copy_defs(entry_defs), loop_breaks, loop_continues)
+                    body_returns: list[tuple[bool, DefsMap]] = []
+                    body_raises: list[tuple[bool, DefsMap]] = []
+                    post_returns: list[tuple[bool, DefsMap]] = []
+                    post_raises: list[tuple[bool, DefsMap]] = []
+                    try_breaks: list[tuple[bool, DefsMap]] = []
+                    try_continues: list[tuple[bool, DefsMap]] = []
+                    lt, dt, ft = walk_stmts(
+                        s.body, entry_live, _copy_defs(entry_defs), try_breaks, try_continues, body_returns, body_raises
+                    )
                     le, de, fe = (
-                        walk_stmts(s.orelse, lt, _copy_defs(dt), loop_breaks, loop_continues)
+                        walk_stmts(
+                            s.orelse, lt, _copy_defs(dt), try_breaks, try_continues, post_returns, post_raises
+                        )
                         if ft
                         else (False, {}, False)
                     )
@@ -766,17 +800,95 @@ def _live_param_expr_nodes(
                         if h.name:
                             hd.pop(h.name, None)
                         h_in = False if h.name == nm else (entry_live or lt)
-                        lh, dh, fh = walk_stmts(h.body, h_in, hd, loop_breaks, loop_continues)
+                        lh, dh, fh = walk_stmts(
+                            h.body, h_in, hd, try_breaks, try_continues, post_returns, post_raises
+                        )
                         if fh:
                             any_fall = True
                             h_lives.append(lh)
                             h_defs.append(dh)
-                    fin_in_l = any(h_lives) if any_fall else (entry_live or lt)
-                    fin_in_d = _merge_defs(*h_defs) if any_fall else exc_base_defs
-                    lf, df, ff = walk_stmts(s.finalbody, fin_in_l, fin_in_d, loop_breaks, loop_continues)
-                    if not ff or not any_fall:
-                        return lf, df, False
-                    live, defs = lf, df
+                    has_bare_except = isinstance(s, ast.Try) and any(h.type is None for h in s.handlers)
+                    all_returns = body_returns + post_returns
+                    uncaught_raises = post_raises if has_bare_except else (body_raises + post_raises)
+                    fall_in_l = any(h_lives) if any_fall else False
+                    fall_in_d = _merge_defs(*h_defs) if any_fall else {}
+                    if not s.finalbody:
+                        if abrupt_returns is not None:
+                            abrupt_returns.extend(all_returns)
+                        if abrupt_raises is not None:
+                            abrupt_raises.extend(uncaught_raises)
+                        if loop_breaks is not None:
+                            loop_breaks.extend(try_breaks)
+                        if loop_continues is not None:
+                            loop_continues.extend(try_continues)
+                        if not any_fall:
+                            return False, {}, False
+                        live, defs = fall_in_l, fall_in_d
+                    else:
+                        fin_states: list[tuple[bool, DefsMap]] = []
+                        if any_fall:
+                            fin_states.append((fall_in_l, fall_in_d))
+                        fin_states.extend(all_returns)
+                        fin_states.extend(uncaught_raises)
+                        if loop_breaks is not None:
+                            fin_states.extend(try_breaks)
+                        if loop_continues is not None:
+                            fin_states.extend(try_continues)
+                        if not fin_states:
+                            fin_states.append((entry_live or lt, exc_base_defs))
+                        fin_union_l = any(l for l, _ in fin_states)
+                        fin_union_d = _merge_defs(*(d for _, d in fin_states))
+                        walk_stmts(
+                            s.finalbody,
+                            fin_union_l,
+                            _copy_defs(fin_union_d),
+                            loop_breaks,
+                            loop_continues,
+                            abrupt_returns,
+                            abrupt_raises,
+                        )
+
+                        def eval_finalizer(
+                            in_l: bool, in_d: DefsMap, final_stmts: list[ast.stmt] = s.finalbody
+                        ) -> tuple[bool, DefsMap, bool]:
+                            out_len = len(out)
+                            dead_snap = set(dead_refs)
+                            rl, rd, rf = walk_stmts(final_stmts, in_l, _copy_defs(in_d))
+                            del out[out_len:]
+                            dead_refs.clear()
+                            dead_refs.update(dead_snap)
+                            return rl, rd, rf
+
+                        if all_returns and abrupt_returns is not None:
+                            rl, rd, rf = eval_finalizer(
+                                any(l for l, _ in all_returns), _merge_defs(*(d for _, d in all_returns))
+                            )
+                            if rf:
+                                abrupt_returns.append((rl, rd))
+                        if uncaught_raises and abrupt_raises is not None:
+                            rl, rd, rf = eval_finalizer(
+                                any(l for l, _ in uncaught_raises), _merge_defs(*(d for _, d in uncaught_raises))
+                            )
+                            if rf:
+                                abrupt_raises.append((rl, rd))
+                        if try_breaks and loop_breaks is not None:
+                            rl, rd, rf = eval_finalizer(
+                                any(l for l, _ in try_breaks), _merge_defs(*(d for _, d in try_breaks))
+                            )
+                            if rf:
+                                loop_breaks.append((rl, rd))
+                        if try_continues and loop_continues is not None:
+                            rl, rd, rf = eval_finalizer(
+                                any(l for l, _ in try_continues), _merge_defs(*(d for _, d in try_continues))
+                            )
+                            if rf:
+                                loop_continues.append((rl, rd))
+                        if not any_fall:
+                            return False, {}, False
+                        lf, df, ff = eval_finalizer(fall_in_l, fall_in_d)
+                        if not ff:
+                            return lf, df, False
+                        live, defs = lf, df
                 elif isinstance(s, ast.Match):
                     live, defs = walk_expr(s.subject, live, defs)
                     c_lives: list[bool] = []
@@ -798,7 +910,9 @@ def _live_param_expr_nodes(
                         if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None:
                             has_wild = True
                         cin, cd = walk_expr(case.guard, cin, cd)
-                        lc, dc, fc = walk_stmts(case.body, cin, cd, loop_breaks, loop_continues)
+                        lc, dc, fc = walk_stmts(
+                            case.body, cin, cd, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                        )
                         exit_lives.append(lc)
                         exit_defs.append(dc)
                         if fc:
@@ -818,17 +932,22 @@ def _live_param_expr_nodes(
                         if isinstance(ch, ast.expr):
                             live, defs = walk_expr(ch, live, defs)
                         elif isinstance(ch, ast.stmt):
-                            live, defs, fs = walk_stmts([ch], live, defs, loop_breaks, loop_continues)
+                            live, defs, fs = walk_stmts(
+                                [ch], live, defs, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                            )
                             if not fs:
                                 return live, defs, False
             return live, defs, True
 
         if isinstance(body, list):
-            end_live, end_defs, _ = walk_stmts(body, True, init_defs)
-            if end_live:
-                for fn_name, fn_nodes in list(end_defs.items()):
+            top_returns: list[tuple[bool, DefsMap]] = []
+            end_live, end_defs, end_fall = walk_stmts(body, True, init_defs, None, None, top_returns, None)
+            exit_states = ([(end_live, end_defs)] if end_fall else []) + top_returns
+            if any(l for l, _ in exit_states):
+                live_exit_defs = _merge_defs(*(d for l, d in exit_states if l))
+                for fn_name, fn_nodes in list(live_exit_defs.items()):
                     if any(id(fn_node) not in dead_refs for fn_node in fn_nodes):
-                        activate_defs(fn_name, end_defs)
+                        activate_defs(fn_name, live_exit_defs)
         else:
             walk_expr(body, True, init_defs)
 

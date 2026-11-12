@@ -904,6 +904,45 @@ def test_migration_helper_defaults_closures_and_asi_arrow_scopes(
     assert ("GET", "/api/v1/items") in calls
 
 
+def test_finally_preserves_terminating_paths_without_polluting_fallthrough(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "backend/app/services/finally_worker.py",
+        "class FinallyWorker:\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/finally_route.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/finally-return')\n"
+        "def run_finally_return(worker, flag, replacement):\n"
+        "    try:\n"
+        "        if flag:\n"
+        "            return None\n"
+        "        worker = replacement\n"
+        "    finally:\n"
+        "        worker.execute_tasks()\n"
+        "    return worker.post_rebind_only\n\n"
+        "@router.post('/api/v1/finally-break')\n"
+        "def run_finally_break(worker, flag, replacement):\n"
+        "    for _ in [1]:\n"
+        "        try:\n"
+        "            if flag:\n"
+        "                break\n"
+        "            worker = replacement\n"
+        "        finally:\n"
+        "            worker.execute_tasks()\n"
+        "    return None\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.finally_route", "m:service:services.finally_worker") in pairs
+
+
+
 
 
 
