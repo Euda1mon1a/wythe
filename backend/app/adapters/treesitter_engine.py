@@ -42,7 +42,6 @@ except ImportError:  # pragma: no cover
 _HTTP_VERBS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 _FETCH_HELPERS = frozenset({"fetch", "ofetch", "$fetch", "useFetch", "useLazyFetch", "apiRequest", "request", "httpClient"})
 _CALLEE_WRAPPERS = frozenset({"await_expression", "parenthesized_expression", "non_null_expression"})
-_METHOD_RE = re.compile(r"""method\s*:\s*['"](?P<m>GET|POST|PUT|PATCH|DELETE)['"]""", re.IGNORECASE)
 _TAURI_READ_PREFIXES = ("get_", "list_", "fetch_", "load_", "find_", "query_", "read_", "detect_", "estimate_", "scope_")
 
 
@@ -317,6 +316,59 @@ def _apply_cst_block_decls(
     return merged, next_bound
 
 
+def _unwrap_cst_expr(node: Any) -> Any:
+    cur = node
+    while cur is not None and cur.named_children:
+        if cur.type in ("parenthesized_expression", "as_expression", "satisfies_expression", "non_null_expression"):
+            cur = cur.named_children[0]
+        elif cur.type == "type_assertion":
+            cur = cur.named_children[-1]
+        else:
+            break
+    return cur
+
+
+def _extract_cst_fetch_method(raw: bytes, opt_node: Any) -> str:
+    """Read HTTP method only from a top-level `method` property on the options object literal."""
+    obj = _unwrap_cst_expr(opt_node)
+    if obj is None or obj.type != "object":
+        return "GET"
+    verb = "GET"
+    for ch in obj.named_children:
+        if ch.type != "pair":
+            continue
+        k_node = ch.child_by_field_name("key") or (ch.named_children[0] if ch.named_children else None)
+        v_node = ch.child_by_field_name("value") or (ch.named_children[-1] if len(ch.named_children) >= 2 else None)
+        if k_node is None or v_node is None:
+            continue
+        key_name = ""
+        if k_node.type in ("property_identifier", "identifier"):
+            key_name = raw[k_node.start_byte : k_node.end_byte].decode("utf-8", errors="replace")
+        elif k_node.type in ("string", "template_string") and not any(
+            c.type == "template_substitution" for c in k_node.children
+        ):
+            key_name = _unquote_node(raw, k_node)
+        elif k_node.type == "computed_property_name" and k_node.named_children:
+            inner_k = _unwrap_cst_expr(k_node.named_children[0])
+            if inner_k is not None and inner_k.type in ("string", "template_string") and not any(
+                c.type == "template_substitution" for c in inner_k.children
+            ):
+                key_name = _unquote_node(raw, inner_k)
+        if key_name != "method":
+            continue
+        val = _unwrap_cst_expr(v_node)
+        if (
+            val is not None
+            and val.type in ("string", "template_string")
+            and not any(c.type == "template_substitution" for c in val.children)
+        ):
+            cand = _unquote_node(raw, val).strip().upper()
+            verb = cand if cand in _HTTP_VERBS else "GET"
+        else:
+            verb = "GET"
+    return verb
+
+
 def extract_ts_http_calls_cst(
     source: str,
     *,
@@ -395,12 +447,7 @@ def extract_ts_http_calls_cst(
                         if upper_c in _HTTP_VERBS:
                             found.append((upper_c, url_val, fn_node.start_point[0] + 1))
                         elif callee_name in _FETCH_HELPERS:
-                            verb = "GET"
-                            if len(arg_items) >= 2:
-                                opt_txt = raw[arg_items[1].start_byte : arg_items[1].end_byte].decode("utf-8", errors="replace")
-                                mm = _METHOD_RE.search(opt_txt)
-                                if mm:
-                                    verb = mm.group("m").upper()
+                            verb = _extract_cst_fetch_method(raw, arg_items[1]) if len(arg_items) >= 2 else "GET"
                             found.append((verb, url_val, fn_node.start_point[0] + 1))
         for ch in node.children:
             walk(ch, scope_consts, scope_bound)

@@ -942,6 +942,101 @@ def test_finally_preserves_terminating_paths_without_polluting_fallthrough(tmp_p
     assert ("m:route:api.routes.finally_route", "m:service:services.finally_worker") in pairs
 
 
+def test_variadic_migration_helpers_and_caller_stored_service_attrs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(
+        tmp_path,
+        "backend/alembic/versions/0001_variadic.py",
+        "revision = '0001'\n"
+        "down_revision = None\n"
+        "from alembic import op\n\n"
+        "CREATE_ALPHA = 'CREATE TABLE alpha_items (id INT PRIMARY KEY);'\n"
+        "CREATE_BETA = 'CREATE TABLE beta_items (id INT PRIMARY KEY);'\n"
+        "DROP_BETA = 'DROP TABLE beta_items;'\n"
+        "CREATE_GAMMA = 'CREATE TABLE gamma_items (id INT PRIMARY KEY);'\n"
+        "CREATE_DELTA = 'CREATE TABLE delta_items (id INT PRIMARY KEY);'\n\n"
+        "def execute_all(*statements):\n"
+        "    for sql in statements:\n"
+        "        op.execute(sql)\n\n"
+        "def execute_named(**queries):\n"
+        "    for key in queries:\n"
+        "        op.execute(queries[key])\n\n"
+        "def upgrade():\n"
+        "    execute_all(CREATE_ALPHA, CREATE_BETA)\n"
+        "    execute_all(DROP_BETA)\n"
+        "    execute_named(gamma=CREATE_GAMMA, delta=CREATE_DELTA)\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert "t:alpha_items" in by_id
+    assert "t:gamma_items" in by_id
+    assert "t:delta_items" in by_id
+    assert "t:beta_items" not in by_id
+
+    _write(
+        tmp_path,
+        "backend/app/services/base_worker.py",
+        "class BaseWorker:\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/services/concrete_worker.py",
+        "from app.services.base_worker import BaseWorker\n\n"
+        "class ConcreteWorker(BaseWorker):\n"
+        "    def run_extra(self):\n"
+        "        return 2\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/trace_route.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/traced-work')\n"
+        "def run_traced(worker):\n"
+        "    worker.trace_id = 'request-1'\n"
+        "    _ = worker.trace_id\n"
+        "    setattr(worker, 'span_id', 'span-1')\n"
+        "    worker.local_cb = lambda: 0\n"
+        "    worker.local_cb()\n"
+        "    if hasattr(worker, 'optional_flush'):\n"
+        "        worker.optional_flush()\n"
+        "    return worker.run_extra() + worker.execute_tasks()\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.trace_route", "m:service:services.concrete_worker") in pairs
+
+    _write(
+        tmp_path,
+        "frontend/src/app/users/page.tsx",
+        "const USERS_URL = '/api/v1/users';\n"
+        "const UPDATE_URL = '/api/v1/users/sync';\n"
+        "export function UsersPage() {\n"
+        "  void fetch(USERS_URL, { headers: { method: 'POST' } });\n"
+        "  void fetch('/api/v1/direct', { headers: { method: 'DELETE' } });\n"
+        "  void fetch(UPDATE_URL, { headers: { method: 'DELETE' }, method: 'POST' });\n"
+        "  return <div />;\n"
+        "}\n",
+    )
+    disp_cst = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    cst_calls = {(c.http_method, c.normalized_path) for c in disp_cst.http_calls}
+    assert ("GET", "/api/v1/users") in cst_calls
+    assert ("POST", "/api/v1/users") not in cst_calls
+    assert ("GET", "/api/v1/direct") in cst_calls
+    assert ("POST", "/api/v1/users/sync") in cst_calls
+
+    monkeypatch.setattr(typescript_nextjs, "extract_ts_http_calls_cst", lambda *a, **kw: None)
+    disp_fb = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    fb_calls = {(c.http_method, c.normalized_path) for c in disp_fb.http_calls}
+    assert ("GET", "/api/v1/users") in fb_calls
+    assert ("POST", "/api/v1/users") not in fb_calls
+    assert ("GET", "/api/v1/direct") in fb_calls
+    assert ("POST", "/api/v1/users/sync") in fb_calls
+
+
 
 
 

@@ -47,7 +47,7 @@ _HTTP_CALL_START_RE = re.compile(
     r"""\b(?:api\.|axios\.|http\.|client\.|ky\.)?(?P<verb>get|post|put|patch|del|delete|fetch|apiRequest|request|httpClient|ofetch)\s*(?:<[^;()]{0,220}?>)?\s*\(\s*(?:[A-Za-z_$][A-Za-z0-9_$.]*\s*\?\s*)?(?P<quote>['"`])"""
 )
 _FETCH_LIKE_VERBS = frozenset({"FETCH", "APIREQUEST", "REQUEST", "HTTPCLIENT", "OFETCH"})
-_FETCH_METHOD_RE = re.compile(r"""method\s*:\s*['"](?P<m>GET|POST|PUT|PATCH|DELETE)['"]""", re.IGNORECASE)
+_VALID_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 _RTK_BASE_URL_RE = re.compile(r"""fetchBaseQuery\s*\(\s*\{[\s\S]{0,160}?baseUrl\s*:\s*['"](?P<base>[^'"]+)['"]""")
 _RTK_ENDPOINT_RE = re.compile(
     r"""builder\.(?P<kind>query|mutation)\s*(?:<[^;()]{0,220}?>)?\s*\(\s*\{[\s\S]{0,260}?url\s*:\s*(?P<quote>['"`])(?P<url>[^'"`\n]+)(?P=quote)"""
@@ -486,19 +486,199 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
     return root_consts, consts_at
 
 
-def _fetch_method_from_call_tail(txt: str, pos: int) -> str:
-    n = len(txt)
-    pdepth = 1
-    j = pos
-    limit = min(n, pos + 260)
-    while j < limit and pdepth > 0:
-        if txt[j] == "(":
-            pdepth += 1
-        elif txt[j] == ")":
-            pdepth -= 1
+def _skip_ts_ws_and_comments(s: str, idx: int) -> int:
+    n = len(s)
+    while idx < n:
+        if s[idx].isspace():
+            idx += 1
+        elif s.startswith("//", idx):
+            nl = s.find("\n", idx + 2)
+            idx = n if nl < 0 else nl + 1
+        elif s.startswith("/*", idx):
+            end_c = s.find("*/", idx + 2)
+            idx = n if end_c < 0 else end_c + 2
+        else:
+            break
+    return idx
+
+
+def _skip_ts_quoted(s: str, idx: int) -> tuple[str | None, int]:
+    """Read a static JS/TS string or template literal starting at `idx`, returning `(value_or_None, next_idx)`."""
+    n = len(s)
+    q = s[idx]
+    j = idx + 1
+    chars: list[str] = []
+    dynamic = False
+    if q == "`":
+        bdepth = 0
+        while j < n:
+            ch = s[j]
+            if bdepth == 0:
+                if ch == "\\":
+                    if j + 1 < n:
+                        chars.append(s[j + 1])
+                    j += 2
+                    continue
+                if ch == "`":
+                    return (None if dynamic else "".join(chars)), j + 1
+                if ch == "$" and j + 1 < n and s[j + 1] == "{":
+                    dynamic = True
+                    bdepth = 1
+                    j += 2
+                    continue
+                chars.append(ch)
+                j += 1
+            else:
+                if ch in ("'", '"', "`"):
+                    _, j = _skip_ts_quoted(s, j)
+                    continue
+                if s.startswith("//", j) or s.startswith("/*", j):
+                    j = _skip_ts_ws_and_comments(s, j)
+                    continue
+                if ch == "{":
+                    bdepth += 1
+                elif ch == "}":
+                    bdepth -= 1
+                j += 1
+        return None, n
+    while j < n:
+        ch = s[j]
+        if ch == "\\":
+            if j + 1 < n:
+                chars.append(s[j + 1])
+            j += 2
+            continue
+        if ch == q:
+            return "".join(chars), j + 1
+        if ch in ("\n", "\r"):
+            return None, j
+        chars.append(ch)
         j += 1
-    mm = _FETCH_METHOD_RE.search(txt[pos:j])
-    return mm.group("m").upper() if mm else "GET"
+    return None, n
+
+
+def _unwrap_ts_prefix_wrappers(s: str, idx: int) -> int:
+    n = len(s)
+    while idx < n:
+        idx = _skip_ts_ws_and_comments(s, idx)
+        if idx < n and s[idx] == "(":
+            idx += 1
+            continue
+        if idx < n and s[idx] == "<":
+            close_gt = _find_matching_delim(s, idx, "<", ">")
+            if close_gt > idx + 1:
+                idx = close_gt
+                continue
+        break
+    return idx
+
+
+def _fetch_method_from_call_tail(txt: str, pos: int, *, at_second_arg: bool = False) -> str:
+    n = len(txt)
+    if at_second_arg:
+        arg2_pos = pos
+    else:
+        k = pos + 1 if pos < n and txt[pos] in ("'", '"', "`") else pos
+        pdepth = 1
+        bdepth = cdepth = 0
+        arg2_pos = -1
+        while k < n and pdepth > 0:
+            ch = txt[k]
+            if ch in ("'", '"', "`"):
+                _, k = _skip_ts_quoted(txt, k)
+                continue
+            if txt.startswith("//", k) or txt.startswith("/*", k):
+                k = _skip_ts_ws_and_comments(txt, k)
+                continue
+            if ch == "(":
+                pdepth += 1
+            elif ch == ")":
+                pdepth -= 1
+            elif ch == "[":
+                bdepth += 1
+            elif ch == "]":
+                bdepth = max(0, bdepth - 1)
+            elif ch == "{":
+                cdepth += 1
+            elif ch == "}":
+                cdepth = max(0, cdepth - 1)
+            elif ch == "," and pdepth == 1 and bdepth == 0 and cdepth == 0:
+                arg2_pos = k + 1
+                break
+            k += 1
+        if arg2_pos < 0:
+            return "GET"
+
+    obj_pos = _unwrap_ts_prefix_wrappers(txt, arg2_pos)
+    if obj_pos >= n or txt[obj_pos] != "{":
+        return "GET"
+
+    props: list[tuple[int, int]] = []
+    j = obj_pos + 1
+    cdepth = 1
+    pdepth = bdepth = 0
+    seg_start = j
+    while j < n and cdepth > 0:
+        ch = txt[j]
+        if ch in ("'", '"', "`"):
+            _, j = _skip_ts_quoted(txt, j)
+            continue
+        if txt.startswith("//", j) or txt.startswith("/*", j):
+            j = _skip_ts_ws_and_comments(txt, j)
+            continue
+        if ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            cdepth -= 1
+            if cdepth == 0:
+                props.append((seg_start, j))
+                break
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            pdepth = max(0, pdepth - 1)
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            bdepth = max(0, bdepth - 1)
+        elif ch == "," and cdepth == 1 and pdepth == 0 and bdepth == 0:
+            props.append((seg_start, j))
+            seg_start = j + 1
+        j += 1
+
+    verb = "GET"
+    for ps, pe in props:
+        prop = txt[ps:pe]
+        p = _skip_ts_ws_and_comments(prop, 0)
+        if p >= len(prop):
+            continue
+        key_name: str | None = None
+        if prop[p] in ("'", '"', "`"):
+            key_name, p = _skip_ts_quoted(prop, p)
+        elif prop[p] == "[":
+            inner_p = _unwrap_ts_prefix_wrappers(prop, p + 1)
+            if inner_p < len(prop) and prop[inner_p] in ("'", '"', "`"):
+                key_name, inner_p = _skip_ts_quoted(prop, inner_p)
+                close_b = prop.find("]", inner_p)
+                p = close_b + 1 if close_b >= 0 else len(prop)
+        else:
+            km = re.match(r"[A-Za-z_$][\w$]*", prop[p:])
+            if km:
+                key_name = km.group(0)
+                p += km.end()
+        if key_name != "method":
+            continue
+        p = _skip_ts_ws_and_comments(prop, p)
+        if p >= len(prop) or prop[p] != ":":
+            continue
+        val_p = _unwrap_ts_prefix_wrappers(prop, p + 1)
+        if val_p < len(prop) and prop[val_p] in ("'", '"', "`"):
+            raw_m, _ = _skip_ts_quoted(prop, val_p)
+            cand = raw_m.strip().upper() if raw_m is not None else ""
+            verb = cand if cand in _VALID_HTTP_METHODS else "GET"
+        else:
+            verb = "GET"
+    return verb
 
 
 def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
@@ -579,7 +759,11 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
             if iverb == "DEL":
                 iverb = "DELETE"
             elif iverb in _FETCH_LIKE_VERBS:
-                iverb = _fetch_method_from_call_tail(txt, im.end()) if txt[im.end() - 1] == "," else "GET"
+                iverb = (
+                    _fetch_method_from_call_tail(txt, im.end(), at_second_arg=True)
+                    if txt[im.end() - 1] == ","
+                    else "GET"
+                )
             results.append((iverb, local_consts[ident], txt.count("\n", 0, im.start()) + 1))
     if "createApi" in txt and "builder." in txt:
         bm = _RTK_BASE_URL_RE.search(txt)

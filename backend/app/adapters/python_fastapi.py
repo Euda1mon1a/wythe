@@ -338,10 +338,22 @@ class PythonFastApiAdapter:
                 summary=pm.summary,
             )
 
+        import_resolver = _ImportResolver(
+            mod_name_to_node_id,
+            {pm.module_name: pm for pm in parsed_modules.values()},
+            packages,
+            symbol_to_defining_nodes,
+        )
+
         for _ in range(4):
             for key, bases in raw_class_bases.items():
                 for bname in bases:
-                    bkeys = classes_by_name.get(bname, ())
+                    bshort = bname.rpartition(".")[2] if "." in bname else bname
+                    resolved_nid = import_resolver.node_for(bname) if "." in bname else None
+                    if resolved_nid is not None and (resolved_nid, bshort) in raw_class_attrs:
+                        bkeys = [(resolved_nid, bshort)]
+                    else:
+                        bkeys = classes_by_name.get(bshort, ())
                     if len(bkeys) == 1:
                         raw_class_attrs[key].update(raw_class_attrs[bkeys[0]])
                         for mname, def_nid in raw_class_methods[bkeys[0]].items():
@@ -354,13 +366,6 @@ class PythonFastApiAdapter:
                 full_attrs = frozenset(raw_class_attrs[(nid, cname)])
                 for mname, def_nid in raw_class_methods[(nid, cname)].items():
                     method_to_class_profiles.setdefault(mname, []).append((def_nid, nid, full_attrs))
-
-        import_resolver = _ImportResolver(
-            mod_name_to_node_id,
-            {pm.module_name: pm for pm in parsed_modules.values()},
-            packages,
-            symbol_to_defining_nodes,
-        )
         edges: list[AtlasEdge] = []
         seen_edges: set[tuple[str, str, str]] = set()
         routes: list[RouteDescriptor] = []

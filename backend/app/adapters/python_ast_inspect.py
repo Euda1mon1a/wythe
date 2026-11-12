@@ -420,94 +420,183 @@ def _is_nonempty_iter_literal(expr: ast.AST) -> bool:
     return False
 
 
+_OBJECT_ATTRS = frozenset(dir(object)) | frozenset(
+    {"__dict__", "__weakref__", "__module__", "__annotations__", "__name__", "__qualname__"}
+)
+
+
+def _merge_stored(branches: list[tuple[bool, frozenset[str]]]) -> frozenset[str]:
+    live_sets = [st for lv, st in branches if lv]
+    if not live_sets:
+        return frozenset()
+    acc = set(live_sets[0])
+    for st in live_sets[1:]:
+        acc &= st
+    return frozenset(acc)
+
+
+def _hasattr_guarded(
+    test: ast.AST | None, nm: str, defs: DefsMap
+) -> tuple[frozenset[str], frozenset[str]]:
+    if test is None or "hasattr" in defs:
+        return frozenset(), frozenset()
+    if (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == "hasattr"
+        and len(test.args) == 2
+        and not test.keywords
+        and isinstance(test.args[0], ast.Name)
+        and test.args[0].id == nm
+        and isinstance(test.args[1], ast.Constant)
+        and isinstance(test.args[1].value, str)
+    ):
+        return frozenset({test.args[1].value}), frozenset()
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        wt, wf = _hasattr_guarded(test.operand, nm, defs)
+        return wf, wt
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        wt_all: set[str] = set()
+        for v in test.values:
+            wt_v, _ = _hasattr_guarded(v, nm, defs)
+            wt_all.update(wt_v)
+        return frozenset(wt_all), frozenset()
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or) and test.values:
+        wf_all: set[str] = set()
+        wt_common: set[str] | None = None
+        for v in test.values:
+            wt_v, wf_v = _hasattr_guarded(v, nm, defs)
+            wf_all.update(wf_v)
+            wt_common = set(wt_v) if wt_common is None else (wt_common & set(wt_v))
+        return frozenset(wt_common or ()), frozenset(wf_all)
+    return frozenset(), frozenset()
+
+
+StateTriple = tuple[bool, DefsMap, frozenset[str]]
+
+
 def _live_param_expr_nodes(
-    fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda, nm: str
-) -> list[ast.AST]:
-    """Collect AST expression nodes reachable while `nm` may still hold `fn`'s initial parameter."""
-    out: list[ast.AST] = []
-    activated_states: set[tuple[int, frozenset[tuple[str, frozenset[int]]]]] = set()
+    fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    nm: str,
+    excluded: set[int] | None = None,
+) -> tuple[dict[int, str], frozenset[str]]:
+    """Return `(live_method_calls, required_attrs)` for `fn`'s initial parameter `nm`."""
+    skip = excluded or set()
+    live_calls: dict[int, str] = {}
+    required_attrs: set[str] = set()
+    activated_states: dict[
+        tuple[int, frozenset[tuple[str, frozenset[int]]], frozenset[str], frozenset[str]],
+        frozenset[str],
+    ] = {}
     active_fn_stack: set[int] = set()
 
     def run_scope(
         body: list[ast.stmt] | ast.expr,
         outer_defs: DefsMap | None = None,
-    ) -> None:
+        init_stored: frozenset[str] = frozenset(),
+        init_guarded: frozenset[str] = frozenset(),
+    ) -> frozenset[str]:
         init_defs: DefsMap = _copy_defs(outer_defs or {})
         dead_refs: set[int] = set()
 
-        def activate_defs(name: str, cur_defs: DefsMap) -> None:
-            for fn_def in list(cur_defs.get(name, ())):
+        def activate_defs(
+            name: str,
+            cur_defs: DefsMap,
+            cur_stored: frozenset[str],
+            cur_guarded: frozenset[str],
+        ) -> frozenset[str] | None:
+            fn_list = list(cur_defs.get(name, ()))
+            exit_sets: list[frozenset[str]] = []
+            for fn_def in fn_list:
                 if id(fn_def) in active_fn_stack:
                     continue
                 fn_locals = _fn_local_names(fn_def)
                 if nm in fn_locals:
+                    exit_sets.append(cur_stored)
                     continue
                 scoped_defs = {k: set(v) for k, v in cur_defs.items() if k not in fn_locals and v}
                 sig = frozenset((k, frozenset(id(x) for x in v)) for k, v in scoped_defs.items())
-                state_key = (id(fn_def), sig)
+                state_key = (id(fn_def), sig, cur_stored, cur_guarded)
                 if state_key in activated_states:
+                    exit_sets.append(activated_states[state_key])
                     continue
-                activated_states.add(state_key)
+                activated_states[state_key] = cur_stored
                 active_fn_stack.add(id(fn_def))
                 try:
-                    run_scope(fn_def.body, scoped_defs)
+                    res_st = run_scope(fn_def.body, scoped_defs, cur_stored, cur_guarded)
                 finally:
                     active_fn_stack.discard(id(fn_def))
+                activated_states[state_key] = res_st
+                exit_sets.append(res_st)
+            if not exit_sets:
+                return None
+            acc = set(exit_sets[0])
+            for st in exit_sets[1:]:
+                acc &= st
+            return frozenset(acc)
 
-        def walk_target(tgt: ast.AST, live: bool, defs: DefsMap) -> tuple[bool, DefsMap]:
+        def walk_target(
+            tgt: ast.AST,
+            live: bool,
+            defs: DefsMap,
+            stored: frozenset[str],
+            guarded: frozenset[str],
+            *,
+            is_delete: bool = False,
+        ) -> StateTriple:
             if isinstance(tgt, ast.Name):
                 defs.pop(tgt.id, None)
                 if tgt.id == nm:
-                    return False, defs
-                return live, defs
+                    return False, defs, frozenset()
+                return live, defs, stored
             if isinstance(tgt, (ast.Tuple, ast.List)):
                 for elt in tgt.elts:
-                    live, defs = walk_target(elt, live, defs)
-                return live, defs
+                    live, defs, stored = walk_target(elt, live, defs, stored, guarded, is_delete=is_delete)
+                return live, defs, stored
             if isinstance(tgt, ast.Starred):
-                return walk_target(tgt.value, live, defs)
+                return walk_target(tgt.value, live, defs, stored, guarded, is_delete=is_delete)
             if isinstance(tgt, ast.Attribute):
-                if live:
-                    out.append(tgt)
-                return walk_expr(tgt.value, live, defs)
+                is_direct = isinstance(tgt.value, ast.Name) and tgt.value.id == nm
+                live, defs, stored = walk_expr(tgt.value, live, defs, stored, guarded)
+                if live and is_direct:
+                    stored = (stored - {tgt.attr}) if is_delete else (stored | {tgt.attr})
+                return live, defs, stored
             if isinstance(tgt, ast.Subscript):
-                if live:
-                    out.append(tgt)
-                live, defs = walk_expr(tgt.value, live, defs)
-                return walk_expr(tgt.slice, live, defs)
-            return live, defs
+                live, defs, stored = walk_expr(tgt.value, live, defs, stored, guarded)
+                return walk_expr(tgt.slice, live, defs, stored, guarded)
+            return live, defs, stored
 
-        def walk_expr(expr: ast.AST | None, live: bool, defs: DefsMap) -> tuple[bool, DefsMap]:
-            if expr is None:
-                return live, defs
+        def walk_expr(
+            expr: ast.AST | None,
+            live: bool,
+            defs: DefsMap,
+            stored: frozenset[str],
+            guarded: frozenset[str],
+        ) -> StateTriple:
+            if expr is None or id(expr) in skip:
+                return live, defs, stored
             if isinstance(expr, ast.NamedExpr):
                 rhs_defs = set(defs.get(expr.value.id, ())) if isinstance(expr.value, ast.Name) else set()
-                live, defs = walk_expr(expr.value, live, defs)
-                if live:
-                    out.append(expr)
-                live, defs = walk_target(expr.target, live, defs)
+                live, defs, stored = walk_expr(expr.value, live, defs, stored, guarded)
+                live, defs, stored = walk_target(expr.target, live, defs, stored, guarded)
                 if rhs_defs and isinstance(expr.target, ast.Name) and expr.target.id != nm:
                     defs[expr.target.id] = rhs_defs
-                return live, defs
+                return live, defs, stored
             if isinstance(expr, ast.Lambda):
-                if live:
-                    out.append(expr)
                 for dflt in (*expr.args.defaults, *(d for d in expr.args.kw_defaults if d is not None)):
-                    live, defs = walk_expr(dflt, live, defs)
+                    live, defs, stored = walk_expr(dflt, live, defs, stored, guarded)
                 lam_bound = _arg_names(expr.args) | {
                     sub.target.id
-                    for sub in _expr_nodes_shallow(expr.body, set())
+                    for sub in _expr_nodes_shallow(expr.body, skip)
                     if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name)
                 }
                 if live and nm not in lam_bound:
                     lam_defs = {k: set(v) for k, v in defs.items() if k not in lam_bound and v}
-                    run_scope(expr.body, lam_defs)
-                return live, defs
+                    run_scope(expr.body, lam_defs, stored, guarded)
+                return live, defs, stored
             if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
-                if live:
-                    out.append(expr)
                 if expr.generators:
-                    live, defs = walk_expr(expr.generators[0].iter, live, defs)
+                    live, defs, stored = walk_expr(expr.generators[0].iter, live, defs, stored, guarded)
                 cbound = _comp_bound_names(expr)
                 eager_nonempty = (
                     not isinstance(expr, ast.GeneratorExp)
@@ -517,141 +606,216 @@ def _live_param_expr_nodes(
                 if live and nm not in cbound:
                     clive = live
                     cdefs = {k: set(v) for k, v in defs.items() if k not in cbound and v}
+                    cstored = stored
                     must_live = live
                     must_defs: DefsMap | None = None
+                    must_stored: frozenset[str] | None = None
                     if expr.generators:
                         for idx_if, ifs_e in enumerate(expr.generators[0].ifs):
-                            clive, cdefs = walk_expr(ifs_e, clive, cdefs)
+                            clive, cdefs, cstored = walk_expr(ifs_e, clive, cdefs, cstored, guarded)
                             if eager_nonempty and idx_if == 0:
                                 must_live = clive
                                 must_defs = _copy_defs(cdefs)
+                                must_stored = cstored
                         for gen in expr.generators[1:]:
-                            clive, cdefs = walk_expr(gen.iter, clive, cdefs)
+                            clive, cdefs, cstored = walk_expr(gen.iter, clive, cdefs, cstored, guarded)
                             for ifs_e in gen.ifs:
-                                clive, cdefs = walk_expr(ifs_e, clive, cdefs)
+                                clive, cdefs, cstored = walk_expr(ifs_e, clive, cdefs, cstored, guarded)
                     if isinstance(expr, ast.DictComp):
-                        clive, cdefs = walk_expr(expr.key, clive, cdefs)
-                        clive, cdefs = walk_expr(expr.value, clive, cdefs)
+                        clive, cdefs, cstored = walk_expr(expr.key, clive, cdefs, cstored, guarded)
+                        clive, cdefs, cstored = walk_expr(expr.value, clive, cdefs, cstored, guarded)
                     else:
-                        clive, cdefs = walk_expr(expr.elt, clive, cdefs)
+                        clive, cdefs, cstored = walk_expr(expr.elt, clive, cdefs, cstored, guarded)
                     if eager_nonempty and len(expr.generators) == 1 and not expr.generators[0].ifs:
                         must_live = clive
                         must_defs = _copy_defs(cdefs)
+                        must_stored = cstored
                     kept_cbound = {k: set(v) for k, v in defs.items() if k in cbound and v}
-                    if must_defs is not None:
+                    if must_defs is not None and must_stored is not None:
                         live = must_live
                         defs = _merge_defs(kept_cbound, must_defs, cdefs)
+                        stored = _merge_stored([(must_live, must_stored), (clive, cstored)])
                     else:
                         defs = _merge_defs(defs, cdefs)
-                return live, defs
+                        stored = _merge_stored([(live, stored), (clive, cstored)])
+                return live, defs, stored
             if isinstance(expr, ast.IfExp):
-                if live:
-                    out.append(expr)
-                lt, dt = walk_expr(expr.test, live, defs)
-                lb, db = walk_expr(expr.body, lt, _copy_defs(dt))
-                le, de = walk_expr(expr.orelse, lt, _copy_defs(dt))
-                return (lb or le), _merge_defs(db, de)
+                lt, dt, st = walk_expr(expr.test, live, defs, stored, guarded)
+                wt, wf = _hasattr_guarded(expr.test, nm, dt)
+                lb, db, sb = walk_expr(expr.body, lt, _copy_defs(dt), st, guarded | wt)
+                le, de, se = walk_expr(expr.orelse, lt, _copy_defs(dt), st, guarded | wf)
+                return (lb or le), _merge_defs(db, de), _merge_stored([(lb, sb), (le, se)])
             if isinstance(expr, ast.BoolOp):
-                if live:
-                    out.append(expr)
-                cur_l, cur_d = walk_expr(expr.values[0], live, defs)
+                cur_l, cur_d, cur_s = walk_expr(expr.values[0], live, defs, stored, guarded)
+                wt0, wf0 = _hasattr_guarded(expr.values[0], nm, cur_d)
+                cur_g = guarded | (wt0 if isinstance(expr.op, ast.And) else wf0)
                 any_sc = cur_l
                 snaps = [_copy_defs(cur_d)]
+                st_branches: list[tuple[bool, frozenset[str]]] = [(cur_l, cur_s)]
                 for val in expr.values[1:]:
-                    cur_l, cur_d = walk_expr(val, cur_l, _copy_defs(cur_d))
+                    cur_l, cur_d, cur_s = walk_expr(val, cur_l, _copy_defs(cur_d), cur_s, cur_g)
+                    wt_v, wf_v = _hasattr_guarded(val, nm, cur_d)
+                    cur_g = cur_g | (wt_v if isinstance(expr.op, ast.And) else wf_v)
                     any_sc = any_sc or cur_l
                     snaps.append(_copy_defs(cur_d))
-                return any_sc, _merge_defs(*snaps)
+                    st_branches.append((cur_l, cur_s))
+                return any_sc, _merge_defs(*snaps), _merge_stored(st_branches)
             if isinstance(expr, ast.Name) and isinstance(expr.ctx, ast.Load):
                 if live:
-                    out.append(expr)
                     if expr.id in defs:
-                        activate_defs(expr.id, defs)
+                        activate_defs(expr.id, defs, stored, guarded)
                 elif expr.id in defs:
                     for fn_node in defs[expr.id]:
                         dead_refs.add(id(fn_node))
-                return live, defs
+                return live, defs, stored
+            if isinstance(expr, ast.Attribute) and isinstance(expr.ctx, ast.Load):
+                if (
+                    live
+                    and isinstance(expr.value, ast.Name)
+                    and expr.value.id == nm
+                    and expr.attr not in stored
+                    and expr.attr not in guarded
+                    and expr.attr not in _OBJECT_ATTRS
+                ):
+                    required_attrs.add(expr.attr)
+                return walk_expr(expr.value, live, defs, stored, guarded)
             if isinstance(expr, ast.Call):
-                if live:
-                    out.append(expr)
-                live, defs = walk_expr(expr.func, live, defs)
+                if (
+                    live
+                    and isinstance(expr.func, ast.Attribute)
+                    and isinstance(expr.func.value, ast.Name)
+                    and expr.func.value.id == nm
+                    and expr.func.attr not in stored
+                ):
+                    live_calls[id(expr)] = expr.func.attr
+                is_direct_helper_call = isinstance(expr.func, ast.Name) and expr.func.id in defs
+                helper_name = expr.func.id if isinstance(expr.func, ast.Name) else ""
+                live, defs, stored = walk_expr(expr.func, live, defs, stored, guarded)
                 for arg_e in expr.args:
-                    live, defs = walk_expr(arg_e, live, defs)
+                    live, defs, stored = walk_expr(arg_e, live, defs, stored, guarded)
                 for kw in expr.keywords:
-                    live, defs = walk_expr(kw.value, live, defs)
-                return live, defs
+                    live, defs, stored = walk_expr(kw.value, live, defs, stored, guarded)
+                if live and is_direct_helper_call and helper_name in defs:
+                    post_st = activate_defs(helper_name, defs, stored, guarded)
+                    if post_st is not None:
+                        stored = post_st
+                if (
+                    live
+                    and isinstance(expr.func, ast.Name)
+                    and expr.func.id == "setattr"
+                    and "setattr" not in defs
+                    and len(expr.args) == 3
+                    and not expr.keywords
+                    and isinstance(expr.args[0], ast.Name)
+                    and expr.args[0].id == nm
+                    and isinstance(expr.args[1], ast.Constant)
+                    and isinstance(expr.args[1].value, str)
+                ):
+                    stored = stored | {expr.args[1].value}
+                if (
+                    live
+                    and isinstance(expr.func, ast.Name)
+                    and expr.func.id == "delattr"
+                    and "delattr" not in defs
+                    and len(expr.args) == 2
+                    and not expr.keywords
+                    and isinstance(expr.args[0], ast.Name)
+                    and expr.args[0].id == nm
+                    and isinstance(expr.args[1], ast.Constant)
+                    and isinstance(expr.args[1].value, str)
+                ):
+                    stored = stored - {expr.args[1].value}
+                return live, defs, stored
             if isinstance(expr, ast.Dict):
-                if live:
-                    out.append(expr)
                 for k_e, v_e in zip(expr.keys, expr.values, strict=False):
-                    live, defs = walk_expr(k_e, live, defs)
-                    live, defs = walk_expr(v_e, live, defs)
-                return live, defs
-            if live:
-                out.append(expr)
+                    live, defs, stored = walk_expr(k_e, live, defs, stored, guarded)
+                    live, defs, stored = walk_expr(v_e, live, defs, stored, guarded)
+                return live, defs, stored
             for ch in ast.iter_child_nodes(expr):
                 if isinstance(ch, ast.expr):
-                    live, defs = walk_expr(ch, live, defs)
-            return live, defs
+                    live, defs, stored = walk_expr(ch, live, defs, stored, guarded)
+            return live, defs, stored
 
         def walk_stmts(
             stmts: list[ast.stmt],
             live: bool,
             defs: DefsMap,
-            loop_breaks: list[tuple[bool, DefsMap]] | None = None,
-            loop_continues: list[tuple[bool, DefsMap]] | None = None,
-            abrupt_returns: list[tuple[bool, DefsMap]] | None = None,
-            abrupt_raises: list[tuple[bool, DefsMap]] | None = None,
-        ) -> tuple[bool, DefsMap, bool]:
+            stored: frozenset[str],
+            guarded: frozenset[str],
+            loop_breaks: list[StateTriple] | None = None,
+            loop_continues: list[StateTriple] | None = None,
+            abrupt_returns: list[StateTriple] | None = None,
+            abrupt_raises: list[StateTriple] | None = None,
+        ) -> tuple[bool, DefsMap, frozenset[str], bool]:
             for s in stmts:
+                if id(s) in skip:
+                    continue
                 if isinstance(s, ast.Return):
-                    live, defs = walk_expr(s.value, live, defs)
+                    live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
                     if abrupt_returns is not None:
-                        abrupt_returns.append((live, _copy_defs(defs)))
-                    return live, defs, False
+                        abrupt_returns.append((live, _copy_defs(defs), stored))
+                    return live, defs, stored, False
                 if isinstance(s, ast.Raise):
-                    live, defs = walk_expr(s.exc, live, defs)
-                    live, defs = walk_expr(s.cause, live, defs)
+                    live, defs, stored = walk_expr(s.exc, live, defs, stored, guarded)
+                    live, defs, stored = walk_expr(s.cause, live, defs, stored, guarded)
                     if abrupt_raises is not None:
-                        abrupt_raises.append((live, _copy_defs(defs)))
-                    return live, defs, False
+                        abrupt_raises.append((live, _copy_defs(defs), stored))
+                    return live, defs, stored, False
                 if isinstance(s, ast.Break):
                     if loop_breaks is not None:
-                        loop_breaks.append((live, _copy_defs(defs)))
-                    return live, defs, False
+                        loop_breaks.append((live, _copy_defs(defs), stored))
+                    return live, defs, stored, False
                 if isinstance(s, ast.Continue):
                     if loop_continues is not None:
-                        loop_continues.append((live, _copy_defs(defs)))
-                    return live, defs, False
+                        loop_continues.append((live, _copy_defs(defs), stored))
+                    return live, defs, stored, False
                 if isinstance(s, ast.Assign):
                     rhs_defs = set(defs.get(s.value.id, ())) if isinstance(s.value, ast.Name) else set()
-                    live, defs = walk_expr(s.value, live, defs)
+                    live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
                     for tgt in s.targets:
-                        live, defs = walk_target(tgt, live, defs)
+                        live, defs, stored = walk_target(tgt, live, defs, stored, guarded)
                     if rhs_defs and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name) and s.targets[0].id != nm:
                         defs[s.targets[0].id] = rhs_defs
                 elif isinstance(s, ast.AnnAssign):
                     if s.value is not None:
                         rhs_defs = set(defs.get(s.value.id, ())) if isinstance(s.value, ast.Name) else set()
-                        live, defs = walk_expr(s.value, live, defs)
-                        live, defs = walk_target(s.target, live, defs)
+                        live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                        live, defs, stored = walk_target(s.target, live, defs, stored, guarded)
                         if rhs_defs and isinstance(s.target, ast.Name) and s.target.id != nm:
                             defs[s.target.id] = rhs_defs
                 elif isinstance(s, ast.AugAssign):
                     if isinstance(s.target, ast.Name):
-                        live, defs = walk_expr(s.value, live, defs)
-                        live, defs = walk_target(s.target, live, defs)
+                        live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                        live, defs, stored = walk_target(s.target, live, defs, stored, guarded)
+                    elif (
+                        isinstance(s.target, ast.Attribute)
+                        and isinstance(s.target.value, ast.Name)
+                        and s.target.value.id == nm
+                    ):
+                        if (
+                            live
+                            and s.target.attr not in stored
+                            and s.target.attr not in guarded
+                            and s.target.attr not in _OBJECT_ATTRS
+                        ):
+                            required_attrs.add(s.target.attr)
+                        live, defs, stored = walk_expr(s.target.value, live, defs, stored, guarded)
+                        live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                        if live:
+                            stored = stored | {s.target.attr}
                     else:
-                        live, defs = walk_target(s.target, live, defs)
-                        live, defs = walk_expr(s.value, live, defs)
+                        live, defs, stored = walk_target(s.target, live, defs, stored, guarded)
+                        live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
                 elif isinstance(s, ast.Delete):
                     for tgt in s.targets:
-                        live, defs = walk_target(tgt, live, defs)
+                        live, defs, stored = walk_target(tgt, live, defs, stored, guarded, is_delete=True)
                 elif isinstance(s, ast.Expr):
-                    live, defs = walk_expr(s.value, live, defs)
+                    live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
                 elif isinstance(s, ast.Assert):
-                    live, defs = walk_expr(s.test, live, defs)
-                    live, defs = walk_expr(s.msg, live, defs)
+                    live, defs, stored = walk_expr(s.test, live, defs, stored, guarded)
+                    wt_a, _ = _hasattr_guarded(s.test, nm, defs)
+                    live, defs, stored = walk_expr(s.msg, live, defs, stored, guarded)
+                    guarded = guarded | wt_a
                 elif isinstance(s, (ast.Import, ast.ImportFrom)):
                     for alias in s.names:
                         if alias.name != "*":
@@ -659,67 +823,111 @@ def _live_param_expr_nodes(
                             defs.pop(bound_nm, None)
                             if bound_nm == nm:
                                 live = False
+                                stored = frozenset()
                 elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     for dec in s.decorator_list:
-                        live, defs = walk_expr(dec, live, defs)
+                        live, defs, stored = walk_expr(dec, live, defs, stored, guarded)
                     for dflt in (*s.args.defaults, *(d for d in s.args.kw_defaults if d is not None)):
-                        live, defs = walk_expr(dflt, live, defs)
+                        live, defs, stored = walk_expr(dflt, live, defs, stored, guarded)
                     if s.decorator_list:
                         defs.pop(s.name, None)
                         s_locals = _fn_local_names(s)
                         if live and nm not in s_locals:
-                            run_scope(s.body, {k: set(v) for k, v in defs.items() if k not in s_locals and v})
+                            run_scope(
+                                s.body,
+                                {k: set(v) for k, v in defs.items() if k not in s_locals and v},
+                                stored,
+                                guarded,
+                            )
                     else:
                         defs[s.name] = {s}
                     if s.name == nm:
                         defs.pop(nm, None)
                         live = False
+                        stored = frozenset()
                 elif isinstance(s, ast.ClassDef):
                     for dec in s.decorator_list:
-                        live, defs = walk_expr(dec, live, defs)
+                        live, defs, stored = walk_expr(dec, live, defs, stored, guarded)
                     defs.pop(s.name, None)
                     if s.name == nm:
                         live = False
+                        stored = frozenset()
                 elif isinstance(s, ast.TypeAlias):
                     if isinstance(s.name, ast.Name):
                         defs.pop(s.name.id, None)
                         if s.name.id == nm:
                             live = False
+                            stored = frozenset()
                 elif isinstance(s, ast.If):
-                    live, defs = walk_expr(s.test, live, defs)
-                    lb, db, fb = walk_stmts(
-                        s.body, live, _copy_defs(defs), loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                    live, defs, stored = walk_expr(s.test, live, defs, stored, guarded)
+                    wt_i, wf_i = _hasattr_guarded(s.test, nm, defs)
+                    lb, db, sb, fb = walk_stmts(
+                        s.body,
+                        live,
+                        _copy_defs(defs),
+                        stored,
+                        guarded | wt_i,
+                        loop_breaks,
+                        loop_continues,
+                        abrupt_returns,
+                        abrupt_raises,
                     )
-                    le, de, fe = walk_stmts(
-                        s.orelse, live, _copy_defs(defs), loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                    le, de, se, fe = walk_stmts(
+                        s.orelse,
+                        live,
+                        _copy_defs(defs),
+                        stored,
+                        guarded | wf_i,
+                        loop_breaks,
+                        loop_continues,
+                        abrupt_returns,
+                        abrupt_raises,
                     )
                     if not fb and not fe:
-                        return (lb or le), _merge_defs(db, de), False
+                        return (lb or le), _merge_defs(db, de), _merge_stored([(lb, sb), (le, se)]), False
                     live = (lb if fb else False) or (le if fe else False)
                     defs = _merge_defs(*(([db] if fb else []) + ([de] if fe else [])))
+                    stored = _merge_stored(([(lb, sb)] if fb else []) + ([(le, se)] if fe else []))
                 elif isinstance(s, (ast.For, ast.AsyncFor)):
-                    live, defs = walk_expr(s.iter, live, defs)
+                    live, defs, stored = walk_expr(s.iter, live, defs, stored, guarded)
                     nonempty_iter = _is_nonempty_iter_literal(s.iter)
-                    body_in, body_defs = walk_target(s.target, live, _copy_defs(defs))
-                    brk: list[tuple[bool, DefsMap]] = []
-                    cnt: list[tuple[bool, DefsMap]] = []
-                    lb, db, fb = walk_stmts(s.body, body_in, body_defs, brk, cnt, abrupt_returns, abrupt_raises)
-                    iter_end_l = (lb if fb else False) or any(cl for cl, _ in cnt)
-                    iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd in cnt]))
+                    body_in, body_defs, body_st = walk_target(s.target, live, _copy_defs(defs), stored, guarded)
+                    brk: list[StateTriple] = []
+                    cnt: list[StateTriple] = []
+                    lb, db, sb, fb = walk_stmts(
+                        s.body, body_in, body_defs, body_st, guarded, brk, cnt, abrupt_returns, abrupt_raises
+                    )
+                    iter_branches = ([(lb, sb)] if fb else []) + [(cl, cs) for cl, _, cs in cnt]
+                    iter_end_l = any(bl for bl, _ in iter_branches)
+                    iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd, _ in cnt]))
+                    iter_end_s = _merge_stored(iter_branches)
                     if fb or cnt:
-                        body2_in, body2_defs = walk_target(s.target, iter_end_l, _copy_defs(iter_end_d))
+                        body2_in, body2_defs, body2_st = walk_target(
+                            s.target, iter_end_l, _copy_defs(iter_end_d), iter_end_s, guarded
+                        )
                         merged_body_defs = _merge_defs(body_defs, body2_defs)
-                        if merged_body_defs != body_defs:
+                        merged_body_st = _merge_stored([(body_in, body_st), (body2_in, body2_st)])
+                        if merged_body_defs != body_defs or merged_body_st != body_st:
                             brk = []
                             cnt = []
-                            lb, db, fb = walk_stmts(
-                                s.body, body_in or body2_in, merged_body_defs, brk, cnt, abrupt_returns, abrupt_raises
+                            lb, db, sb, fb = walk_stmts(
+                                s.body,
+                                body_in or body2_in,
+                                merged_body_defs,
+                                merged_body_st,
+                                guarded,
+                                brk,
+                                cnt,
+                                abrupt_returns,
+                                abrupt_raises,
                             )
-                            iter_end_l = (lb if fb else False) or any(cl for cl, _ in cnt)
-                            iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd in cnt]))
+                            iter_branches = ([(lb, sb)] if fb else []) + [(cl, cs) for cl, _, cs in cnt]
+                            iter_end_l = any(bl for bl, _ in iter_branches)
+                            iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd, _ in cnt]))
+                            iter_end_s = _merge_stored(iter_branches)
                     zero_iter = False if nonempty_iter else live
                     if nonempty_iter and not fb and not cnt:
-                        le, de, fe = False, {}, False
+                        le, de, se, fe = False, {}, frozenset(), False
                     else:
                         else_in_l = zero_iter or iter_end_l
                         else_in_d = (
@@ -727,91 +935,174 @@ def _live_param_expr_nodes(
                             if nonempty_iter
                             else (_merge_defs(defs, iter_end_d) if (fb or cnt) else _copy_defs(defs))
                         )
-                        le, de, fe = walk_stmts(
-                            s.orelse, else_in_l, else_in_d, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                        else_in_s = (
+                            iter_end_s
+                            if nonempty_iter
+                            else (
+                                _merge_stored([(live, stored), (iter_end_l, iter_end_s)])
+                                if (fb or cnt)
+                                else stored
+                            )
                         )
-                    if not fe and not brk:
-                        return le, de, False
-                    live = (le if fe else False) or any(bl for bl, _ in brk)
-                    defs = _merge_defs(*(([de] if fe else []) + [bd for _, bd in brk]))
-                elif isinstance(s, ast.While):
-                    live, defs = walk_expr(s.test, live, defs)
-                    always_true = isinstance(s.test, ast.Constant) and bool(s.test.value) is True
-                    brk = []
-                    cnt = []
-                    lb, db, fb = walk_stmts(s.body, live, _copy_defs(defs), brk, cnt, abrupt_returns, abrupt_raises)
-                    iter_end_l = (lb if fb else False) or any(cl for cl, _ in cnt)
-                    iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd in cnt]))
-                    zero_iter = False if always_true else live
-                    if not zero_iter and not fb and not cnt:
-                        le, de, fe = False, {}, False
-                    else:
-                        else_in_d = iter_end_d if always_true else _merge_defs(defs, iter_end_d)
-                        le, de, fe = walk_stmts(
+                        le, de, se, fe = walk_stmts(
                             s.orelse,
-                            zero_iter or iter_end_l,
+                            else_in_l,
                             else_in_d,
+                            else_in_s,
+                            guarded,
                             loop_breaks,
                             loop_continues,
                             abrupt_returns,
                             abrupt_raises,
                         )
                     if not fe and not brk:
-                        return le, de, False
-                    live = (le if fe else False) or any(bl for bl, _ in brk)
-                    defs = _merge_defs(*(([de] if fe else []) + [bd for _, bd in brk]))
+                        return le, de, se, False
+                    live = (le if fe else False) or any(bl for bl, _, _ in brk)
+                    defs = _merge_defs(*(([de] if fe else []) + [bd for _, bd, _ in brk]))
+                    stored = _merge_stored(([(le, se)] if fe else []) + [(bl, bs) for bl, _, bs in brk])
+                elif isinstance(s, ast.While):
+                    w_entry_l, w_entry_d, w_entry_s = live, _copy_defs(defs), stored
+                    live, defs, stored = walk_expr(s.test, w_entry_l, _copy_defs(w_entry_d), w_entry_s, guarded)
+                    wt_w, wf_w = _hasattr_guarded(s.test, nm, defs)
+                    always_true = isinstance(s.test, ast.Constant) and bool(s.test.value) is True
+                    brk = []
+                    cnt = []
+                    lb, db, sb, fb = walk_stmts(
+                        s.body, live, _copy_defs(defs), stored, guarded | wt_w, brk, cnt, abrupt_returns, abrupt_raises
+                    )
+                    iter_branches = ([(lb, sb)] if fb else []) + [(cl, cs) for cl, _, cs in cnt]
+                    iter_end_l = any(bl for bl, _ in iter_branches)
+                    iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd, _ in cnt]))
+                    iter_end_s = _merge_stored(iter_branches)
+                    if fb or cnt:
+                        merged_w_d = _merge_defs(w_entry_d, iter_end_d)
+                        merged_w_s = _merge_stored([(w_entry_l, w_entry_s), (iter_end_l, iter_end_s)])
+                        if merged_w_d != w_entry_d or merged_w_s != w_entry_s:
+                            brk = []
+                            cnt = []
+                            live2, defs2, stored2 = walk_expr(
+                                s.test, w_entry_l or iter_end_l, _copy_defs(merged_w_d), merged_w_s, guarded
+                            )
+                            lb, db, sb, fb = walk_stmts(
+                                s.body,
+                                live2,
+                                _copy_defs(defs2),
+                                stored2,
+                                guarded | wt_w,
+                                brk,
+                                cnt,
+                                abrupt_returns,
+                                abrupt_raises,
+                            )
+                            live, defs, stored = live2, defs2, stored2
+                            iter_branches = ([(lb, sb)] if fb else []) + [(cl, cs) for cl, _, cs in cnt]
+                            iter_end_l = any(bl for bl, _ in iter_branches)
+                            iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd, _ in cnt]))
+                            iter_end_s = _merge_stored(iter_branches)
+                    zero_iter = False if always_true else live
+                    if not zero_iter and not fb and not cnt:
+                        le, de, se, fe = False, {}, frozenset(), False
+                    else:
+                        else_in_d = iter_end_d if always_true else _merge_defs(defs, iter_end_d)
+                        else_in_s = (
+                            iter_end_s
+                            if always_true
+                            else _merge_stored([(live, stored), (iter_end_l, iter_end_s)])
+                        )
+                        le, de, se, fe = walk_stmts(
+                            s.orelse,
+                            zero_iter or iter_end_l,
+                            else_in_d,
+                            else_in_s,
+                            guarded | wf_w,
+                            loop_breaks,
+                            loop_continues,
+                            abrupt_returns,
+                            abrupt_raises,
+                        )
+                    if not fe and not brk:
+                        return le, de, se, False
+                    live = (le if fe else False) or any(bl for bl, _, _ in brk)
+                    defs = _merge_defs(*(([de] if fe else []) + [bd for _, bd, _ in brk]))
+                    stored = _merge_stored(([(le, se)] if fe else []) + [(bl, bs) for bl, _, bs in brk])
                 elif isinstance(s, (ast.With, ast.AsyncWith)):
                     for item in s.items:
-                        live, defs = walk_expr(item.context_expr, live, defs)
+                        live, defs, stored = walk_expr(item.context_expr, live, defs, stored, guarded)
                         if item.optional_vars is not None:
-                            live, defs = walk_target(item.optional_vars, live, defs)
-                    live, defs, fw = walk_stmts(
-                        s.body, live, defs, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                            live, defs, stored = walk_target(item.optional_vars, live, defs, stored, guarded)
+                    live, defs, stored, fw = walk_stmts(
+                        s.body, live, defs, stored, guarded, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
                     )
                     if not fw:
-                        return live, defs, False
+                        return live, defs, stored, False
                 elif isinstance(s, (ast.Try, ast.TryStar)):
                     entry_live = live
                     entry_defs = _copy_defs(defs)
-                    body_returns: list[tuple[bool, DefsMap]] = []
-                    body_raises: list[tuple[bool, DefsMap]] = []
-                    post_returns: list[tuple[bool, DefsMap]] = []
-                    post_raises: list[tuple[bool, DefsMap]] = []
-                    try_breaks: list[tuple[bool, DefsMap]] = []
-                    try_continues: list[tuple[bool, DefsMap]] = []
-                    lt, dt, ft = walk_stmts(
-                        s.body, entry_live, _copy_defs(entry_defs), try_breaks, try_continues, body_returns, body_raises
+                    entry_stored = stored
+                    body_returns: list[StateTriple] = []
+                    body_raises: list[StateTriple] = []
+                    post_returns: list[StateTriple] = []
+                    post_raises: list[StateTriple] = []
+                    try_breaks: list[StateTriple] = []
+                    try_continues: list[StateTriple] = []
+                    lt, dt, st_t, ft = walk_stmts(
+                        s.body,
+                        entry_live,
+                        _copy_defs(entry_defs),
+                        entry_stored,
+                        guarded,
+                        try_breaks,
+                        try_continues,
+                        body_returns,
+                        body_raises,
                     )
-                    le, de, fe = (
+                    le, de, se, fe = (
                         walk_stmts(
-                            s.orelse, lt, _copy_defs(dt), try_breaks, try_continues, post_returns, post_raises
+                            s.orelse,
+                            lt,
+                            _copy_defs(dt),
+                            st_t,
+                            guarded,
+                            try_breaks,
+                            try_continues,
+                            post_returns,
+                            post_raises,
                         )
                         if ft
-                        else (False, {}, False)
+                        else (False, {}, frozenset(), False)
                     )
-                    h_lives: list[bool] = [le] if fe else []
-                    h_defs: list[DefsMap] = [de] if fe else []
+                    h_branches: list[StateTriple] = [(le, de, se)] if fe else []
                     any_fall = fe
                     exc_base_defs = _merge_defs(entry_defs, dt)
+                    exc_base_st = _merge_stored([(entry_live, entry_stored), (lt, st_t)])
                     for h in s.handlers:
                         if h.type is not None:
-                            walk_expr(h.type, entry_live or lt, _copy_defs(exc_base_defs))
+                            walk_expr(h.type, entry_live or lt, _copy_defs(exc_base_defs), exc_base_st, guarded)
                         hd = _copy_defs(exc_base_defs)
                         if h.name:
                             hd.pop(h.name, None)
                         h_in = False if h.name == nm else (entry_live or lt)
-                        lh, dh, fh = walk_stmts(
-                            h.body, h_in, hd, try_breaks, try_continues, post_returns, post_raises
+                        h_st_in = frozenset() if h.name == nm else exc_base_st
+                        lh, dh, sh, fh = walk_stmts(
+                            h.body,
+                            h_in,
+                            hd,
+                            h_st_in,
+                            guarded,
+                            try_breaks,
+                            try_continues,
+                            post_returns,
+                            post_raises,
                         )
                         if fh:
                             any_fall = True
-                            h_lives.append(lh)
-                            h_defs.append(dh)
+                            h_branches.append((lh, dh, sh))
                     has_bare_except = isinstance(s, ast.Try) and any(h.type is None for h in s.handlers)
                     all_returns = body_returns + post_returns
                     uncaught_raises = post_raises if has_bare_except else (body_raises + post_raises)
-                    fall_in_l = any(h_lives) if any_fall else False
-                    fall_in_d = _merge_defs(*h_defs) if any_fall else {}
+                    fall_in_l = any(hl for hl, _, _ in h_branches) if any_fall else False
+                    fall_in_d = _merge_defs(*(hd for _, hd, _ in h_branches)) if any_fall else {}
+                    fall_in_s = _merge_stored([(hl, hs) for hl, _, hs in h_branches]) if any_fall else frozenset()
                     if not s.finalbody:
                         if abrupt_returns is not None:
                             abrupt_returns.extend(all_returns)
@@ -822,12 +1113,12 @@ def _live_param_expr_nodes(
                         if loop_continues is not None:
                             loop_continues.extend(try_continues)
                         if not any_fall:
-                            return False, {}, False
-                        live, defs = fall_in_l, fall_in_d
+                            return False, {}, frozenset(), False
+                        live, defs, stored = fall_in_l, fall_in_d, fall_in_s
                     else:
-                        fin_states: list[tuple[bool, DefsMap]] = []
+                        fin_states: list[StateTriple] = []
                         if any_fall:
-                            fin_states.append((fall_in_l, fall_in_d))
+                            fin_states.append((fall_in_l, fall_in_d, fall_in_s))
                         fin_states.extend(all_returns)
                         fin_states.extend(uncaught_raises)
                         if loop_breaks is not None:
@@ -835,13 +1126,16 @@ def _live_param_expr_nodes(
                         if loop_continues is not None:
                             fin_states.extend(try_continues)
                         if not fin_states:
-                            fin_states.append((entry_live or lt, exc_base_defs))
-                        fin_union_l = any(l for l, _ in fin_states)
-                        fin_union_d = _merge_defs(*(d for _, d in fin_states))
+                            fin_states.append((entry_live or lt, exc_base_defs, exc_base_st))
+                        fin_union_l = any(l for l, _, _ in fin_states)
+                        fin_union_d = _merge_defs(*(d for _, d, _ in fin_states))
+                        fin_union_s = _merge_stored([(l, st) for l, _, st in fin_states])
                         walk_stmts(
                             s.finalbody,
                             fin_union_l,
                             _copy_defs(fin_union_d),
+                            fin_union_s,
+                            guarded,
                             loop_breaks,
                             loop_continues,
                             abrupt_returns,
@@ -849,52 +1143,66 @@ def _live_param_expr_nodes(
                         )
 
                         def eval_finalizer(
-                            in_l: bool, in_d: DefsMap, final_stmts: list[ast.stmt] = s.finalbody
-                        ) -> tuple[bool, DefsMap, bool]:
-                            out_len = len(out)
+                            in_l: bool,
+                            in_d: DefsMap,
+                            in_s: frozenset[str],
+                            cur_g: frozenset[str] = guarded,
+                            final_stmts: list[ast.stmt] = s.finalbody,
+                        ) -> tuple[bool, DefsMap, frozenset[str], bool]:
+                            calls_snap = dict(live_calls)
+                            req_snap = set(required_attrs)
                             dead_snap = set(dead_refs)
-                            rl, rd, rf = walk_stmts(final_stmts, in_l, _copy_defs(in_d))
-                            del out[out_len:]
+                            rl, rd, rs, rf = walk_stmts(final_stmts, in_l, _copy_defs(in_d), in_s, cur_g)
+                            live_calls.clear()
+                            live_calls.update(calls_snap)
+                            required_attrs.clear()
+                            required_attrs.update(req_snap)
                             dead_refs.clear()
                             dead_refs.update(dead_snap)
-                            return rl, rd, rf
+                            return rl, rd, rs, rf
 
                         if all_returns and abrupt_returns is not None:
-                            rl, rd, rf = eval_finalizer(
-                                any(l for l, _ in all_returns), _merge_defs(*(d for _, d in all_returns))
+                            rl, rd, rs, rf = eval_finalizer(
+                                any(l for l, _, _ in all_returns),
+                                _merge_defs(*(d for _, d, _ in all_returns)),
+                                _merge_stored([(l, st) for l, _, st in all_returns]),
                             )
                             if rf:
-                                abrupt_returns.append((rl, rd))
+                                abrupt_returns.append((rl, rd, rs))
                         if uncaught_raises and abrupt_raises is not None:
-                            rl, rd, rf = eval_finalizer(
-                                any(l for l, _ in uncaught_raises), _merge_defs(*(d for _, d in uncaught_raises))
+                            rl, rd, rs, rf = eval_finalizer(
+                                any(l for l, _, _ in uncaught_raises),
+                                _merge_defs(*(d for _, d, _ in uncaught_raises)),
+                                _merge_stored([(l, st) for l, _, st in uncaught_raises]),
                             )
                             if rf:
-                                abrupt_raises.append((rl, rd))
+                                abrupt_raises.append((rl, rd, rs))
                         if try_breaks and loop_breaks is not None:
-                            rl, rd, rf = eval_finalizer(
-                                any(l for l, _ in try_breaks), _merge_defs(*(d for _, d in try_breaks))
+                            rl, rd, rs, rf = eval_finalizer(
+                                any(l for l, _, _ in try_breaks),
+                                _merge_defs(*(d for _, d, _ in try_breaks)),
+                                _merge_stored([(l, st) for l, _, st in try_breaks]),
                             )
                             if rf:
-                                loop_breaks.append((rl, rd))
+                                loop_breaks.append((rl, rd, rs))
                         if try_continues and loop_continues is not None:
-                            rl, rd, rf = eval_finalizer(
-                                any(l for l, _ in try_continues), _merge_defs(*(d for _, d in try_continues))
+                            rl, rd, rs, rf = eval_finalizer(
+                                any(l for l, _, _ in try_continues),
+                                _merge_defs(*(d for _, d, _ in try_continues)),
+                                _merge_stored([(l, st) for l, _, st in try_continues]),
                             )
                             if rf:
-                                loop_continues.append((rl, rd))
+                                loop_continues.append((rl, rd, rs))
                         if not any_fall:
-                            return False, {}, False
-                        lf, df, ff = eval_finalizer(fall_in_l, fall_in_d)
+                            return False, {}, frozenset(), False
+                        lf, df, sf, ff = eval_finalizer(fall_in_l, fall_in_d, fall_in_s)
                         if not ff:
-                            return lf, df, False
-                        live, defs = lf, df
+                            return lf, df, sf, False
+                        live, defs, stored = lf, df, sf
                 elif isinstance(s, ast.Match):
-                    live, defs = walk_expr(s.subject, live, defs)
-                    c_lives: list[bool] = []
-                    c_defs: list[DefsMap] = []
-                    exit_lives: list[bool] = []
-                    exit_defs: list[DefsMap] = []
+                    live, defs, stored = walk_expr(s.subject, live, defs, stored, guarded)
+                    c_branches: list[StateTriple] = []
+                    exit_branches: list[StateTriple] = []
                     any_fall = False
                     has_wild = False
                     for case in s.cases:
@@ -907,56 +1215,81 @@ def _live_param_expr_nodes(
                         for pn in pat_names:
                             cd.pop(pn, None)
                         cin = False if nm in pat_names else live
+                        cst = frozenset() if nm in pat_names else stored
                         if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None:
                             has_wild = True
-                        cin, cd = walk_expr(case.guard, cin, cd)
-                        lc, dc, fc = walk_stmts(
-                            case.body, cin, cd, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                        cin, cd, cst = walk_expr(case.guard, cin, cd, cst, guarded)
+                        wt_m, _ = _hasattr_guarded(case.guard, nm, cd)
+                        lc, dc, sc, fc = walk_stmts(
+                            case.body,
+                            cin,
+                            cd,
+                            cst,
+                            guarded | wt_m,
+                            loop_breaks,
+                            loop_continues,
+                            abrupt_returns,
+                            abrupt_raises,
                         )
-                        exit_lives.append(lc)
-                        exit_defs.append(dc)
+                        exit_branches.append((lc, dc, sc))
                         if fc:
                             any_fall = True
-                            c_lives.append(lc)
-                            c_defs.append(dc)
+                            c_branches.append((lc, dc, sc))
                     if not has_wild:
                         any_fall = True
-                        c_lives.append(live)
-                        c_defs.append(_copy_defs(defs))
+                        c_branches.append((live, _copy_defs(defs), stored))
                     if not any_fall:
-                        return any(exit_lives), _merge_defs(*exit_defs), False
-                    live = any(c_lives)
-                    defs = _merge_defs(*c_defs)
+                        return (
+                            any(el for el, _, _ in exit_branches),
+                            _merge_defs(*(ed for _, ed, _ in exit_branches)),
+                            _merge_stored([(el, es) for el, _, es in exit_branches]),
+                            False,
+                        )
+                    live = any(cl for cl, _, _ in c_branches)
+                    defs = _merge_defs(*(cd_i for _, cd_i, _ in c_branches))
+                    stored = _merge_stored([(cl, cs) for cl, _, cs in c_branches])
                 else:
                     for ch in ast.iter_child_nodes(s):
                         if isinstance(ch, ast.expr):
-                            live, defs = walk_expr(ch, live, defs)
+                            live, defs, stored = walk_expr(ch, live, defs, stored, guarded)
                         elif isinstance(ch, ast.stmt):
-                            live, defs, fs = walk_stmts(
-                                [ch], live, defs, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                            live, defs, stored, fs = walk_stmts(
+                                [ch],
+                                live,
+                                defs,
+                                stored,
+                                guarded,
+                                loop_breaks,
+                                loop_continues,
+                                abrupt_returns,
+                                abrupt_raises,
                             )
                             if not fs:
-                                return live, defs, False
-            return live, defs, True
+                                return live, defs, stored, False
+            return live, defs, stored, True
 
         if isinstance(body, list):
-            top_returns: list[tuple[bool, DefsMap]] = []
-            end_live, end_defs, end_fall = walk_stmts(body, True, init_defs, None, None, top_returns, None)
-            exit_states = ([(end_live, end_defs)] if end_fall else []) + top_returns
-            if any(l for l, _ in exit_states):
-                live_exit_defs = _merge_defs(*(d for l, d in exit_states if l))
+            top_returns: list[StateTriple] = []
+            end_live, end_defs, end_st, end_fall = walk_stmts(
+                body, True, init_defs, init_stored, init_guarded, None, None, top_returns, None
+            )
+            exit_states = ([(end_live, end_defs, end_st)] if end_fall else []) + top_returns
+            exit_stored = _merge_stored([(l, st) for l, _, st in exit_states])
+            if any(l for l, _, _ in exit_states):
+                live_exit_defs = _merge_defs(*(d for l, d, _ in exit_states if l))
                 for fn_name, fn_nodes in list(live_exit_defs.items()):
                     if any(id(fn_node) not in dead_refs for fn_node in fn_nodes):
-                        activate_defs(fn_name, live_exit_defs)
-        else:
-            walk_expr(body, True, init_defs)
+                        activate_defs(fn_name, live_exit_defs, exit_stored, init_guarded)
+            return exit_stored
+        _, _, expr_st = walk_expr(body, True, init_defs, init_stored, init_guarded)
+        return expr_st
 
     run_scope(fn.body)
-    return out
+    return live_calls, frozenset(required_attrs)
 
 
 def _injected_param_profiles(tree: ast.AST, excluded: set[int]) -> dict[int, dict[str, frozenset[str]]]:
-    """Map each call `id(call)` to `{unannotated_param: frozenset(attrs accessed on param in that fn)}`."""
+    """Map each call `id(call)` to `{unannotated_param: frozenset(attrs required on param in that fn)}`."""
     out: dict[int, dict[str, frozenset[str]]] = {}
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) or id(fn) in excluded:
@@ -970,20 +1303,15 @@ def _injected_param_profiles(tree: ast.AST, excluded: set[int]) -> dict[int, dic
         if not names:
             continue
         for nm in names:
-            subnodes = [s for s in _live_param_expr_nodes(fn, nm) if id(s) not in excluded]
-            atts = {
-                sub.attr
-                for sub in subnodes
-                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id == nm
-            }
-            if not atts:
+            live_calls, req_attrs = _live_param_expr_nodes(fn, nm, excluded)
+            if not live_calls:
                 continue
-            frozen_atts = frozenset(atts)
-            for sub in subnodes:
-                if isinstance(sub, ast.Call):
-                    merged = dict(out.get(id(sub), {}))
-                    merged[nm] = frozen_atts
-                    out[id(sub)] = merged
+            for call_id, mname in live_calls.items():
+                if call_id in excluded:
+                    continue
+                merged = dict(out.get(call_id, {}))
+                merged[nm] = req_attrs if mname in _OBJECT_ATTRS else (req_attrs | {mname})
+                out[call_id] = merged
     return out
 
 
@@ -1723,7 +2051,7 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                             isinstance(sub, ast.Attribute)
                             and isinstance(sub.ctx, ast.Store)
                             and isinstance(sub.value, ast.Name)
-                            and sub.value.id == "self"
+                            and sub.value.id in ("self", "cls")
                         ):
                             cattrs.add(sub.attr)
                 elif isinstance(member, ast.Assign):
