@@ -1,0 +1,57 @@
+name: Wythe CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    name: 3-Tier Lint, Test, UI Build, Self-Gate & Wheel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend & dev dependencies
+        run: uv sync --extra dev
+
+      - name: Lint backend (Ruff)
+        run: uv run ruff check backend/app backend/tests
+
+      - name: Run test suite (serial)
+        run: uv run pytest -v
+
+      - name: Build static 3D WebGL UI & verify OpenAPI contract
+        run: |
+          uv run wythe export-openapi --out frontend/openapi.json
+          cd frontend
+          npm ci
+          npm run generate:types
+          npm run type-check
+          npm run build
+          rm -rf ../backend/app/ui_dist
+          cp -R out ../backend/app/ui_dist
+
+      - name: Self-dogfood strict 3-tier & a11y gate
+        run: uv run wythe gate --strict wythe
+
+      - name: Build wheel & verify isolated execution
+        run: |
+          uv build
+          uv run --no-cache --isolated --no-project --with dist/wythe-*.whl \
+            wythe gate --strict .
