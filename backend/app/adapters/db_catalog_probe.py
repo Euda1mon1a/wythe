@@ -69,6 +69,21 @@ _MIGRATION_META_TABLES = frozenset(
 )
 
 
+# Read pg_catalog, not information_schema: information_schema.tables lists only tables the
+# connecting role holds a privilege on, so a least-privilege probe role would see tables it
+# cannot read as "absent" and raise false drift. pg_class is readable by every role and
+# exposes names only. Ordinary and partitioned tables count; partitions do not (their parent
+# is the table the source declares).
+_PG_TABLES_QUERY = (
+    "SELECT n.nspname, c.relname "
+    "FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition "
+    "AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
+    "AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp\\_%'"
+)
+
+
 def clean_sql_ident(raw: str | None) -> str:
     if not raw:
         return ""
@@ -144,12 +159,7 @@ def probe_live_catalog_tables(dsn: str) -> tuple[set[str], str]:
 
     if lower.startswith(("postgresql:", "postgres:", "postgresql+psycopg:")):
         pg_url = dsn.replace("postgresql+psycopg://", "postgresql://", 1)
-        query = (
-            "SELECT table_schema, table_name "
-            "FROM information_schema.tables "
-            "WHERE table_type = 'BASE TABLE' "
-            "AND table_schema NOT IN ('pg_catalog', 'information_schema')"
-        )
+        query = _PG_TABLES_QUERY
         found: set[str] = set()
         with psycopg.connect(pg_url, autocommit=True) as conn:
             conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
