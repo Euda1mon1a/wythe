@@ -688,3 +688,39 @@ def test_loop_else_mutations_comprehension_param_shadow_and_lexical_migration_he
     assert "t:local_widgets" not in by_id
 
 
+def test_rebound_injected_param_excludes_post_rebind_attributes(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "backend/app/services/worker_only.py",
+        "class WorkerOnly:\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/rebind.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/rebind-assign')\n"
+        "def rebind_assign(worker, flag):\n"
+        "    if flag:\n"
+        "        worker = object()\n"
+        "        return getattr(worker, 'unused', None) or worker.early_name\n"
+        "    def show_later():\n"
+        "        return worker.closure_name\n"
+        "    res = worker.execute_tasks()\n"
+        "    worker = object()\n"
+        "    return res, worker.name, show_later()\n\n"
+        "@router.post('/api/v1/rebind-loop')\n"
+        "def rebind_loop(worker, employees):\n"
+        "    res = worker.execute_tasks()\n"
+        "    for worker in employees:\n"
+        "        _ = worker.badge\n"
+        "    return res, worker.role\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.rebind", "m:service:services.worker_only") in pairs
+
+
+

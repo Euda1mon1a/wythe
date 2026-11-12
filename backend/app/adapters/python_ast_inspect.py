@@ -394,69 +394,312 @@ def _fn_local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     return bound - nonlocals
 
 
-def _scope_expr_nodes(root: ast.AST, skip_params: frozenset[str] = frozenset()) -> list[ast.AST]:
-    """Nodes inside `root` without crossing into inner scopes that shadow `skip_params`."""
+def _live_param_expr_nodes(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda, nm: str
+) -> list[ast.AST]:
+    """Collect AST expression nodes reachable while `nm` may still hold `fn`'s initial parameter."""
     out: list[ast.AST] = []
-    if skip_params and isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        queue: list[ast.AST] = list(root.body)
-    elif skip_params and isinstance(root, ast.Lambda):
-        queue = [root.body]
-    else:
-        queue = list(ast.iter_child_nodes(root))
-    idx = 0
-    while idx < len(queue):
-        node = queue[idx]
-        idx += 1
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            out.append(node)
-            if not skip_params:
-                continue
-            queue.extend(node.decorator_list)
-            queue.extend(node.args.defaults)
-            queue.extend(d for d in node.args.kw_defaults if d is not None)
-            if not (_fn_local_names(node) & skip_params):
-                queue.extend(node.body)
-            continue
-        if isinstance(node, ast.Lambda):
-            out.append(node)
-            if not skip_params:
-                continue
-            queue.extend(node.args.defaults)
-            queue.extend(d for d in node.args.kw_defaults if d is not None)
-            lam_bound = _arg_names(node.args) | {
-                sub.target.id
-                for sub in _expr_nodes_shallow(node.body, set())
-                if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name)
-            }
-            if not (lam_bound & skip_params):
-                queue.append(node.body)
-            continue
-        if isinstance(node, ast.ClassDef):
-            out.append(node)
-            if skip_params:
-                queue.extend(node.decorator_list)
-            continue
-        if skip_params and isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
-            out.append(node)
-            if node.generators:
-                queue.append(node.generators[0].iter)
-            if _comp_bound_names(node) & skip_params:
-                continue
-            if node.generators:
-                queue.append(node.generators[0].target)
-                queue.extend(node.generators[0].ifs)
-                for gen in node.generators[1:]:
-                    queue.append(gen.iter)
-                    queue.append(gen.target)
-                    queue.extend(gen.ifs)
-            if isinstance(node, ast.DictComp):
-                queue.append(node.key)
-                queue.append(node.value)
-            else:
-                queue.append(node.elt)
-            continue
-        out.append(node)
-        queue.extend(ast.iter_child_nodes(node))
+    activated_defs: set[int] = set()
+
+    def run_scope(
+        body: list[ast.stmt] | ast.expr,
+        outer_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] | None = None,
+    ) -> None:
+        local_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = dict(outer_defs or {})
+
+        def activate_def(name: str) -> None:
+            fn_def = local_defs.get(name)
+            if fn_def is None or id(fn_def) in activated_defs:
+                return
+            activated_defs.add(id(fn_def))
+            fn_locals = _fn_local_names(fn_def)
+            if nm not in fn_locals:
+                scoped_defs = {k: v for k, v in local_defs.items() if k not in fn_locals}
+                run_scope(fn_def.body, scoped_defs)
+
+        def walk_target(tgt: ast.AST, live: bool) -> bool:
+            if isinstance(tgt, ast.Name):
+                if tgt.id == nm:
+                    local_defs.pop(nm, None)
+                    return False
+                local_defs.pop(tgt.id, None)
+                return live
+            if isinstance(tgt, (ast.Tuple, ast.List)):
+                for elt in tgt.elts:
+                    live = walk_target(elt, live)
+                return live
+            if isinstance(tgt, ast.Starred):
+                return walk_target(tgt.value, live)
+            if isinstance(tgt, ast.Attribute):
+                if live:
+                    out.append(tgt)
+                return walk_expr(tgt.value, live)
+            if isinstance(tgt, ast.Subscript):
+                if live:
+                    out.append(tgt)
+                live = walk_expr(tgt.value, live)
+                return walk_expr(tgt.slice, live)
+            return live
+
+        def walk_expr(expr: ast.AST | None, live: bool) -> bool:
+            if expr is None:
+                return live
+            if isinstance(expr, ast.NamedExpr):
+                live = walk_expr(expr.value, live)
+                if live:
+                    out.append(expr)
+                return walk_target(expr.target, live)
+            if isinstance(expr, ast.Lambda):
+                if live:
+                    out.append(expr)
+                for dflt in (*expr.args.defaults, *(d for d in expr.args.kw_defaults if d is not None)):
+                    live = walk_expr(dflt, live)
+                lam_bound = _arg_names(expr.args) | {
+                    sub.target.id
+                    for sub in _expr_nodes_shallow(expr.body, set())
+                    if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name)
+                }
+                if live and nm not in lam_bound:
+                    lam_defs = {k: v for k, v in local_defs.items() if k not in lam_bound}
+                    run_scope(expr.body, lam_defs)
+                return live
+            if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+                if live:
+                    out.append(expr)
+                if expr.generators:
+                    live = walk_expr(expr.generators[0].iter, live)
+                comp_walrus = {
+                    sub.target.id
+                    for sub in _expr_nodes_shallow(expr, set())
+                    if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name)
+                }
+                if live and nm not in _comp_bound_names(expr):
+                    clive = live
+                    if expr.generators:
+                        for ifs_e in expr.generators[0].ifs:
+                            clive = walk_expr(ifs_e, clive)
+                        for gen in expr.generators[1:]:
+                            clive = walk_expr(gen.iter, clive)
+                            for ifs_e in gen.ifs:
+                                clive = walk_expr(ifs_e, clive)
+                    if isinstance(expr, ast.DictComp):
+                        clive = walk_expr(expr.key, clive)
+                        walk_expr(expr.value, clive)
+                    else:
+                        walk_expr(expr.elt, clive)
+                if nm in comp_walrus:
+                    local_defs.pop(nm, None)
+                    live = False
+                return live
+            if isinstance(expr, ast.IfExp):
+                if live:
+                    out.append(expr)
+                lt = walk_expr(expr.test, live)
+                lb = walk_expr(expr.body, lt)
+                le = walk_expr(expr.orelse, lt)
+                return lb or le
+            if isinstance(expr, ast.BoolOp):
+                if live:
+                    out.append(expr)
+                cur = walk_expr(expr.values[0], live)
+                any_sc = cur
+                for val in expr.values[1:]:
+                    cur = walk_expr(val, cur)
+                    any_sc = any_sc or cur
+                return any_sc
+            if isinstance(expr, ast.Name) and isinstance(expr.ctx, ast.Load):
+                if live:
+                    out.append(expr)
+                    if expr.id in local_defs:
+                        activate_def(expr.id)
+                return live
+            if live:
+                out.append(expr)
+            for ch in ast.iter_child_nodes(expr):
+                if isinstance(ch, ast.expr):
+                    live = walk_expr(ch, live)
+            return live
+
+        def walk_stmts(
+            stmts: list[ast.stmt],
+            live: bool,
+            loop_breaks: list[bool] | None = None,
+            loop_continues: list[bool] | None = None,
+        ) -> tuple[bool, bool]:
+            for s in stmts:
+                if isinstance(s, ast.Return):
+                    live = walk_expr(s.value, live)
+                    return live, False
+                if isinstance(s, ast.Raise):
+                    live = walk_expr(s.exc, live)
+                    live = walk_expr(s.cause, live)
+                    return live, False
+                if isinstance(s, ast.Break):
+                    if loop_breaks is not None:
+                        loop_breaks.append(live)
+                    return live, False
+                if isinstance(s, ast.Continue):
+                    if loop_continues is not None:
+                        loop_continues.append(live)
+                    return live, False
+                if isinstance(s, ast.Assign):
+                    live = walk_expr(s.value, live)
+                    for tgt in s.targets:
+                        live = walk_target(tgt, live)
+                elif isinstance(s, ast.AnnAssign):
+                    if s.value is not None:
+                        live = walk_expr(s.value, live)
+                        live = walk_target(s.target, live)
+                elif isinstance(s, ast.AugAssign):
+                    if isinstance(s.target, ast.Name):
+                        live = walk_expr(s.value, live)
+                        live = walk_target(s.target, live)
+                    else:
+                        live = walk_target(s.target, live)
+                        live = walk_expr(s.value, live)
+                elif isinstance(s, ast.Delete):
+                    for tgt in s.targets:
+                        live = walk_target(tgt, live)
+                elif isinstance(s, ast.Expr):
+                    live = walk_expr(s.value, live)
+                elif isinstance(s, ast.Assert):
+                    live = walk_expr(s.test, live)
+                    live = walk_expr(s.msg, live)
+                elif isinstance(s, (ast.Import, ast.ImportFrom)):
+                    for alias in s.names:
+                        if alias.name != "*":
+                            bound_nm = (alias.asname or alias.name).split(".", 1)[0]
+                            local_defs.pop(bound_nm, None)
+                            if bound_nm == nm:
+                                live = False
+                elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for dec in s.decorator_list:
+                        live = walk_expr(dec, live)
+                    for dflt in (*s.args.defaults, *(d for d in s.args.kw_defaults if d is not None)):
+                        live = walk_expr(dflt, live)
+                    if s.decorator_list:
+                        local_defs.pop(s.name, None)
+                        s_locals = _fn_local_names(s)
+                        if live and nm not in s_locals:
+                            run_scope(s.body, {k: v for k, v in local_defs.items() if k not in s_locals})
+                    else:
+                        local_defs[s.name] = s
+                    if s.name == nm:
+                        local_defs.pop(nm, None)
+                        live = False
+                elif isinstance(s, ast.ClassDef):
+                    for dec in s.decorator_list:
+                        live = walk_expr(dec, live)
+                    local_defs.pop(s.name, None)
+                    if s.name == nm:
+                        live = False
+                elif isinstance(s, ast.If):
+                    live = walk_expr(s.test, live)
+                    lb, fb = walk_stmts(s.body, live, loop_breaks, loop_continues)
+                    le, fe = walk_stmts(s.orelse, live, loop_breaks, loop_continues)
+                    if not fb and not fe:
+                        return (lb or le), False
+                    live = (lb if fb else False) or (le if fe else False)
+                elif isinstance(s, (ast.For, ast.AsyncFor)):
+                    live = walk_expr(s.iter, live)
+                    rebinds_tgt = nm in {
+                        t.id for t in ast.walk(s.target) if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)
+                    }
+                    body_in = walk_target(s.target, live)
+                    brk: list[bool] = []
+                    cnt: list[bool] = []
+                    lb, fb = walk_stmts(s.body, body_in, brk, cnt)
+                    iter_end = (lb if fb else False) or any(cnt)
+                    else_in = (False if rebinds_tgt else live) or iter_end
+                    le, fe = walk_stmts(s.orelse, else_in, loop_breaks, loop_continues)
+                    if not fe and not brk:
+                        return le, False
+                    live = (le if fe else False) or any(brk)
+                elif isinstance(s, ast.While):
+                    live = walk_expr(s.test, live)
+                    always_true = isinstance(s.test, ast.Constant) and bool(s.test.value) is True
+                    brk = []
+                    cnt = []
+                    lb, fb = walk_stmts(s.body, live, brk, cnt)
+                    iter_end = (lb if fb else False) or any(cnt)
+                    zero_iter = False if always_true else live
+                    if not zero_iter and not fb and not cnt:
+                        le, fe = False, False
+                    else:
+                        le, fe = walk_stmts(s.orelse, zero_iter or iter_end, loop_breaks, loop_continues)
+                    if not fe and not brk:
+                        return le, False
+                    live = (le if fe else False) or any(brk)
+                elif isinstance(s, (ast.With, ast.AsyncWith)):
+                    for item in s.items:
+                        live = walk_expr(item.context_expr, live)
+                        if item.optional_vars is not None:
+                            live = walk_target(item.optional_vars, live)
+                    live, fw = walk_stmts(s.body, live, loop_breaks, loop_continues)
+                    if not fw:
+                        return live, False
+                elif isinstance(s, (ast.Try, ast.TryStar)):
+                    entry_live = live
+                    lt, ft = walk_stmts(s.body, entry_live, loop_breaks, loop_continues)
+                    le, fe = walk_stmts(s.orelse, lt, loop_breaks, loop_continues) if ft else (False, False)
+                    h_lives: list[bool] = [le] if fe else []
+                    any_fall = fe
+                    for h in s.handlers:
+                        if h.type is not None:
+                            walk_expr(h.type, entry_live or lt)
+                        h_in = False if h.name == nm else (entry_live or lt)
+                        lh, fh = walk_stmts(h.body, h_in, loop_breaks, loop_continues)
+                        if fh:
+                            any_fall = True
+                            h_lives.append(lh)
+                    fin_in = any(h_lives) if any_fall else (entry_live or lt)
+                    lf, ff = walk_stmts(s.finalbody, fin_in, loop_breaks, loop_continues)
+                    if not ff or not any_fall:
+                        return lf, False
+                    live = lf
+                elif isinstance(s, ast.Match):
+                    live = walk_expr(s.subject, live)
+                    c_lives: list[bool] = []
+                    exit_lives: list[bool] = []
+                    any_fall = False
+                    has_wild = False
+                    for case in s.cases:
+                        binds_nm = any(
+                            (isinstance(p, (ast.MatchAs, ast.MatchStar)) and p.name == nm)
+                            or (isinstance(p, ast.MatchMapping) and p.rest == nm)
+                            for p in ast.walk(case.pattern)
+                        )
+                        cin = False if binds_nm else live
+                        if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None:
+                            has_wild = True
+                        cin = walk_expr(case.guard, cin)
+                        lc, fc = walk_stmts(case.body, cin, loop_breaks, loop_continues)
+                        exit_lives.append(lc)
+                        if fc:
+                            any_fall = True
+                            c_lives.append(lc)
+                    if not has_wild:
+                        any_fall = True
+                        c_lives.append(live)
+                    if not any_fall:
+                        return any(exit_lives), False
+                    live = any(c_lives)
+                else:
+                    for ch in ast.iter_child_nodes(s):
+                        if isinstance(ch, ast.expr):
+                            live = walk_expr(ch, live)
+                        elif isinstance(ch, ast.stmt):
+                            live, fs = walk_stmts([ch], live, loop_breaks, loop_continues)
+                            if not fs:
+                                return live, False
+            return live, True
+
+        if isinstance(body, list):
+            walk_stmts(body, True)
+        else:
+            walk_expr(body, True)
+
+    run_scope(fn.body)
     return out
 
 
@@ -475,7 +718,7 @@ def _injected_param_profiles(tree: ast.AST, excluded: set[int]) -> dict[int, dic
         if not names:
             continue
         for nm in names:
-            subnodes = [s for s in _scope_expr_nodes(fn, frozenset({nm})) if id(s) not in excluded]
+            subnodes = [s for s in _live_param_expr_nodes(fn, nm) if id(s) not in excluded]
             atts = {
                 sub.attr
                 for sub in subnodes
