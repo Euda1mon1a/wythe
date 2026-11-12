@@ -12,6 +12,11 @@ from app.adapters.base import (
     RawCandidateFinding,
 )
 from app.adapters.treesitter_engine import blank_comments_cst, extract_ts_http_calls_cst
+from app.adapters.ts_reachability import (
+    MODULE_SYMBOL,
+    ReachabilityIndex,
+    build_nextjs_reachability,
+)
 from app.core.policy_context import get_active_policy_tokens
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
@@ -203,29 +208,75 @@ def _strip_ts_comments(source: str) -> str:
     return "".join(out)
 
 
+_QUERY_SUFFIX_NAMES = frozenset(
+    {"query", "qs", "querystring", "querystr", "search", "searchparams", "params", "urlparams", "queryparams"}
+)
+_QUERY_SUFFIX_CALL_RE = re.compile(r"^[\w$.]*?(?:query|querystring|searchparams)[\w$]*\s*\(", re.IGNORECASE)
+_QUOTED_QUESTION_RE = re.compile(r"""[`'"]\?""")
+
+
+def _skip_template_expr(raw_url: str, start: int) -> int:
+    """Return the index just past the `}` closing a `${` that opened before `start`."""
+    depth = 1
+    j = start
+    n = len(raw_url)
+    quote: str | None = None
+    while j < n and depth > 0:
+        ch = raw_url[j]
+        if quote:
+            if ch == "\\":
+                j += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        j += 1
+    return j
+
+
+def _is_query_suffix_expr(expr: str) -> bool:
+    """True when a `${...}` that ends the URL yields a query string rather than a path segment."""
+    stripped = expr.strip()
+    # `${qs ? `?${qs}` : ''}` or `${p ? '?' + p : ''}` build a query string.
+    if _QUOTED_QUESTION_RE.search(stripped):
+        return True
+    compact = stripped.replace(" ", "")
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", compact):
+        low = compact.lower()
+        return low in _QUERY_SUFFIX_NAMES or low.endswith(("querystring", "searchparams", "query", "qs"))
+    if compact.endswith(".toString()") and re.fullmatch(r"[A-Za-z_$][\w$]*\.toString\(\)", compact):
+        return compact.split(".", 1)[0].lower() in _QUERY_SUFFIX_NAMES or "param" in compact.lower()
+    return bool(_QUERY_SUFFIX_CALL_RE.match(stripped))
+
+
 def _normalize_ts_url(raw_url: str) -> str:
+    """Normalize a URL literal/template: `${...}` path segments become `{param}`, query strings drop.
+
+    A `${...}` is a path segment unless it ends the URL *and* evidently builds a query string,
+    so `${params.id}`, `${encodeURIComponent(id ?? '')}` and `${searchId}` stay path segments.
+    """
     out: list[str] = []
     i = 0
     n = len(raw_url)
     while i < n:
-        if raw_url[i] == "?":
+        ch = raw_url[i]
+        if ch in ("?", "#"):
             break
-        if raw_url[i] == "$" and i + 1 < n and raw_url[i + 1] == "{":
-            depth = 1
-            j = i + 2
-            while j < n and depth > 0:
-                if raw_url[j] == "{":
-                    depth += 1
-                elif raw_url[j] == "}":
-                    depth -= 1
-                j += 1
+        if ch == "$" and i + 1 < n and raw_url[i + 1] == "{":
+            j = _skip_template_expr(raw_url, i + 2)
             expr = raw_url[i + 2 : j - 1]
-            if any(k in expr.lower() for k in ("query", "param", "search", "?")):
+            at_end = j >= n or raw_url[j] in ("?", "#")
+            if at_end and _is_query_suffix_expr(expr):
                 break
             out.append("{param}")
             i = j
             continue
-        out.append(raw_url[i])
+        out.append(ch)
         i += 1
     cleaned = re.sub(r"/+", "/", "".join(out)).rstrip("/")
     return cleaned or "/"
@@ -328,6 +379,19 @@ class TypeScriptNextJsAdapter:
                     continue
                 ts_files.append(resolved)
 
+        reach: ReachabilityIndex | None = None
+        local_route_patterns: list[str] = []
+        try:
+            reach, local_route_patterns = build_nextjs_reachability(
+                fe_dir,
+                src_root,
+                repo_root.resolve(),
+                _strip_ts_comments,
+                pre_cleaned=cleaned_texts,
+            )
+        except (OSError, ValueError, RecursionError):
+            reach = None  # reachability unknown: unbacked calls stay blocking
+
         nodes_by_path: dict[Path, AtlasNode] = {}
         for fpath in ts_files:
             rel_src = (
@@ -423,6 +487,15 @@ class TypeScriptNextJsAdapter:
                     methods_seen.append(verb)
                 if norm_u not in paths_seen:
                     paths_seen.append(norm_u)
+                caller_sym: str | None = None
+                live: bool | None = None
+                trail: tuple[str, ...] = ()
+                if reach is not None:
+                    sym = reach.enclosing_symbol(fpath, lineno)
+                    caller_sym = None if sym == MODULE_SYMBOL else sym
+                    if reach.has_roots:
+                        live = reach.is_live(fpath, sym)
+                        trail = reach.trail(fpath, sym) if live else ()
                 http_calls.append(
                     FrontendHttpCall(
                         caller_node_id=node.id,
@@ -431,6 +504,9 @@ class TypeScriptNextJsAdapter:
                         normalized_path=norm_u,
                         source_file=rel_repo,
                         line=lineno,
+                        caller_symbol=caller_sym,
+                        reachable=live,
+                        reach_trail=trail,
                     )
                 )
             node.http_methods = methods_seen
@@ -519,4 +595,5 @@ class TypeScriptNextJsAdapter:
             edges=edges,
             http_calls=http_calls,
             findings=findings,
+            local_route_patterns=local_route_patterns,
         )

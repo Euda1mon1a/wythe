@@ -121,7 +121,7 @@ def _print_report_summary(report) -> None:
     )
     print(f"Wythe :: {report.target_name} ({report.target_slug})")
     print(
-        f"  Profile : {report.stack_profile}{maturity_tag} | Commit: {report.source_commit[:12]} | Source: {report.observation_source}"
+        f"  Profile : {report.stack_profile}{maturity_tag} | Commit: {_commit_label(report)} | Source: {report.observation_source}"
     )
     if getattr(report, "stack_profile_status", "implemented") == "experimental":
         print(
@@ -156,6 +156,33 @@ def _print_report_summary(report) -> None:
             print(
                 f"    - {row.rule_code} [{row.tier:<10}] {row.observed_count}{ceil_str} ({row.status}) :: {row.title}"
             )
+    for note in getattr(report, "scan_notes", []) or []:
+        print(f"  Note                     : {note}")
+
+
+def _commit_label(report) -> str:
+    """`abc123def456`, or `abc123def456 + 12 uncommitted paths` when the scanned tree is dirty."""
+    label = report.source_commit[:12]
+    count = getattr(report, "dirty_path_count", None)
+    if count:
+        label += f" + {count} uncommitted path{'s' if count != 1 else ''}"
+    return label
+
+
+def _add_probe_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--probe-url",
+        default=None,
+        help=(
+            "Opt-in: base URL of a running backend (what frontend API paths are relative to). "
+            "Sends one unauthenticated GET per unbacked call to confirm (404/405) or clear it."
+        ),
+    )
+    p.add_argument(
+        "--probe-allow-remote",
+        action="store_true",
+        help="Allow --probe-url to target a host that is not loopback/private",
+    )
 
 
 def _write_json_file(dest: str, payload_str: str) -> Path:
@@ -177,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--strict", action="store_true", help="Ignore ratchet baselines")
     p_scan.add_argument("--json", dest="json_out", default=None, help="Write full JSON report to file")
     p_scan.add_argument("--sarif", dest="sarif_out", default=None, help="Write SARIF 2.1.0 report to file")
+    _add_probe_args(p_scan)
 
     p_gate = sub.add_parser("gate", help="Fail-closed 3-tier boundary check (exit 0 pass, 1 violation, 2 error)")
     p_gate.add_argument("target", help="Registered target slug or filesystem path")
@@ -186,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
     p_gate.add_argument("--strict", action="store_true", help="Require zero blocking violations (ignore ratchet)")
     p_gate.add_argument("--sync-config", action="store_true", help="Hydrate DB from .wythe/governance.json first")
     p_gate.add_argument("--sarif", dest="sarif_out", default=None, help="Write SARIF 2.1.0 report to file")
+    _add_probe_args(p_gate)
 
     p_diff = sub.add_parser("diff", help="PR diff gate & 3-tier blast-radius analyzer (exit 0 pass, 1 new blocking)")
     p_diff.add_argument("target", help="Registered target slug or filesystem path")
@@ -195,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     p_diff.add_argument("--redis-dsn", default=None, help="Optional read-only Redis DSN")
     p_diff.add_argument("--json", dest="json_out", default=None, help="Write DiffBlastRadiusReport JSON")
     p_diff.add_argument("--sarif", dest="sarif_out", default=None, help="Write diff-scoped SARIF 2.1.0 report")
+    _add_probe_args(p_diff)
 
     p_exp = sub.add_parser("export-config", help="Export DB governance into .wythe/governance.json")
     p_exp.add_argument("target", help="Registered target slug or filesystem path")
@@ -385,12 +415,14 @@ def main(argv: list[str] | None = None) -> int:
                     redis_dsn=args.redis_dsn,
                     strict_gate=True,
                     persist_snapshot=False,
+                    probe_url=args.probe_url,
+                    probe_allow_remote=args.probe_allow_remote,
                 )
                 diff_rep = compute_diff_and_blast_radius(
                     Path(target.repo_path).resolve(), report, base_ref=args.base
                 )
                 print(
-                    f"Wythe Diff :: {diff_rep.target_slug} (base={diff_rep.base_ref} -> {diff_rep.head_commit[:12]})"
+                    f"Wythe Diff :: {diff_rep.target_slug} (base={diff_rep.base_ref} -> {_commit_label(report)})"
                 )
                 print(
                     f"  Changed Files  : {len(diff_rep.changed_files)} | Touched Nodes: {len(diff_rep.touched_node_ids)} | Commits: {len(diff_rep.commits_in_range)}"
@@ -419,6 +451,8 @@ def main(argv: list[str] | None = None) -> int:
                 redis_dsn=args.redis_dsn,
                 strict_gate=args.strict,
                 persist_snapshot=is_persisted,
+                probe_url=args.probe_url,
+                probe_allow_remote=args.probe_allow_remote,
             )
             _print_report_summary(report)
             if args.cmd == "scan" and args.json_out:

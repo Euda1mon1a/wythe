@@ -200,10 +200,16 @@ class TruthAtlasReport(StrictSchema):
     stack_profile: str
     stack_profile_status: Literal["implemented", "experimental", "planned"] = "implemented"
     source_commit: str
+    # The scan reads files from disk, so a dirty tree means `source_commit` alone does not
+    # describe the scanned code. None outside git.
+    worktree_dirty: bool | None = None
+    dirty_path_count: int | None = None
     observed_at: datetime
     valid_until: datetime
     observation_source: str
     content_digest: str
+    # Plain-language notes about what the scan could not check or how it decided.
+    scan_notes: list[str] = Field(default_factory=list)
     summary: AtlasSummaryStats
     nodes: list[AtlasNode]
     edges: list[AtlasEdge]

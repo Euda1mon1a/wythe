@@ -429,6 +429,6 @@ def test_portable_governance_bundle_export_and_ci_sync_roundtrip(
         assert "TENANT_SLO_CAP" in vocabs_b
         tgt_b = get_target_by_slug(sess_b, "portable-repo")
         assert tgt_b is not None
-        assert len(list_ratchet_baselines(sess_b, tgt_b.id)) == 12
+        assert len(list_ratchet_baselines(sess_b, tgt_b.id)) == 15
         assert len(list_rulings(sess_b, tgt_b.id)) == 1
     get_session_factory.cache_clear()

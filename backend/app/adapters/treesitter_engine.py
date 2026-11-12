@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover
 
 _HTTP_VERBS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 _FETCH_HELPERS = frozenset({"fetch", "ofetch", "$fetch", "useFetch", "useLazyFetch", "apiRequest", "request", "httpClient"})
+_CALLEE_WRAPPERS = frozenset({"await_expression", "parenthesized_expression", "non_null_expression"})
 _METHOD_RE = re.compile(r"""method\s*:\s*['"](?P<m>GET|POST|PUT|PATCH|DELETE)['"]""", re.IGNORECASE)
 _TAURI_READ_PREFIXES = ("get_", "list_", "fetch_", "load_", "find_", "query_", "read_", "detect_", "estimate_", "scope_")
 
@@ -201,6 +202,10 @@ def extract_ts_http_calls_cst(source: str, *, is_tsx: bool = True) -> list[tuple
     def walk(node: Any) -> None:
         if node.type == "call_expression" and node.children:
             fn_node = node.children[0]
+            # tree-sitter-typescript parses `await post<T>(url)` as a call whose function is
+            # `await post`; unwrap await/parens/non-null so generic calls are not missed.
+            while fn_node.type in _CALLEE_WRAPPERS and fn_node.named_children:
+                fn_node = fn_node.named_children[-1]
             args_node = next((c for c in node.children if c.type == "arguments"), None)
             if args_node is not None:
                 arg_items = [c for c in args_node.children if c.type not in ("(", ")", ",")]

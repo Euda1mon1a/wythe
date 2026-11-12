@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.adapters import build_default_registry
 from app.adapters.base import (
     DisplayExtractionResult,
+    FrontendHttpCall,
     ManipulatorExtractionResult,
     RawCandidateFinding,
     RouteDescriptor,
@@ -36,6 +37,80 @@ from app.schemas.atlas import (
 )
 from app.services.gate_service import evaluate_findings_and_gate
 from app.services.governance_service import list_rulings
+from app.services.route_probe_service import apply_live_route_probe
+
+_API_VERSION_PREFIX_RE = re.compile(r"^/api/v\d+(?=/|$)")
+_ROUTE_PARAM_SEG_RE = re.compile(r"^(?:\{[^/]*\}|:[\w$]+\??|<[^>]+>|\*.*)$")
+_CALL_PARAM_SPLIT_RE = re.compile(r"(\{param\})")
+
+
+def _strip_api_version_prefix(path: str) -> str:
+    return _API_VERSION_PREFIX_RE.sub("", path.rstrip("/")) or "/"
+
+
+def _call_segment_matches(call_seg: str, route_seg: str) -> bool:
+    """Only the call's runtime `{param}` parts are wildcards; its literal words must match literally.
+
+    A literal call segment such as `balance` matching a route parameter `{absence_id}` is
+    exactly the comparison that already failed, so it must not make the call "unresolved".
+    """
+    route_is_param = bool(_ROUTE_PARAM_SEG_RE.match(route_seg))
+    if "{param}" in call_seg:
+        if call_seg == "{param}":
+            return True
+        if route_is_param:
+            return False
+        pattern = "".join(
+            "[^/]*" if part == "{param}" else re.escape(part)
+            for part in _CALL_PARAM_SPLIT_RE.split(call_seg)
+        )
+        return re.fullmatch(pattern, route_seg) is not None
+    return not route_is_param and call_seg == route_seg
+
+
+def _wildcard_route_candidates(
+    call: FrontendHttpCall, routes: list[RouteDescriptor]
+) -> list[RouteDescriptor]:
+    """Routes a runtime-built call path could resolve to, treating each `{param}` as a wildcard."""
+    if "{param}" not in call.normalized_path:
+        return []
+    call_segs = _strip_api_version_prefix(call.normalized_path).strip("/").split("/")
+    found: list[RouteDescriptor] = []
+    for route in routes:
+        if route.http_method != call.http_method:
+            continue
+        route_segs = _strip_api_version_prefix(route.full_path).strip("/").split("/")
+        if len(route_segs) == len(call_segs) and all(
+            _call_segment_matches(c, r) for c, r in zip(call_segs, route_segs)
+        ):
+            found.append(route)
+    return found
+
+
+def _git_dirty_path_count(repo_root: Path) -> int | None:
+    """Count uncommitted paths (modified, deleted, untracked; renames once), or None outside git."""
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    count = 0
+    skip_next = False
+    for token in res.stdout.split(b"\x00"):
+        if skip_next:
+            skip_next = False
+            continue
+        if not token:
+            continue
+        count += 1
+        if b"R" in token[:2] or b"C" in token[:2]:
+            skip_next = True  # rename/copy entries carry the original path as the next token
+    return count
 
 
 def _resolve_git_commit(repo_root: Path) -> str:
@@ -61,6 +136,7 @@ class _CachedStaticExtraction:
     edges: list[AtlasEdge]
     chains: list[EndToEndChain]
     raw_findings: list[RawCandidateFinding]
+    notes: list[str]
 
 
 _EXTRACTION_CACHE: OrderedDict[tuple[object, ...], _CachedStaticExtraction] = OrderedDict()
@@ -104,6 +180,81 @@ def _compute_git_worktree_fingerprint(repo_root: Path) -> tuple[str, str] | None
         except OSError:
             continue
     return head_sha, h.hexdigest()
+
+
+def _classify_unbacked_call(
+    call: FrontendHttpCall,
+    routes: list[RouteDescriptor],
+    local_route_res: list[re.Pattern[str]],
+) -> list[RawCandidateFinding]:
+    """Decide what a frontend call with no matching backend route means.
+
+    - served by the frontend itself (Next.js `route.ts`): not a backend call, no finding;
+    - built at runtime and could match real routes: DISP-006 (unresolved, warning);
+    - no entry point reaches the calling symbol: DISP-007 (dead code, warning);
+    - otherwise: DISP-004 (blocking), with the page path that reaches it when known.
+    """
+    method_path = f"{call.http_method} {call.normalized_path}"
+    if any(rx.match(call.normalized_path) for rx in local_route_res):
+        return []
+
+    candidates = _wildcard_route_candidates(call, routes)
+    if candidates:
+        shown = ", ".join(f"`{c.http_method} {c.full_path}`" for c in candidates[:3])
+        more = f" (+{len(candidates) - 3} more)" if len(candidates) > 3 else ""
+        return [
+            RawCandidateFinding(
+                rule_code="DISP-006",
+                node_id=call.caller_node_id,
+                source_file=call.source_file,
+                line=call.line,
+                title=f"Frontend `{method_path}` is built at runtime; it may match {len(candidates)} backend route(s)",
+                detail=(
+                    f"{call.source_file}:{call.line} calls `{call.raw_path}`. With its runtime segment(s) "
+                    f"treated as wildcards it could resolve to {shown}{more}. Static analysis cannot tell "
+                    "which value is used at runtime."
+                ),
+                remediation="Confirm the runtime values map to these routes, or build the path from literal segments.",
+                http_method=call.http_method,
+                http_path=call.normalized_path,
+            )
+        ]
+
+    where = f"`{call.caller_symbol}`" if call.caller_symbol else "this module"
+    if call.reachable is False:
+        return [
+            RawCandidateFinding(
+                rule_code="DISP-007",
+                node_id=call.caller_node_id,
+                source_file=call.source_file,
+                line=call.line,
+                title=f"Frontend `{method_path}` has no matching backend route (unreachable code)",
+                detail=(
+                    f"{call.source_file}:{call.line} calls `{call.raw_path}`, which matched zero backend routes. "
+                    f"No page, layout, or code they reach imports {where}, so users cannot trigger it today."
+                ),
+                remediation="Remove the dead call, or repoint it to a real route before a page starts using it.",
+                http_method=call.http_method,
+                http_path=call.normalized_path,
+            )
+        ]
+
+    reached = (
+        f" Reached from: {' -> '.join(call.reach_trail)}." if call.reach_trail else ""
+    )
+    return [
+        RawCandidateFinding(
+            rule_code="DISP-004",
+            node_id=call.caller_node_id,
+            source_file=call.source_file,
+            line=call.line,
+            title=f"Frontend `{method_path}` has no matching backend route",
+            detail=f"{call.source_file}:{call.line} calls `{call.raw_path}`, which matched zero registered backend routes.{reached}",
+            remediation="Align the frontend API path/method with an active backend route handler.",
+            http_method=call.http_method,
+            http_path=call.normalized_path,
+        )
+    ]
 
 
 def _solve_cross_tier_lineage(
@@ -181,6 +332,7 @@ def _solve_cross_tier_lineage(
 
     chains: list[EndToEndChain] = []
     seen_chains: set[tuple[str, str, str, str]] = set()
+    local_route_res = [re.compile(p) for p in disp.local_route_patterns]
 
     for call in disp.http_calls:
         matched_routes = [
@@ -189,17 +341,7 @@ def _solve_cross_tier_lineage(
             if r.http_method == call.http_method and pat.match(call.normalized_path)
         ]
         if not matched_routes:
-            extra_findings.append(
-                RawCandidateFinding(
-                    rule_code="DISP-004",
-                    node_id=call.caller_node_id,
-                    source_file=call.source_file,
-                    line=call.line,
-                    title=f"Frontend `{call.http_method} {call.normalized_path}` has no matching backend route",
-                    detail=f"{call.source_file}:{call.line} calls `{call.raw_path}`, which matched zero registered backend routes.",
-                    remediation="Align the frontend API path/method with an active backend route handler.",
-                )
-            )
+            extra_findings.extend(_classify_unbacked_call(call, manip.routes, local_route_res))
             continue
 
         kind = "queries_endpoint" if call.http_method == "GET" else "mutates_endpoint"
@@ -260,8 +402,14 @@ def run_target_scan(
     redis_dsn: str | None = None,
     strict_gate: bool = False,
     persist_snapshot: bool = True,
+    probe_url: str | None = None,
+    probe_allow_remote: bool = False,
 ) -> TruthAtlasReport:
-    """Execute a 3-tier Truth Atlas scan for a registered TargetProject."""
+    """Execute a 3-tier Truth Atlas scan for a registered TargetProject.
+
+    `probe_url` opts into one unauthenticated GET per unbacked frontend call against a
+    running backend (see `route_probe_service`) to confirm or clear DISP-004/007 findings.
+    """
     profile_slug = (
         "fastapi-sqlalchemy-nextjs"
         if target.stack_profile_slug.endswith("-native")
@@ -316,6 +464,7 @@ def run_target_scan(
         all_edges = list(cached.edges)
         chains = list(cached.chains)
         raw_findings = list(cached.raw_findings)
+        scan_notes = list(cached.notes)
     else:
         with policy_tokens_scope(enabled_tokens):
             truth_res = t_adapter.extract(repo_root, target.backend_subdir, pg_dsn=pg_dsn)
@@ -347,6 +496,7 @@ def run_target_scan(
             *disp_res.findings,
             *cross_findings,
         ]
+        scan_notes = list(truth_res.notes)
         commit_sha = git_fp[0] if git_fp is not None else _resolve_git_commit(repo_root)
         if cache_key is not None:
             _EXTRACTION_CACHE[cache_key] = _CachedStaticExtraction(
@@ -356,9 +506,19 @@ def run_target_scan(
                 edges=list(all_edges),
                 chains=list(chains),
                 raw_findings=list(raw_findings),
+                notes=list(scan_notes),
             )
             while len(_EXTRACTION_CACHE) > _EXTRACTION_CACHE_MAX:
                 _EXTRACTION_CACHE.popitem(last=False)
+
+    if probe_url:
+        raw_findings, probe_note = apply_live_route_probe(
+            raw_findings, probe_url, allow_remote=probe_allow_remote
+        )
+        obs_source = f"{obs_source}+http_probe"
+        scan_notes.append(probe_note)
+
+    dirty_count = _git_dirty_path_count(repo_root)
 
     legacy_summary = apply_legacy_snapshot_bridge(
         repo_root, target.legacy_snapshot_relpath, all_nodes
@@ -423,10 +583,13 @@ def run_target_scan(
         stack_profile=target.stack_profile_slug,
         stack_profile_status=profile_maturity,  # type: ignore[arg-type]
         source_commit=commit_sha,
+        worktree_dirty=None if dirty_count is None else dirty_count > 0,
+        dirty_path_count=dirty_count,
         observed_at=observed,
         valid_until=valid_until_from(observed),
         observation_source=obs_source,
         content_digest=digest,
+        scan_notes=scan_notes,
         summary=stats,
         nodes=all_nodes,
         edges=all_edges,

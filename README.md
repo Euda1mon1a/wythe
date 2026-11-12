@@ -17,7 +17,7 @@ Wythe supports **18 full-stack profiles** via `--profile auto` (**1 production-d
 
 > [!IMPORTANT]
 > **Status, Maturity & Zero-Maintenance Notice (`"AS IS"`)**
-> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.1` or `wythe==0.1.1`) and fork freely.
+> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.1` or `wythe==0.1.1`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
 > - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **16 polyglot profiles** (`nextjs-prisma`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, `django-react`, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
 
 ---
@@ -67,14 +67,21 @@ Rule severity, enablement, gate-blocking behavior, and effective-date windows li
 | `TRUTH-002` | `truth` | Blocking | ORM model, `schema.sql`/migrations, or live DB catalog table drift |
 | `TRUTH-003` | `truth` | Blocking | Table or Redis store mutated directly inside HTTP route without service/DB door |
 | `TRUTH-004` | `truth` | Warning | Unbounded Redis `SET`/`HSET` write without TTL risks volatile shadow truth |
+| `TRUTH-005` | `truth` | Warning | Table exists in the live DB (`--dsn`) but no `schema.sql`/migration creates it |
 | `MANIP-001` | `manipulate` | Blocking | Mutable domain policy/threshold constant hardcoded in code (`atlas_policy_vocabularies`) |
 | `MANIP-002` | `manipulate` | Blocking | Direct host `date.today()` or naive `datetime.utcnow()` call |
 | `MANIP-003` | `manipulate` | Warning | Service/solver module has zero verified inbound route, CLI, or worker callers |
 | `DISP-001` | `display` | Blocking | Display tier defines domain policy threshold shadows in frontend code |
 | `DISP-002` | `display` | Blocking | Raw `new Date()` or UTC `.toISOString().slice(0, 10)` date slicing |
 | `DISP-003` | `display` | Warning | Frontend API client omits `api-generated` OpenAPI/schema types |
-| `DISP-004` | `display` | Blocking | Frontend HTTP/IPC call targets a path absent from backend router graph |
+| `DISP-004` | `display` | Blocking | Frontend HTTP/IPC call targets a path absent from backend router graph, in code a page can reach |
 | `DISP-005` | `display` | Warning | Display markup violates core WCAG semantics (missing `alt`, unlabeled form input, nameless icon button, non-keyboard `<div onClick>`) |
+| `DISP-006` | `display` | Warning | Call path is built at runtime (`/${kind}/items`) and could match real routes: reported for review, not called broken |
+| `DISP-007` | `display` | Warning | Call to a missing route in code no page, layout, or code they reach imports (dead code) |
+
+**How a frontend call with no matching route is classified.** A call served by the frontend's own Next.js `route.ts` / `pages/api` handler is not a backend call and is not reported. A path built at runtime that could match real routes is `DISP-006`. On the `typescript-nextjs` profile, Wythe follows imports per exported symbol from pages and layouts (honoring `tsconfig` path aliases, barrels, re-exports, and dynamic imports); a call in a symbol nothing reaches is `DISP-007`. Everything else is `DISP-004`, and its detail names the page path that reaches it. When the analysis cannot tell, it treats the call as reachable, so a real defect is never demoted to a warning by a parsing gap. Other display profiles keep `DISP-004` for every unmatched call.
+
+**Separate databases and migration DDL.** SQLAlchemy models on a second declarative base (their own metadata, often another database or schema) are not checked for drift against the primary schema and are listed in the scan notes. Alembic `upgrade()` DDL is read from literals, module-level constants (including f-strings), and helper functions it calls, in `down_revision` order, so a table a later revision drops is no longer counted as created.
 
 ---
 
@@ -88,6 +95,11 @@ wythe scan /path/to/repo --json report.json --sarif report.sarif.json
 wythe scan /path/to/repo \
   --dsn "postgresql://readonly@127.0.0.1:5432/appdb" \
   --redis-dsn "redis://127.0.0.1:6379/0"
+
+# Opt-in: confirm unbacked calls against a RUNNING backend (one unauthenticated GET each,
+# never a write; loopback/private hosts only unless --probe-allow-remote).
+# 404 confirms a missing path; 401/403/422 means the route exists and the finding moves to DISP-006.
+wythe scan /path/to/repo --probe-url http://127.0.0.1:8000
 
 # PR diff gate & directional 3-tier blast-radius slice
 wythe diff /path/to/repo --base origin/main --sarif diff.sarif.json

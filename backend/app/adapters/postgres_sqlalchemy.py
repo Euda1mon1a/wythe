@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.adapters.base import RawCandidateFinding, TruthExtractionResult
@@ -13,11 +15,19 @@ from app.adapters.db_catalog_probe import (
 )
 from app.schemas.atlas import AtlasNode
 
+_IDENT = r'"?[A-Za-z_]\w*"?'
+# TEMP tables are deliberately not matched: they never become schema truth. The `(?!IF\s+NOT\b)`
+# guard stops `IF NOT EXISTS <unresolved name>` from being read as a table called `if`.
 _CREATE_TABLE_RE = re.compile(
-    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-    r'(?:(?P<schema>"?[A-Za-z_]\w*"?)\.)?(?P<table>"?[A-Za-z_]\w*"?)',
+    r"CREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?!IF\s+NOT\b)"
+    rf"(?:(?P<schema>{_IDENT})\.)?(?P<table>{_IDENT})(?![.\w])",
     re.IGNORECASE,
 )
+_DROP_TABLE_RE = re.compile(
+    r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<names>[^;()]+?)\s*(?:\bCASCADE\b|\bRESTRICT\b|;|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_TABLE_NAME_RE = re.compile(rf"^\s*(?:(?P<schema>{_IDENT})\.)?(?P<table>{_IDENT})\s*$")
 _CREATE_FUNC_RE = re.compile(
     r"CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+"
     r'(?:(?P<schema>"?[A-Za-z_]\w*"?)\.)?(?P<func>"?[A-Za-z_]\w*"?)\s*\(',
@@ -44,6 +54,10 @@ _RECORD_SUFFIXES = (
     "_versions",
     "transaction",
 )
+_DECLARATIVE_ROOT_BASES = frozenset({"DeclarativeBase", "DeclarativeBaseNoMeta"})
+_DECLARATIVE_FACTORIES = frozenset({"declarative_base", "generate_base"})
+_DEFAULT_GROUP = ""  # models whose base is imported from outside the models package
+_UNRESOLVED = "\x00"  # an f-string part whose value is not known statically
 
 
 def _infer_table_role(table_name: str) -> str:
@@ -53,17 +67,67 @@ def _infer_table_role(table_name: str) -> str:
     return "input"
 
 
-def _extract_model_classes(py_file: Path, rel_path: str) -> list[tuple[str, str, int, list[str], str]]:
-    """Return (class_name, table_name, lineno, columns, docstring_summary) from a Python file."""
+def _expr_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _expr_name(node.func)
+    if isinstance(node, ast.Subscript):
+        return _expr_name(node.value)
+    return ""
+
+
+@dataclass
+class _ModelScan:
+    """Models, class -> base names, and declarative roots found in one module."""
+
+    models: list[tuple[str, str, int, list[str], str, list[str]]] = field(default_factory=list)
+    class_bases: dict[str, list[str]] = field(default_factory=dict)
+    roots: set[str] = field(default_factory=set)
+
+
+def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
+    """Return models as (class, table, lineno, columns, summary, base names) plus base metadata."""
+    scan = _ModelScan()
     try:
         tree = ast.parse(py_file.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, SyntaxError):
-        return []
+        return scan
 
-    discovered: list[tuple[str, str, int, list[str], str]] = []
+    # Module-level string constants, so `{"schema": AUDIT_SCHEMA}` resolves.
+    str_consts: dict[str, str] = {}
     for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    str_consts[t.id] = node.value.value
+
+    def str_value(expr: ast.expr) -> str | None:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return expr.value
+        if isinstance(expr, ast.Name):
+            return str_consts.get(expr.id)
+        return None
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            if _expr_name(node.value.func) in _DECLARATIVE_FACTORIES:
+                scan.roots.update(t.id for t in node.targets if isinstance(t, ast.Name))
+            continue
         if not isinstance(node, ast.ClassDef):
             continue
+        base_names = [_expr_name(b) for b in node.bases]
+        scan.class_bases[node.name] = base_names
+        decorated_root = any("declarative" in _expr_name(d) for d in node.decorator_list)
+        if decorated_root or any(b in _DECLARATIVE_ROOT_BASES for b in base_names):
+            scan.roots.add(node.name)
+
         table_name: str | None = None
         table_schema: str | None = None
         is_abstract = False
@@ -72,19 +136,13 @@ def _extract_model_classes(py_file: Path, rel_path: str) -> list[tuple[str, str,
             if isinstance(stmt, ast.Assign):
                 for target in stmt.targets:
                     if isinstance(target, ast.Name) and target.id == "__tablename__":
-                        if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
-                            table_name = stmt.value.value
+                        table_name = str_value(stmt.value) or table_name
                     elif isinstance(target, ast.Name) and target.id == "__table_args__":
                         for sub in ast.walk(stmt.value):
                             if isinstance(sub, ast.Dict):
                                 for k, v in zip(sub.keys, sub.values):
-                                    if (
-                                        isinstance(k, ast.Constant)
-                                        and k.value == "schema"
-                                        and isinstance(v, ast.Constant)
-                                        and isinstance(v.value, str)
-                                    ):
-                                        table_schema = v.value
+                                    if isinstance(k, ast.Constant) and k.value == "schema" and v is not None:
+                                        table_schema = str_value(v) or table_schema
                     elif isinstance(target, ast.Name) and target.id == "__abstract__":
                         if isinstance(stmt.value, ast.Constant) and stmt.value.value is True:
                             is_abstract = True
@@ -111,8 +169,30 @@ def _extract_model_classes(py_file: Path, rel_path: str) -> list[tuple[str, str,
             )
             doc = (ast.get_docstring(node) or "").strip().splitlines()
             first_line = doc[0].strip() if doc else f"Persisted table `{qualified}` ({rel_path})."
-            discovered.append((node.name, qualified, node.lineno, columns, first_line))
-    return discovered
+            scan.models.append((node.name, qualified, node.lineno, columns, first_line, base_names))
+    return scan
+
+
+def _model_group(
+    base_names: list[str],
+    class_bases: dict[str, list[str]],
+    roots: set[str],
+    seen: frozenset[str] = frozenset(),
+) -> str:
+    """Name of the declarative root a model inherits from (`""` when it is imported/unknown)."""
+    for name in base_names:
+        if name in roots:
+            return name
+    for name in base_names:
+        if name in class_bases and name not in seen:
+            group = _model_group(class_bases[name], class_bases, roots, seen | {name})
+            if group != _DEFAULT_GROUP:
+                return group
+    return _DEFAULT_GROUP
+
+
+def _clean_sql_name(raw: str | None) -> str:
+    return (raw or "").replace('"', "").lower()
 
 
 def _parse_sql_objects(sql_text: str) -> tuple[set[str], dict[str, int]]:
@@ -120,16 +200,219 @@ def _parse_sql_objects(sql_text: str) -> tuple[set[str], dict[str, int]]:
     tables: set[str] = set()
     functions: dict[str, int] = {}
     for match in _CREATE_TABLE_RE.finditer(sql_text):
-        schema = (match.group("schema") or "public").replace('"', "").lower()
-        table = match.group("table").replace('"', "").lower()
+        schema = _clean_sql_name(match.group("schema")) or "public"
+        table = _clean_sql_name(match.group("table"))
         tables.add(table if schema == "public" else f"{schema}.{table}")
     for match in _CREATE_FUNC_RE.finditer(sql_text):
-        schema = (match.group("schema") or "public").replace('"', "").lower()
-        func = match.group("func").replace('"', "").lower()
+        schema = _clean_sql_name(match.group("schema")) or "public"
+        func = _clean_sql_name(match.group("func"))
         key = func if schema == "public" else f"{schema}.{func}"
         line = sql_text.count("\n", 0, match.start()) + 1
         functions[key] = line
     return tables, functions
+
+
+def _parse_dropped_tables(sql_text: str) -> set[str]:
+    dropped: set[str] = set()
+    for match in _DROP_TABLE_RE.finditer(sql_text):
+        for raw_name in match.group("names").split(","):
+            nm = _TABLE_NAME_RE.match(raw_name)
+            if nm:
+                schema = _clean_sql_name(nm.group("schema")) or "public"
+                table = _clean_sql_name(nm.group("table"))
+                dropped.add(table if schema == "public" else f"{schema}.{table}")
+    return dropped
+
+
+def _eval_str(node: ast.AST | None, consts: dict[str, str]) -> str | None:
+    """Statically evaluate a string expression: literals, f-strings, `+`, `text()`, `"".join()`."""
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.Name):
+        return consts.get(node.id)
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                inner = _eval_str(value.value, consts)
+                parts.append(inner if inner is not None else _UNRESOLVED)
+            else:
+                parts.append(_UNRESOLVED)
+        return "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _eval_str(node.left, consts)
+        right = _eval_str(node.right, consts)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, (ast.Tuple, ast.List)):
+        items = [_eval_str(e, consts) for e in node.elts]
+        known = [i for i in items if i is not None]
+        return "\n".join(known) if known else None
+    if isinstance(node, ast.Call):
+        fname = _expr_name(node.func)
+        if (
+            fname == "join"
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and node.args
+            and isinstance(node.args[0], (ast.Tuple, ast.List))
+        ):
+            items = [_eval_str(e, consts) for e in node.args[0].elts]
+            return node.func.value.value.join(i for i in items if i is not None)
+        if fname in ("text", "dedent", "strip") and node.args:
+            return _eval_str(node.args[0], consts)
+    return None
+
+
+@dataclass
+class _MigrationEffects:
+    revision: str | None = None
+    down_revisions: tuple[str, ...] = ()
+    created_tables: set[str] = field(default_factory=set)
+    dropped_tables: set[str] = field(default_factory=set)
+    created_functions: dict[str, int] = field(default_factory=dict)
+    dropped_functions: set[str] = field(default_factory=set)
+    creates_all_metadata: bool = False
+
+
+def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
+    """Tables/functions an Alembic revision's `upgrade()` creates or drops.
+
+    Follows module-level string constants (including f-strings built from other constants)
+    and module-level helper functions that `upgrade()` calls, so DDL kept outside the
+    function body is still seen.
+    """
+    effects = _MigrationEffects()
+    consts: dict[str, str] = {}
+    functions: dict[str, ast.FunctionDef] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.FunctionDef):
+            functions[stmt.name] = stmt
+            continue
+        targets: list[str] = []
+        value: ast.expr | None = None
+        if isinstance(stmt, ast.Assign):
+            targets = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+            value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            targets, value = [stmt.target.id], stmt.value
+        if not targets or value is None:
+            continue
+        if "revision" in targets and isinstance(value, ast.Constant) and isinstance(value.value, str):
+            effects.revision = value.value
+        if "down_revision" in targets:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                effects.down_revisions = (value.value,)
+            elif isinstance(value, (ast.Tuple, ast.List)):
+                effects.down_revisions = tuple(
+                    e.value for e in value.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                )
+        evaluated = _eval_str(value, consts)
+        if evaluated is not None:
+            for name in targets:
+                consts[name] = evaluated
+
+    upgrade = functions.get("upgrade")
+    if upgrade is None:
+        return effects
+
+    def absorb_sql(sql_text: str, lineno: int) -> None:
+        tables, funcs = _parse_sql_objects(sql_text)
+        effects.created_tables |= tables
+        effects.dropped_tables |= _parse_dropped_tables(sql_text)
+        for fn_name in funcs:
+            effects.created_functions[fn_name] = lineno
+        for drop_match in _DROP_FUNC_RE.finditer(sql_text):
+            schema = _clean_sql_name(drop_match.group("schema")) or "public"
+            fn = _clean_sql_name(drop_match.group("func"))
+            effects.dropped_functions.add(fn if schema == "public" else f"{schema}.{fn}")
+
+    def table_key(call: ast.Call) -> str | None:
+        name = _eval_str(call.args[0], consts) if call.args else None
+        if not name or _UNRESOLVED in name:
+            return None
+        schema = "public"
+        for kw in call.keywords:
+            if kw.arg == "schema":
+                schema = (_eval_str(kw.value, consts) or "public").lower()
+        return name.lower() if schema == "public" else f"{schema}.{name.lower()}"
+
+    visited_fns: set[str] = set()
+    absorbed_consts: set[str] = set()
+
+    def visit(fn: ast.FunctionDef) -> None:
+        if fn.name in visited_fns:
+            return
+        visited_fns.add(fn.name)
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Call):
+                callee = _expr_name(sub.func)
+                if callee == "create_table":
+                    key = table_key(sub)
+                    if key:
+                        effects.created_tables.add(key)
+                elif callee == "drop_table":
+                    key = table_key(sub)
+                    if key:
+                        effects.dropped_tables.add(key)
+                elif callee == "create_all":
+                    effects.creates_all_metadata = True
+                elif isinstance(sub.func, ast.Name) and sub.func.id in functions:
+                    visit(functions[sub.func.id])
+            elif isinstance(sub, ast.Name) and sub.id in consts and sub.id not in absorbed_consts:
+                absorbed_consts.add(sub.id)
+                absorb_sql(consts[sub.id], sub.lineno)
+            elif isinstance(sub, (ast.Constant, ast.JoinedStr, ast.BinOp)):
+                text = _eval_str(sub, consts)
+                if text and ("TABLE" in text.upper() or "FUNCTION" in text.upper()):
+                    absorb_sql(text, getattr(sub, "lineno", 1))
+
+    visit(upgrade)
+    effects.dropped_tables -= effects.created_tables  # drop-then-recreate keeps the table
+    return effects
+
+
+def _order_migrations(
+    entries: list[tuple[Path, _MigrationEffects]],
+) -> list[tuple[Path, _MigrationEffects]]:
+    """Order revisions by their `down_revision` chain; fall back to file name order."""
+    if not entries or any(e.revision is None for _, e in entries):
+        return entries
+    by_rev = {e.revision: (p, e) for p, e in entries}
+    pending = {rev: {d for d in e.down_revisions if d in by_rev} for rev, (_, e) in by_rev.items()}
+    ordered: list[tuple[Path, _MigrationEffects]] = []
+    ready = sorted((rev for rev, deps in pending.items() if not deps), key=lambda r: str(by_rev[r][0]))
+    while ready:
+        rev = ready.pop(0)
+        ordered.append(by_rev[rev])
+        del pending[rev]
+        newly = [r for r, deps in pending.items() if rev in deps and len(deps) == 1]
+        for deps in pending.values():
+            deps.discard(rev)
+        ready.extend(sorted(newly, key=lambda r: str(by_rev[r][0])))
+    if pending:  # a cycle or a revision missing its parent: keep file order for the rest
+        ordered.extend(by_rev[r] for r in sorted(pending, key=lambda r: str(by_rev[r][0])))
+    return ordered
+
+
+def _git_last_commit_epoch(repo_root: Path, rel_path: str) -> int | None:
+    try:
+        res = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "--", rel_path],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = res.stdout.strip()
+    return int(out) if out.isdigit() else None
 
 
 class PostgresSqlAlchemyAdapter:
@@ -152,20 +435,50 @@ class PostgresSqlAlchemyAdapter:
         table_symbol_map: dict[str, str] = {}
         function_symbol_map: dict[str, str] = {}
         findings: list[RawCandidateFinding] = []
+        notes: list[str] = []
 
+        # 1. Models, grouped by the declarative base they inherit from.
         orm_tables: dict[str, tuple[str, int, list[str], str, list[str]]] = {}
+        model_bases: dict[str, list[str]] = {}
+        class_bases: dict[str, list[str]] = {}
+        roots: set[str] = set()
         if models_dir.is_dir():
             for py_file in sorted(models_dir.rglob("*.py")):
                 if "__pycache__" in py_file.parts:
                     continue
                 rel_path = py_file.relative_to(repo_root).as_posix()
-                for cls_name, tbl_name, lineno, cols, summary in _extract_model_classes(py_file, rel_path):
+                scan = _scan_model_module(py_file, rel_path)
+                class_bases.update(scan.class_bases)
+                roots |= scan.roots
+                for cls_name, tbl_name, lineno, cols, summary, bases in scan.models:
                     key = tbl_name.lower()
                     if key not in orm_tables:
                         orm_tables[key] = (rel_path, lineno, cols, summary, [cls_name])
+                        model_bases[key] = bases
                     else:
                         orm_tables[key][4].append(cls_name)
 
+        table_group = {
+            key: _model_group(model_bases.get(key, []), class_bases, roots) for key in orm_tables
+        }
+        group_sizes: dict[str, int] = {}
+        for grp in table_group.values():
+            group_sizes[grp] = group_sizes.get(grp, 0) + 1
+        primary_group = (
+            max(group_sizes, key=lambda g: (group_sizes[g], g == _DEFAULT_GROUP, g == "Base", g))
+            if group_sizes
+            else _DEFAULT_GROUP
+        )
+        separate = {k for k, g in table_group.items() if g != primary_group}
+        if separate:
+            other = sorted({table_group[k] or "an imported base" for k in separate})
+            notes.append(
+                f"{len(separate)} model(s) on a separate declarative base ({', '.join(f'`{g}`' for g in other)}) "
+                "were not checked for drift against schema.sql, migrations, or the live catalog: they use "
+                "their own metadata, often for another database or schema."
+            )
+
+        # 2. DDL sources: schema.sql and Alembic upgrade() bodies.
         sql_tables: set[str] = set()
         sql_functions: dict[str, tuple[str, int]] = {}
         if schema_sql_path.is_file():
@@ -176,45 +489,46 @@ class PostgresSqlAlchemyAdapter:
             for fn_name, fn_line in parsed_funcs.items():
                 sql_functions[fn_name] = (rel_schema, fn_line)
 
+        migration_entries: list[tuple[Path, _MigrationEffects]] = []
         if alembic_dir.is_dir():
             for mig_file in sorted(alembic_dir.glob("*.py")):
-                rel_mig = mig_file.relative_to(repo_root).as_posix()
                 try:
                     tree = ast.parse(mig_file.read_text(encoding="utf-8"))
                 except (OSError, UnicodeError, SyntaxError):
                     continue
-                for stmt in tree.body:
-                    if isinstance(stmt, ast.FunctionDef) and stmt.name == "upgrade":
-                        for sub in ast.walk(stmt):
-                            if (
-                                isinstance(sub, ast.Call)
-                                and isinstance(sub.func, ast.Attribute)
-                                and sub.func.attr == "create_table"
-                                and sub.args
-                                and isinstance(sub.args[0], ast.Constant)
-                                and isinstance(sub.args[0].value, str)
-                            ):
-                                t_name = sub.args[0].value.lower()
-                                t_schema = "public"
-                                for kw in sub.keywords:
-                                    if (
-                                        kw.arg == "schema"
-                                        and isinstance(kw.value, ast.Constant)
-                                        and isinstance(kw.value.value, str)
-                                    ):
-                                        t_schema = kw.value.value.lower()
-                                sql_tables.add(t_name if t_schema == "public" else f"{t_schema}.{t_name}")
-                            elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-                                mig_tables, parsed_funcs = _parse_sql_objects(sub.value)
-                                sql_tables |= mig_tables
-                                for fn_name in parsed_funcs:
-                                    sql_functions[fn_name] = (rel_mig, sub.lineno)
-                                for drop_match in _DROP_FUNC_RE.finditer(sub.value):
-                                    schema = (drop_match.group("schema") or "public").replace('"', "").lower()
-                                    fn = drop_match.group("func").replace('"', "").lower()
-                                    key = fn if schema == "public" else f"{schema}.{fn}"
-                                    sql_functions.pop(key, None)
+                migration_entries.append((mig_file, _collect_migration_effects(tree)))
 
+        migrated_tables: set[str] = set()
+        metadata_create_all = False
+        for mig_file, effects in _order_migrations(migration_entries):
+            rel_mig = mig_file.relative_to(repo_root).as_posix()
+            migrated_tables -= effects.dropped_tables
+            migrated_tables |= effects.created_tables
+            metadata_create_all |= effects.creates_all_metadata
+            for fn_name, fn_line in effects.created_functions.items():
+                sql_functions[fn_name] = (rel_mig, fn_line)
+            for fn_name in effects.dropped_functions - set(effects.created_functions):
+                sql_functions.pop(fn_name, None)
+        sql_tables |= migrated_tables
+        if metadata_create_all:
+            # A revision runs `metadata.create_all()`: every primary-base model is created by it.
+            sql_tables |= {k for k in orm_tables if k not in separate}
+
+        has_schema_sql = schema_sql_path.is_file()
+        has_migrations = bool(migration_entries)
+        stale_note = ""
+        if has_schema_sql and has_migrations:
+            sql_epoch = _git_last_commit_epoch(repo_root, schema_sql_path.relative_to(repo_root).as_posix())
+            mig_epoch = _git_last_commit_epoch(repo_root, alembic_dir.relative_to(repo_root).as_posix())
+            if sql_epoch is not None and mig_epoch is not None and mig_epoch > sql_epoch:
+                days = max(1, (mig_epoch - sql_epoch) // 86400)
+                stale_note = f" (schema.sql was last changed {days} day(s) before the newest migration)"
+                notes.append(
+                    f"schema.sql was last changed {days} day(s) before the newest migration; "
+                    "migrations were read as DDL too, so tables they create are not reported missing."
+                )
+
+        # 3. Nodes.
         all_table_keys = sorted(set(orm_tables.keys()) | sql_tables)
         for tbl_key in all_table_keys:
             if is_migration_meta_table(tbl_key):
@@ -224,10 +538,13 @@ class PostgresSqlAlchemyAdapter:
                 src_file, lineno, cols, summary, cls_names = orm_tables[tbl_key]
                 for cls_name in cls_names:
                     table_symbol_map[cls_name] = node_id
+                if tbl_key in separate:
+                    base = table_group[tbl_key] or "an imported base"
+                    summary = f"{summary} (separate declarative base `{base}`; not checked against the primary schema.)"
             else:
                 src_file = (
                     schema_sql_path.relative_to(repo_root).as_posix()
-                    if schema_sql_path.is_file()
+                    if has_schema_sql
                     else f"{backend_subdir}/schema.sql"
                 )
                 lineno, cols, summary = 1, [], f"SQL-defined table `{tbl_key}`."
@@ -252,21 +569,6 @@ class PostgresSqlAlchemyAdapter:
                 )
             )
 
-        if schema_sql_path.is_file():
-            for tbl_key, (src_file, lineno, _, _, _) in sorted(orm_tables.items()):
-                if "." not in tbl_key and tbl_key not in sql_tables and not tbl_key.endswith("_version"):
-                    findings.append(
-                        RawCandidateFinding(
-                            rule_code="TRUTH-002",
-                            node_id=f"t:{tbl_key}",
-                            source_file=src_file,
-                            line=lineno,
-                            title=f"ORM model `{tbl_key}` missing from schema.sql",
-                            detail=f"SQLAlchemy declares `{tbl_key}` in {src_file}, but schema.sql has no CREATE TABLE for it.",
-                            remediation="Generate/apply the migration and refresh schema.sql, or retire the unmapped model.",
-                        )
-                    )
-
         for fn_key, (fn_src, fn_line) in sorted(sql_functions.items()):
             fn_node_id = f"fn:{fn_key}"
             function_symbol_map[fn_key] = fn_node_id
@@ -285,22 +587,76 @@ class PostgresSqlAlchemyAdapter:
                 )
             )
 
+        # 4. Drift: primary-base models with no DDL, and (with --dsn) models absent live.
+        checked = {k: v for k, v in orm_tables.items() if k not in separate}
+        ddl_source = "schema.sql or any migration" if has_migrations else "schema.sql"
+        static_missing: set[str] = set()
+        # Gated on schema.sql as before: a migrations-only repo whose DDL style is not
+        # recognized would otherwise get new false alarms.
+        if has_schema_sql:
+            static_missing = {
+                k
+                for k in checked
+                if "." not in k and k not in sql_tables and not k.endswith("_version")
+            }
+
         obs_source = "static_ast"
+        live_missing: set[str] = set()
         if pg_dsn:
             live_tables, obs_source = probe_live_catalog_tables(pg_dsn)
-            for tbl_key, (src_file, lineno, _, _, _) in sorted(orm_tables.items()):
-                if tbl_key not in live_tables:
-                    findings.append(
-                        RawCandidateFinding(
-                            rule_code="TRUTH-002",
-                            node_id=f"t:{tbl_key}",
-                            source_file=src_file,
-                            line=lineno,
-                            title=f"ORM model `{tbl_key}` absent from live database catalog",
-                            detail=f"Read-only catalog check ({obs_source}) did not find base table `{tbl_key}`.",
-                            remediation="Apply pending migrations on the target database before trusting ORM consumers.",
-                        )
+            live_missing = {k for k in checked if k not in live_tables}
+
+        for tbl_key in sorted(static_missing - live_missing):
+            src_file, lineno, _, _, _ = checked[tbl_key]
+            if pg_dsn:
+                findings.append(
+                    RawCandidateFinding(
+                        rule_code="TRUTH-005",
+                        node_id=f"t:{tbl_key}",
+                        source_file=src_file,
+                        line=lineno,
+                        title=f"Table `{tbl_key}` exists live but no CREATE TABLE in {ddl_source} creates it",
+                        detail=(
+                            f"SQLAlchemy declares `{tbl_key}` in {src_file} and the live catalog has it, but "
+                            f"Wythe found no CREATE TABLE for it in {ddl_source}{stale_note}."
+                        ),
+                        remediation="Add the migration that creates it (or confirm how it is created) so the schema can be rebuilt from source.",
                     )
+                )
+            else:
+                findings.append(
+                    RawCandidateFinding(
+                        rule_code="TRUTH-002",
+                        node_id=f"t:{tbl_key}",
+                        source_file=src_file,
+                        line=lineno,
+                        title=f"ORM model `{tbl_key}` has no CREATE TABLE in {ddl_source}",
+                        detail=(
+                            f"SQLAlchemy declares `{tbl_key}` in {src_file}, but {ddl_source} has no "
+                            f"CREATE TABLE for it{stale_note}. Pass --dsn to check the live database."
+                        ),
+                        remediation="Add the migration that creates the table, or retire the unmapped model.",
+                    )
+                )
+
+        for tbl_key in sorted(live_missing):
+            src_file, lineno, _, _, _ = checked[tbl_key]
+            also = (
+                f" No CREATE TABLE in {ddl_source} creates it either."
+                if tbl_key in static_missing
+                else ""
+            )
+            findings.append(
+                RawCandidateFinding(
+                    rule_code="TRUTH-002",
+                    node_id=f"t:{tbl_key}",
+                    source_file=src_file,
+                    line=lineno,
+                    title=f"ORM model `{tbl_key}` absent from live database catalog",
+                    detail=f"Read-only catalog check ({obs_source}) did not find base table `{tbl_key}`.{also}",
+                    remediation="Apply pending migrations on the target database before trusting ORM consumers.",
+                )
+            )
 
         return TruthExtractionResult(
             nodes=nodes,
@@ -308,4 +664,5 @@ class PostgresSqlAlchemyAdapter:
             function_symbol_map=function_symbol_map,
             findings=findings,
             observation_source=obs_source,
+            notes=notes,
         )
