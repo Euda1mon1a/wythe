@@ -46,6 +46,23 @@ _DROP_FUNC_RE = re.compile(
     r'(?:(?P<schema>"?[A-Za-z_]\w*"?)\.)?(?P<func>"?[A-Za-z_]\w*"?)\b',
     re.IGNORECASE,
 )
+_QUALIFIED = rf"{_IDENT}(?:\.{_IDENT})?"
+# Body of `CREATE FUNCTION ... AS $tag$ <body> $tag$` (dollar-quoted; the header has no `;`).
+_DOLLAR_BODY_RE = re.compile(r"\bAS\s+(\$[A-Za-z0-9_]*\$)", re.IGNORECASE)
+# Tables a SQL body reads. `DELETE FROM t` is a write, so it is matched (and skipped) as a unit;
+# `FROM fn(...)` is a set-returning function call, not a table.
+_BODY_READ_RE = re.compile(
+    rf"\b(?P<kw>DELETE\s+FROM|FROM|JOIN)\s+(?:ONLY\s+)?(?P<t>{_QUALIFIED})(?![\w\".])(?!\s*\()",
+    re.IGNORECASE,
+)
+_SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+# One CREATE/ALTER TABLE statement (up to its `;`), to pair each REFERENCES with its source table.
+_FK_STMT_RE = re.compile(
+    r"\b(?:CREATE\s+(?:UNLOGGED\s+)?TABLE|ALTER\s+TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?(?:ONLY\s+)?"
+    rf"(?P<src>{_QUALIFIED})(?P<rest>[^;]*)",
+    re.IGNORECASE,
+)
+_REFERENCES_RE = re.compile(rf"\bREFERENCES\s+(?:ONLY\s+)?(?P<dst>{_QUALIFIED})", re.IGNORECASE)
 _RECORD_SUFFIXES = (
     "_log",
     "_logs",
@@ -94,6 +111,8 @@ class _ModelScan:
     models: list[tuple[str, str, int, list[str], str, list[str]]] = field(default_factory=list)
     class_bases: dict[str, list[str]] = field(default_factory=dict)
     roots: set[str] = field(default_factory=set)
+    # (referencing table, "table" key or "class" name of the referenced side) from ForeignKey(...).
+    fk_refs: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
@@ -178,6 +197,22 @@ def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
             doc = (ast.get_docstring(node) or "").strip().splitlines()
             first_line = doc[0].strip() if doc else f"Persisted table `{qualified}` ({rel_path})."
             scan.models.append((node.name, qualified, node.lineno, columns, first_line, base_names))
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Call):
+                    continue
+                callee = _expr_name(sub.func)
+                targets: list[ast.expr] = []
+                if callee == "ForeignKey" and sub.args:
+                    targets = [sub.args[0]]
+                elif callee == "ForeignKeyConstraint" and len(sub.args) >= 2 and isinstance(sub.args[1], (ast.List, ast.Tuple)):
+                    targets = list(sub.args[1].elts)
+                for tgt in targets:
+                    text_target = str_value(tgt)
+                    fk_table = _fk_target_table(text_target) if text_target else None
+                    if fk_table:
+                        scan.fk_refs.append((qualified, "table", fk_table))
+                    elif isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name):
+                        scan.fk_refs.append((qualified, "class", tgt.value.id))  # ForeignKey(Parent.id)
     return scan
 
 
@@ -230,6 +265,57 @@ def _parse_dropped_tables(sql_text: str) -> set[str]:
                 table = _clean_sql_name(nm.group("table"))
                 dropped.add(table if schema == "public" else f"{schema}.{table}")
     return dropped
+
+
+def _sql_table_key(raw: str) -> str:
+    """`public.t` / `"S"."T"` / `t` -> the key Wythe uses for table nodes (public is implicit)."""
+    parts = [_clean_sql_name(p) for p in raw.split(".")]
+    if len(parts) == 2 and parts[0] != "public":
+        return f"{parts[0]}.{parts[1]}"
+    return parts[-1]
+
+
+def _parse_sql_lineage(sql_text: str) -> tuple[dict[str, set[str]], set[tuple[str, str]]]:
+    """Database-side consumers of tables in SQL text.
+
+    Returns ({function key: tables its dollar-quoted body reads}, {(referencing table,
+    referenced table)} from REFERENCES clauses of CREATE/ALTER TABLE statements).
+    """
+    function_reads: dict[str, set[str]] = {}
+    for match in _CREATE_FUNC_RE.finditer(sql_text):
+        schema = _clean_sql_name(match.group("schema")) or "public"
+        func = _clean_sql_name(match.group("func"))
+        key = func if schema == "public" else f"{schema}.{func}"
+        tag = _DOLLAR_BODY_RE.search(sql_text, match.end())
+        if tag is None or ";" in sql_text[match.end() : tag.start()]:
+            continue
+        body_start = tag.end()
+        body_end = sql_text.find(tag.group(1), body_start)
+        if body_end < 0:
+            continue
+        body = _SQL_LINE_COMMENT_RE.sub("", sql_text[body_start:body_end])
+        reads = function_reads.setdefault(key, set())
+        for read in _BODY_READ_RE.finditer(body):
+            if not read.group("kw").upper().startswith("DELETE"):
+                reads.add(_sql_table_key(read.group("t")))
+    fk_refs: set[tuple[str, str]] = set()
+    for stmt in _FK_STMT_RE.finditer(sql_text):
+        src = _sql_table_key(stmt.group("src"))
+        for ref in _REFERENCES_RE.finditer(stmt.group("rest")):
+            dst = _sql_table_key(ref.group("dst"))
+            if dst != src:
+                fk_refs.add((src, dst))
+    return function_reads, fk_refs
+
+
+def _fk_target_table(target: str) -> str | None:
+    """SQLAlchemy `ForeignKey("table.col")` / `"schema.table.col"` target -> table key."""
+    parts = [p.lower() for p in target.split(".")]
+    if len(parts) == 2:
+        return parts[0]
+    if len(parts) == 3:
+        return parts[1] if parts[0] == "public" else f"{parts[0]}.{parts[1]}"
+    return None
 
 
 def _eval_str(node: ast.AST | None, consts: dict[str, str]) -> str | None:
@@ -319,6 +405,8 @@ class _MigrationEffects:
     dropped_functions: set[str] = field(default_factory=set)
     creates_all_metadata: bool = False
     touches_ddl: bool = False
+    function_reads: dict[str, set[str]] = field(default_factory=dict)
+    fk_refs: set[tuple[str, str]] = field(default_factory=set)
 
 
 def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
@@ -377,6 +465,20 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             schema = _clean_sql_name(drop_match.group("schema")) or "public"
             fn = _clean_sql_name(drop_match.group("func"))
             effects.dropped_functions.add(fn if schema == "public" else f"{schema}.{fn}")
+        fn_reads, fk_refs = _parse_sql_lineage(sql_text)
+        for fn_name, read_tables in fn_reads.items():
+            effects.function_reads.setdefault(fn_name, set()).update(read_tables)
+        effects.fk_refs |= fk_refs
+
+    def fk_targets_in(node: ast.AST) -> set[str]:
+        found: set[str] = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and _expr_name(sub.func) == "ForeignKey" and sub.args:
+                target = _eval_str(sub.args[0], consts)
+                fk_table = _fk_target_table(target) if target and _UNRESOLVED not in target else None
+                if fk_table:
+                    found.add(fk_table)
+        return found
 
     def table_key(call: ast.Call, arg_index: int = 0) -> str | None:
         name = _eval_str(call.args[arg_index], consts) if len(call.args) > arg_index else None
@@ -413,6 +515,18 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                     if key:
                         add_event(order, "create", key, None, sub.lineno)
                         effects.created_columns[key] = column_names(sub)
+                        effects.fk_refs |= {(key, dst) for dst in fk_targets_in(sub) if dst != key}
+                elif callee == "create_foreign_key" and len(sub.args) >= 3:
+                    src = _eval_str(sub.args[1], consts)
+                    dst = _eval_str(sub.args[2], consts)
+                    kw = {k.arg: _eval_str(k.value, consts) for k in sub.keywords if k.arg}
+                    if src and dst and _UNRESOLVED not in src + dst:
+                        src_schema = (kw.get("source_schema") or "public").lower()
+                        dst_schema = (kw.get("referent_schema") or "public").lower()
+                        src_key = src.lower() if src_schema == "public" else f"{src_schema}.{src.lower()}"
+                        dst_key = dst.lower() if dst_schema == "public" else f"{dst_schema}.{dst.lower()}"
+                        if src_key != dst_key:
+                            effects.fk_refs.add((src_key, dst_key))
                 elif callee == "drop_table":
                     key = table_key(sub)
                     if key:
@@ -473,6 +587,46 @@ def _order_migrations(
     return ordered
 
 
+_MODEL_SCAN_SKIP_PARTS = frozenset({"__pycache__", "tests", "test"})
+
+
+def _model_source_files(app_dir: Path, models_dir: Path) -> list[Path]:
+    """Python files that may declare ORM models or declarative bases.
+
+    Every file under `app/models`, then any other file in the app package whose text declares
+    a `__tablename__` or a declarative base (models and bases also live in `db/`, feature
+    packages, and so on).
+    """
+    files = (
+        [p for p in sorted(models_dir.rglob("*.py")) if "__pycache__" not in p.parts]
+        if models_dir.is_dir()
+        else []
+    )
+    seen = set(files)
+    if app_dir.is_dir():
+        for py_file in sorted(app_dir.rglob("*.py")):
+            if py_file in seen or _MODEL_SCAN_SKIP_PARTS.intersection(py_file.relative_to(app_dir).parts):
+                continue
+            try:
+                text = py_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            if "__tablename__" in text or "declarative" in text.lower():
+                files.append(py_file)
+    return files
+
+
+def _dotted_module(app_dir: Path, py_file: Path) -> str:
+    """`<backend>/app/models/user.py` -> `app.models.user` (package `__init__` -> the package)."""
+    try:
+        parts = list(py_file.relative_to(app_dir).with_suffix("").parts)
+    except ValueError:
+        return py_file.stem
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join([app_dir.name, *parts])
+
+
 def _git_last_commit_epoch(repo_root: Path, rel_path: str) -> int | None:
     try:
         res = subprocess.run(
@@ -515,22 +669,28 @@ class PostgresSqlAlchemyAdapter:
         orm_tables: dict[str, tuple[str, int, list[str], str, list[str]]] = {}
         model_bases: dict[str, list[str]] = {}
         class_bases: dict[str, list[str]] = {}
+        class_modules: dict[str, set[str]] = {}
+        model_modules: set[str] = set()
+        model_fk_refs: list[tuple[str, str, str, str]] = []  # (src table, kind, target, evidence path)
         roots: set[str] = set()
-        if models_dir.is_dir():
-            for py_file in sorted(models_dir.rglob("*.py")):
-                if "__pycache__" in py_file.parts:
-                    continue
-                rel_path = py_file.relative_to(repo_root).as_posix()
-                scan = _scan_model_module(py_file, rel_path)
-                class_bases.update(scan.class_bases)
-                roots |= scan.roots
-                for cls_name, tbl_name, lineno, cols, summary, bases in scan.models:
-                    key = tbl_name.lower()
-                    if key not in orm_tables:
-                        orm_tables[key] = (rel_path, lineno, cols, summary, [cls_name])
-                        model_bases[key] = bases
-                    else:
-                        orm_tables[key][4].append(cls_name)
+        app_dir = backend_dir / "app"
+        for py_file in _model_source_files(app_dir, models_dir):
+            rel_path = py_file.relative_to(repo_root).as_posix()
+            scan = _scan_model_module(py_file, rel_path)
+            class_bases.update(scan.class_bases)
+            roots |= scan.roots
+            module = _dotted_module(app_dir, py_file)
+            if scan.models or models_dir in py_file.parents:
+                model_modules.add(module)
+            model_fk_refs.extend((src, kind, target, rel_path) for src, kind, target in scan.fk_refs)
+            for cls_name, tbl_name, lineno, cols, summary, bases in scan.models:
+                class_modules.setdefault(cls_name, set()).add(module)
+                key = tbl_name.lower()
+                if key not in orm_tables:
+                    orm_tables[key] = (rel_path, lineno, cols, summary, [cls_name])
+                    model_bases[key] = bases
+                else:
+                    orm_tables[key][4].append(cls_name)
 
         table_group = {
             key: _model_group(model_bases.get(key, []), class_bases, roots) for key in orm_tables
@@ -555,6 +715,8 @@ class PostgresSqlAlchemyAdapter:
         # 2. DDL sources: schema.sql and Alembic upgrade() bodies.
         sql_tables: set[str] = set()
         sql_functions: dict[str, tuple[str, int]] = {}
+        function_reads: dict[str, set[str]] = {}
+        fk_refs: dict[tuple[str, str], str] = {}  # (referencing, referenced) -> evidence path
         # Where each DDL-only table is defined, so its node points at the CREATE TABLE.
         table_origin: dict[str, tuple[str, int, list[str]]] = {}
         if schema_sql_path.is_file():
@@ -564,6 +726,10 @@ class PostgresSqlAlchemyAdapter:
             sql_tables |= parsed_tables
             for fn_name, fn_line in parsed_funcs.items():
                 sql_functions[fn_name] = (rel_schema, fn_line)
+            schema_fn_reads, schema_fks = _parse_sql_lineage(text)
+            function_reads.update(schema_fn_reads)
+            for pair in schema_fks:
+                fk_refs.setdefault(pair, rel_schema)
             ddl_detail, _ = parse_sql_ddl_objects(text)
             for offset, kind, tbl, _new, line_offset in _sql_table_events(text):
                 if kind == "create" and tbl in parsed_tables and tbl not in table_origin:
@@ -600,8 +766,16 @@ class PostgresSqlAlchemyAdapter:
             metadata_create_all |= effects.creates_all_metadata
             for fn_name, fn_line in effects.created_functions.items():
                 sql_functions[fn_name] = (rel_mig, fn_line)
+                # A (re)definition with a readable body replaces what the function reads. A header
+                # without a parsable body (e.g. text spliced into a fetched definition) leaves the
+                # last known body in place.
+                if fn_name in effects.function_reads:
+                    function_reads[fn_name] = set(effects.function_reads[fn_name])
             for fn_name in effects.dropped_functions - set(effects.created_functions):
                 sql_functions.pop(fn_name, None)
+                function_reads.pop(fn_name, None)
+            for pair in effects.fk_refs:
+                fk_refs.setdefault(pair, rel_mig)
         sql_tables |= migrated_tables
         for tbl in migrated_tables:
             if tbl not in table_origin and tbl in mig_origin:
@@ -692,6 +866,36 @@ class PostgresSqlAlchemyAdapter:
                 )
             )
 
+        # 3b. Database-side readers: SQL function bodies and foreign keys consume tables too.
+        def table_node(key: str) -> str | None:
+            nid = table_symbol_map.get(key)
+            return nid if nid and nid.startswith("t:") else None
+
+        db_readers: dict[str, dict[str, tuple[str, str, str]]] = {}
+        for fn_key, read_tables in sorted(function_reads.items()):
+            if fn_key not in sql_functions:
+                continue
+            fn_src = sql_functions[fn_key][0]
+            for tbl in sorted(read_tables):
+                tid = table_node(tbl)
+                if tid:
+                    db_readers.setdefault(tid, {}).setdefault(
+                        f"fn:{fn_key}",
+                        (fn_src, "reads_truth", f"SQL function `{fn_key}()` reads `{tbl}`."),
+                    )
+        for src_kind_target in model_fk_refs:
+            src, kind, target, evidence = src_kind_target
+            dst = table_node(target) if kind == "table" else table_symbol_map.get(target)
+            if dst:
+                fk_refs.setdefault((src, dst.removeprefix("t:")), evidence)
+        for (src, dst), evidence in sorted(fk_refs.items()):
+            src_id, dst_id = table_node(src), table_node(dst)
+            if src_id and dst_id and src_id != dst_id:
+                db_readers.setdefault(dst_id, {}).setdefault(
+                    src_id,
+                    (evidence, "guards_truth", f"Foreign key from `{src}` references `{dst}`."),
+                )
+
         # 4. Drift: primary-base models with no DDL, and (with --dsn) models absent live.
         checked = {k: v for k, v in orm_tables.items() if k not in separate}
         ddl_source = "schema.sql or any migration" if has_migrations else "schema.sql"
@@ -770,4 +974,7 @@ class PostgresSqlAlchemyAdapter:
             findings=findings,
             observation_source=obs_source,
             notes=notes,
+            class_modules=class_modules,
+            model_modules=model_modules,
+            db_readers=db_readers,
         )

@@ -9,6 +9,7 @@ Why Redis is inspected as Tier-1 `cache_store` (`role='ephemeral'`) rather than 
 
 from __future__ import annotations
 
+import ast
 import re
 import socket
 import ssl
@@ -43,8 +44,11 @@ _EXPIRE_CALL_RE = re.compile(
     rf"""\b{_RECV_PAT}\s*\.\s*(?:expire|pexpire|Expire)\s*\(\s*(?:ctx\s*,\s*)?['"`](?P<key>[A-Za-z0-9_.-]+:)"""
 )
 _TTL_OPT_RE = re.compile(
-    r"""(?:\b(?:ex|px|exat|pxat|timeout|EX|PX)\s*[=:]|['"](?:EX|PX)['"]\s*,)"""
+    r"""(?:\b(?:ex|px|exat|pxat|timeout|ttl|EX|PX)\s*[=:]|\b(?:keepttl|KEEPTTL)\s*[=:]\s*(?:True|true)\b|['"](?:EX|PX|KEEPTTL)['"]\s*[,)])"""
 )
+# Python keyword arguments that bound a write's lifetime (redis-py and common cache wrappers).
+_PY_TTL_KWARGS = frozenset({"ex", "px", "exat", "pxat", "ttl", "timeout", "expire", "expires", "expiry"})
+_PY_EXPIRE_OPS = frozenset({"expire", "pexpire", "expireat", "pexpireat"})
 
 _WORKER_DEF_RE = re.compile(
     r"""(?:@(?P<cel_dec>shared_task|(?:celery_app|app|celery)\.task)\b|\bnew\s+Worker\s*\(\s*['"](?P<bull_q>[A-Za-z0-9_:-]+)['"]|\basynq\.NewServeMux\s*\()"""
@@ -103,6 +107,121 @@ def _go_set_has_ttl(args_str: str) -> bool:
         ttl_expr = parts[3]
         return ttl_expr not in ("0", "0s", "time.Duration(0)")
     return False
+
+
+def _is_falsy_const(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and node.value in (None, 0, False)
+
+
+def _leading_literal(node: ast.AST | None) -> str | None:
+    """Literal text a key expression starts with: `"a:b"`, `f"a:{x}"`, `"a:" + x`."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        head = ""
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                head += part.value
+            else:
+                break
+        return head
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _leading_literal(node.left)
+    return None
+
+
+class _PyRedisCalls:
+    """Syntax-tree view of one Python file, used to qualify regex-found Redis calls.
+
+    A regex hit with no matching call in the tree is inside a string or docstring and is not
+    code. For a real call, the tree answers what the regex cannot: TTL keyword/positional
+    arguments, an `expire(<same key>)` in the same block after the write, and the literal prefix
+    of an f-string or of a key variable assigned in the same function.
+    """
+
+    def __init__(self, tree: ast.Module) -> None:
+        self._calls: dict[tuple[int, str], list[ast.Call]] = {}
+        self._parent: dict[int, ast.AST] = {}
+        expire_calls: list[ast.Call] = []
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                self._parent[id(child)] = node
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                line = node.func.value.end_lineno or node.lineno
+                self._calls.setdefault((line, node.func.attr), []).append(node)
+                if node.func.attr in _PY_EXPIRE_OPS and node.args:
+                    expire_calls.append(node)
+        for calls in self._calls.values():
+            calls.sort(key=lambda c: c.func.value.end_col_offset or 0)  # type: ignore[attr-defined]
+        self._expires = expire_calls
+
+    def take(self, lineno: int, op: str) -> ast.Call | None:
+        calls = self._calls.get((lineno, op))
+        return calls.pop(0) if calls else None
+
+    def _enclosing(self, node: ast.AST, kinds: tuple[type, ...]) -> ast.AST | None:
+        cur = self._parent.get(id(node))
+        while cur is not None and not isinstance(cur, kinds):
+            cur = self._parent.get(id(cur))
+        return cur
+
+    def _block(self, node: ast.AST) -> tuple[int, str] | None:
+        stmt = node if isinstance(node, ast.stmt) else self._enclosing(node, (ast.stmt,))
+        parent = self._parent.get(id(stmt)) if stmt is not None else None
+        if parent is None:
+            return None
+        for name, value in ast.iter_fields(parent):
+            if isinstance(value, list) and any(item is stmt for item in value):
+                return (id(parent), name)
+        return None
+
+    def has_ttl(self, call: ast.Call, op: str) -> bool:
+        for kw in call.keywords:
+            if kw.arg in _PY_TTL_KWARGS and not _is_falsy_const(kw.value):
+                return True
+            if kw.arg == "keepttl" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                return True
+        # redis-py: set(name, value, ex=None, px=None, ...) -> a third positional is `ex`.
+        return op == "set" and len(call.args) >= 3 and not _is_falsy_const(call.args[2])
+
+    def expired_after(self, call: ast.Call) -> bool:
+        """`expire(<same key expression>)` later in the same block of the same function."""
+        if not call.args:
+            return False
+        key_dump = ast.dump(call.args[0])
+        block = self._block(call)
+        scope = self._enclosing(call, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module))
+        for exp in self._expires:
+            if (
+                exp.lineno >= call.lineno
+                and ast.dump(exp.args[0]) == key_dump
+                and self._enclosing(exp, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)) is scope
+                and block is not None
+                and self._block(exp) == block
+            ):
+                return True
+        return False
+
+    def key_literal(self, call: ast.Call) -> str | None:
+        """Leading literal of the key argument, following one local `key = ...` assignment."""
+        if not call.args:
+            return None
+        key = call.args[0]
+        if isinstance(key, ast.Name):
+            scope = self._enclosing(call, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module))
+            value: ast.AST | None = None
+            best_line = 0
+            for node in ast.walk(scope) if scope is not None else ():
+                if (
+                    isinstance(node, ast.Assign)
+                    and best_line <= node.lineno < call.lineno
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == key.id
+                ):
+                    value, best_line = node.value, node.lineno
+            return _leading_literal(value)
+        return _leading_literal(key)
 
 
 def _send_resp(sock: socket.socket, *parts: str) -> str:
@@ -349,17 +468,33 @@ def augment_redis_ephemeral_lineage(
             em.group("key").rstrip(":").lower() for em in _EXPIRE_CALL_RE.finditer(txt)
         }
 
+        py_calls: _PyRedisCalls | None = None
+        if src_file.suffix == ".py":
+            try:
+                py_calls = _PyRedisCalls(ast.parse(src_file.read_text(encoding="utf-8")))
+            except (OSError, UnicodeError, SyntaxError, ValueError):
+                py_calls = None
+
         for cm in _REDIS_CALL_RE.finditer(txt):
             op = cm.group("op")
+            lineno = txt.count("\n", 0, cm.start()) + 1
+            py_call = py_calls.take(lineno, op) if py_calls is not None else None
+            if py_calls is not None and py_call is None:
+                continue  # inside a string or docstring (e.g. a usage example), not a call
             call_args = _extract_call_window(txt, cm.end())
             km = _FIRST_STR_ARG_RE.match(call_args)
             if km is None and not has_sdk:
                 continue
-            raw_key = km.group("key") if km else "default:key"
+            literal = py_calls.key_literal(py_call) if py_calls is not None and py_call is not None else None
+            if km:
+                raw_key = km.group("key")
+            elif literal and ":" in literal:
+                raw_key = f"{literal.split(':', 1)[0]}:*"  # f-string / assigned key: keep its prefix
+            else:
+                raw_key = "default:key"
             if ":" not in raw_key and not has_sdk:
                 continue
             prefix = raw_key.split(":", 1)[0]
-            lineno = txt.count("\n", 0, cm.start()) + 1
             sid = ensure_store(prefix, rel_repo, lineno, "keyspace")
 
             if op in _READ_OPS:
@@ -373,6 +508,11 @@ def augment_redis_ephemeral_lineage(
                     or bool(_TTL_OPT_RE.search(call_args))
                     or (src_file.suffix == ".go" and op == "Set" and _go_set_has_ttl(call_args))
                     or prefix.lower() in expired_prefixes
+                    or (
+                        py_calls is not None
+                        and py_call is not None
+                        and (py_calls.has_ttl(py_call, op) or py_calls.expired_after(py_call))
+                    )
                 )
                 if not has_ttl:
                     if redis_nodes[sid].status == "clean":
