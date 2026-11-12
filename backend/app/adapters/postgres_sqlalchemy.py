@@ -277,6 +277,7 @@ class _MigrationEffects:
     created_functions: dict[str, int] = field(default_factory=dict)
     dropped_functions: set[str] = field(default_factory=set)
     creates_all_metadata: bool = False
+    touches_ddl: bool = False
 
 
 def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
@@ -361,18 +362,32 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                         effects.dropped_tables.add(key)
                 elif callee == "create_all":
                     effects.creates_all_metadata = True
+                elif callee in ("add_column", "drop_column", "alter_column", "rename_table"):
+                    effects.touches_ddl = True
                 elif isinstance(sub.func, ast.Name) and sub.func.id in functions:
                     visit(functions[sub.func.id])
             elif isinstance(sub, ast.Name) and sub.id in consts and sub.id not in absorbed_consts:
                 absorbed_consts.add(sub.id)
+                if "ALTER TABLE" in consts[sub.id].upper():
+                    effects.touches_ddl = True
                 absorb_sql(consts[sub.id], sub.lineno)
             elif isinstance(sub, (ast.Constant, ast.JoinedStr, ast.BinOp)):
                 text = _eval_str(sub, consts)
                 if text and ("TABLE" in text.upper() or "FUNCTION" in text.upper()):
+                    if "ALTER TABLE" in text.upper():
+                        effects.touches_ddl = True
                     absorb_sql(text, getattr(sub, "lineno", 1))
 
     visit(upgrade)
     effects.dropped_tables -= effects.created_tables  # drop-then-recreate keeps the table
+    if (
+        effects.created_tables
+        or effects.dropped_tables
+        or effects.created_functions
+        or effects.dropped_functions
+        or effects.creates_all_metadata
+    ):
+        effects.touches_ddl = True
     return effects
 
 
@@ -516,15 +531,21 @@ class PostgresSqlAlchemyAdapter:
 
         has_schema_sql = schema_sql_path.is_file()
         has_migrations = bool(migration_entries)
+        ddl_mig_files = [mf for mf, eff in migration_entries if eff.touches_ddl]
         stale_note = ""
-        if has_schema_sql and has_migrations:
+        if has_schema_sql and ddl_mig_files:
             sql_epoch = _git_last_commit_epoch(repo_root, schema_sql_path.relative_to(repo_root).as_posix())
-            mig_epoch = _git_last_commit_epoch(repo_root, alembic_dir.relative_to(repo_root).as_posix())
+            ddl_epochs = [
+                ep
+                for mf in ddl_mig_files
+                if (ep := _git_last_commit_epoch(repo_root, mf.relative_to(repo_root).as_posix())) is not None
+            ]
+            mig_epoch = max(ddl_epochs) if ddl_epochs else None
             if sql_epoch is not None and mig_epoch is not None and mig_epoch > sql_epoch:
                 days = max(1, (mig_epoch - sql_epoch) // 86400)
-                stale_note = f" (schema.sql was last changed {days} day(s) before the newest migration)"
+                stale_note = f" (schema.sql was last changed {days} day(s) before the newest DDL migration)"
                 notes.append(
-                    f"schema.sql was last changed {days} day(s) before the newest migration; "
+                    f"schema.sql was last changed {days} day(s) before the newest DDL migration; "
                     "migrations were read as DDL too, so tables they create are not reported missing."
                 )
 

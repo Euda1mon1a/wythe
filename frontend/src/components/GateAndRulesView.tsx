@@ -82,6 +82,17 @@ export function GateAndRulesView({
         </button>
       </div>
 
+      {(report.scan_notes ?? []).length > 0 && (
+        <div className="space-y-1 border border-sky-500/30 bg-sky-950/20 p-3 font-mono text-xs text-sky-200">
+          <div className="font-semibold text-sky-300">Scan Provenance &amp; Probe Notes</div>
+          <ul className="list-disc space-y-0.5 pl-5 text-slate-200">
+            {(report.scan_notes ?? []).map((note, idx) => (
+              <li key={idx}>{note}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {/* PR Diff Blast-Radius, SARIF, Portable Config Sync & Domain Vocabularies */}
       <GovernanceAndDiffPanel
         activeSlug={activeSlug}

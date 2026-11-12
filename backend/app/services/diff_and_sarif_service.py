@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import __version__
 from app.models import ScanSnapshot
 from app.schemas.atlas import (
     BoundaryFinding,
@@ -293,8 +294,8 @@ def build_sarif_log(
                 "tool": {
                     "driver": {
                         "name": "Wythe",
-                        "version": "0.3.0",
-                        "informationUri": "https://github.com/wythe-dev/wythe",
+                        "version": __version__,
+                        "informationUri": "https://github.com/Euda1mon1a/wythe",
                         "rules": rules_payload,
                     }
                 },

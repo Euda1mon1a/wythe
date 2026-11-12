@@ -24,6 +24,103 @@ _SESSION_WRITES = frozenset(
 )
 _CONSTRUCT_WRITES = frozenset({"insert", "update", "delete"})
 _HTTP_DECORATORS = frozenset({"get", "post", "put", "patch", "delete"})
+_GENERIC_ATTR_METHODS = frozenset(
+    {
+        "add",
+        "all",
+        "append",
+        "as_posix",
+        "clear",
+        "close",
+        "commit",
+        "compile",
+        "copy",
+        "count",
+        "decode",
+        "delete",
+        "dict",
+        "dumps",
+        "encode",
+        "endswith",
+        "execute",
+        "exists",
+        "extend",
+        "filter",
+        "findall",
+        "finditer",
+        "first",
+        "flush",
+        "format",
+        "fullmatch",
+        "get",
+        "glob",
+        "group",
+        "group_by",
+        "index",
+        "insert",
+        "is_dir",
+        "is_file",
+        "is_relative_to",
+        "items",
+        "join",
+        "json",
+        "keys",
+        "limit",
+        "loads",
+        "lower",
+        "lstrip",
+        "match",
+        "merge",
+        "model_copy",
+        "model_dump",
+        "model_validate",
+        "offset",
+        "one",
+        "one_or_none",
+        "open",
+        "order_by",
+        "parse",
+        "pop",
+        "read",
+        "read_bytes",
+        "read_text",
+        "refresh",
+        "relative_to",
+        "remove",
+        "removeprefix",
+        "removesuffix",
+        "replace",
+        "resolve",
+        "rglob",
+        "rollback",
+        "rsplit",
+        "rstrip",
+        "run",
+        "scalar",
+        "scalar_one",
+        "scalar_one_or_none",
+        "scalars",
+        "search",
+        "select",
+        "set",
+        "setdefault",
+        "sort",
+        "split",
+        "splitlines",
+        "startswith",
+        "strip",
+        "sub",
+        "update",
+        "upper",
+        "values",
+        "walk",
+        "where",
+        "with_suffix",
+        "write",
+        "write_bytes",
+        "write_text",
+    }
+)
 
 _POLICY_NUMERIC_TOKENS = (
     "WEIGHT",
@@ -82,6 +179,7 @@ class ParsedPythonModule:
     route_handlers: tuple[ParsedRouteHandler, ...]
     policy_literals: tuple[tuple[str, int, str], ...]  # (const_name, lineno, sample)
     raw_clock_calls: tuple[tuple[str, int], ...]  # (expr, lineno)
+    symbol_calls: frozenset[str] = frozenset()
 
 
 def _dotted(node: ast.AST) -> str | None:
@@ -172,25 +270,34 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
                 docstring_ids.add(id(first.value))
 
+    local_pkg = module_name.split(".", 1)[0]
     aliases: dict[str, str] = {}
     imported_modules: set[str] = set()
+    external_roots: set[str] = set()
     for n in ast.walk(tree):
         if isinstance(n, ast.ImportFrom) and n.module:
             imported_modules.add(n.module)
+            is_ext = n.level == 0 and n.module.split(".", 1)[0] != local_pkg
             for alias in n.names:
                 imported_modules.add(f"{n.module}.{alias.name}")
-                aliases[alias.asname or alias.name] = alias.name
+                local_name = alias.asname or alias.name
+                aliases[local_name] = alias.name
+                if is_ext:
+                    external_roots.add(local_name)
         elif isinstance(n, ast.Import):
             for alias in n.names:
                 imported_modules.add(alias.name)
                 if alias.asname:
                     aliases[alias.asname] = alias.name
+                if alias.name.split(".", 1)[0] != local_pkg:
+                    external_roots.add(alias.asname or alias.name.split(".", 1)[0])
 
     def resolve(sym: str) -> str:
         return aliases.get(sym, sym)
 
     writes: set[str] = set()
     called: set[str] = set()
+    symbol_calls: set[str] = set()
     write_only: set[int] = set()
     raw_clocks: list[tuple[str, int]] = []
     router_prefix = ""
@@ -224,11 +331,19 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             raw_clocks.append((f"{dotted}()", n.lineno))
 
         if short:
-            called.add(resolve(short))
+            resolved_short = resolve(short)
+            called.add(resolved_short)
+            if isinstance(target, ast.Name):
+                if target.id not in external_roots:
+                    symbol_calls.add(resolved_short)
+            elif isinstance(target, ast.Attribute):
+                recv_root = dotted.split(".", 1)[0] if dotted else ""
+                if recv_root not in external_roots and short not in _GENERIC_ATTR_METHODS:
+                    symbol_calls.add(resolved_short)
             if dotted:
                 head, _, tail = dotted.partition(".")
                 called.add(f"{resolve(head)}.{tail}" if tail else resolve(head))
-            writes.add(resolve(short))
+            writes.add(resolved_short)
             write_only.add(id(target))
 
         is_construct = isinstance(target, ast.Name) and short in _CONSTRUCT_WRITES
@@ -265,9 +380,16 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
 
     handlers: list[ParsedRouteHandler] = []
     defined: set[str] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defined.add(stmt.name)
+        elif isinstance(stmt, ast.ClassDef):
+            defined.add(stmt.name)
+            for member in stmt.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and not member.name.startswith("_"):
+                    defined.add(member.name)
+
     for n in ast.walk(tree):
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            defined.add(n.name)
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for dec in n.decorator_list:
                 if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr in _HTTP_DECORATORS:
@@ -328,4 +450,5 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         route_handlers=tuple(handlers),
         policy_literals=tuple(policy_literals),
         raw_clock_calls=tuple(raw_clocks),
+        symbol_calls=frozenset(symbol_calls),
     )

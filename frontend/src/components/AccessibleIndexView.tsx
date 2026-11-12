@@ -17,6 +17,7 @@ interface AccessibleIndexViewProps {
   slots: AdapterSlotSchema[];
   profiles: StackProfileRead[];
   legacyBridge: LegacyBridgeSummary;
+  scanNotes?: string[];
   onSelectNode: (nodeId: string) => void;
 }
 
@@ -26,6 +27,7 @@ export function AccessibleIndexView({
   slots,
   profiles,
   legacyBridge,
+  scanNotes = [],
   onSelectNode,
 }: AccessibleIndexViewProps) {
   const [search, setSearch] = useState('');
@@ -66,6 +68,16 @@ export function AccessibleIndexView({
 
   return (
     <div className="space-y-6">
+      {scanNotes.length > 0 && (
+        <section className="space-y-1 border border-sky-500/30 bg-sky-950/20 p-3 font-mono text-xs text-sky-200">
+          <h2 className="font-semibold text-sky-300">Scan Provenance &amp; Probe Notes</h2>
+          <ul className="list-disc space-y-0.5 pl-5 text-slate-200">
+            {scanNotes.map((note, idx) => (
+              <li key={idx}>{note}</li>
+            ))}
+          </ul>
+        </section>
+      )}
       {/* Day-1 Newcomer 3-Tier Placement Guide */}
       <section className="space-y-3 border border-slate-800 bg-slate-950/60 p-4 text-xs">
         <div>
