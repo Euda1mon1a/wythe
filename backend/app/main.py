@@ -39,7 +39,7 @@ def create_app() -> FastAPI:
     settings = load_settings()
     application = FastAPI(
         title="Wythe API",
-        version="0.1.0",
+        version="0.1.1",
         description=(
             "Why -> Therefore: 3-tier architecture & lineage verifier. "
             "PostgreSQL holds truth, Backend manipulates truth, UI displays truth."
