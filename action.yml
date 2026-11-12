@@ -1,0 +1,72 @@
+name: "Wythe 3-Tier Gate"
+description: "Why -> Therefore: Verify cross-tier DB -> Backend -> UI lineage, boundary invariants, and WCAG accessibility via uvx."
+branding:
+  icon: "layers"
+  color: "blue"
+
+inputs:
+  target:
+    description: "Repository path to scan"
+    required: false
+    default: "."
+  profile:
+    description: "Stack profile slug or 'auto'"
+    required: false
+    default: "auto"
+  mode:
+    description: "'gate' (full repo) or 'diff' (PR blast-radius & new findings only)"
+    required: false
+    default: "gate"
+  base-ref:
+    description: "Git base ref when mode is 'diff'"
+    required: false
+    default: "origin/main"
+  strict:
+    description: "Ignore ratchet baselines and require zero blocking findings ('true' or 'false')"
+    required: false
+    default: "false"
+  sync-config:
+    description: "Hydrate governance rules/ratchets from .wythe/governance.json ('true' or 'false')"
+    required: false
+    default: "true"
+  sarif-file:
+    description: "Optional output path for SARIF 2.1.0 report"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        python-version: "3.12"
+
+    - name: Run Wythe verification
+      shell: bash
+      env:
+        TA_TARGET: ${{ inputs.target }}
+        TA_PROFILE: ${{ inputs.profile }}
+        TA_MODE: ${{ inputs.mode }}
+        TA_BASE: ${{ inputs.base-ref }}
+        TA_STRICT: ${{ inputs.strict }}
+        TA_SYNC: ${{ inputs.sync-config }}
+        TA_SARIF: ${{ inputs.sarif-file }}
+      run: |
+        set -euo pipefail
+        ARGS=()
+        if [ "$TA_MODE" = "diff" ]; then
+          ARGS+=("diff" "$TA_TARGET" "--profile" "$TA_PROFILE" "--base" "$TA_BASE")
+        else
+          ARGS+=("gate" "$TA_TARGET" "--profile" "$TA_PROFILE")
+          if [ "$TA_STRICT" = "true" ]; then
+            ARGS+=("--strict")
+          fi
+          if [ "$TA_SYNC" = "true" ]; then
+            ARGS+=("--sync-config")
+          fi
+        fi
+        if [ -n "$TA_SARIF" ]; then
+          ARGS+=("--sarif" "$TA_SARIF")
+        fi
+        uvx --from "${{ github.action_path }}[treesitter]" wythe "${ARGS[@]}"
