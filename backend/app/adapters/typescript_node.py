@@ -35,7 +35,7 @@ _NEST_VERB_RE = re.compile(
     r"""@(?P<verb>Get|Post|Put|Patch|Delete)\(\s*(?:['"](?P<subpath>[^'"]*)['"])?\s*\)"""
 )
 _PRISMA_OP_RE = re.compile(
-    r"""(?:\bthis\.)?\b(?:prisma|tx)\.(?P<model>[A-Za-z_]\w*)\.(?P<op>findMany|findUnique|findFirst|findUniqueOrThrow|findFirstOrThrow|count|aggregate|groupBy|create|createMany|update|updateMany|upsert|delete|deleteMany)\b"""
+    r"""(?:\bthis\.)?\b(?:prisma(?:\.client)?|tx|db)\.(?P<model>[A-Za-z_]\w*)\.(?P<op>findMany|findUnique|findFirst|findUniqueOrThrow|findFirstOrThrow|count|aggregate|groupBy|create|createMany|update|updateMany|upsert|delete|deleteMany)\b"""
 )
 _DRIZZLE_READ_RE = re.compile(r"""\.from\(\s*(?P<sym>[A-Za-z_]\w*)\s*\)|\bquery\.(?P<qsym>[A-Za-z_]\w*)\.find""")
 _DRIZZLE_WRITE_RE = re.compile(r"""\b(?:db|tx)\.(?:insert|update|delete)\(\s*(?P<sym>[A-Za-z_]\w*)\s*\)""")
@@ -60,17 +60,27 @@ def _strip_preserve_lines(source: str) -> str:
 
 
 def _norm_colon_params(path: str) -> str:
-    cleaned = "/" + "/".join(p for p in path.strip().split("/") if p)
+    segs = [
+        p
+        for p in path.strip().split("/")
+        if p and not (p.startswith("(") and p.endswith(")"))
+    ]
+    cleaned = "/" + "/".join(segs)
     cleaned = re.sub(r":([A-Za-z_]\w*)", r"{\1}", cleaned)
-    cleaned = re.sub(r"\[\.\.\.([A-Za-z_]\w*)\]", r"{\1}", cleaned)
+    cleaned = re.sub(r"\[\[\.\.\.([A-Za-z_]\w*)\]\]", r"{\1?*}", cleaned)
+    cleaned = re.sub(r"\[\.\.\.([A-Za-z_]\w*)\]", r"{\1+}", cleaned)
     cleaned = re.sub(r"\[([A-Za-z_]\w*)\]", r"{\1}", cleaned)
     return cleaned or "/"
 
 
 def _route_regex(full_path: str) -> str:
-    norm = full_path.rstrip("/") or "/"
-    escaped = "" if norm == "/" else re.sub(r"\{[^/{}]+\}", r"[^/?#]+", norm)
-    return rf"^(?:/api(?:/v\d+)?)?{escaped}/?$" if escaped else r"^(?:/api(?:/v\d+)?)?/?$"
+    norm = re.sub(r"^/api(?:/v\d+)?(?=/|$)", "", full_path.rstrip("/")) or "/"
+    if norm == "/":
+        return r"^(?:/api(?:/v\d+)?)?/?$"
+    escaped = re.sub(r"/\{[A-Za-z_]\w*\?\*\}", r"(?:/[^?#]+)?", norm)
+    escaped = re.sub(r"/\{[A-Za-z_]\w*\+\}", r"/[^?#]+", escaped)
+    escaped = re.sub(r"\{[^/{}]+\}", r"[^/?#]+", escaped)
+    return rf"^(?:/api(?:/v\d+)?)?{escaped}/?$"
 
 
 def _sveltekit_server_route_path(rel_base: str) -> str:
@@ -99,7 +109,19 @@ def _is_backend_ts_candidate(rel_base: str, fullstack_root: bool) -> bool:
         return True
     return any(
         seg in parts
-        for seg in ("server", "services", "repositories", "controllers", "routes", "actions")
+        for seg in (
+            "server",
+            "services",
+            "repositories",
+            "controllers",
+            "routes",
+            "actions",
+            "queries",
+            "db",
+            "models",
+            "prisma",
+            "drizzle",
+        )
     ) and rel_base.endswith(".ts")
 
 

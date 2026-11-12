@@ -138,8 +138,29 @@ export function AccessibleIndexView({
             Pluggable Language &amp; Framework Adapter Registry ({profiles.length} stack profiles)
           </h2>
           <p className="text-xs text-slate-300">
-            Core lineage verification operates on normalized Truth, Manipulate, and Display contracts so new language adapters plug in cleanly.
+            Core lineage verification is production-dogfooded on{' '}
+            <code className="font-mono text-teal-300">fastapi-sqlalchemy-nextjs</code>; secondary polyglot profiles &amp; adapters are marked{' '}
+            <span className="font-mono text-amber-300">experimental</span> (use{' '}
+            <code className="font-mono">wythe diff</code> or ratchets before strict gating).
           </p>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {profiles.map((prof) => (
+            <span
+              key={prof.slug}
+              title={prof.description}
+              className={`border px-2 py-0.5 font-mono text-[11px] ${
+                prof.implementation_status === 'implemented'
+                  ? 'border-teal-500/40 bg-teal-950/30 text-teal-200'
+                  : prof.implementation_status === 'experimental'
+                    ? 'border-amber-500/35 bg-amber-950/20 text-amber-200'
+                    : 'border-slate-800 bg-slate-950/60 text-slate-400'
+              }`}
+            >
+              {prof.slug}{' '}
+              <span className="text-[9px] uppercase opacity-80">[{prof.implementation_status}]</span>
+            </span>
+          ))}
         </div>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
           {slots.map((slot) => (
@@ -153,7 +174,9 @@ export function AccessibleIndexView({
                   className={`px-1.5 py-0.5 text-[10px] uppercase ${
                     slot.implementation_status === 'implemented'
                       ? 'bg-teal-500/15 text-teal-300'
-                      : 'bg-slate-800 text-slate-300'
+                      : slot.implementation_status === 'experimental'
+                        ? 'bg-amber-500/15 text-amber-300'
+                        : 'bg-slate-800 text-slate-300'
                   }`}
                 >
                   {slot.implementation_status}

@@ -175,7 +175,7 @@ class AdapterRegistry:
                 tier="truth",
                 language="Prisma / SQL",
                 frameworks=["PostgreSQL", "MySQL", "SQLite", "SQL Server", "Prisma ORM"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "schema.prisma datasource, model, @@map, and @@schema extraction",
                     "prisma/migrations/*.sql DDL & stored guard verification",
@@ -187,7 +187,7 @@ class AdapterRegistry:
                 tier="truth",
                 language="TypeScript / SQL",
                 frameworks=["PostgreSQL", "MySQL", "SQLite", "Drizzle ORM", "drizzle-kit"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "pgTable / mysqlTable / sqliteTable & custom schema extraction",
                     "Drizzle SQL migration parity & live read-only catalog probe",
@@ -198,7 +198,7 @@ class AdapterRegistry:
                 tier="truth",
                 language="Python / SQL",
                 frameworks=["PostgreSQL", "MySQL", "SQLite", "Django ORM", "Django Migrations"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "Django models.Model AST (Meta.db_table, abstract/proxy exclusion)",
                     "CreateModel & RunSQL migration verification + live catalog probe",
@@ -209,7 +209,7 @@ class AdapterRegistry:
                 tier="truth",
                 language="SQL",
                 frameworks=["PostgreSQL", "MySQL", "SQLite", "sqlc", "golang-migrate", "goose", "Flyway", "sqlx"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "Multi-dialect CREATE TABLE / FUNCTION / PROCEDURE / TRIGGER DDL parsing",
                     "sqlc `-- name:` query-to-table read/write symbol binding",
@@ -221,7 +221,7 @@ class AdapterRegistry:
                 tier="truth",
                 language="Rust / SQL",
                 frameworks=["PostgreSQL", "MySQL", "SQLite", "sqlx", "Diesel", "SeaORM"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "sqlx migrations & query_file! SQL-to-table binding",
                     "Diesel table! schema.rs & SeaORM #[sea_orm(table_name)] entity extraction",
@@ -245,7 +245,7 @@ class AdapterRegistry:
                 tier="manipulate",
                 language="TypeScript / Node.js",
                 frameworks=["Next.js Route Handlers (route.ts)", "Express", "Hono", "Fastify", "NestJS"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "App Router route.ts, Express/Hono mounts, and NestJS @Controller synthesis",
                     "Prisma, Drizzle, and raw SQL read vs. write extraction",
@@ -257,7 +257,7 @@ class AdapterRegistry:
                 tier="manipulate",
                 language="Python",
                 frameworks=["Django", "Django REST Framework", "Django Ninja"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "urls.py path/include, DRF ViewSet routers, and Ninja route synthesis",
                     "Model.objects read vs. write AST separation & view-write detection",
@@ -268,7 +268,7 @@ class AdapterRegistry:
                 tier="manipulate",
                 language="Go",
                 frameworks=["net/http (Go 1.22+)", "chi", "gin", "echo", "sqlc", "pgx", "GORM"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "Router group & ServeMux HTTP pattern synthesis",
                     "sqlc generated query & raw SQL read/write package lineage",
@@ -280,7 +280,7 @@ class AdapterRegistry:
                 tier="manipulate",
                 language="Rust",
                 frameworks=["axum", "actix-web", "rocket", "Tauri v2 (#[tauri::command])", "sqlx", "Diesel", "SeaORM"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "axum Router/nest, actix-web/rocket macros, and #[tauri::command] IPC synthesis",
                     "sqlx query!/query_file!, Diesel, and SeaORM read-vs-write crate lineage",
@@ -303,7 +303,7 @@ class AdapterRegistry:
                 tier="display",
                 language="TypeScript / TSX",
                 frameworks=["React SPA", "Vite", "React Router", "TanStack Router", "Remix"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "SPA pages/routes/views, hooks, and typed client lineage",
                     "Client policy shadow & browser clock/UTC-slicing detection",
@@ -314,7 +314,7 @@ class AdapterRegistry:
                 tier="display",
                 language="Vue / TypeScript",
                 frameworks=["Vue 3", "Nuxt 3", "Vue Router", "Pinia"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "Line-accurate .vue <script setup> extraction & composable graph",
                     "$fetch / useFetch / axios / typed client lineage & DISP checks",
@@ -325,7 +325,7 @@ class AdapterRegistry:
                 tier="display",
                 language="Svelte / TypeScript",
                 frameworks=["Svelte 5", "SvelteKit"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "+page.svelte / +page.ts route & $lib store/client graph",
                     "Line-accurate .svelte script inspection & DISP boundary checks",
@@ -336,7 +336,7 @@ class AdapterRegistry:
                 tier="display",
                 language="Rust (WASM)",
                 frameworks=["Leptos", "Dioxus", "Yew", "gloo-net", "Tauri WASM"],
-                implementation_status="implemented",
+                implementation_status="experimental",
                 capabilities=[
                     "Leptos/Dioxus/Yew route & component graph extraction",
                     "gloo-net / reqwest HTTP & Tauri invoke() lineage + WASM DISP-001..004 checks",

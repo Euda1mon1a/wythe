@@ -33,7 +33,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "prisma-schema",
         "manipulator_adapter": "typescript-node",
         "display_adapter": "typescript-nextjs",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "Prisma schema.prisma + SQL migrations, Next.js route.ts/Node handlers, and Next.js App/Pages UI.",
     },
@@ -43,7 +43,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "drizzle-orm",
         "manipulator_adapter": "typescript-node",
         "display_adapter": "typescript-nextjs",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "Full-TypeScript Drizzle pgTable/mysqlTable/sqliteTable + Node/Next.js route manipulation + Next.js display.",
     },
@@ -53,7 +53,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "prisma-schema",
         "manipulator_adapter": "typescript-node",
         "display_adapter": "typescript-react",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "Prisma schema truth, Express/Fastify/Hono/NestJS backend manipulation, and React/Vite SPA display.",
     },
@@ -63,7 +63,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "drizzle-orm",
         "manipulator_adapter": "typescript-node",
         "display_adapter": "typescript-react",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "Drizzle ORM truth, TypeScript Node backend manipulation, and React/Vite/TanStack Router display.",
     },
@@ -73,7 +73,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "postgres-sqlalchemy",
         "manipulator_adapter": "python-fastapi",
         "display_adapter": "typescript-react",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "SQLAlchemy/Alembic truth, FastAPI manipulation, and React/Vite/Remix SPA display.",
     },
@@ -83,7 +83,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "postgres-sqlalchemy",
         "manipulator_adapter": "python-fastapi",
         "display_adapter": "vue-sfc",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "SQLAlchemy/Alembic truth, FastAPI manipulation, and Vue 3 / Nuxt SFC display.",
     },
@@ -93,7 +93,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "postgres-sqlalchemy",
         "manipulator_adapter": "python-fastapi",
         "display_adapter": "sveltekit",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "SQLAlchemy/Alembic truth, FastAPI manipulation, and Svelte 5 / SvelteKit display.",
     },
@@ -103,7 +103,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "django-orm",
         "manipulator_adapter": "python-django",
         "display_adapter": "typescript-react",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "Django models/migrations truth, Django URLs/DRF/Ninja manipulation, and React SPA display.",
     },
@@ -113,7 +113,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "django-orm",
         "manipulator_adapter": "python-django",
         "display_adapter": "vue-sfc",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "Django models/migrations truth, Django URLs/DRF/Ninja manipulation, and Vue 3 / Nuxt SFC display.",
     },
@@ -123,7 +123,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "sql-ddl",
         "manipulator_adapter": "go-http",
         "display_adapter": "typescript-react",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "SQL DDL/migrations + sqlc truth, Go HTTP router/service manipulation, and React/Vite SPA display.",
     },
@@ -133,7 +133,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "sql-ddl",
         "manipulator_adapter": "go-http",
         "display_adapter": "sveltekit",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "SQL DDL/migrations + sqlc truth, Go HTTP router/service manipulation, and SvelteKit display.",
     },
@@ -143,7 +143,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "rust-sql",
         "manipulator_adapter": "rust-http",
         "display_adapter": "typescript-react",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "sqlx/Diesel/SeaORM truth, Rust axum/actix-web/Tauri manipulation, and React/Vite or Tauri SPA display.",
     },
@@ -153,7 +153,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "rust-sql",
         "manipulator_adapter": "rust-http",
         "display_adapter": "typescript-nextjs",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "sqlx/Diesel/SeaORM truth, Rust axum/actix-web manipulation, and Next.js App/Pages Router display.",
     },
@@ -163,7 +163,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "rust-sql",
         "manipulator_adapter": "rust-http",
         "display_adapter": "sveltekit",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "sqlx/Diesel/SeaORM truth, Rust axum/actix-web or Tauri command manipulation, and SvelteKit display.",
     },
@@ -173,7 +173,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "rust-sql",
         "manipulator_adapter": "rust-http",
         "display_adapter": "rust-wasm",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "100% Rust 3-tier stack: sqlx/Diesel/SeaORM truth, axum/actix-web manipulation, and Leptos/Dioxus/Yew WASM UI.",
     },
@@ -183,7 +183,7 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         "truth_adapter": "drizzle-orm",
         "manipulator_adapter": "typescript-node",
         "display_adapter": "sveltekit",
-        "implementation_status": "implemented",
+        "implementation_status": "experimental",
         "is_enabled": True,
         "description": "Drizzle ORM schema truth, SvelteKit +page.server.ts/+server.ts manipulation, and Svelte 5 / SvelteKit display.",
     },
@@ -368,13 +368,17 @@ def seed_catalog_if_needed(session: Session) -> None:
         prev = existing_profiles.get(slug)
         if prev is None:
             session.add(StackProfile(**item, created_at=now))
-        elif prev.implementation_status == "planned" and item["implementation_status"] == "implemented":
+        elif prev.implementation_status != item["implementation_status"] and item[
+            "implementation_status"
+        ] in ("implemented", "experimental"):
+            was_planned = prev.implementation_status == "planned"
             prev.label = str(item["label"])
             prev.truth_adapter = str(item["truth_adapter"])
             prev.manipulator_adapter = str(item["manipulator_adapter"])
             prev.display_adapter = str(item["display_adapter"])
-            prev.implementation_status = "implemented"
-            prev.is_enabled = bool(item["is_enabled"])
+            prev.implementation_status = str(item["implementation_status"])
+            if was_planned or prev.implementation_status == "implemented":
+                prev.is_enabled = bool(item["is_enabled"])
             prev.description = str(item["description"])
 
     existing_rules = set(session.scalars(select(RulePolicy.rule_code)).all())

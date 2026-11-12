@@ -93,10 +93,14 @@ class RustSqlTruthAdapter:
                 if not t_objs and not g_objs:
                     query_sql_files.append((sf, text))
 
-        if base_dir.is_dir():
-            for rs_file in sorted(base_dir.rglob("*.rs")):
-                if any(p in rs_file.parts for p in ("target", "node_modules", ".git")):
+        seen_rs_files: set[Path] = set()
+        for root in search_roots:
+            if not root.is_dir():
+                continue
+            for rs_file in sorted(root.rglob("*.rs")):
+                if rs_file in seen_rs_files or any(p in rs_file.parts for p in ("target", "node_modules", ".git")):
                     continue
+                seen_rs_files.add(rs_file)
                 rel_rs = rs_file.relative_to(repo_root).as_posix()
                 rs_text = rs_file.read_text(encoding="utf-8", errors="replace")
 

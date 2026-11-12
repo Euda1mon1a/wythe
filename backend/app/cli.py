@@ -114,10 +114,19 @@ def _print_report_summary(report) -> None:
     ephemeral_note = (
         f", {s.ephemeral_stores} Redis ephemeral store(s)" if s.ephemeral_stores > 0 else ""
     )
+    maturity_tag = (
+        f" [{report.stack_profile_status}]"
+        if getattr(report, "stack_profile_status", "implemented") != "implemented"
+        else ""
+    )
     print(f"Wythe :: {report.target_name} ({report.target_slug})")
     print(
-        f"  Profile : {report.stack_profile} | Commit: {report.source_commit[:12]} | Source: {report.observation_source}"
+        f"  Profile : {report.stack_profile}{maturity_tag} | Commit: {report.source_commit[:12]} | Source: {report.observation_source}"
     )
+    if getattr(report, "stack_profile_status", "implemented") == "experimental":
+        print(
+            "  Maturity: Experimental polyglot profile — prefer 'wythe diff' or ratchets over '--strict' until tuned for your repo."
+        )
     print(f"  Digest  : {report.content_digest[:16]}...")
     print(
         f"  Tier 1 (DB Truth)        : {s.truth_tables} tables, {s.sql_functions} SQL functions{ephemeral_note}"

@@ -497,7 +497,7 @@ export interface components {
              * Implementation Status
              * @enum {string}
              */
-            implementation_status: "implemented" | "planned";
+            implementation_status: "implemented" | "experimental" | "planned";
             /** Capabilities */
             capabilities: string[];
         };
@@ -1543,6 +1543,12 @@ export interface components {
             repo_path: string;
             /** Stack Profile */
             stack_profile: string;
+            /**
+             * Stack Profile Status
+             * @default implemented
+             * @enum {string}
+             */
+            stack_profile_status: "implemented" | "experimental" | "planned";
             /** Source Commit */
             source_commit: string;
             /**

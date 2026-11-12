@@ -44,8 +44,11 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
     if (repo_root / "manage.py").is_file():
         backend_sub = "."
 
-    # Cargo workspace scan (`crates/*/Cargo.toml`) for Rust backend + WASM UI split
+    # Cargo workspace scan (`*/Cargo.toml` + `crates/*/Cargo.toml`) for Rust backend + WASM UI split
     workspace_cargos: list[tuple[str, str]] = []
+    for ctoml in sorted(repo_root.glob("*/Cargo.toml")):
+        rel_c = ctoml.parent.relative_to(repo_root).as_posix()
+        workspace_cargos.append((rel_c, _read_lower(ctoml)))
     if (repo_root / "crates").is_dir():
         for ctoml in sorted((repo_root / "crates").glob("*/Cargo.toml")):
             rel_c = ctoml.parent.relative_to(repo_root).as_posix()
