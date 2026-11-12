@@ -1037,9 +1037,95 @@ def test_variadic_migration_helpers_and_caller_stored_service_attrs(
     assert ("POST", "/api/v1/users/sync") in fb_calls
 
 
+def test_conditional_rebound_chained_migration_sql_and_try_row_writes(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "backend/alembic/versions/0001_branches_and_closures.py",
+        "revision = '0001'\n"
+        "down_revision = None\n"
+        "from alembic import op\n\n"
+        "def upgrade():\n"
+        "    flag = True\n"
+        "    if flag:\n"
+        "        same_ddl = 'CREATE TABLE same_branch_tbl (id INT PRIMARY KEY);'\n"
+        "    else:\n"
+        "        same_ddl = 'CREATE TABLE same_branch_tbl (id INT PRIMARY KEY);'\n"
+        "    op.execute(same_ddl)\n\n"
+        "    if flag:\n"
+        "        alt_ddl = 'CREATE TABLE pg_branch_tbl (id INT PRIMARY KEY);'\n"
+        "    else:\n"
+        "        alt_ddl = 'CREATE TABLE alt_branch_tbl (id INT PRIMARY KEY);'\n"
+        "    op.execute(alt_ddl)\n\n"
+        "    rebound = 'CREATE TABLE stale_closure_tbl (id INT PRIMARY KEY);'\n"
+        "    def run_late():\n"
+        "        op.execute(rebound)\n"
+        "    rebound = 'CREATE TABLE live_closure_tbl (id INT PRIMARY KEY);'\n"
+        "    run_late()\n\n"
+        "    if flag:\n"
+        "        rebound = 'CREATE TABLE branch_closure_tbl (id INT PRIMARY KEY);'\n"
+        "        run_late()\n\n"
+        "    chained = copy_sql = 'CREATE TABLE chained_sql_tbl (id INT PRIMARY KEY);'\n"
+        "    op.execute(chained)\n"
+        "    _ = copy_sql\n\n"
+        "    first_sql, second_sql = (\n"
+        "        'CREATE TABLE unpacked_one_tbl (id INT PRIMARY KEY);',\n"
+        "        'CREATE TABLE unpacked_two_tbl (id INT PRIMARY KEY);',\n"
+        "    )\n"
+        "    op.execute(first_sql)\n"
+        "    op.execute(second_sql)\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/models/user.py",
+        "from sqlalchemy import Column, Integer, String\n"
+        "from sqlalchemy.orm import DeclarativeBase\n\n"
+        "class Base(DeclarativeBase):\n"
+        "    pass\n\n"
+        "class AccountRow(Base):\n"
+        "    __tablename__ = 'same_branch_tbl'\n"
+        "    id = Column(Integer, primary_key=True)\n"
+        "    status = Column(String)\n\n"
+        "class AuditRow(Base):\n"
+        "    __tablename__ = 'chained_sql_tbl'\n"
+        "    id = Column(Integer, primary_key=True)\n"
+        "    note = Column(String)\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/accounts.py",
+        "from fastapi import APIRouter\n"
+        "from app.models.user import AccountRow, AuditRow\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/accounts')\n"
+        "def process_account(db):\n"
+        "    try:\n"
+        "        row = db.get(AccountRow, 1)\n"
+        "        might_fail()\n"
+        "        row = None\n"
+        "    except Exception:\n"
+        "        row.status = 'failed'\n"
+        "        db.commit()\n"
+        "    primary = alias = db.get(AuditRow, 2)\n"
+        "    alias.note = 'recorded'\n"
+        "    db.commit()\n"
+        "    return primary\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert "t:same_branch_tbl" in by_id
+    assert "t:pg_branch_tbl" in by_id
+    assert "t:alt_branch_tbl" in by_id
+    assert "t:live_closure_tbl" in by_id
+    assert "t:branch_closure_tbl" in by_id
+    assert "t:chained_sql_tbl" in by_id
+    assert "t:unpacked_one_tbl" in by_id
+    assert "t:unpacked_two_tbl" in by_id
+    assert "t:stale_closure_tbl" not in by_id
 
-
-
+    manip = PythonFastApiAdapter().extract(tmp_path, "backend", truth)
+    write_targets = {e.target_id for e in manip.edges if e.kind == "writes_truth"}
+    assert "t:same_branch_tbl" in write_targets
+    assert "t:chained_sql_tbl" in write_targets
 
 
 

@@ -1483,7 +1483,7 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                         elif isinstance(elt, ast.Name) and elt.id in made and name != "delete":
                             for m in made[elt.id]:
                                 session_writes.append((m, expr.lineno))
-            elif name == "setattr" and isinstance(expr.func, ast.Name) and expr.args:
+            elif name in ("setattr", "delattr") and isinstance(expr.func, ast.Name) and expr.args:
                 first = expr.args[0]
                 if isinstance(first, ast.Name) and first.id in rows:
                     for m in rows[first.id]:
@@ -1493,6 +1493,11 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                 inspect_expr(arg_e, rows, made)
             for kw in expr.keywords:
                 inspect_expr(kw.value, rows, made)
+            return
+        if isinstance(expr, ast.NamedExpr):
+            inspect_expr(expr.value, rows, made)
+            if isinstance(expr.target, ast.Name):
+                bind_expr_to_name(expr.target.id, expr.value, rows, made, rows, made)
             return
         for ch in ast.iter_child_nodes(expr):
             if isinstance(ch, ast.expr):
@@ -1514,6 +1519,45 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
         rows.pop(var, None)
         made.pop(var, None)
 
+    def bind_expr_to_name(
+        var: str,
+        rhs: ast.AST | None,
+        rows: dict[str, set[str]],
+        made: dict[str, set[str]],
+        snap_rows: dict[str, set[str]],
+        snap_made: dict[str, set[str]],
+    ) -> None:
+        if isinstance(rhs, ast.Name) and (rhs.id in snap_rows or rhs.id in snap_made):
+            if rhs.id in snap_rows:
+                rows[var] = set(snap_rows[rhs.id])
+            else:
+                rows.pop(var, None)
+            if rhs.id in snap_made:
+                made[var] = set(snap_made[rhs.id])
+            else:
+                made.pop(var, None)
+            return
+        bind_var(var, rhs, rows, made)
+
+    def bind_target_tree(
+        tgt: ast.AST,
+        rhs: ast.AST | None,
+        rows: dict[str, set[str]],
+        made: dict[str, set[str]],
+        snap_rows: dict[str, set[str]],
+        snap_made: dict[str, set[str]],
+    ) -> None:
+        if isinstance(tgt, ast.Name):
+            bind_expr_to_name(tgt.id, rhs, rows, made, snap_rows, snap_made)
+        elif (
+            isinstance(tgt, (ast.Tuple, ast.List))
+            and isinstance(rhs, (ast.Tuple, ast.List))
+            and len(tgt.elts) == len(rhs.elts)
+            and not any(isinstance(e, ast.Starred) for e in tgt.elts)
+        ):
+            for te, re_ in zip(tgt.elts, rhs.elts, strict=False):
+                bind_target_tree(te, re_, rows, made, snap_rows, snap_made)
+
     def record_target_mutations(tgt: ast.AST, lineno: int, rows: dict[str, set[str]]) -> None:
         for t in ast.walk(tgt):
             if (
@@ -1526,11 +1570,53 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                     mutations.append((m, lineno))
 
     def walk_block(
-        stmts: list[ast.stmt], rows: dict[str, set[str]], made: dict[str, set[str]]
-    ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+        stmts: list[ast.stmt],
+        rows: dict[str, set[str]],
+        made: dict[str, set[str]],
+        exc_rows: dict[str, set[str]] | None = None,
+        exc_made: dict[str, set[str]] | None = None,
+        loop_breaks_r: list[dict[str, set[str]]] | None = None,
+        loop_breaks_m: list[dict[str, set[str]]] | None = None,
+        loop_continues_r: list[dict[str, set[str]]] | None = None,
+        loop_continues_m: list[dict[str, set[str]]] | None = None,
+    ) -> tuple[dict[str, set[str]], dict[str, set[str]], bool]:
+        def record_exc(r_cur: dict[str, set[str]], m_cur: dict[str, set[str]]) -> None:
+            if exc_rows is not None:
+                for k, vals in r_cur.items():
+                    if vals:
+                        exc_rows.setdefault(k, set()).update(vals)
+            if exc_made is not None:
+                for k, vals in m_cur.items():
+                    if vals:
+                        exc_made.setdefault(k, set()).update(vals)
+
+        record_exc(rows, made)
         for s in stmts:
             if id(s) in excluded:
                 continue
+            if isinstance(s, ast.Return):
+                inspect_expr(s.value, rows, made)
+                record_exc(rows, made)
+                return rows, made, False
+            if isinstance(s, ast.Raise):
+                inspect_expr(s.exc, rows, made)
+                inspect_expr(s.cause, rows, made)
+                record_exc(rows, made)
+                return rows, made, False
+            if isinstance(s, ast.Break):
+                record_exc(rows, made)
+                if loop_breaks_r is not None:
+                    loop_breaks_r.append({k: set(v) for k, v in rows.items()})
+                if loop_breaks_m is not None:
+                    loop_breaks_m.append({k: set(v) for k, v in made.items()})
+                return rows, made, False
+            if isinstance(s, ast.Continue):
+                record_exc(rows, made)
+                if loop_continues_r is not None:
+                    loop_continues_r.append({k: set(v) for k, v in rows.items()})
+                if loop_continues_m is not None:
+                    loop_continues_m.append({k: set(v) for k, v in made.items()})
+                return rows, made, False
             if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for dec in s.decorator_list:
                     inspect_expr(dec, rows, made)
@@ -1538,12 +1624,14 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                     inspect_expr(dflt, rows, made)
                 rows.pop(s.name, None)
                 made.pop(s.name, None)
+                record_exc(rows, made)
                 continue
             if isinstance(s, ast.ClassDef):
                 for dec in s.decorator_list:
                     inspect_expr(dec, rows, made)
                 rows.pop(s.name, None)
                 made.pop(s.name, None)
+                record_exc(rows, made)
                 continue
             if isinstance(s, (ast.Import, ast.ImportFrom)):
                 for alias in s.names:
@@ -1551,24 +1639,42 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                         bnm = (alias.asname or alias.name).split(".", 1)[0]
                         rows.pop(bnm, None)
                         made.pop(bnm, None)
+                record_exc(rows, made)
                 continue
-            if isinstance(s, ast.Assign):
+            if isinstance(s, ast.Delete):
+                for tgt in s.targets:
+                    if isinstance(tgt, ast.Name):
+                        rows.pop(tgt.id, None)
+                        made.pop(tgt.id, None)
+                    elif isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name) and tgt.value.id in rows:
+                        for m in rows[tgt.value.id]:
+                            mutations.append((m, s.lineno))
+                    else:
+                        inspect_expr(tgt, rows, made)
+            elif isinstance(s, ast.Assign):
                 inspect_expr(s.value, rows, made)
                 for tgt in s.targets:
                     record_target_mutations(tgt, s.lineno, rows)
-                if len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
-                    bind_var(s.targets[0].id, s.value, rows, made)
-                else:
-                    for tgt in s.targets:
-                        for sub in ast.walk(tgt):
-                            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
-                                rows.pop(sub.id, None)
-                                made.pop(sub.id, None)
+                snap_r = {k: set(v) for k, v in rows.items()}
+                snap_m = {k: set(v) for k, v in made.items()}
+                for tgt in s.targets:
+                    for sub in ast.walk(tgt):
+                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                            rows.pop(sub.id, None)
+                            made.pop(sub.id, None)
+                for tgt in s.targets:
+                    bind_target_tree(tgt, s.value, rows, made, snap_r, snap_m)
             elif isinstance(s, ast.AnnAssign):
                 inspect_expr(s.value, rows, made)
                 record_target_mutations(s.target, s.lineno, rows)
-                if isinstance(s.target, ast.Name) and s.value is not None:
-                    bind_var(s.target.id, s.value, rows, made)
+                if s.value is not None:
+                    snap_r = {k: set(v) for k, v in rows.items()}
+                    snap_m = {k: set(v) for k, v in made.items()}
+                    for sub in ast.walk(s.target):
+                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                            rows.pop(sub.id, None)
+                            made.pop(sub.id, None)
+                    bind_target_tree(s.target, s.value, rows, made, snap_r, snap_m)
             elif isinstance(s, ast.AugAssign):
                 inspect_expr(s.value, rows, made)
                 record_target_mutations(s.target, s.lineno, rows)
@@ -1584,63 +1690,234 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                     else:
                         r_loop_in.pop(s.target.id, None)
                         m_loop_in.pop(s.target.id, None)
-                r_body, m_body = walk_block(s.body, r_loop_in, m_loop_in)
-                r_else, m_else = walk_block(
-                    s.orelse,
-                    _merge_binding_maps(rows, r_body),
-                    _merge_binding_maps(made, m_body),
+                else:
+                    for sub in ast.walk(s.target):
+                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                            r_loop_in.pop(sub.id, None)
+                            m_loop_in.pop(sub.id, None)
+                f_breaks_r: list[dict[str, set[str]]] = []
+                f_breaks_m: list[dict[str, set[str]]] = []
+                f_conts_r: list[dict[str, set[str]]] = []
+                f_conts_m: list[dict[str, set[str]]] = []
+                r_body, m_body, f_body = walk_block(
+                    s.body, r_loop_in, m_loop_in, exc_rows, exc_made, f_breaks_r, f_breaks_m, f_conts_r, f_conts_m
                 )
-                rows = _merge_binding_maps(rows, r_body, r_else)
-                made = _merge_binding_maps(made, m_body, m_else)
+                iter_end_r = _merge_binding_maps(*(([r_body] if f_body else []) + f_conts_r))
+                iter_end_m = _merge_binding_maps(*(([m_body] if f_body else []) + f_conts_m))
+                r_else, m_else, f_else = walk_block(
+                    s.orelse,
+                    _merge_binding_maps(rows, iter_end_r),
+                    _merge_binding_maps(made, iter_end_m),
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
+                )
+                if not f_else and not f_breaks_r:
+                    return rows, made, False
+                rows = _merge_binding_maps(*(([rows, iter_end_r, r_else] if f_else else []) + f_breaks_r))
+                made = _merge_binding_maps(*(([made, iter_end_m, m_else] if f_else else []) + f_breaks_m))
             elif isinstance(s, ast.While):
                 inspect_expr(s.test, rows, made)
-                r_body, m_body = walk_block(
-                    s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
+                w_breaks_r: list[dict[str, set[str]]] = []
+                w_breaks_m: list[dict[str, set[str]]] = []
+                w_conts_r: list[dict[str, set[str]]] = []
+                w_conts_m: list[dict[str, set[str]]] = []
+                r_body, m_body, f_body = walk_block(
+                    s.body,
+                    {k: set(v) for k, v in rows.items()},
+                    {k: set(v) for k, v in made.items()},
+                    exc_rows,
+                    exc_made,
+                    w_breaks_r,
+                    w_breaks_m,
+                    w_conts_r,
+                    w_conts_m,
                 )
-                r_else, m_else = walk_block(
+                w_end_r = _merge_binding_maps(*(([r_body] if f_body else []) + w_conts_r))
+                w_end_m = _merge_binding_maps(*(([m_body] if f_body else []) + w_conts_m))
+                r_else, m_else, f_else = walk_block(
                     s.orelse,
-                    _merge_binding_maps(rows, r_body),
-                    _merge_binding_maps(made, m_body),
+                    _merge_binding_maps(rows, w_end_r),
+                    _merge_binding_maps(made, w_end_m),
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
                 )
-                rows = _merge_binding_maps(rows, r_body, r_else)
-                made = _merge_binding_maps(made, m_body, m_else)
+                if not f_else and not w_breaks_r:
+                    return rows, made, False
+                rows = _merge_binding_maps(*(([rows, w_end_r, r_else] if f_else else []) + w_breaks_r))
+                made = _merge_binding_maps(*(([made, w_end_m, m_else] if f_else else []) + w_breaks_m))
             elif isinstance(s, ast.If):
                 inspect_expr(s.test, rows, made)
-                r_body, m_body = walk_block(s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()})
-                r_else, m_else = walk_block(s.orelse, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()})
-                rows = _merge_binding_maps(r_body, r_else)
-                made = _merge_binding_maps(m_body, m_else)
+                r_body, m_body, f_body = walk_block(
+                    s.body,
+                    {k: set(v) for k, v in rows.items()},
+                    {k: set(v) for k, v in made.items()},
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
+                )
+                r_else, m_else, f_else = walk_block(
+                    s.orelse,
+                    {k: set(v) for k, v in rows.items()},
+                    {k: set(v) for k, v in made.items()},
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
+                )
+                if not f_body and not f_else:
+                    return rows, made, False
+                rows = _merge_binding_maps(*(([r_body] if f_body else []) + ([r_else] if f_else else [])))
+                made = _merge_binding_maps(*(([m_body] if f_body else []) + ([m_else] if f_else else [])))
             elif isinstance(s, (ast.With, ast.AsyncWith)):
                 for item in s.items:
                     inspect_expr(item.context_expr, rows, made)
-                    if isinstance(item.optional_vars, ast.Name):
-                        bind_var(item.optional_vars.id, item.context_expr, rows, made)
-                rows, made = walk_block(s.body, rows, made)
+                    if item.optional_vars is not None:
+                        snap_r = {k: set(v) for k, v in rows.items()}
+                        snap_m = {k: set(v) for k, v in made.items()}
+                        for sub in ast.walk(item.optional_vars):
+                            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                                rows.pop(sub.id, None)
+                                made.pop(sub.id, None)
+                        bind_target_tree(item.optional_vars, item.context_expr, rows, made, snap_r, snap_m)
+                rows, made, f_with = walk_block(
+                    s.body,
+                    rows,
+                    made,
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
+                )
+                if not f_with:
+                    return rows, made, False
             elif isinstance(s, (ast.Try, ast.TryStar)):
+                try_exc_r: dict[str, set[str]] = {}
+                try_exc_m: dict[str, set[str]] = {}
+                post_exc_r: dict[str, set[str]] = {}
+                post_exc_m: dict[str, set[str]] = {}
+                inner_breaks_r: list[dict[str, set[str]]] = []
+                inner_breaks_m: list[dict[str, set[str]]] = []
+                inner_conts_r: list[dict[str, set[str]]] = []
+                inner_conts_m: list[dict[str, set[str]]] = []
+                b_target_r = inner_breaks_r if s.finalbody else loop_breaks_r
+                b_target_m = inner_breaks_m if s.finalbody else loop_breaks_m
+                c_target_r = inner_conts_r if s.finalbody else loop_continues_r
+                c_target_m = inner_conts_m if s.finalbody else loop_continues_m
                 branches_r: list[dict[str, set[str]]] = []
                 branches_m: list[dict[str, set[str]]] = []
-                r_try, m_try = walk_block(
-                    s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
+                r_try, m_try, f_try = walk_block(
+                    s.body,
+                    {k: set(v) for k, v in rows.items()},
+                    {k: set(v) for k, v in made.items()},
+                    try_exc_r,
+                    try_exc_m,
+                    b_target_r,
+                    b_target_m,
+                    c_target_r,
+                    c_target_m,
                 )
-                rb, mb = walk_block(
-                    s.orelse, {k: set(v) for k, v in r_try.items()}, {k: set(v) for k, v in m_try.items()}
-                )
-                branches_r.append(rb)
-                branches_m.append(mb)
-                h_in_r = _merge_binding_maps(rows, r_try)
-                h_in_m = _merge_binding_maps(made, m_try)
+                if f_try:
+                    rb, mb, fb = walk_block(
+                        s.orelse,
+                        {k: set(v) for k, v in r_try.items()},
+                        {k: set(v) for k, v in m_try.items()},
+                        post_exc_r,
+                        post_exc_m,
+                        b_target_r,
+                        b_target_m,
+                        c_target_r,
+                        c_target_m,
+                    )
+                    if fb:
+                        branches_r.append(rb)
+                        branches_m.append(mb)
+                h_in_r = _merge_binding_maps(rows, r_try, try_exc_r)
+                h_in_m = _merge_binding_maps(made, m_try, try_exc_m)
                 for h in s.handlers:
+                    inspect_expr(h.type, h_in_r, h_in_m)
                     hr = {k: set(v) for k, v in h_in_r.items()}
                     hm = {k: set(v) for k, v in h_in_m.items()}
                     if h.name:
                         hr.pop(h.name, None)
                         hm.pop(h.name, None)
-                    rh, mh = walk_block(h.body, hr, hm)
-                    branches_r.append(rh)
-                    branches_m.append(mh)
-                rows = _merge_binding_maps(*branches_r)
-                made = _merge_binding_maps(*branches_m)
-                rows, made = walk_block(s.finalbody, rows, made)
+                    rh, mh, fh = walk_block(
+                        h.body, hr, hm, post_exc_r, post_exc_m, b_target_r, b_target_m, c_target_r, c_target_m
+                    )
+                    if fh:
+                        branches_r.append(rh)
+                        branches_m.append(mh)
+                has_bare = isinstance(s, ast.Try) and any(h.type is None for h in s.handlers)
+                uncaught_r = post_exc_r if has_bare else _merge_binding_maps(try_exc_r, post_exc_r)
+                uncaught_m = post_exc_m if has_bare else _merge_binding_maps(try_exc_m, post_exc_m)
+                record_exc(uncaught_r, uncaught_m)
+                if s.finalbody:
+                    fin_in_r = _merge_binding_maps(*branches_r, try_exc_r, post_exc_r, *inner_breaks_r, *inner_conts_r)
+                    fin_in_m = _merge_binding_maps(*branches_m, try_exc_m, post_exc_m, *inner_breaks_m, *inner_conts_m)
+                    _, _, fin_falls = walk_block(
+                        s.finalbody,
+                        fin_in_r,
+                        fin_in_m,
+                        exc_rows,
+                        exc_made,
+                        loop_breaks_r,
+                        loop_breaks_m,
+                        loop_continues_r,
+                        loop_continues_m,
+                    )
+                    if fin_falls and loop_breaks_r is not None and inner_breaks_r:
+                        sw_len, mut_len = len(session_writes), len(mutations)
+                        br_r, br_m, _ = walk_block(
+                            s.finalbody,
+                            _merge_binding_maps(*inner_breaks_r),
+                            _merge_binding_maps(*inner_breaks_m),
+                        )
+                        del session_writes[sw_len:]
+                        del mutations[mut_len:]
+                        loop_breaks_r.append(br_r)
+                        if loop_breaks_m is not None:
+                            loop_breaks_m.append(br_m)
+                    if fin_falls and loop_continues_r is not None and inner_conts_r:
+                        sw_len, mut_len = len(session_writes), len(mutations)
+                        ct_r, ct_m, _ = walk_block(
+                            s.finalbody,
+                            _merge_binding_maps(*inner_conts_r),
+                            _merge_binding_maps(*inner_conts_m),
+                        )
+                        del session_writes[sw_len:]
+                        del mutations[mut_len:]
+                        loop_continues_r.append(ct_r)
+                        if loop_continues_m is not None:
+                            loop_continues_m.append(ct_m)
+                    if not fin_falls or not branches_r:
+                        return rows, made, False
+                    sw_len, mut_len = len(session_writes), len(mutations)
+                    rows, made, _ = walk_block(
+                        s.finalbody,
+                        _merge_binding_maps(*branches_r),
+                        _merge_binding_maps(*branches_m),
+                    )
+                    del session_writes[sw_len:]
+                    del mutations[mut_len:]
+                else:
+                    if not branches_r:
+                        return rows, made, False
+                    rows = _merge_binding_maps(*branches_r)
+                    made = _merge_binding_maps(*branches_m)
             elif isinstance(s, ast.Match):
                 inspect_expr(s.subject, rows, made)
                 case_r: list[dict[str, set[str]]] = []
@@ -1663,12 +1940,25 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                     if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None:
                         has_wildcard = True
                     inspect_expr(case.guard, cr, cm)
-                    cr, cm = walk_block(case.body, cr, cm)
-                    case_r.append(cr)
-                    case_m.append(cm)
+                    cr, cm, fc = walk_block(
+                        case.body,
+                        cr,
+                        cm,
+                        exc_rows,
+                        exc_made,
+                        loop_breaks_r,
+                        loop_breaks_m,
+                        loop_continues_r,
+                        loop_continues_m,
+                    )
+                    if fc:
+                        case_r.append(cr)
+                        case_m.append(cm)
                 if not has_wildcard:
                     case_r.append(rows)
                     case_m.append(made)
+                if not case_r:
+                    return rows, made, False
                 rows = _merge_binding_maps(*case_r)
                 made = _merge_binding_maps(*case_m)
             else:
@@ -1676,8 +1966,21 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                     if isinstance(ch, ast.expr):
                         inspect_expr(ch, rows, made)
                     elif isinstance(ch, ast.stmt):
-                        rows, made = walk_block([ch], rows, made)
-        return rows, made
+                        rows, made, f_ch = walk_block(
+                            [ch],
+                            rows,
+                            made,
+                            exc_rows,
+                            exc_made,
+                            loop_breaks_r,
+                            loop_breaks_m,
+                            loop_continues_r,
+                            loop_continues_m,
+                        )
+                        if not f_ch:
+                            return rows, made, False
+            record_exc(rows, made)
+        return rows, made, True
 
     walk_block(tree.body, {}, {})
     for n in ast.walk(tree):
