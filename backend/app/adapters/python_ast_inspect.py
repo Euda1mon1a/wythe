@@ -2129,6 +2129,219 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
     return found
 
 
+def _collect_method_self_attrs(member: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    is_static = any(
+        (isinstance(d, ast.Name) and d.id == "staticmethod") or _dotted(d) == "staticmethod"
+        for d in member.decorator_list
+    )
+    recv_names: set[str] = {"self", "cls"}
+    if not is_static:
+        first_params = [*member.args.posonlyargs, *member.args.args]
+        if first_params:
+            recv_names.add(first_params[0].arg)
+    init_shadow = {
+        p.arg
+        for p in (
+            *member.args.posonlyargs,
+            *member.args.args,
+            *member.args.kwonlyargs,
+            member.args.vararg,
+            member.args.kwarg,
+        )
+        if p is not None and p.arg == "setattr"
+    }
+    found: set[str] = set()
+
+    def static_strs(expr: ast.AST, env: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str) and expr.value.isidentifier():
+            return (expr.value,)
+        if isinstance(expr, ast.Name) and expr.id in env:
+            return env[expr.id]
+        if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+            return tuple(dict.fromkeys(s for elt in expr.elts for s in static_strs(elt, env)))
+        if isinstance(expr, ast.Dict):
+            return tuple(dict.fromkeys(s for k in expr.keys if k is not None for s in static_strs(k, env)))
+        return ()
+
+    def merge_envs(envs: list[dict[str, tuple[str, ...]]]) -> dict[str, tuple[str, ...]]:
+        merged: dict[str, tuple[str, ...]] = {}
+        for k in {k for e in envs for k in e}:
+            vals = tuple(dict.fromkeys(s for e in envs for s in e.get(k, ())))
+            if vals:
+                merged[k] = vals
+        return merged
+
+    def walk_expr(node: ast.AST, env: dict[str, tuple[str, ...]], cur_recv: set[str], shadowed: set[str]) -> None:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in cur_recv
+        ):
+            found.add(node.attr)
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "__dict__"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in cur_recv
+        ):
+            found.update(static_strs(node.slice, env))
+        elif isinstance(node, ast.Call):
+            if (
+                (
+                    (isinstance(node.func, ast.Name) and node.func.id == "setattr" and "setattr" not in shadowed)
+                    or _dotted(node.func) in ("builtins.setattr", "object.__setattr__")
+                )
+                and len(node.args) == 3
+                and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in cur_recv
+            ):
+                found.update(static_strs(node.args[1], env))
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "__setattr__"
+                and len(node.args) == 2
+                and not node.keywords
+                and (
+                    (isinstance(node.func.value, ast.Name) and node.func.value.id in cur_recv)
+                    or (
+                        isinstance(node.func.value, ast.Call)
+                        and isinstance(node.func.value.func, ast.Name)
+                        and node.func.value.func.id == "super"
+                    )
+                )
+            ):
+                found.update(static_strs(node.args[0], env))
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "update"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "__dict__"
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id in cur_recv
+            ):
+                for arg in node.args[:1]:
+                    found.update(static_strs(arg, env))
+                for kw in node.keywords:
+                    if kw.arg and kw.arg.isidentifier():
+                        found.add(kw.arg)
+        for ch in ast.iter_child_nodes(node):
+            walk_expr(ch, env, cur_recv, shadowed)
+
+    def walk_stmts(
+        stmts: list[ast.stmt],
+        env: dict[str, tuple[str, ...]],
+        cur_recv: set[str],
+        shadowed: set[str],
+    ) -> tuple[dict[str, tuple[str, ...]], set[str]]:
+        cur_env = dict(env)
+        cur_sh = set(shadowed)
+        for st in stmts:
+            if isinstance(st, ast.ClassDef):
+                if st.name == "setattr":
+                    cur_sh.add("setattr")
+                cur_env.pop(st.name, None)
+                continue
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if st.name == "setattr":
+                    cur_sh.add("setattr")
+                cur_env.pop(st.name, None)
+                inner_params = _arg_names(st.args)
+                inner_recv = cur_recv - inner_params
+                if inner_recv:
+                    inner_env = {k: v for k, v in cur_env.items() if k not in inner_params}
+                    inner_sh = cur_sh | ({"setattr"} & inner_params)
+                    walk_stmts(st.body, inner_env, inner_recv, inner_sh)
+                continue
+            if isinstance(st, ast.Assign):
+                walk_expr(st.value, cur_env, cur_recv, cur_sh)
+                vals = static_strs(st.value, cur_env)
+                for t in st.targets:
+                    walk_expr(t, cur_env, cur_recv, cur_sh)
+                    if isinstance(t, ast.Name):
+                        if t.id == "setattr":
+                            cur_sh.add("setattr")
+                        if vals:
+                            cur_env[t.id] = vals
+                        else:
+                            cur_env.pop(t.id, None)
+            elif isinstance(st, ast.AnnAssign):
+                if st.value is not None:
+                    walk_expr(st.value, cur_env, cur_recv, cur_sh)
+                    vals = static_strs(st.value, cur_env)
+                    walk_expr(st.target, cur_env, cur_recv, cur_sh)
+                    if isinstance(st.target, ast.Name):
+                        if st.target.id == "setattr":
+                            cur_sh.add("setattr")
+                        if vals:
+                            cur_env[st.target.id] = vals
+                        else:
+                            cur_env.pop(st.target.id, None)
+                else:
+                    walk_expr(st.target, cur_env, cur_recv, cur_sh)
+            elif isinstance(st, (ast.For, ast.AsyncFor)):
+                walk_expr(st.iter, cur_env, cur_recv, cur_sh)
+                iter_vals = static_strs(st.iter, cur_env)
+                if (
+                    not iter_vals
+                    and isinstance(st.iter, ast.Call)
+                    and isinstance(st.iter.func, ast.Attribute)
+                    and st.iter.func.attr in ("items", "keys")
+                    and not st.iter.args
+                ):
+                    iter_vals = static_strs(st.iter.func.value, cur_env)
+                tname: str | None = None
+                if isinstance(st.target, ast.Name):
+                    tname = st.target.id
+                elif (
+                    isinstance(st.target, (ast.Tuple, ast.List))
+                    and st.target.elts
+                    and isinstance(st.target.elts[0], ast.Name)
+                ):
+                    tname = st.target.elts[0].id
+                walk_expr(st.target, cur_env, cur_recv, cur_sh)
+                body_env = {**cur_env, tname: iter_vals} if (tname and iter_vals) else dict(cur_env)
+                if tname and not iter_vals:
+                    body_env.pop(tname, None)
+                b_out, b_sh = walk_stmts(st.body, body_env, cur_recv, cur_sh | ({tname} & {"setattr"}))
+                e_out, e_sh = walk_stmts(st.orelse, merge_envs([cur_env, b_out]), cur_recv, cur_sh | b_sh)
+                cur_env, cur_sh = e_out, e_sh
+            elif isinstance(st, ast.If):
+                walk_expr(st.test, cur_env, cur_recv, cur_sh)
+                b_env, b_sh = walk_stmts(st.body, cur_env, cur_recv, cur_sh)
+                e_env, e_sh = walk_stmts(st.orelse, cur_env, cur_recv, cur_sh)
+                cur_env = merge_envs([b_env, e_env])
+                cur_sh = b_sh | e_sh
+            elif isinstance(st, (ast.With, ast.AsyncWith)):
+                for item in st.items:
+                    walk_expr(item.context_expr, cur_env, cur_recv, cur_sh)
+                    if item.optional_vars is not None:
+                        walk_expr(item.optional_vars, cur_env, cur_recv, cur_sh)
+                cur_env, cur_sh = walk_stmts(st.body, cur_env, cur_recv, cur_sh)
+            elif isinstance(st, (ast.Try, ast.TryStar)):
+                b_env, b_sh = walk_stmts(st.body, cur_env, cur_recv, cur_sh)
+                o_env, o_sh = walk_stmts(st.orelse, b_env, cur_recv, b_sh)
+                branches = [o_env]
+                all_sh = set(o_sh)
+                for h in st.handlers:
+                    h_env, h_sh = walk_stmts(h.body, merge_envs([cur_env, b_env]), cur_recv, cur_sh | b_sh)
+                    branches.append(h_env)
+                    all_sh |= h_sh
+                m_env = merge_envs(branches)
+                cur_env, cur_sh = walk_stmts(st.finalbody, m_env, cur_recv, all_sh)
+            else:
+                walk_expr(st, cur_env, cur_recv, cur_sh)
+        return cur_env, cur_sh
+
+    walk_stmts(member.body, {}, recv_names, init_shadow)
+    return found
+
+
 def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedPythonModule | None:
     try:
         tree = ast.parse(source)
@@ -2394,51 +2607,100 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                         else:
                             bases.append(resolve(head))
                     class_bases[stmt.name] = tuple(bases)
-                    for member in stmt.body:
-                        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                            cattrs.add(member.name)
-                            if not member.name.startswith("_"):
-                                defined.add(member.name)
-                                method_defs.add(member.name)
-                            for sub in ast.walk(member):
-                                if (
-                                    isinstance(sub, ast.Attribute)
-                                    and isinstance(sub.ctx, ast.Store)
-                                    and isinstance(sub.value, ast.Name)
-                                    and sub.value.id in ("self", "cls")
-                                ):
-                                    cattrs.add(sub.attr)
-                        elif isinstance(member, ast.Assign):
-                            for t in member.targets:
-                                if isinstance(t, ast.Name):
-                                    cattrs.add(t.id)
-                        elif isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
-                            cattrs.add(member.target.id)
+                    def _extract_slots(val: ast.AST | None) -> set[str]:
+                        if isinstance(val, ast.Constant) and isinstance(val.value, str) and val.value.isidentifier():
+                            return {val.value}
+                        if isinstance(val, (ast.Tuple, ast.List, ast.Set)):
+                            return {
+                                e.value
+                                for e in val.elts
+                                if isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value.isidentifier()
+                            }
+                        if isinstance(val, ast.Dict):
+                            return {
+                                k.value
+                                for k in val.keys
+                                if isinstance(k, ast.Constant) and isinstance(k.value, str) and k.value.isidentifier()
+                            }
+                        return set()
+
+                    def _scan_class_stmts(c_stmts: list[ast.stmt], out_attrs: set[str]) -> None:
+                        for member in c_stmts:
+                            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                out_attrs.add(member.name)
+                                if not member.name.startswith("_"):
+                                    defined.add(member.name)
+                                    method_defs.add(member.name)
+                                out_attrs.update(_collect_method_self_attrs(member))
+                            elif isinstance(member, ast.Assign):
+                                for t in member.targets:
+                                    if isinstance(t, ast.Name):
+                                        out_attrs.add(t.id)
+                                        if t.id == "__slots__":
+                                            out_attrs.update(_extract_slots(member.value))
+                            elif isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
+                                out_attrs.add(member.target.id)
+                                if member.target.id == "__slots__" and member.value is not None:
+                                    out_attrs.update(_extract_slots(member.value))
+                            elif isinstance(member, ast.If):
+                                _scan_class_stmts(member.body, out_attrs)
+                                _scan_class_stmts(member.orelse, out_attrs)
+                            elif isinstance(member, (ast.Try, ast.TryStar)):
+                                _scan_class_stmts(member.body, out_attrs)
+                                for h in member.handlers:
+                                    _scan_class_stmts(h.body, out_attrs)
+                                _scan_class_stmts(member.orelse, out_attrs)
+                                _scan_class_stmts(member.finalbody, out_attrs)
+
+                    _scan_class_stmts(stmt.body, cattrs)
                     class_attrs[stmt.name] = frozenset(cattrs)
                     scope_base_targets[stmt.name] = f"{module_name}.{stmt.name}"
                     import_targets.pop(stmt.name, None)
                 else:
                     scope_base_targets.setdefault(stmt.name, f"{module_name}.{stmt.name}")
-            elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
-                tname = stmt.targets[0].id
-                rhs_d = _dotted(stmt.value)
-                qual_rhs: str | None = None
-                if rhs_d:
-                    rh, _, rt = rhs_d.partition(".")
-                    if rt and rh in scope_base_targets:
-                        qual_rhs = f"{scope_base_targets[rh]}.{rt}"
-                    elif not rt and rh in scope_base_targets:
-                        qual_rhs = scope_base_targets[rh]
-                if qual_rhs:
-                    if top_level:
-                        scope_base_targets[tname] = qual_rhs
-                        import_targets[tname] = qual_rhs
-                    else:
-                        scope_base_targets.setdefault(tname, qual_rhs)
-                        import_targets.setdefault(tname, qual_rhs)
-                elif top_level:
-                    scope_base_targets.pop(tname, None)
-                    import_targets.pop(tname, None)
+            elif (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id == "setattr"
+                and len(stmt.value.args) == 3
+                and not stmt.value.keywords
+                and isinstance(stmt.value.args[0], ast.Name)
+                and stmt.value.args[0].id in class_attrs
+                and isinstance(stmt.value.args[1], ast.Constant)
+                and isinstance(stmt.value.args[1].value, str)
+                and stmt.value.args[1].value.isidentifier()
+            ):
+                cname = stmt.value.args[0].id
+                class_attrs[cname] = class_attrs[cname] | {stmt.value.args[1].value}
+            elif isinstance(stmt, ast.Assign):
+                for t in stmt.targets:
+                    if (
+                        isinstance(t, ast.Attribute)
+                        and isinstance(t.value, ast.Name)
+                        and t.value.id in class_attrs
+                    ):
+                        class_attrs[t.value.id] = class_attrs[t.value.id] | {t.attr}
+                if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                    tname = stmt.targets[0].id
+                    rhs_d = _dotted(stmt.value)
+                    qual_rhs: str | None = None
+                    if rhs_d:
+                        rh, _, rt = rhs_d.partition(".")
+                        if rt and rh in scope_base_targets:
+                            qual_rhs = f"{scope_base_targets[rh]}.{rt}"
+                        elif not rt and rh in scope_base_targets:
+                            qual_rhs = scope_base_targets[rh]
+                    if qual_rhs:
+                        if top_level:
+                            scope_base_targets[tname] = qual_rhs
+                            import_targets[tname] = qual_rhs
+                        else:
+                            scope_base_targets.setdefault(tname, qual_rhs)
+                            import_targets.setdefault(tname, qual_rhs)
+                    elif top_level:
+                        scope_base_targets.pop(tname, None)
+                        import_targets.pop(tname, None)
             elif isinstance(stmt, ast.If):
                 walk_module_scope(stmt.body, top_level=False)
                 walk_module_scope(stmt.orelse, top_level=False)

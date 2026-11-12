@@ -1237,5 +1237,102 @@ def test_subscript_migration_sql_imported_base_disambiguation_and_ts_shadow_and_
     assert len([f for f in fb_disp.findings if f.rule_code == "DISP-005"]) == 1
 
 
+def test_shared_migration_collection_mutations_and_setattr_class_profiles(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "backend/alembic/versions/012_shared_collections.py",
+        "from alembic import op\n\n"
+        "def push_sql(out):\n"
+        "    out.append('CREATE TABLE helper_append_tbl (id INT);')\n"
+        "    out = []\n"
+        "    out.append('CREATE TABLE local_rebound_tbl (id INT);')\n\n"
+        "def put_sql(mapping):\n"
+        "    mapping['b'] = 'CREATE TABLE dict_helper_tbl (id INT);'\n\n"
+        "def upgrade():\n"
+        "    statements = []\n"
+        "    alias = statements\n"
+        "    alias.append('CREATE TABLE alias_append_tbl (id INT);')\n"
+        "    push_sql(statements)\n"
+        "    def add_closure():\n"
+        "        statements.append('CREATE TABLE closure_append_tbl (id INT);')\n"
+        "    add_closure()\n"
+        "    cloned = list(statements)\n"
+        "    cloned.append('CREATE TABLE cloned_only_tbl (id INT);')\n"
+        "    for sql in statements:\n"
+        "        op.execute(sql)\n"
+        "    d = {}\n"
+        "    d_alias = d\n"
+        "    d_alias['a'] = 'CREATE TABLE dict_alias_tbl (id INT);'\n"
+        "    put_sql(d)\n"
+        "    op.execute(d['a'])\n"
+        "    op.execute(d.get('b'))\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert "t:alias_append_tbl" in by_id
+    assert "t:helper_append_tbl" in by_id
+    assert "t:closure_append_tbl" in by_id
+    assert "t:dict_alias_tbl" in by_id
+    assert "t:dict_helper_tbl" in by_id
+    assert "t:local_rebound_tbl" not in by_id
+    assert "t:cloned_only_tbl" not in by_id
+
+    _write(
+        tmp_path,
+        "backend/app/services/setattr_worker.py",
+        "class SetattrWorker:\n"
+        "    def __init__(self):\n"
+        "        setattr(self, 'config', {})\n"
+        "        attr_key = 'endpoint'\n"
+        "        setattr(self, attr_key, '/v1')\n"
+        "        object.__setattr__(self, 'frozen_token', 'ok')\n"
+        "        for k in ('timeout', 'retries'):\n"
+        "            setattr(self, k, 1)\n"
+        "        def _inner(self):\n"
+        "            self.decoy_only = 1\n"
+        "    def execute_jobs(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/services/slotted_worker.py",
+        "class SlottedWorker:\n"
+        "    __slots__ = ('queue_name',)\n"
+        "    def drain_queue(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/jobs_setattr.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/jobs-setattr')\n"
+        "def run_jobs(worker, slotted, other):\n"
+        "    _ = (worker.config, worker.endpoint, worker.frozen_token, worker.timeout)\n"
+        "    _ = slotted.queue_name\n"
+        "    _ = other.decoy_only\n"
+        "    return worker.execute_jobs(), slotted.drain_queue(), other.execute_jobs()\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.jobs_setattr", "m:service:services.setattr_worker") in pairs
+    assert ("m:route:api.routes.jobs_setattr", "m:service:services.slotted_worker") in pairs
+
+    _write(
+        tmp_path,
+        "backend/app/api/routes/decoy_only.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/decoy-only')\n"
+        "def run_decoy(other):\n"
+        "    _ = other.decoy_only\n"
+        "    return other.execute_jobs()\n",
+    )
+    manip2 = _extract_manip(tmp_path)
+    pairs2 = {(e.source_id, e.target_id) for e in manip2.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.decoy_only", "m:service:services.setattr_worker") not in pairs2
+
+
+
 
 

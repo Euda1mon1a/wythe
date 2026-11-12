@@ -523,7 +523,23 @@ def _eval_str(
                 items = [_eval_str(e, consts, seqs, dicts) for e in arg0.elts]
                 return node.func.value.value.join(i for i in items if i is not None)
             if seqs and isinstance(arg0, ast.Name) and arg0.id in seqs:
-                return node.func.value.value.join(s for s, _ in seqs[arg0.id])
+                return node.func.value.value.join(s for s, _ in seqs[arg0.id] if _UNRESOLVED not in s)
+        if (
+            fname == "get"
+            and dicts
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in dicts
+            and 1 <= len(node.args) <= 2
+            and not node.keywords
+        ):
+            k_str = _eval_str(node.args[0], consts, seqs, dicts)
+            if k_str is not None and _UNRESOLVED not in k_str:
+                hit = dicts[node.func.value.id].get(k_str)
+                if hit is not None:
+                    return hit[0]
+                if len(node.args) == 2:
+                    return _eval_str(node.args[1], consts, seqs, dicts)
         if fname in ("text", "dedent", "strip") and node.args:
             return _eval_str(node.args[0], consts, seqs, dicts)
     return None
@@ -585,16 +601,93 @@ class _MigrationEnv:
     alts: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     seqs: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     dicts: dict[str, dict[str, tuple[str, int]]] = field(default_factory=dict)
+    seq_ids: dict[str, int] = field(default_factory=dict)
+    seq_heap: dict[int, list[tuple[str, int]]] = field(default_factory=dict)
+    dict_ids: dict[str, int] = field(default_factory=dict)
+    dict_heap: dict[int, dict[str, tuple[str, int]]] = field(default_factory=dict)
+    _next_cid: list[int] = field(default_factory=lambda: [1])
+    mutable_seq_cids: set[int] = field(default_factory=set)
+
+    def alloc_cid(self) -> int:
+        cid = self._next_cid[0]
+        self._next_cid[0] += 1
+        return cid
+
+    def bind_seq(
+        self,
+        name: str,
+        items: list[tuple[str, int]],
+        cid: int | None = None,
+        *,
+        mutable: bool = True,
+    ) -> int:
+        if cid is None:
+            cid = self.alloc_cid()
+            self.seq_heap[cid] = list(items)
+            if mutable:
+                self.mutable_seq_cids.add(cid)
+        elif cid not in self.seq_heap:
+            self.seq_heap[cid] = list(items)
+            if mutable:
+                self.mutable_seq_cids.add(cid)
+        self.seq_ids[name] = cid
+        self.seqs[name] = self.seq_heap[cid]
+        return cid
+
+    def bind_dict(self, name: str, dmap: dict[str, tuple[str, int]], cid: int | None = None) -> int:
+        if cid is None:
+            cid = self.alloc_cid()
+            self.dict_heap[cid] = dict(dmap)
+        elif cid not in self.dict_heap:
+            self.dict_heap[cid] = dict(dmap)
+        self.dict_ids[name] = cid
+        self.dicts[name] = self.dict_heap[cid]
+        return cid
+
+    def sync_seq_cid(self, cid: int) -> None:
+        buf = self.seq_heap.get(cid)
+        if buf is None:
+            return
+        known = [(s, ln) for s, ln in buf if s and _UNRESOLVED not in s]
+        for k, k_cid in list(self.seq_ids.items()):
+            if k_cid != cid:
+                continue
+            self.seqs[k] = buf
+            self.alts.pop(k, None)
+            if known:
+                self.consts[k] = "\n".join(s for s, _ in known)
+                self.lines[k] = known[0][1]
+            else:
+                self.consts.pop(k, None)
+                self.lines.pop(k, None)
+
+    def sync_dict_cid(self, cid: int) -> None:
+        buf = self.dict_heap.get(cid)
+        if buf is None:
+            return
+        for k, k_cid in list(self.dict_ids.items()):
+            if k_cid == cid:
+                self.dicts[k] = buf
 
     def clone(self, scope_id: int | None = None) -> _MigrationEnv:
+        new_seq_heap = {cid: list(v) for cid, v in self.seq_heap.items()}
+        new_dict_heap = {cid: dict(v) for cid, v in self.dict_heap.items()}
+        new_seq_ids = dict(self.seq_ids)
+        new_dict_ids = dict(self.dict_ids)
         return _MigrationEnv(
             scope_id=self.scope_id if scope_id is None else scope_id,
             fns={k: list(v) for k, v in self.fns.items() if v},
             consts=dict(self.consts),
             lines=dict(self.lines),
             alts={k: list(v) for k, v in self.alts.items() if v},
-            seqs={k: list(v) for k, v in self.seqs.items()},
-            dicts={k: dict(v) for k, v in self.dicts.items()},
+            seqs={k: new_seq_heap[cid] for k, cid in new_seq_ids.items() if cid in new_seq_heap},
+            dicts={k: new_dict_heap[cid] for k, cid in new_dict_ids.items() if cid in new_dict_heap},
+            seq_ids=new_seq_ids,
+            seq_heap=new_seq_heap,
+            dict_ids=new_dict_ids,
+            dict_heap=new_dict_heap,
+            _next_cid=self._next_cid,
+            mutable_seq_cids=self.mutable_seq_cids,
         )
 
     def pop_name(self, name: str) -> None:
@@ -604,6 +697,8 @@ class _MigrationEnv:
         self.alts.pop(name, None)
         self.seqs.pop(name, None)
         self.dicts.pop(name, None)
+        self.seq_ids.pop(name, None)
+        self.dict_ids.pop(name, None)
 
 
 @dataclass
@@ -615,6 +710,9 @@ class _MigrationHelper:
     default_lines: dict[str, int]
     default_alts: dict[str, list[tuple[str, int]]]
     default_seqs: dict[str, list[tuple[str, int]]]
+    default_dicts: dict[str, dict[str, tuple[str, int]]] = field(default_factory=dict)
+    default_seq_ids: dict[str, int] = field(default_factory=dict)
+    default_dict_ids: dict[str, int] = field(default_factory=dict)
 
 
 def _stmts_always_exit(stmts: list[ast.stmt]) -> bool:
@@ -643,10 +741,22 @@ def _merge_migration_envs(target: _MigrationEnv, branches: list[_MigrationEnv]) 
         target.lines.update(only.lines)
         target.alts.clear()
         target.alts.update({k: list(v) for k, v in only.alts.items() if v})
+        target.seq_heap.clear()
+        target.seq_heap.update({cid: list(v) for cid, v in only.seq_heap.items()})
+        target.dict_heap.clear()
+        target.dict_heap.update({cid: dict(v) for cid, v in only.dict_heap.items()})
+        target.seq_ids.clear()
+        target.seq_ids.update(only.seq_ids)
+        target.dict_ids.clear()
+        target.dict_ids.update(only.dict_ids)
         target.seqs.clear()
-        target.seqs.update({k: list(v) for k, v in only.seqs.items()})
+        target.seqs.update(
+            {k: target.seq_heap[cid] for k, cid in target.seq_ids.items() if cid in target.seq_heap}
+        )
         target.dicts.clear()
-        target.dicts.update({k: dict(v) for k, v in only.dicts.items()})
+        target.dicts.update(
+            {k: target.dict_heap[cid] for k, cid in target.dict_ids.items() if cid in target.dict_heap}
+        )
         return
 
     branch_set = tuple(branches)
@@ -691,36 +801,76 @@ def _merge_migration_envs(target: _MigrationEnv, branches: list[_MigrationEnv]) 
         elif cands:
             merged_alts[k] = cands
 
-    all_seq_keys = {k for br in branches for k in br.seqs}
-    merged_seqs: dict[str, list[tuple[str, int]]] = {}
-    for k in all_seq_keys:
-        if all(k in br.seqs for br in branches):
-            first_seq = branches[0].seqs[k]
-            if all(br.seqs[k] == first_seq for br in branches[1:]):
-                merged_seqs[k] = list(first_seq)
-                continue
+    merged_seq_heap: dict[int, list[tuple[str, int]]] = {}
+    for cid in {c for br in branches for c in br.seq_heap}:
+        holders = [br.seq_heap[cid] for br in branches if cid in br.seq_heap]
+        if all(h == holders[0] for h in holders[1:]):
+            merged_seq_heap[cid] = list(holders[0])
+            continue
         combined_seq: list[tuple[str, int]] = []
         seen_seq: set[tuple[str, int]] = set()
-        for br in branches:
-            for item in br.seqs.get(k, ()):
+        for h in holders:
+            for item in h:
                 if item not in seen_seq:
                     seen_seq.add(item)
                     combined_seq.append(item)
-        merged_seqs[k] = combined_seq
+        merged_seq_heap[cid] = combined_seq
 
-    all_dict_keys = {k for br in branches for k in br.dicts}
-    merged_dicts: dict[str, dict[str, tuple[str, int]]] = {}
-    for k in all_dict_keys:
+    merged_dict_heap: dict[int, dict[str, tuple[str, int]]] = {}
+    for cid in {c for br in branches for c in br.dict_heap}:
         combined_d: dict[str, tuple[str, int]] = {}
         for br in branches:
-            for dk, dval in br.dicts.get(k, {}).items():
+            if cid not in br.dict_heap:
+                continue
+            for dk, dval in br.dict_heap[cid].items():
                 if dk not in combined_d:
                     combined_d[dk] = dval
                 elif combined_d[dk][0] != dval[0]:
                     existing_parts = combined_d[dk][0].split("\n")
                     if dval[0] not in existing_parts:
                         combined_d[dk] = (f"{combined_d[dk][0]}\n{dval[0]}", combined_d[dk][1])
-        merged_dicts[k] = combined_d
+        merged_dict_heap[cid] = combined_d
+
+    merged_seq_ids: dict[str, int] = {}
+    for k in {k for br in branches for k in br.seq_ids}:
+        cids = {br.seq_ids[k] for br in branches if k in br.seq_ids}
+        if len(cids) == 1 and all(k in br.seq_ids for br in branches):
+            merged_seq_ids[k] = next(iter(cids))
+        else:
+            mcid = target.alloc_cid()
+            comb_k: list[tuple[str, int]] = []
+            seen_k: set[tuple[str, int]] = set()
+            for br in branches:
+                if k in br.seq_ids:
+                    for item in merged_seq_heap.get(br.seq_ids[k], ()):
+                        if item not in seen_k:
+                            seen_k.add(item)
+                            comb_k.append(item)
+            merged_seq_heap[mcid] = comb_k
+            if any(br.seq_ids.get(k) in target.mutable_seq_cids for br in branches):
+                target.mutable_seq_cids.add(mcid)
+            merged_seq_ids[k] = mcid
+
+    merged_dict_ids: dict[str, int] = {}
+    for k in {k for br in branches for k in br.dict_ids}:
+        cids = {br.dict_ids[k] for br in branches if k in br.dict_ids}
+        if len(cids) == 1 and all(k in br.dict_ids for br in branches):
+            merged_dict_ids[k] = next(iter(cids))
+        else:
+            mcid = target.alloc_cid()
+            comb_d: dict[str, tuple[str, int]] = {}
+            for br in branches:
+                if k not in br.dict_ids:
+                    continue
+                for dk, dval in merged_dict_heap.get(br.dict_ids[k], {}).items():
+                    if dk not in comb_d:
+                        comb_d[dk] = dval
+                    elif comb_d[dk][0] != dval[0]:
+                        existing_parts = comb_d[dk][0].split("\n")
+                        if dval[0] not in existing_parts:
+                            comb_d[dk] = (f"{comb_d[dk][0]}\n{dval[0]}", comb_d[dk][1])
+            merged_dict_heap[mcid] = comb_d
+            merged_dict_ids[k] = mcid
 
     target.fns.clear()
     target.fns.update(merged_fns)
@@ -730,10 +880,22 @@ def _merge_migration_envs(target: _MigrationEnv, branches: list[_MigrationEnv]) 
     target.lines.update(merged_lines)
     target.alts.clear()
     target.alts.update(merged_alts)
+    target.seq_heap.clear()
+    target.seq_heap.update(merged_seq_heap)
+    target.dict_heap.clear()
+    target.dict_heap.update(merged_dict_heap)
+    target.seq_ids.clear()
+    target.seq_ids.update(merged_seq_ids)
+    target.dict_ids.clear()
+    target.dict_ids.update(merged_dict_ids)
     target.seqs.clear()
-    target.seqs.update(merged_seqs)
+    target.seqs.update(
+        {k: target.seq_heap[cid] for k, cid in target.seq_ids.items() if cid in target.seq_heap}
+    )
     target.dicts.clear()
-    target.dicts.update(merged_dicts)
+    target.dicts.update(
+        {k: target.dict_heap[cid] for k, cid in target.dict_ids.items() if cid in target.dict_heap}
+    )
 
 
 def _eval_str_variants(node: ast.AST | None, env: _MigrationEnv) -> list[tuple[str, int]]:
@@ -782,7 +944,24 @@ def _eval_int_index(node: ast.AST | None) -> int | None:
     return None
 
 
+def _is_mutable_seq_expr(node: ast.AST | None, env: _MigrationEnv) -> bool:
+    if isinstance(node, ast.List):
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        if node.func.id == "list":
+            return True
+        if node.func.id == "tuple":
+            return False
+    if isinstance(node, ast.Name) and node.id in env.seq_ids:
+        return env.seq_ids[node.id] in env.mutable_seq_cids
+    return False
+
+
 def _sync_seq_const(cur_env: _MigrationEnv, vname: str) -> None:
+    cid = cur_env.seq_ids.get(vname)
+    if cid is not None:
+        cur_env.sync_seq_cid(cid)
+        return
     seq_list = cur_env.seqs.get(vname)
     if seq_list is None:
         return
@@ -811,22 +990,19 @@ def _bind_subscript(tgt: ast.Subscript, variants: list[tuple[str, int]], cur_env
         key_variants = _eval_str_variants(tgt.slice, cur_env)
         if not key_variants:
             return False
-        d_copy = dict(cur_env.dicts[vname])
+        d_ref = cur_env.dicts[vname]
         for k_str, _ in key_variants:
             if combined is not None:
-                d_copy[k_str] = combined
+                d_ref[k_str] = combined
             else:
-                d_copy.pop(k_str, None)
-        cur_env.dicts[vname] = d_copy
+                d_ref.pop(k_str, None)
         return True
     if vname in cur_env.seqs:
         idx = _eval_int_index(tgt.slice)
-        seq_cur = cur_env.seqs[vname]
-        if idx is None or not (-len(seq_cur) <= idx < len(seq_cur)):
+        seq_ref = cur_env.seqs[vname]
+        if idx is None or not (-len(seq_ref) <= idx < len(seq_ref)):
             return False
-        seq_copy = list(seq_cur)
-        seq_copy[idx] = combined if combined is not None else (_UNRESOLVED, 0)
-        cur_env.seqs[vname] = seq_copy
+        seq_ref[idx] = combined if combined is not None else (_UNRESOLVED, 0)
         _sync_seq_const(cur_env, vname)
         return True
     return False
@@ -902,11 +1078,22 @@ def _eval_dict_items(node: ast.AST | None, env: _MigrationEnv) -> dict[str, tupl
 def _extract_fn_defaults(
     fn: ast.FunctionDef | ast.AsyncFunctionDef,
     def_env: _MigrationEnv,
-) -> tuple[dict[str, str], dict[str, int], dict[str, list[tuple[str, int]]], dict[str, list[tuple[str, int]]]]:
+) -> tuple[
+    dict[str, str],
+    dict[str, int],
+    dict[str, list[tuple[str, int]]],
+    dict[str, list[tuple[str, int]]],
+    dict[str, dict[str, tuple[str, int]]],
+    dict[str, int],
+    dict[str, int],
+]:
     d_consts: dict[str, str] = {}
     d_lines: dict[str, int] = {}
     d_alts: dict[str, list[tuple[str, int]]] = {}
     d_seqs: dict[str, list[tuple[str, int]]] = {}
+    d_dicts: dict[str, dict[str, tuple[str, int]]] = {}
+    d_seq_ids: dict[str, int] = {}
+    d_dict_ids: dict[str, int] = {}
     pos_params = [*fn.args.posonlyargs, *fn.args.args]
     pairs: list[tuple[ast.arg, ast.expr]] = []
     if fn.args.defaults:
@@ -918,12 +1105,29 @@ def _extract_fn_defaults(
         seq = _eval_seq_items(dflt, def_env)
         if seq is not None:
             d_seqs[param.arg] = seq
+            if isinstance(dflt, ast.Name) and dflt.id in def_env.seq_ids:
+                d_seq_ids[param.arg] = def_env.seq_ids[dflt.id]
+            else:
+                d_seq_ids[param.arg] = def_env.bind_seq(
+                    f"__default_seq_{id(fn)}_{param.arg}",
+                    seq,
+                    mutable=_is_mutable_seq_expr(dflt, def_env),
+                )
+                def_env.pop_name(f"__default_seq_{id(fn)}_{param.arg}")
+        dmap = _eval_dict_items(dflt, def_env)
+        if dmap is not None:
+            d_dicts[param.arg] = dmap
+            if isinstance(dflt, ast.Name) and dflt.id in def_env.dict_ids:
+                d_dict_ids[param.arg] = def_env.dict_ids[dflt.id]
+            else:
+                d_dict_ids[param.arg] = def_env.bind_dict(f"__default_dict_{id(fn)}_{param.arg}", dmap)
+                def_env.pop_name(f"__default_dict_{id(fn)}_{param.arg}")
         variants = [] if isinstance(dflt, ast.Dict) else _eval_str_variants(dflt, def_env)
         if len(variants) == 1:
             d_consts[param.arg], d_lines[param.arg] = variants[0]
         elif len(variants) > 1:
             d_alts[param.arg] = variants
-    return d_consts, d_lines, d_alts, d_seqs
+    return d_consts, d_lines, d_alts, d_seqs, d_dicts, d_seq_ids, d_dict_ids
 
 
 def _shallow_scope_decls(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[set[str], set[str]]:
@@ -954,9 +1158,21 @@ def _copy_env_binding(dst: _MigrationEnv, src: _MigrationEnv, name: str) -> None
     if name in src.alts:
         dst.alts[name] = list(src.alts[name])
     if name in src.seqs:
-        dst.seqs[name] = list(src.seqs[name])
+        scid = src.seq_ids.get(name)
+        if scid is not None:
+            dst.seq_heap[scid] = list(src.seqs[name])
+            dst.bind_seq(name, dst.seq_heap[scid], cid=scid, mutable=scid in src.mutable_seq_cids)
+            dst.sync_seq_cid(scid)
+        else:
+            dst.bind_seq(name, src.seqs[name])
     if name in src.dicts:
-        dst.dicts[name] = dict(src.dicts[name])
+        dcid = src.dict_ids.get(name)
+        if dcid is not None:
+            dst.dict_heap[dcid] = dict(src.dicts[name])
+            dst.bind_dict(name, dst.dict_heap[dcid], cid=dcid)
+            dst.sync_dict_cid(dcid)
+        else:
+            dst.bind_dict(name, src.dicts[name])
 
 
 def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
@@ -981,6 +1197,81 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             elif isinstance(stmt.target, ast.Subscript):
                 sub_targets = [stmt.target]
             value = stmt.value
+        elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.op, ast.Add):
+            if isinstance(stmt.target, ast.Name):
+                mt_name = stmt.target.id
+                if mt_name in module_env.seqs:
+                    m_rhs = _eval_seq_items(stmt.value, module_env)
+                    if m_rhs is not None:
+                        if module_env.seq_ids.get(mt_name) in module_env.mutable_seq_cids:
+                            module_env.seqs[mt_name].extend(m_rhs)
+                        else:
+                            module_env.bind_seq(mt_name, [*module_env.seqs[mt_name], *m_rhs], mutable=False)
+                        _sync_seq_const(module_env, mt_name)
+                else:
+                    m_aug = _eval_str_variants(
+                        ast.BinOp(left=ast.Name(id=mt_name, ctx=ast.Load()), op=ast.Add(), right=stmt.value),
+                        module_env,
+                    )
+                    module_env.pop_name(mt_name)
+                    if len(m_aug) == 1:
+                        module_env.consts[mt_name], module_env.lines[mt_name] = m_aug[0]
+                    elif len(m_aug) > 1:
+                        module_env.alts[mt_name] = list(m_aug)
+            elif isinstance(stmt.target, ast.Subscript):
+                m_aug = _eval_str_variants(
+                    ast.BinOp(
+                        left=ast.Subscript(value=stmt.target.value, slice=stmt.target.slice, ctx=ast.Load()),
+                        op=ast.Add(),
+                        right=stmt.value,
+                    ),
+                    module_env,
+                )
+                _bind_subscript(stmt.target, m_aug, module_env)
+            continue
+        elif (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and isinstance(stmt.value.func.value, ast.Name)
+        ):
+            m_call = stmt.value
+            m_recv = stmt.value.func.value.id
+            m_attr = stmt.value.func.attr
+            if m_attr == "append" and m_recv in module_env.seqs and len(m_call.args) == 1 and not m_call.keywords:
+                m_vars = _eval_str_variants(m_call.args[0], module_env)
+                module_env.seqs[m_recv].append(
+                    (
+                        m_vars[0]
+                        if len(m_vars) == 1
+                        else ("\n".join(dict.fromkeys(v for v, _ in m_vars)), m_vars[0][1])
+                    )
+                    if m_vars
+                    else (_UNRESOLVED, 0)
+                )
+                _sync_seq_const(module_env, m_recv)
+            elif m_attr == "extend" and m_recv in module_env.seqs and len(m_call.args) == 1 and not m_call.keywords:
+                m_ext = _eval_seq_items(m_call.args[0], module_env)
+                if m_ext is not None:
+                    module_env.seqs[m_recv].extend(m_ext)
+                    _sync_seq_const(module_env, m_recv)
+            elif m_attr == "update" and m_recv in module_env.dicts and len(m_call.args) <= 1:
+                if m_call.args:
+                    m_d = _eval_dict_items(m_call.args[0], module_env)
+                    if m_d is not None:
+                        module_env.dicts[m_recv].update(m_d)
+                for kw in m_call.keywords:
+                    if kw.arg is not None:
+                        kv = _eval_str_variants(kw.value, module_env)
+                        if kv:
+                            module_env.dicts[m_recv][kw.arg] = (
+                                kv[0] if len(kv) == 1 else ("\n".join(dict.fromkeys(v for v, _ in kv)), kv[0][1])
+                            )
+                        else:
+                            module_env.dicts[m_recv].pop(kw.arg, None)
+                    elif isinstance(kw.value, ast.Name) and kw.value.id in module_env.dicts:
+                        module_env.dicts[m_recv].update(module_env.dicts[kw.value.id])
+            continue
         if (not targets and not sub_targets) or value is None:
             continue
         if "revision" in targets and isinstance(value, ast.Constant) and isinstance(value.value, str):
@@ -995,12 +1286,15 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         seq_val = _eval_seq_items(value, module_env)
         dmap_val = _eval_dict_items(value, module_env)
         variants = [] if isinstance(value, ast.Dict) else _eval_str_variants(value, module_env)
+        shared_scid = module_env.seq_ids.get(value.id) if isinstance(value, ast.Name) else None
+        shared_dcid = module_env.dict_ids.get(value.id) if isinstance(value, ast.Name) else None
+        is_mut_seq = _is_mutable_seq_expr(value, module_env)
         for name in targets:
             module_env.pop_name(name)
             if seq_val is not None:
-                module_env.seqs[name] = list(seq_val)
+                shared_scid = module_env.bind_seq(name, seq_val, cid=shared_scid, mutable=is_mut_seq)
             if dmap_val is not None:
-                module_env.dicts[name] = dict(dmap_val)
+                shared_dcid = module_env.bind_dict(name, dmap_val, cid=shared_dcid)
             if len(variants) == 1:
                 module_env.consts[name], module_env.lines[name] = variants[0]
             elif len(variants) > 1:
@@ -1009,7 +1303,11 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             _bind_subscript(stgt, variants, module_env)
 
     for fnode, def_snap in raw_module_fns:
-        d_consts, d_lines, d_alts, d_seqs = _extract_fn_defaults(fnode, def_snap)
+        d_consts, d_lines, d_alts, d_seqs, d_dicts, d_seq_ids, d_dict_ids = _extract_fn_defaults(fnode, def_snap)
+        for scid, s_items in def_snap.seq_heap.items():
+            module_env.seq_heap.setdefault(scid, list(s_items))
+        for dcid, d_items in def_snap.dict_heap.items():
+            module_env.dict_heap.setdefault(dcid, dict(d_items))
         module_env.fns[fnode.name] = [
             _MigrationHelper(
                 fn=fnode,
@@ -1019,6 +1317,9 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 default_lines=d_lines,
                 default_alts=d_alts,
                 default_seqs=d_seqs,
+                default_dicts=d_dicts,
+                default_seq_ids=d_seq_ids,
+                default_dict_ids=d_dict_ids,
             )
         ]
 
@@ -1129,13 +1430,24 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         seq = _eval_seq_items(expr, cur_env)
         dmap = _eval_dict_items(expr, cur_env)
         variants = [] if isinstance(expr, ast.Dict) else _eval_str_variants(expr, cur_env)
+        seq_cid = cur_env.seq_ids.get(expr.id) if isinstance(expr, ast.Name) else None
+        dict_cid = cur_env.dict_ids.get(expr.id) if isinstance(expr, ast.Name) else None
+        is_mut_seq = _is_mutable_seq_expr(expr, cur_env)
+        if seq is not None and seq_cid is None:
+            seq_cid = cur_env.alloc_cid()
+            cur_env.seq_heap[seq_cid] = list(seq)
+            if is_mut_seq:
+                cur_env.mutable_seq_cids.add(seq_cid)
+        if dmap is not None and dict_cid is None:
+            dict_cid = cur_env.alloc_cid()
+            cur_env.dict_heap[dict_cid] = dict(dmap)
         sub_snaps = [snapshot_rhs(e, cur_env) for e in expr.elts] if isinstance(expr, (ast.Tuple, ast.List)) else None
-        return (fns, seq, dmap, variants, sub_snaps, expr)
+        return (fns, seq, dmap, variants, sub_snaps, expr, seq_cid, dict_cid, is_mut_seq)
 
     def walk_unresolved_rhs(
         snap: tuple, ctx_r: tuple, cur_env: _MigrationEnv, *, in_sql_exec: bool, in_non_exec: bool
     ) -> None:
-        fns, seq, dmap, variants, sub_snaps, expr = snap
+        fns, seq, dmap, variants, sub_snaps, expr, _seq_cid, _dict_cid, _is_mut_seq = snap
         if sub_snaps is not None:
             for elt_snap in sub_snaps:
                 walk_unresolved_rhs(elt_snap, ctx_r, cur_env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
@@ -1144,14 +1456,14 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             walk_node(expr, ctx_r, cur_env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
 
     def bind_target(tgt: ast.AST, snap: tuple, cur_env: _MigrationEnv) -> bool:
-        fns, seq, dmap, variants, sub_snaps, _expr = snap
+        fns, seq, dmap, variants, sub_snaps, _expr, seq_cid, dict_cid, is_mut_seq = snap
         if isinstance(tgt, ast.Name):
             if fns is not None:
                 cur_env.fns[tgt.id] = list(fns)
             if seq is not None:
-                cur_env.seqs[tgt.id] = list(seq)
+                cur_env.bind_seq(tgt.id, seq, cid=seq_cid, mutable=is_mut_seq)
             if dmap is not None:
-                cur_env.dicts[tgt.id] = dict(dmap)
+                cur_env.bind_dict(tgt.id, dmap, cid=dict_cid)
             if len(variants) == 1:
                 cur_env.consts[tgt.id], cur_env.lines[tgt.id] = variants[0]
             elif len(variants) > 1:
@@ -1168,7 +1480,9 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 ok = True
                 for t_elt, item_pair in zip(tgt.elts, seq, strict=False):
                     elt_vars = [] if _UNRESOLVED in item_pair[0] else [item_pair]
-                    if not bind_target(t_elt, (None, None, None, elt_vars, None, _expr), cur_env):
+                    if not bind_target(
+                        t_elt, (None, None, None, elt_vars, None, _expr, None, None, False), cur_env
+                    ):
                         ok = False
                 return ok
         return False
@@ -1182,7 +1496,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         in_non_exec: bool = False,
     ) -> None:
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            d_consts, d_lines, d_alts, d_seqs = _extract_fn_defaults(sub, env)
+            d_consts, d_lines, d_alts, d_seqs, d_dicts, d_seq_ids, d_dict_ids = _extract_fn_defaults(sub, env)
             env.pop_name(sub.name)
             env.fns[sub.name] = [
                 _MigrationHelper(
@@ -1193,6 +1507,9 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                     default_lines=d_lines,
                     default_alts=d_alts,
                     default_seqs=d_seqs,
+                    default_dicts=d_dicts,
+                    default_seq_ids=d_seq_ids,
+                    default_dict_ids=d_dict_ids,
                 )
             ]
             return
@@ -1208,16 +1525,12 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 elif isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Name):
                     vname = tgt.value.id
                     if vname in env.dicts:
-                        d_copy = dict(env.dicts[vname])
                         for k_str, _ in _eval_str_variants(tgt.slice, env):
-                            d_copy.pop(k_str, None)
-                        env.dicts[vname] = d_copy
+                            env.dicts[vname].pop(k_str, None)
                     elif vname in env.seqs:
                         idx = _eval_int_index(tgt.slice)
                         if idx is not None and -len(env.seqs[vname]) <= idx < len(env.seqs[vname]):
-                            seq_copy = list(env.seqs[vname])
-                            seq_copy.pop(idx)
-                            env.seqs[vname] = seq_copy
+                            env.seqs[vname].pop(idx)
                             _sync_seq_const(env, vname)
                 else:
                     walk_node(tgt, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
@@ -1428,7 +1741,10 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 if tname in env.seqs:
                     rhs_seq = _eval_seq_items(sub.value, env)
                     if rhs_seq is not None:
-                        env.seqs[tname] = [*env.seqs[tname], *rhs_seq]
+                        if env.seq_ids.get(tname) in env.mutable_seq_cids:
+                            env.seqs[tname].extend(rhs_seq)
+                        else:
+                            env.bind_seq(tname, [*env.seqs[tname], *rhs_seq], mutable=False)
                         _sync_seq_const(env, tname)
                         return
                 aug_vars = _eval_str_variants(
@@ -1548,24 +1864,38 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                         and _eval_dict_items(kw_expr, env) is None
                     ):
                         walk_node(kw_expr, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+                post_call_envs: list[_MigrationEnv] = []
+                multi_targets = len(targets) > 1
                 for helper in targets:
+                    call_env = env.clone() if multi_targets else env
                     call_consts: dict[str, str] = {}
                     call_lines: dict[str, int] = {}
                     call_alts: dict[str, list[tuple[str, int]]] = {}
                     call_seqs: dict[str, list[tuple[str, int]]] = {}
+                    call_seq_ids: dict[str, int] = {}
+                    call_seq_mut: dict[str, bool] = {}
                     call_dicts: dict[str, dict[str, tuple[str, int]]] = {}
+                    call_dict_ids: dict[str, int] = {}
                     supplied_params: set[str] = set()
                     pos_params = [*helper.fn.args.posonlyargs, *helper.fn.args.args]
                     named_params = {p.arg for p in (*pos_params, *helper.fn.args.kwonlyargs)}
                     for p_node, (arg_expr, variants) in zip(pos_params, flat_pos, strict=False):
                         supplied_params.add(p_node.arg)
                         if arg_expr is not None:
-                            seq_arg = _eval_seq_items(arg_expr, env)
+                            seq_arg = _eval_seq_items(arg_expr, call_env)
                             if seq_arg is not None:
                                 call_seqs[p_node.arg] = seq_arg
-                            dict_arg = _eval_dict_items(arg_expr, env)
+                                if isinstance(arg_expr, ast.Name) and arg_expr.id in call_env.seq_ids:
+                                    scid = call_env.seq_ids[arg_expr.id]
+                                    call_seq_ids[p_node.arg] = scid
+                                    call_seq_mut[p_node.arg] = scid in call_env.mutable_seq_cids
+                                else:
+                                    call_seq_mut[p_node.arg] = _is_mutable_seq_expr(arg_expr, call_env)
+                            dict_arg = _eval_dict_items(arg_expr, call_env)
                             if dict_arg is not None:
                                 call_dicts[p_node.arg] = dict_arg
+                                if isinstance(arg_expr, ast.Name) and arg_expr.id in call_env.dict_ids:
+                                    call_dict_ids[p_node.arg] = call_env.dict_ids[arg_expr.id]
                         if len(variants) == 1 and not isinstance(arg_expr, ast.Dict):
                             call_consts[p_node.arg], call_lines[p_node.arg] = variants[0]
                         elif len(variants) > 1 and not isinstance(arg_expr, ast.Dict):
@@ -1576,6 +1906,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                         var_known = [pair for _expr, variants in var_slice for pair in variants]
                         if var_known or (not var_slice and not unknown_star):
                             call_seqs[vname] = var_known
+                            call_seq_mut[vname] = False
                     if unknown_star:
                         for p_node in pos_params[len(flat_pos) :]:
                             supplied_params.add(p_node.arg)
@@ -1585,12 +1916,20 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                         if kname in named_params:
                             supplied_params.add(kname)
                             if kw_expr is not None:
-                                seq_kw = _eval_seq_items(kw_expr, env)
+                                seq_kw = _eval_seq_items(kw_expr, call_env)
                                 if seq_kw is not None:
                                     call_seqs[kname] = seq_kw
-                                dict_kw = _eval_dict_items(kw_expr, env)
+                                    if isinstance(kw_expr, ast.Name) and kw_expr.id in call_env.seq_ids:
+                                        scid = call_env.seq_ids[kw_expr.id]
+                                        call_seq_ids[kname] = scid
+                                        call_seq_mut[kname] = scid in call_env.mutable_seq_cids
+                                    else:
+                                        call_seq_mut[kname] = _is_mutable_seq_expr(kw_expr, call_env)
+                                dict_kw = _eval_dict_items(kw_expr, call_env)
                                 if dict_kw is not None:
                                     call_dicts[kname] = dict_kw
+                                    if isinstance(kw_expr, ast.Name) and kw_expr.id in call_env.dict_ids:
+                                        call_dict_ids[kname] = call_env.dict_ids[kw_expr.id]
                             if len(variants) == 1 and not isinstance(kw_expr, ast.Dict):
                                 call_consts[kname], call_lines[kname] = variants[0]
                             elif len(variants) > 1 and not isinstance(kw_expr, ast.Dict):
@@ -1616,7 +1955,15 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                         call_seqs,
                         call_dicts,
                         supplied_params,
+                        bound_seq_ids=call_seq_ids,
+                        bound_seq_mut=call_seq_mut,
+                        bound_dict_ids=call_dict_ids,
+                        caller_env=call_env,
                     )
+                    if multi_targets:
+                        post_call_envs.append(call_env)
+                if multi_targets and post_call_envs:
+                    _merge_migration_envs(env, post_call_envs)
                 return
             if isinstance(sub.func, ast.Attribute) and isinstance(sub.func.value, ast.Name):
                 recv_name = sub.func.value.id
@@ -1628,44 +1975,110 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                             if len(app_vars) == 1
                             else ("\n".join(dict.fromkeys(v for v, _ in app_vars)), app_vars[0][1])
                         )
-                        env.seqs[recv_name] = [*env.seqs[recv_name], item]
+                        env.seqs[recv_name].append(item)
                     else:
                         walk_node(sub.args[0], ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-                        env.seqs[recv_name] = [*env.seqs[recv_name], (_UNRESOLVED, 0)]
+                        env.seqs[recv_name].append((_UNRESOLVED, 0))
                     _sync_seq_const(env, recv_name)
                     return
+                if callee == "insert" and recv_name in env.seqs and len(sub.args) == 2 and not sub.keywords:
+                    ins_idx = _eval_int_index(sub.args[0])
+                    if ins_idx is not None:
+                        ins_vars = _eval_str_variants(sub.args[1], env)
+                        if ins_vars:
+                            ins_item = (
+                                ins_vars[0]
+                                if len(ins_vars) == 1
+                                else ("\n".join(dict.fromkeys(v for v, _ in ins_vars)), ins_vars[0][1])
+                            )
+                        else:
+                            walk_node(sub.args[1], ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+                            ins_item = (_UNRESOLVED, 0)
+                        env.seqs[recv_name].insert(ins_idx, ins_item)
+                        _sync_seq_const(env, recv_name)
+                        return
                 if callee == "extend" and recv_name in env.seqs and len(sub.args) == 1 and not sub.keywords:
                     ext_items = _eval_seq_items(sub.args[0], env)
                     if ext_items is not None:
-                        env.seqs[recv_name] = [*env.seqs[recv_name], *ext_items]
+                        env.seqs[recv_name].extend(ext_items)
                         _sync_seq_const(env, recv_name)
                         return
+                if callee == "clear" and not sub.args and not sub.keywords:
+                    if recv_name in env.seqs:
+                        env.seqs[recv_name].clear()
+                        _sync_seq_const(env, recv_name)
+                        return
+                    if recv_name in env.dicts:
+                        env.dicts[recv_name].clear()
+                        return
+                if callee == "pop" and not sub.keywords:
+                    if recv_name in env.seqs and len(sub.args) <= 1:
+                        pop_idx = -1 if not sub.args else _eval_int_index(sub.args[0])
+                        if pop_idx is not None and -len(env.seqs[recv_name]) <= pop_idx < len(env.seqs[recv_name]):
+                            env.seqs[recv_name].pop(pop_idx)
+                            _sync_seq_const(env, recv_name)
+                            return
+                    if recv_name in env.dicts and 1 <= len(sub.args) <= 2:
+                        pop_keys = _eval_str_variants(sub.args[0], env)
+                        if pop_keys:
+                            for k_str, _ in pop_keys:
+                                env.dicts[recv_name].pop(k_str, None)
+                            return
+                if callee == "setdefault" and recv_name in env.dicts and len(sub.args) == 2 and not sub.keywords:
+                    sd_keys = _eval_str_variants(sub.args[0], env)
+                    if sd_keys:
+                        sd_vals = _eval_str_variants(sub.args[1], env)
+                        if not sd_vals:
+                            walk_node(sub.args[1], ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+                        for k_str, _ in sd_keys:
+                            if k_str not in env.dicts[recv_name] and sd_vals:
+                                env.dicts[recv_name][k_str] = (
+                                    sd_vals[0]
+                                    if len(sd_vals) == 1
+                                    else ("\n".join(dict.fromkeys(v for v, _ in sd_vals)), sd_vals[0][1])
+                                )
+                        return
                 if callee == "update" and recv_name in env.dicts and len(sub.args) <= 1:
-                    upd_map = dict(env.dicts[recv_name])
+                    d_ref = env.dicts[recv_name]
                     if sub.args:
                         arg_d = _eval_dict_items(sub.args[0], env)
                         if arg_d is not None:
-                            upd_map.update(arg_d)
+                            d_ref.update(arg_d)
                         else:
                             walk_node(sub.args[0], ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
                     for kw in sub.keywords:
                         if kw.arg is not None:
                             kv = _eval_str_variants(kw.value, env)
                             if kv:
-                                upd_map[kw.arg] = (
+                                d_ref[kw.arg] = (
                                     kv[0]
                                     if len(kv) == 1
                                     else ("\n".join(dict.fromkeys(v for v, _ in kv)), kv[0][1])
                                 )
                             else:
-                                upd_map.pop(kw.arg, None)
+                                d_ref.pop(kw.arg, None)
                                 walk_node(kw.value, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
                         elif isinstance(kw.value, ast.Name) and kw.value.id in env.dicts:
-                            upd_map.update(env.dicts[kw.value.id])
+                            d_ref.update(env.dicts[kw.value.id])
                         else:
                             walk_node(kw.value, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-                    env.dicts[recv_name] = upd_map
                     return
+                if (
+                    callee == "get"
+                    and recv_name in env.dicts
+                    and 1 <= len(sub.args) <= 2
+                    and not sub.keywords
+                    and not in_non_exec
+                ):
+                    get_vars = _eval_str_variants(sub, env)
+                    if get_vars:
+                        for idx_g, (g_sql, g_ln) in enumerate(get_vars):
+                            cleaned_g = _blank_sql_comments(g_sql).upper()
+                            if "TABLE" in cleaned_g or "FUNCTION" in cleaned_g:
+                                if "ALTER TABLE" in cleaned_g:
+                                    effects.touches_ddl = True
+                                absorb_sql(g_sql, getattr(sub, "lineno", g_ln), (*order, (idx_g,)))
+                        return
             next_exec = in_sql_exec or callee in sql_exec_calls
             next_non_exec = in_non_exec or (callee in non_exec_calls and not next_exec)
             walk_node(sub.func, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
@@ -1751,6 +2164,11 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         bound_arg_seqs: dict[str, list[tuple[str, int]]] | None = None,
         bound_arg_dicts: dict[str, dict[str, tuple[str, int]]] | None = None,
         supplied_params: set[str] | None = None,
+        *,
+        bound_seq_ids: dict[str, int] | None = None,
+        bound_seq_mut: dict[str, bool] | None = None,
+        bound_dict_ids: dict[str, int] | None = None,
+        caller_env: _MigrationEnv | None = None,
     ) -> None:
         nonlocal next_scope_seq
         fn = helper.fn
@@ -1761,6 +2179,13 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         fn_scope_id = next_scope_seq
         next_scope_seq += 1
         frame = enclosing.clone(scope_id=fn_scope_id)
+        if caller_env is not None:
+            for scid, s_items in caller_env.seq_heap.items():
+                frame.seq_heap[scid] = list(s_items)
+                frame.sync_seq_cid(scid)
+            for dcid, d_items in caller_env.dict_heap.items():
+                frame.dict_heap[dcid] = dict(d_items)
+                frame.sync_dict_cid(dcid)
         for p in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs, fn.args.vararg, fn.args.kwarg):
             if p is not None:
                 frame.pop_name(p.arg)
@@ -1775,7 +2200,15 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 frame.alts[pname] = list(dalts)
         for pname, dseq in helper.default_seqs.items():
             if pname not in supplied:
-                frame.seqs[pname] = list(dseq)
+                d_scid = helper.default_seq_ids.get(pname)
+                d_mut = d_scid in frame.mutable_seq_cids if d_scid is not None else True
+                assigned_scid = frame.bind_seq(pname, dseq, cid=d_scid, mutable=d_mut)
+                frame.sync_seq_cid(assigned_scid)
+        for pname, ddict in helper.default_dicts.items():
+            if pname not in supplied:
+                d_dcid = helper.default_dict_ids.get(pname)
+                assigned_dcid = frame.bind_dict(pname, ddict, cid=d_dcid)
+                frame.sync_dict_cid(assigned_dcid)
         if bound_arg_consts:
             frame.consts.update(bound_arg_consts)
         if bound_arg_lines:
@@ -1783,9 +2216,18 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         if bound_arg_alts:
             frame.alts.update(bound_arg_alts)
         if bound_arg_seqs:
-            frame.seqs.update(bound_arg_seqs)
+            for pname, bseq in bound_arg_seqs.items():
+                b_scid = (bound_seq_ids or {}).get(pname)
+                b_mut = (bound_seq_mut or {}).get(
+                    pname, b_scid in frame.mutable_seq_cids if b_scid is not None else True
+                )
+                assigned_scid = frame.bind_seq(pname, bseq, cid=b_scid, mutable=b_mut)
+                frame.sync_seq_cid(assigned_scid)
         if bound_arg_dicts:
-            frame.dicts.update(bound_arg_dicts)
+            for pname, bdict in bound_arg_dicts.items():
+                b_dcid = (bound_dict_ids or {}).get(pname)
+                assigned_dcid = frame.bind_dict(pname, bdict, cid=b_dcid)
+                frame.sync_dict_cid(assigned_dcid)
         nonlocals, globals_ = _shallow_scope_decls(fn)
         body_stmts = (
             fn.body[1:]
@@ -1803,11 +2245,18 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 _copy_env_binding(enclosing, frame, nl_name)
             for gl_name in globals_:
                 _copy_env_binding(module_env, frame, gl_name)
+            if caller_env is not None:
+                for scid, s_items in frame.seq_heap.items():
+                    caller_env.seq_heap[scid] = list(s_items)
+                    caller_env.sync_seq_cid(scid)
+                for dcid, d_items in frame.dict_heap.items():
+                    caller_env.dict_heap[dcid] = dict(d_items)
+                    caller_env.sync_dict_cid(dcid)
         finally:
             active_scope_envs.pop(fn_scope_id, None)
             active_fns.discard(id(fn))
 
-    visit(upgrade_helpers[0], ())
+    visit(upgrade_helpers[0], (), caller_env=module_env)
     if (
         effects.table_events
         or effects.created_functions
