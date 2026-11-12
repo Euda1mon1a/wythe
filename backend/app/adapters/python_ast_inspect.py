@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import re
 from dataclasses import dataclass, field
 
@@ -222,6 +223,12 @@ class ParsedPythonModule:
     route_handlers: tuple[ParsedRouteHandler, ...]
     policy_literals: tuple[tuple[str, int, str], ...]  # (const_name, lineno, sample)
     raw_clock_calls: tuple[tuple[str, int], ...]  # (expr, lineno)
+    method_calls: frozenset[str] = frozenset()  # `param.method()` on an injected, unannotated parameter
+    top_level_defs: frozenset[str] = frozenset()
+    method_defs: frozenset[str] = frozenset()
+    # Package `__init__` only: (exported name, absolute "module.name" source, the initializer's own top-level
+    # definitions that use it; "*" = module-level code, which runs on import)
+    package_exports: tuple[tuple[str, str, frozenset[str]], ...] = ()
     symbol_calls: frozenset[str] = frozenset()
     # Precision fields (all are subsets/annotations of the coarse sets above):
     # `constructed` = names called like constructors; `persisted` = names that reach a session
@@ -304,6 +311,48 @@ def _excluded_ids(tree: ast.AST) -> set[int]:
             for b in (*node.bases, *node.keywords):
                 mark(b)
     return excluded
+
+
+_BUILTIN_NAMES = frozenset(dir(builtins))
+
+
+def _absolute_import_bindings(tree: ast.AST, module_name: str, rel_path: str) -> list[tuple[str, str, int]]:
+    """(local name, absolute "module.name", level) for every `from ... import`, relative ones resolved.
+
+    A package `__init__` is its own package; any other module resolves against its parent.
+    """
+    own_pkg = module_name.removesuffix(".__init__")
+    if not rel_path.endswith("__init__.py"):
+        own_pkg = own_pkg.rpartition(".")[0]
+    out: list[tuple[str, str, int]] = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.ImportFrom):
+            continue
+        src_mod = n.module or ""
+        if n.level:
+            base = own_pkg
+            for _ in range(n.level - 1):
+                base = base.rpartition(".")[0]
+            src_mod = ".".join(p for p in (base, n.module) if p)
+        if src_mod:
+            out.extend((alias.asname or alias.name, f"{src_mod}.{alias.name}", n.level) for alias in n.names)
+    return out
+
+
+def _injected_params_by_call(tree: ast.AST) -> dict[int, frozenset[str]]:
+    """Map each call to the unannotated parameters (bar `self`/`cls`) of the functions enclosing it."""
+    out: dict[int, frozenset[str]] = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = fn.args
+            names = frozenset(
+                p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs) if p.annotation is None and p.arg not in ("self", "cls")
+            )
+            if names:
+                for sub in ast.walk(fn):
+                    if isinstance(sub, ast.Call):
+                        out[id(sub)] = out.get(id(sub), frozenset()) | names
+    return out
 
 
 def _sql_targets(text: str) -> tuple[set[str], set[str], set[str]]:
@@ -515,6 +564,12 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                     aliases[alias.asname] = alias.name
                 if alias.name.split(".", 1)[0] != local_pkg:
                     external_roots.add(alias.asname or alias.name.split(".", 1)[0])
+    # Relative imports (`from .x import y`, `from . import x`) by their absolute module path.
+    bindings = _absolute_import_bindings(tree, module_name, rel_path)
+    for local_name, target, level in bindings:
+        if level:
+            imported_modules.update((target.rpartition(".")[0], target))
+            aliases[local_name] = target.rpartition(".")[2]
 
     def resolve(sym: str) -> str:
         return aliases.get(sym, sym)
@@ -544,6 +599,8 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     has_session_writes = False
     called: set[str] = set()
     symbol_calls: set[str] = set()
+    method_calls: set[str] = set()
+    injected_params = _injected_params_by_call(tree)
     write_only: set[int] = set()
 
     def note_write(sym: str, lineno: int) -> None:
@@ -599,12 +656,16 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             resolved_short = resolve(short)
             called.add(resolved_short)
             if isinstance(target, ast.Name):
-                if target.id not in external_roots:
+                # Imported names resolve through their import edge; builtins never cross modules.
+                if target.id not in external_roots and target.id not in aliases and target.id not in _BUILTIN_NAMES:
                     symbol_calls.add(resolved_short)
             elif isinstance(target, ast.Attribute):
-                recv_root = dotted.split(".", 1)[0] if dotted else ""
-                if recv_root not in external_roots and short not in _GENERIC_ATTR_METHODS:
-                    symbol_calls.add(resolved_short)
+                # Only an injected, unannotated parameter hides its class from the imports. Any
+                # other receiver resolves through an import edge or is a library object
+                # (`logger.error()`, `session.query()`), so a name match there is a coincidence.
+                recv = target.value
+                if isinstance(recv, ast.Name) and recv.id in injected_params.get(id(n), ()) and short not in _GENERIC_ATTR_METHODS:
+                    method_calls.add(short)
             if dotted:
                 head, _, tail = dotted.partition(".")
                 called.add(f"{resolve(head)}.{tail}" if tail else resolve(head))
@@ -678,14 +739,19 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
 
     handlers: list[ParsedRouteHandler] = []
     defined: set[str] = set()
+    top_level_defs: set[str] = set()
+    method_defs: set[str] = set()
     for stmt in tree.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             defined.add(stmt.name)
+            top_level_defs.add(stmt.name)
         elif isinstance(stmt, ast.ClassDef):
             defined.add(stmt.name)
+            top_level_defs.add(stmt.name)
             for member in stmt.body:
                 if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and not member.name.startswith("_"):
                     defined.add(member.name)
+                    method_defs.add(member.name)
 
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -729,6 +795,9 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             if size >= 3 and name_has_policy_token(target_name, _POLICY_COLLECTION_TOKENS):
                 policy_literals.append((target_name, stmt.lineno, f"collection[{size}]"))
 
+    is_package = rel_path.endswith("__init__.py")
+    package_exports = _package_exports(tree, [b[:2] for b in bindings], excluded, local_pkg) if is_package else ()
+
     doc = (ast.get_docstring(tree) or "").strip().splitlines()
     summary = doc[0].strip() if doc else f"Python module `{module_name}`."
     return ParsedPythonModule(
@@ -749,6 +818,10 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         route_handlers=tuple(handlers),
         policy_literals=tuple(policy_literals),
         raw_clock_calls=tuple(raw_clocks),
+        method_calls=frozenset(method_calls),
+        top_level_defs=frozenset(top_level_defs),
+        method_defs=frozenset(method_defs),
+        package_exports=package_exports,
         symbol_calls=frozenset(symbol_calls),
         constructed=frozenset(constructed),
         persisted=frozenset(persisted),
@@ -756,3 +829,40 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         imported_names={k: frozenset(v) for k, v in imported_names.items()},
         write_lines=write_lines,
     )
+
+
+def _package_exports(
+    tree: ast.Module, bindings: list[tuple[str, str]], excluded: set[int], local_pkg: str
+) -> tuple[tuple[str, str, frozenset[str]], ...]:
+    """What a package `__init__` exports: its `from ... import` bindings, plus PEP 562 lazy tables.
+
+    A lazy table is a module-level dict such as `{"Name": "pkg.mod"}` or `{"Name": ("pkg.mod", "attr")}`
+    in an `__init__` that defines `__getattr__`. Each binding carries which of the initializer's own
+    top-level definitions use it, so a caller is credited only with what the name it imports needs.
+    """
+    users: dict[str, set[str]] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            continue
+        owner = stmt.name if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else "*"
+        for n in ast.walk(stmt):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and id(n) not in excluded:
+                users.setdefault(n.id, set()).add(owner)
+    out = [(local, target, frozenset(users.get(local, ()))) for local, target in bindings]
+    if not any(isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == "__getattr__" for s in tree.body):
+        return tuple(out)
+    for stmt in tree.body:
+        value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+        if not isinstance(value, ast.Dict):
+            continue
+        for key, val in zip(value.keys, value.values):
+            attr = key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) else None
+            if attr is None:
+                continue
+            if isinstance(val, ast.Tuple) and len(val.elts) == 2 and all(isinstance(e, ast.Constant) for e in val.elts):
+                mod, attr = val.elts[0].value, val.elts[1].value
+            else:
+                mod = val.value if isinstance(val, ast.Constant) else None
+            if isinstance(mod, str) and isinstance(attr, str) and mod.startswith(f"{local_pkg}."):
+                out.append((key.value, f"{mod}.{attr}", frozenset()))
+    return tuple(out)
