@@ -389,3 +389,46 @@ def test_id_valued_segment_only_fills_route_parameters(db_session: Session, tmp_
     assert by_rule.get("DISP-006") == [
         "Frontend `GET /{param}/items` is built at runtime; it may match 1 backend route(s)"
     ]
+
+
+# --- WCAG inspector: JSX expressions do not end an opening tag --------------------------
+
+
+def _a11y_kinds(src: str) -> list[tuple[int, str]]:
+    from app.adapters.a11y_inspect import scan_a11y_markup_findings
+
+    return sorted((f.line, f.title.split("`")[1]) for f in scan_a11y_markup_findings(src, "d:component:x", "x.tsx"))
+
+
+def test_gt_inside_jsx_expressions_does_not_end_the_tag() -> None:
+    accessible = (
+        "<select\n"
+        "  ref={fieldRef as React.RefObject<HTMLSelectElement>}\n"
+        "  aria-label='Pick one'\n"
+        "/>\n"
+        "<input disabled={count > 0} aria-label='Quantity' />\n"
+        "<div onClick={() => open()} onKeyDown={onKey} role='button' tabIndex={0}>Row</div>\n"
+        "<span onClick={(e) => { if (e.detail > 1) zoom(); }} role='button' tabIndex={0}>z</span>\n"
+    )
+    assert _a11y_kinds(accessible) == []
+
+    broken = (
+        "<input disabled={count > 0} />\n"
+        "<div onClick={() => open()} className={`row ${active ? 'on' : ''}`}>Row</div>\n"
+        "<button disabled={count > 0}><CloseIcon /></button>\n"
+    )
+    assert _a11y_kinds(broken) == [(1, "<input>"), (2, "<div>"), (3, "<button>")]
+
+
+def test_enclosing_label_is_found_at_any_distance() -> None:
+    long_body = "      <span>" + "detail " * 300 + "</span>\n"
+    wrapped = (
+        "<label className='row'>\n"
+        "  <input type='checkbox' checked={on} onChange={() => toggle()} />\n"
+        + long_body
+        + "</label>\n"
+    )
+    assert _a11y_kinds(wrapped) == []
+
+    closed_before = "<label>Name</label>\n<input type='text' value={v} />\n"
+    assert _a11y_kinds(closed_before) == [(2, "<input>")]
