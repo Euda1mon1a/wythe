@@ -1,0 +1,4635 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Wythe API",
+    "description": "Why -> Therefore: 3-tier architecture & lineage verifier. PostgreSQL holds truth, Backend manipulates truth, UI displays truth.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/adapters/slots": {
+      "get": {
+        "tags": [
+          "adapters"
+        ],
+        "summary": "Get Adapter Slots",
+        "operationId": "get_adapter_slots_api_v1_adapters_slots_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AdapterSlotSchema"
+                  },
+                  "type": "array",
+                  "title": "Response Get Adapter Slots Api V1 Adapters Slots Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adapters/profiles": {
+      "get": {
+        "tags": [
+          "adapters"
+        ],
+        "summary": "Get Stack Profiles",
+        "operationId": "get_stack_profiles_api_v1_adapters_profiles_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/StackProfileRead"
+                  },
+                  "type": "array",
+                  "title": "Response Get Stack Profiles Api V1 Adapters Profiles Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adapters/detect": {
+      "get": {
+        "tags": [
+          "adapters"
+        ],
+        "summary": "Detect Target Stack",
+        "operationId": "detect_target_stack_api_v1_adapters_detect_get",
+        "parameters": [
+          {
+            "name": "repo_path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Filesystem directory to inspect",
+              "title": "Repo Path"
+            },
+            "description": "Filesystem directory to inspect"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StackDetectionResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/targets": {
+      "get": {
+        "tags": [
+          "targets"
+        ],
+        "summary": "Get Targets",
+        "operationId": "get_targets_api_v1_targets_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/TargetProjectRead"
+                  },
+                  "type": "array",
+                  "title": "Response Get Targets Api V1 Targets Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "targets"
+        ],
+        "summary": "Create Or Update Target",
+        "operationId": "create_or_update_target_api_v1_targets_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TargetProjectCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TargetProjectRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/targets/{target_slug}/governance-bundle": {
+      "get": {
+        "tags": [
+          "targets"
+        ],
+        "summary": "Get Governance Bundle",
+        "operationId": "get_governance_bundle_api_v1_targets__target_slug__governance_bundle_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortableGovernanceBundle"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/targets/{target_slug}/governance-sync": {
+      "post": {
+        "tags": [
+          "targets"
+        ],
+        "summary": "Sync Governance Bundle",
+        "operationId": "sync_governance_bundle_api_v1_targets__target_slug__governance_sync_post",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "direction",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "export",
+                "import"
+              ],
+              "type": "string",
+              "default": "export",
+              "title": "Direction"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GovernanceSyncReceipt"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Inspect Target",
+        "operationId": "inspect_target_api_v1_scans__target_slug__get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "strict",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Strict"
+            }
+          },
+          {
+            "name": "persist",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Persist"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TruthAtlasReport"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Execute Recorded Scan",
+        "operationId": "execute_recorded_scan_api_v1_scans__target_slug__post",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "strict",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Strict"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TruthAtlasReport"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/history": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Get Scan History",
+        "operationId": "get_scan_history_api_v1_scans__target_slug__history_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ScanSnapshotSummary"
+                  },
+                  "title": "Response Get Scan History Api V1 Scans  Target Slug  History Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/compare": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Compare Snapshots Route",
+        "operationId": "compare_snapshots_route_api_v1_scans__target_slug__compare_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "base_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "title": "Base Id"
+            }
+          },
+          {
+            "name": "head_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "title": "Head Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotComparisonReport"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/baselines": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Get Ratchet Baselines",
+        "operationId": "get_ratchet_baselines_api_v1_scans__target_slug__baselines_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RatchetBaselineRead"
+                  },
+                  "title": "Response Get Ratchet Baselines Api V1 Scans  Target Slug  Baselines Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Save Ratchet Baselines",
+        "operationId": "save_ratchet_baselines_api_v1_scans__target_slug__baselines_post",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RatchetCaptureRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RatchetBaselineRead"
+                  },
+                  "title": "Response Save Ratchet Baselines Api V1 Scans  Target Slug  Baselines Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/diff": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Inspect Target Diff",
+        "operationId": "inspect_target_diff_api_v1_scans__target_slug__diff_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "base_ref",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "default": "HEAD~1",
+              "title": "Base Ref"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiffBlastRadiusReport"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/sarif": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Export Target Sarif",
+        "operationId": "export_target_sarif_api_v1_scans__target_slug__sarif_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "base_ref",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 128
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Base Ref"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Export Target Sarif Api V1 Scans  Target Slug  Sarif Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/llms": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Export Target Llms Brief",
+        "operationId": "export_target_llms_brief_api_v1_scans__target_slug__llms_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "max_tokens",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 12000,
+              "minimum": 400,
+              "default": 2200,
+              "title": "Max Tokens"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmBriefRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/llms.txt": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Export Target Llms Plaintext",
+        "operationId": "export_target_llms_plaintext_api_v1_scans__target_slug__llms_txt_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "max_tokens",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 12000,
+              "minimum": 400,
+              "default": 2200,
+              "title": "Max Tokens"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/context": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Export Target Lineage Cone Context",
+        "operationId": "export_target_lineage_cone_context_api_v1_scans__target_slug__context_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "title": "Q"
+            }
+          },
+          {
+            "name": "max_nodes",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 150,
+              "minimum": 5,
+              "default": 40,
+              "title": "Max Nodes"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LlmContextConeReport"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/source": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Read Target Source Route",
+        "operationId": "read_target_source_route_api_v1_scans__target_slug__source_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          },
+          {
+            "name": "rel_path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "title": "Rel Path"
+            }
+          },
+          {
+            "name": "line",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500000,
+              "minimum": 1,
+              "default": 1,
+              "title": "Line"
+            }
+          },
+          {
+            "name": "context",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 45,
+              "minimum": 3,
+              "default": 12,
+              "title": "Context"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceSnippetRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/rules": {
+      "get": {
+        "tags": [
+          "rules"
+        ],
+        "summary": "Get Rules",
+        "operationId": "get_rules_api_v1_rules_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RulePolicyRead"
+                  },
+                  "type": "array",
+                  "title": "Response Get Rules Api V1 Rules Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/rules/{rule_code}": {
+      "patch": {
+        "tags": [
+          "rules"
+        ],
+        "summary": "Patch Rule",
+        "operationId": "patch_rule_api_v1_rules__rule_code__patch",
+        "parameters": [
+          {
+            "name": "rule_code",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Rule Code"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RulePolicyUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RulePolicyRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/rulings/{target_slug}": {
+      "get": {
+        "tags": [
+          "rulings"
+        ],
+        "summary": "Get Target Rulings",
+        "operationId": "get_target_rulings_api_v1_rulings__target_slug__get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AuditRulingRead"
+                  },
+                  "title": "Response Get Target Rulings Api V1 Rulings  Target Slug  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "rulings"
+        ],
+        "summary": "Create Target Ruling",
+        "operationId": "create_target_ruling_api_v1_rulings__target_slug__post",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditRulingCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditRulingRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vocabularies": {
+      "get": {
+        "tags": [
+          "vocabularies"
+        ],
+        "summary": "Get Vocabularies",
+        "operationId": "get_vocabularies_api_v1_vocabularies_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PolicyVocabularyRead"
+                  },
+                  "type": "array",
+                  "title": "Response Get Vocabularies Api V1 Vocabularies Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "vocabularies"
+        ],
+        "summary": "Add Vocabulary",
+        "operationId": "add_vocabulary_api_v1_vocabularies_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyVocabularyCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyVocabularyRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vocabularies/{vocab_id}": {
+      "patch": {
+        "tags": [
+          "vocabularies"
+        ],
+        "summary": "Patch Vocabulary",
+        "operationId": "patch_vocabulary_api_v1_vocabularies__vocab_id__patch",
+        "parameters": [
+          {
+            "name": "vocab_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Vocab Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyVocabularyUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyVocabularyRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ui-focus": {
+      "post": {
+        "tags": [
+          "ui-focus"
+        ],
+        "summary": "Sync Ui Focus Route",
+        "operationId": "sync_ui_focus_route_api_v1_ui_focus_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UiFocusStatePayload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UiFocusSyncAck"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "ui-focus"
+        ],
+        "summary": "Get Ui Focus Explanation Route",
+        "operationId": "get_ui_focus_explanation_route_api_v1_ui_focus_get",
+        "parameters": [
+          {
+            "name": "target",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UiFocusExplainRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ui-focus/snapshot.png": {
+      "get": {
+        "tags": [
+          "ui-focus"
+        ],
+        "summary": "Get Ui Focus Snapshot Route",
+        "operationId": "get_ui_focus_snapshot_route_api_v1_ui_focus_snapshot_png_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ask/engines": {
+      "get": {
+        "tags": [
+          "ask"
+        ],
+        "summary": "Get Ask Engines Route",
+        "operationId": "get_ask_engines_route_api_v1_ask_engines_get",
+        "parameters": [
+          {
+            "name": "local_base_url",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Local Base Url"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskEnginesRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ask": {
+      "post": {
+        "tags": [
+          "ask"
+        ],
+        "summary": "Post Ask Wythe Route",
+        "operationId": "post_ask_wythe_route_api_v1_ask_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AskWytheRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskWytheResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/mcp": {
+      "get": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Get Mcp Http Manifest Route",
+        "description": "Return Streamable HTTP MCP discovery manifest & read-only tool schemas.",
+        "operationId": "get_mcp_http_manifest_route_api_v1_mcp_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Mcp Http Manifest Route Api V1 Mcp Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Post Mcp Http Rpc Route",
+        "description": "Handle single or batched JSON-RPC 2.0 MCP requests over Streamable HTTP.",
+        "operationId": "post_mcp_http_rpc_route_api_v1_mcp_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "summary": "Healthcheck",
+        "operationId": "healthcheck_healthz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Healthcheck Healthz Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AdapterSlotSchema": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "truth",
+              "manipulate",
+              "display"
+            ],
+            "title": "Tier"
+          },
+          "language": {
+            "type": "string",
+            "title": "Language"
+          },
+          "frameworks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Frameworks"
+          },
+          "implementation_status": {
+            "type": "string",
+            "enum": [
+              "implemented",
+              "planned"
+            ],
+            "title": "Implementation Status"
+          },
+          "capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Capabilities"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "tier",
+          "language",
+          "frameworks",
+          "implementation_status",
+          "capabilities"
+        ],
+        "title": "AdapterSlotSchema"
+      },
+      "AskChatTurn": {
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant"
+            ],
+            "title": "Role"
+          },
+          "content": {
+            "type": "string",
+            "maxLength": 6000,
+            "minLength": 1,
+            "title": "Content"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "AskChatTurn"
+      },
+      "AskEnginesRead": {
+        "properties": {
+          "auto_order": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Auto Order"
+          },
+          "recommended_backend_engine": {
+            "type": "string",
+            "enum": [
+              "apple",
+              "local",
+              "none"
+            ],
+            "title": "Recommended Backend Engine"
+          },
+          "engines": {
+            "items": {
+              "$ref": "#/components/schemas/OnDeviceEngineStatus"
+            },
+            "type": "array",
+            "title": "Engines"
+          },
+          "mcp_http_path": {
+            "type": "string",
+            "title": "Mcp Http Path",
+            "default": "/api/v1/mcp"
+          },
+          "openapi_path": {
+            "type": "string",
+            "title": "Openapi Path",
+            "default": "/openapi.json"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "recommended_backend_engine"
+        ],
+        "title": "AskEnginesRead"
+      },
+      "AskWytheRequest": {
+        "properties": {
+          "question": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Question"
+          },
+          "engine": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "apple",
+              "local"
+            ],
+            "title": "Engine",
+            "default": "auto"
+          },
+          "target_slug": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Slug"
+          },
+          "local_base_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Local Base Url"
+          },
+          "local_model_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Local Model Id"
+          },
+          "include_vision_snapshot": {
+            "type": "boolean",
+            "title": "Include Vision Snapshot",
+            "default": true
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/AskChatTurn"
+            },
+            "type": "array",
+            "maxItems": 16,
+            "title": "History"
+          },
+          "live_viewport_brief": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Live Viewport Brief"
+          },
+          "snapshot_data_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4500000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Data Url"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "question"
+        ],
+        "title": "AskWytheRequest"
+      },
+      "AskWytheResponse": {
+        "properties": {
+          "engine_used": {
+            "type": "string",
+            "enum": [
+              "apple",
+              "local"
+            ],
+            "title": "Engine Used"
+          },
+          "model_id": {
+            "type": "string",
+            "title": "Model Id"
+          },
+          "used_vision_snapshot": {
+            "type": "boolean",
+            "title": "Used Vision Snapshot",
+            "default": false
+          },
+          "context_headline": {
+            "type": "string",
+            "title": "Context Headline"
+          },
+          "answer_markdown": {
+            "type": "string",
+            "title": "Answer Markdown"
+          },
+          "referenced_node_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Referenced Node Ids"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Observed At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "engine_used",
+          "model_id",
+          "context_headline",
+          "answer_markdown",
+          "observed_at"
+        ],
+        "title": "AskWytheResponse"
+      },
+      "AtlasEdge": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "target_id": {
+            "type": "string",
+            "title": "Target Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "reads_truth",
+              "writes_truth",
+              "guards_truth",
+              "calls_helper",
+              "queries_endpoint",
+              "mutates_endpoint",
+              "uses_hook",
+              "uses_client"
+            ],
+            "title": "Kind"
+          },
+          "verification": {
+            "type": "string",
+            "enum": [
+              "verified",
+              "declared",
+              "unverified",
+              "broken"
+            ],
+            "title": "Verification"
+          },
+          "evidence_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Path"
+          },
+          "evidence_note": {
+            "type": "string",
+            "title": "Evidence Note"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "source_id",
+          "target_id",
+          "kind",
+          "verification",
+          "evidence_note"
+        ],
+        "title": "AtlasEdge"
+      },
+      "AtlasNode": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "truth",
+              "manipulate",
+              "display"
+            ],
+            "title": "Tier"
+          },
+          "subkind": {
+            "type": "string",
+            "enum": [
+              "table",
+              "sql_function",
+              "cache_store",
+              "route",
+              "service",
+              "solver",
+              "cli",
+              "page",
+              "hook",
+              "api_client",
+              "component"
+            ],
+            "title": "Subkind"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "source_file": {
+            "type": "string",
+            "title": "Source File"
+          },
+          "line": {
+            "type": "integer",
+            "title": "Line",
+            "default": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "clean",
+              "policy_in_code",
+              "duplicated_truth",
+              "gray_zone",
+              "orphaned",
+              "in_flight",
+              "unwired"
+            ],
+            "title": "Status",
+            "default": "clean"
+          },
+          "role": {
+            "type": "string",
+            "title": "Role",
+            "default": "mechanism"
+          },
+          "cluster": {
+            "type": "string",
+            "title": "Cluster",
+            "default": "core"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Columns"
+          },
+          "http_methods": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Http Methods"
+          },
+          "http_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Http Paths"
+          },
+          "read_by_count": {
+            "type": "integer",
+            "title": "Read By Count",
+            "default": 0
+          },
+          "written_by_count": {
+            "type": "integer",
+            "title": "Written By Count",
+            "default": 0
+          },
+          "cutover_history": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cutover History"
+          },
+          "ruling_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ruling Summary"
+          },
+          "ruling_audited_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ruling Audited At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "tier",
+          "subkind",
+          "label",
+          "source_file",
+          "summary"
+        ],
+        "title": "AtlasNode"
+      },
+      "AtlasSummaryStats": {
+        "properties": {
+          "truth_tables": {
+            "type": "integer",
+            "title": "Truth Tables"
+          },
+          "sql_functions": {
+            "type": "integer",
+            "title": "Sql Functions"
+          },
+          "ephemeral_stores": {
+            "type": "integer",
+            "title": "Ephemeral Stores",
+            "default": 0
+          },
+          "manipulator_routes": {
+            "type": "integer",
+            "title": "Manipulator Routes"
+          },
+          "manipulator_services": {
+            "type": "integer",
+            "title": "Manipulator Services"
+          },
+          "display_pages": {
+            "type": "integer",
+            "title": "Display Pages"
+          },
+          "display_hooks_and_clients": {
+            "type": "integer",
+            "title": "Display Hooks And Clients"
+          },
+          "verified_edges": {
+            "type": "integer",
+            "title": "Verified Edges"
+          },
+          "end_to_end_chains": {
+            "type": "integer",
+            "title": "End To End Chains"
+          },
+          "clean_nodes": {
+            "type": "integer",
+            "title": "Clean Nodes"
+          },
+          "flagged_nodes": {
+            "type": "integer",
+            "title": "Flagged Nodes"
+          },
+          "blocking_findings": {
+            "type": "integer",
+            "title": "Blocking Findings"
+          },
+          "warning_findings": {
+            "type": "integer",
+            "title": "Warning Findings"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "truth_tables",
+          "sql_functions",
+          "manipulator_routes",
+          "manipulator_services",
+          "display_pages",
+          "display_hooks_and_clients",
+          "verified_edges",
+          "end_to_end_chains",
+          "clean_nodes",
+          "flagged_nodes",
+          "blocking_findings",
+          "warning_findings"
+        ],
+        "title": "AtlasSummaryStats"
+      },
+      "AuditRulingCreate": {
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Node Id"
+          },
+          "disposition": {
+            "type": "string",
+            "maxLength": 48,
+            "minLength": 1,
+            "title": "Disposition"
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Summary"
+          },
+          "cutover_history": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cutover History"
+          },
+          "recorded_by": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Recorded By"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "node_id",
+          "disposition",
+          "summary",
+          "recorded_by"
+        ],
+        "title": "AuditRulingCreate"
+      },
+      "AuditRulingRead": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "target_id": {
+            "type": "integer",
+            "title": "Target Id"
+          },
+          "node_id": {
+            "type": "string",
+            "title": "Node Id"
+          },
+          "disposition": {
+            "type": "string",
+            "title": "Disposition"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "cutover_history": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cutover History"
+          },
+          "audited_commit": {
+            "type": "string",
+            "title": "Audited Commit"
+          },
+          "audited_at": {
+            "type": "string",
+            "format": "date",
+            "title": "Audited At"
+          },
+          "effective_from": {
+            "type": "string",
+            "format": "date",
+            "title": "Effective From"
+          },
+          "effective_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective Until"
+          },
+          "recorded_by": {
+            "type": "string",
+            "title": "Recorded By"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "target_id",
+          "node_id",
+          "disposition",
+          "summary",
+          "audited_commit",
+          "audited_at",
+          "effective_from",
+          "recorded_by",
+          "created_at"
+        ],
+        "title": "AuditRulingRead"
+      },
+      "BoundaryFinding": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "rule_code": {
+            "type": "string",
+            "title": "Rule Code"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "truth",
+              "manipulate",
+              "display"
+            ],
+            "title": "Tier"
+          },
+          "severity": {
+            "type": "string",
+            "title": "Severity"
+          },
+          "blocks_gate": {
+            "type": "boolean",
+            "title": "Blocks Gate"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "source_file": {
+            "type": "string",
+            "title": "Source File"
+          },
+          "line": {
+            "type": "integer",
+            "title": "Line",
+            "default": 1
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          },
+          "remediation": {
+            "type": "string",
+            "title": "Remediation"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "rule_code",
+          "tier",
+          "severity",
+          "blocks_gate",
+          "source_file",
+          "title",
+          "detail",
+          "remediation"
+        ],
+        "title": "BoundaryFinding"
+      },
+      "DiffBlastRadiusReport": {
+        "properties": {
+          "target_slug": {
+            "type": "string",
+            "title": "Target Slug"
+          },
+          "base_ref": {
+            "type": "string",
+            "title": "Base Ref"
+          },
+          "head_commit": {
+            "type": "string",
+            "title": "Head Commit"
+          },
+          "commits_in_range": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Commits In Range"
+          },
+          "changed_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Changed Files"
+          },
+          "touched_node_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Touched Node Ids"
+          },
+          "impacted_truth_nodes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Impacted Truth Nodes"
+          },
+          "impacted_manipulator_nodes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Impacted Manipulator Nodes"
+          },
+          "impacted_display_nodes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Impacted Display Nodes"
+          },
+          "impacted_chains": {
+            "items": {
+              "$ref": "#/components/schemas/EndToEndChain"
+            },
+            "type": "array",
+            "title": "Impacted Chains"
+          },
+          "new_findings": {
+            "items": {
+              "$ref": "#/components/schemas/BoundaryFinding"
+            },
+            "type": "array",
+            "title": "New Findings"
+          },
+          "blocking_new_findings": {
+            "type": "integer",
+            "title": "Blocking New Findings",
+            "default": 0
+          },
+          "diff_verdict": {
+            "type": "string",
+            "enum": [
+              "PASS",
+              "FAIL"
+            ],
+            "title": "Diff Verdict"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "target_slug",
+          "base_ref",
+          "head_commit",
+          "diff_verdict"
+        ],
+        "title": "DiffBlastRadiusReport"
+      },
+      "DistrictXraySummary": {
+        "properties": {
+          "district": {
+            "type": "string",
+            "title": "District"
+          },
+          "node_count": {
+            "type": "integer",
+            "title": "Node Count"
+          },
+          "flagged_node_count": {
+            "type": "integer",
+            "title": "Flagged Node Count"
+          },
+          "crimson_diff_count": {
+            "type": "integer",
+            "title": "Crimson Diff Count",
+            "default": 0
+          },
+          "top_rule_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top Rule Code"
+          },
+          "top_rule_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top Rule Title"
+          },
+          "sample_nodes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sample Nodes"
+          },
+          "sample_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sample Files"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "district",
+          "node_count",
+          "flagged_node_count"
+        ],
+        "title": "DistrictXraySummary"
+      },
+      "EndToEndChain": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "display_node_id": {
+            "type": "string",
+            "title": "Display Node Id"
+          },
+          "display_label": {
+            "type": "string",
+            "title": "Display Label"
+          },
+          "via_node_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Via Node Ids"
+          },
+          "http_method": {
+            "type": "string",
+            "title": "Http Method"
+          },
+          "http_path": {
+            "type": "string",
+            "title": "Http Path"
+          },
+          "route_node_id": {
+            "type": "string",
+            "title": "Route Node Id"
+          },
+          "route_label": {
+            "type": "string",
+            "title": "Route Label"
+          },
+          "manipulator_node_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Manipulator Node Ids"
+          },
+          "truth_table_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Truth Table Ids"
+          },
+          "truth_table_labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Truth Table Labels"
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write"
+            ],
+            "title": "Operation"
+          },
+          "verified": {
+            "type": "boolean",
+            "title": "Verified"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "display_node_id",
+          "display_label",
+          "http_method",
+          "http_path",
+          "route_node_id",
+          "route_label",
+          "operation",
+          "verified"
+        ],
+        "title": "EndToEndChain"
+      },
+      "GateEvaluation": {
+        "properties": {
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "PASS",
+              "RATCHET_PASS",
+              "FAIL"
+            ],
+            "title": "Verdict"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "strict",
+              "ratchet"
+            ],
+            "title": "Mode"
+          },
+          "blocking_violations": {
+            "type": "integer",
+            "title": "Blocking Violations"
+          },
+          "ratchet_exceeded_rules": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Ratchet Exceeded Rules"
+          },
+          "rule_counts": {
+            "items": {
+              "$ref": "#/components/schemas/RuleGateRow"
+            },
+            "type": "array",
+            "title": "Rule Counts"
+          },
+          "evaluated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Evaluated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "verdict",
+          "mode",
+          "blocking_violations",
+          "evaluated_at"
+        ],
+        "title": "GateEvaluation"
+      },
+      "GovernanceSyncReceipt": {
+        "properties": {
+          "target_slug": {
+            "type": "string",
+            "title": "Target Slug"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "export",
+              "import"
+            ],
+            "title": "Direction"
+          },
+          "bundle_path": {
+            "type": "string",
+            "title": "Bundle Path"
+          },
+          "rules_synced": {
+            "type": "integer",
+            "title": "Rules Synced"
+          },
+          "vocabularies_synced": {
+            "type": "integer",
+            "title": "Vocabularies Synced"
+          },
+          "baselines_synced": {
+            "type": "integer",
+            "title": "Baselines Synced"
+          },
+          "rulings_synced": {
+            "type": "integer",
+            "title": "Rulings Synced"
+          },
+          "synced_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Synced At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "target_slug",
+          "direction",
+          "bundle_path",
+          "rules_synced",
+          "vocabularies_synced",
+          "baselines_synced",
+          "rulings_synced",
+          "synced_at"
+        ],
+        "title": "GovernanceSyncReceipt"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "LegacyBridgeSummary": {
+        "properties": {
+          "present": {
+            "type": "boolean",
+            "title": "Present"
+          },
+          "snapshot_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Title"
+          },
+          "audited_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audited At"
+          },
+          "snapshot_commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Commit"
+          },
+          "receipts_checked": {
+            "type": "integer",
+            "title": "Receipts Checked",
+            "default": 0
+          },
+          "receipts_verified": {
+            "type": "integer",
+            "title": "Receipts Verified",
+            "default": 0
+          },
+          "receipts_changed": {
+            "type": "integer",
+            "title": "Receipts Changed",
+            "default": 0
+          },
+          "receipts_error": {
+            "type": "integer",
+            "title": "Receipts Error",
+            "default": 0
+          },
+          "curated_nodes_matched": {
+            "type": "integer",
+            "title": "Curated Nodes Matched",
+            "default": 0
+          },
+          "cutover_reclassified_count": {
+            "type": "integer",
+            "title": "Cutover Reclassified Count",
+            "default": 0
+          },
+          "sample_receipts": {
+            "items": {
+              "$ref": "#/components/schemas/LegacyReceiptItem"
+            },
+            "type": "array",
+            "title": "Sample Receipts"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "present"
+        ],
+        "title": "LegacyBridgeSummary"
+      },
+      "LegacyReceiptItem": {
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "title": "Node Id"
+          },
+          "result": {
+            "type": "string",
+            "enum": [
+              "verified_present",
+              "verified_absent",
+              "changed",
+              "error"
+            ],
+            "title": "Result"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "note": {
+            "type": "string",
+            "title": "Note"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "node_id",
+          "result",
+          "path",
+          "note"
+        ],
+        "title": "LegacyReceiptItem"
+      },
+      "LlmBriefRead": {
+        "properties": {
+          "target_slug": {
+            "type": "string",
+            "title": "Target Slug"
+          },
+          "source_commit": {
+            "type": "string",
+            "title": "Source Commit"
+          },
+          "approx_tokens": {
+            "type": "integer",
+            "title": "Approx Tokens"
+          },
+          "markdown": {
+            "type": "string",
+            "title": "Markdown"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "target_slug",
+          "source_commit",
+          "approx_tokens",
+          "markdown"
+        ],
+        "title": "LlmBriefRead"
+      },
+      "LlmContextConeReport": {
+        "properties": {
+          "target_slug": {
+            "type": "string",
+            "title": "Target Slug"
+          },
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "source_commit": {
+            "type": "string",
+            "title": "Source Commit"
+          },
+          "matched_seed_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Matched Seed Ids"
+          },
+          "suggestions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Suggestions"
+          },
+          "upstream_display_nodes": {
+            "items": {
+              "$ref": "#/components/schemas/LlmNodePointer"
+            },
+            "type": "array",
+            "title": "Upstream Display Nodes"
+          },
+          "manipulator_nodes": {
+            "items": {
+              "$ref": "#/components/schemas/LlmNodePointer"
+            },
+            "type": "array",
+            "title": "Manipulator Nodes"
+          },
+          "downstream_truth_nodes": {
+            "items": {
+              "$ref": "#/components/schemas/LlmNodePointer"
+            },
+            "type": "array",
+            "title": "Downstream Truth Nodes"
+          },
+          "cone_edges": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cone Edges"
+          },
+          "matching_chains": {
+            "items": {
+              "$ref": "#/components/schemas/EndToEndChain"
+            },
+            "type": "array",
+            "title": "Matching Chains"
+          },
+          "cone_findings": {
+            "items": {
+              "$ref": "#/components/schemas/BoundaryFinding"
+            },
+            "type": "array",
+            "title": "Cone Findings"
+          },
+          "approx_tokens": {
+            "type": "integer",
+            "title": "Approx Tokens",
+            "default": 0
+          },
+          "markdown": {
+            "type": "string",
+            "title": "Markdown",
+            "default": ""
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "target_slug",
+          "query",
+          "source_commit"
+        ],
+        "title": "LlmContextConeReport"
+      },
+      "LlmNodePointer": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "truth",
+              "manipulate",
+              "display"
+            ],
+            "title": "Tier"
+          },
+          "subkind": {
+            "type": "string",
+            "enum": [
+              "table",
+              "sql_function",
+              "cache_store",
+              "route",
+              "service",
+              "solver",
+              "cli",
+              "page",
+              "hook",
+              "api_client",
+              "component"
+            ],
+            "title": "Subkind"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "pointer": {
+            "type": "string",
+            "title": "Pointer"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "clean",
+              "policy_in_code",
+              "duplicated_truth",
+              "gray_zone",
+              "orphaned",
+              "in_flight",
+              "unwired"
+            ],
+            "title": "Status"
+          },
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Columns"
+          },
+          "http_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Http Paths"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "tier",
+          "subkind",
+          "label",
+          "pointer",
+          "status"
+        ],
+        "title": "LlmNodePointer"
+      },
+      "OnDeviceEngineStatus": {
+        "properties": {
+          "engine": {
+            "type": "string",
+            "enum": [
+              "apple",
+              "chrome",
+              "local"
+            ],
+            "title": "Engine"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "downloadable",
+              "downloading",
+              "unavailable",
+              "client_probed"
+            ],
+            "title": "State"
+          },
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Id"
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "supports_vision": {
+            "type": "boolean",
+            "title": "Supports Vision",
+            "default": false
+          },
+          "note": {
+            "type": "string",
+            "title": "Note",
+            "default": ""
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "engine",
+          "label",
+          "state"
+        ],
+        "title": "OnDeviceEngineStatus"
+      },
+      "PolicyVocabularyCreate": {
+        "properties": {
+          "domain_pack": {
+            "type": "string",
+            "maxLength": 32,
+            "minLength": 2,
+            "pattern": "^[a-z0-9][a-z0-9-_]*$",
+            "title": "Domain Pack",
+            "default": "custom"
+          },
+          "token": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 2,
+            "pattern": "^[A-Z][A-Z0-9_]*$",
+            "title": "Token"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "is_enabled": {
+            "type": "boolean",
+            "title": "Is Enabled",
+            "default": true
+          },
+          "created_by": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Created By",
+            "default": "operator"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "PolicyVocabularyCreate"
+      },
+      "PolicyVocabularyRead": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "domain_pack": {
+            "type": "string",
+            "title": "Domain Pack"
+          },
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "is_enabled": {
+            "type": "boolean",
+            "title": "Is Enabled"
+          },
+          "created_by": {
+            "type": "string",
+            "title": "Created By"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "domain_pack",
+          "token",
+          "description",
+          "is_enabled",
+          "created_by",
+          "created_at"
+        ],
+        "title": "PolicyVocabularyRead"
+      },
+      "PolicyVocabularyUpdate": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Enabled"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "PolicyVocabularyUpdate"
+      },
+      "PortableGovernanceBundle": {
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "title": "Schema Version",
+            "default": "1.0"
+          },
+          "target_slug": {
+            "type": "string",
+            "title": "Target Slug"
+          },
+          "exported_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Exported At"
+          },
+          "rule_overrides": {
+            "items": {
+              "$ref": "#/components/schemas/PortableRuleOverride"
+            },
+            "type": "array",
+            "title": "Rule Overrides"
+          },
+          "vocabularies": {
+            "items": {
+              "$ref": "#/components/schemas/PortableVocabularyEntry"
+            },
+            "type": "array",
+            "title": "Vocabularies"
+          },
+          "ratchet_baselines": {
+            "items": {
+              "$ref": "#/components/schemas/PortableRatchetItem"
+            },
+            "type": "array",
+            "title": "Ratchet Baselines"
+          },
+          "audit_rulings": {
+            "items": {
+              "$ref": "#/components/schemas/PortableRulingItem"
+            },
+            "type": "array",
+            "title": "Audit Rulings"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "target_slug",
+          "exported_at"
+        ],
+        "title": "PortableGovernanceBundle"
+      },
+      "PortableRatchetItem": {
+        "properties": {
+          "rule_code": {
+            "type": "string",
+            "title": "Rule Code"
+          },
+          "max_allowed_count": {
+            "type": "integer",
+            "title": "Max Allowed Count"
+          },
+          "recorded_commit": {
+            "type": "string",
+            "title": "Recorded Commit"
+          },
+          "recorded_by": {
+            "type": "string",
+            "title": "Recorded By"
+          },
+          "note": {
+            "type": "string",
+            "title": "Note",
+            "default": ""
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rule_code",
+          "max_allowed_count",
+          "recorded_commit",
+          "recorded_by"
+        ],
+        "title": "PortableRatchetItem"
+      },
+      "PortableRuleOverride": {
+        "properties": {
+          "rule_code": {
+            "type": "string",
+            "title": "Rule Code"
+          },
+          "severity": {
+            "type": "string",
+            "title": "Severity"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "blocks_gate": {
+            "type": "boolean",
+            "title": "Blocks Gate"
+          },
+          "updated_by": {
+            "type": "string",
+            "title": "Updated By"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rule_code",
+          "severity",
+          "enabled",
+          "blocks_gate",
+          "updated_by"
+        ],
+        "title": "PortableRuleOverride"
+      },
+      "PortableRulingItem": {
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "title": "Node Id"
+          },
+          "disposition": {
+            "type": "string",
+            "title": "Disposition"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "cutover_history": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cutover History"
+          },
+          "audited_commit": {
+            "type": "string",
+            "title": "Audited Commit"
+          },
+          "recorded_by": {
+            "type": "string",
+            "title": "Recorded By"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "node_id",
+          "disposition",
+          "summary",
+          "audited_commit",
+          "recorded_by"
+        ],
+        "title": "PortableRulingItem"
+      },
+      "PortableVocabularyEntry": {
+        "properties": {
+          "domain_pack": {
+            "type": "string",
+            "title": "Domain Pack"
+          },
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "is_enabled": {
+            "type": "boolean",
+            "title": "Is Enabled",
+            "default": true
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "domain_pack",
+          "token"
+        ],
+        "title": "PortableVocabularyEntry"
+      },
+      "RatchetBaselineRead": {
+        "properties": {
+          "rule_code": {
+            "type": "string",
+            "title": "Rule Code"
+          },
+          "max_allowed_count": {
+            "type": "integer",
+            "title": "Max Allowed Count"
+          },
+          "recorded_commit": {
+            "type": "string",
+            "title": "Recorded Commit"
+          },
+          "recorded_by": {
+            "type": "string",
+            "title": "Recorded By"
+          },
+          "recorded_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Recorded At"
+          },
+          "note": {
+            "type": "string",
+            "title": "Note"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rule_code",
+          "max_allowed_count",
+          "recorded_commit",
+          "recorded_by",
+          "recorded_at",
+          "note"
+        ],
+        "title": "RatchetBaselineRead"
+      },
+      "RatchetCaptureRequest": {
+        "properties": {
+          "recorded_by": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Recorded By"
+          },
+          "note": {
+            "type": "string",
+            "title": "Note",
+            "default": "Captured current observed counts as downward-only ratchet ceiling."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "recorded_by"
+        ],
+        "title": "RatchetCaptureRequest"
+      },
+      "RuleGateRow": {
+        "properties": {
+          "rule_code": {
+            "type": "string",
+            "title": "Rule Code"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "truth",
+              "manipulate",
+              "display"
+            ],
+            "title": "Tier"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "severity": {
+            "type": "string",
+            "title": "Severity"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "blocks_gate": {
+            "type": "boolean",
+            "title": "Blocks Gate"
+          },
+          "observed_count": {
+            "type": "integer",
+            "title": "Observed Count"
+          },
+          "baseline_max": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Max"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pass",
+              "ratcheted",
+              "exceeded",
+              "disabled"
+            ],
+            "title": "Status"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rule_code",
+          "tier",
+          "title",
+          "severity",
+          "enabled",
+          "blocks_gate",
+          "observed_count",
+          "status"
+        ],
+        "title": "RuleGateRow"
+      },
+      "RulePolicyRead": {
+        "properties": {
+          "rule_code": {
+            "type": "string",
+            "title": "Rule Code"
+          },
+          "tier": {
+            "type": "string",
+            "title": "Tier"
+          },
+          "category": {
+            "type": "string",
+            "title": "Category"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "rationale": {
+            "type": "string",
+            "title": "Rationale"
+          },
+          "severity": {
+            "type": "string",
+            "title": "Severity"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "blocks_gate": {
+            "type": "boolean",
+            "title": "Blocks Gate"
+          },
+          "effective_from": {
+            "type": "string",
+            "format": "date",
+            "title": "Effective From"
+          },
+          "effective_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective Until"
+          },
+          "updated_by": {
+            "type": "string",
+            "title": "Updated By"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rule_code",
+          "tier",
+          "category",
+          "title",
+          "rationale",
+          "severity",
+          "enabled",
+          "blocks_gate",
+          "effective_from",
+          "updated_by",
+          "updated_at"
+        ],
+        "title": "RulePolicyRead"
+      },
+      "RulePolicyUpdate": {
+        "properties": {
+          "severity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Severity"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "blocks_gate": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocks Gate"
+          },
+          "updated_by": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Updated By"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "updated_by"
+        ],
+        "title": "RulePolicyUpdate"
+      },
+      "ScanSnapshotSummary": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "source_commit": {
+            "type": "string",
+            "title": "Source Commit"
+          },
+          "observation_source": {
+            "type": "string",
+            "title": "Observation Source"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Observed At"
+          },
+          "valid_until": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Valid Until"
+          },
+          "content_digest": {
+            "type": "string",
+            "title": "Content Digest"
+          },
+          "truth_node_count": {
+            "type": "integer",
+            "title": "Truth Node Count"
+          },
+          "manipulator_node_count": {
+            "type": "integer",
+            "title": "Manipulator Node Count"
+          },
+          "display_node_count": {
+            "type": "integer",
+            "title": "Display Node Count"
+          },
+          "verified_edge_count": {
+            "type": "integer",
+            "title": "Verified Edge Count"
+          },
+          "blocking_finding_count": {
+            "type": "integer",
+            "title": "Blocking Finding Count"
+          },
+          "warning_finding_count": {
+            "type": "integer",
+            "title": "Warning Finding Count"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "source_commit",
+          "observation_source",
+          "observed_at",
+          "valid_until",
+          "content_digest",
+          "truth_node_count",
+          "manipulator_node_count",
+          "display_node_count",
+          "verified_edge_count",
+          "blocking_finding_count",
+          "warning_finding_count"
+        ],
+        "title": "ScanSnapshotSummary"
+      },
+      "SnapshotComparisonReport": {
+        "properties": {
+          "target_slug": {
+            "type": "string",
+            "title": "Target Slug"
+          },
+          "base_snapshot_id": {
+            "type": "integer",
+            "title": "Base Snapshot Id"
+          },
+          "head_snapshot_id": {
+            "type": "integer",
+            "title": "Head Snapshot Id"
+          },
+          "base_commit": {
+            "type": "string",
+            "title": "Base Commit"
+          },
+          "head_commit": {
+            "type": "string",
+            "title": "Head Commit"
+          },
+          "base_observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Base Observed At"
+          },
+          "head_observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Head Observed At"
+          },
+          "edge_delta": {
+            "type": "integer",
+            "title": "Edge Delta"
+          },
+          "chain_delta": {
+            "type": "integer",
+            "title": "Chain Delta"
+          },
+          "blocking_delta": {
+            "type": "integer",
+            "title": "Blocking Delta"
+          },
+          "warning_delta": {
+            "type": "integer",
+            "title": "Warning Delta"
+          },
+          "added_nodes": {
+            "items": {
+              "$ref": "#/components/schemas/AtlasNode"
+            },
+            "type": "array",
+            "title": "Added Nodes"
+          },
+          "removed_nodes": {
+            "items": {
+              "$ref": "#/components/schemas/AtlasNode"
+            },
+            "type": "array",
+            "title": "Removed Nodes"
+          },
+          "new_findings": {
+            "items": {
+              "$ref": "#/components/schemas/BoundaryFinding"
+            },
+            "type": "array",
+            "title": "New Findings"
+          },
+          "resolved_findings": {
+            "items": {
+              "$ref": "#/components/schemas/BoundaryFinding"
+            },
+            "type": "array",
+            "title": "Resolved Findings"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "target_slug",
+          "base_snapshot_id",
+          "head_snapshot_id",
+          "base_commit",
+          "head_commit",
+          "base_observed_at",
+          "head_observed_at",
+          "edge_delta",
+          "chain_delta",
+          "blocking_delta",
+          "warning_delta"
+        ],
+        "title": "SnapshotComparisonReport"
+      },
+      "SourceSnippetLine": {
+        "properties": {
+          "line_number": {
+            "type": "integer",
+            "title": "Line Number"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "is_focus": {
+            "type": "boolean",
+            "title": "Is Focus",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "line_number",
+          "text"
+        ],
+        "title": "SourceSnippetLine"
+      },
+      "SourceSnippetRead": {
+        "properties": {
+          "target_slug": {
+            "type": "string",
+            "title": "Target Slug"
+          },
+          "rel_path": {
+            "type": "string",
+            "title": "Rel Path"
+          },
+          "abs_path": {
+            "type": "string",
+            "title": "Abs Path"
+          },
+          "focus_line": {
+            "type": "integer",
+            "title": "Focus Line"
+          },
+          "start_line": {
+            "type": "integer",
+            "title": "Start Line"
+          },
+          "end_line": {
+            "type": "integer",
+            "title": "End Line"
+          },
+          "total_lines": {
+            "type": "integer",
+            "title": "Total Lines"
+          },
+          "language": {
+            "type": "string",
+            "title": "Language"
+          },
+          "lines": {
+            "items": {
+              "$ref": "#/components/schemas/SourceSnippetLine"
+            },
+            "type": "array",
+            "title": "Lines"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "target_slug",
+          "rel_path",
+          "abs_path",
+          "focus_line",
+          "start_line",
+          "end_line",
+          "total_lines",
+          "language"
+        ],
+        "title": "SourceSnippetRead"
+      },
+      "StackDetectionResult": {
+        "properties": {
+          "repo_path": {
+            "type": "string",
+            "title": "Repo Path"
+          },
+          "recommended_profile_slug": {
+            "type": "string",
+            "title": "Recommended Profile Slug"
+          },
+          "truth_adapter": {
+            "type": "string",
+            "title": "Truth Adapter"
+          },
+          "manipulator_adapter": {
+            "type": "string",
+            "title": "Manipulator Adapter"
+          },
+          "display_adapter": {
+            "type": "string",
+            "title": "Display Adapter"
+          },
+          "backend_subdir": {
+            "type": "string",
+            "title": "Backend Subdir"
+          },
+          "frontend_subdir": {
+            "type": "string",
+            "title": "Frontend Subdir"
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "fallback"
+            ],
+            "title": "Confidence"
+          },
+          "detected_signals": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Detected Signals"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "repo_path",
+          "recommended_profile_slug",
+          "truth_adapter",
+          "manipulator_adapter",
+          "display_adapter",
+          "backend_subdir",
+          "frontend_subdir",
+          "confidence"
+        ],
+        "title": "StackDetectionResult"
+      },
+      "StackProfileRead": {
+        "properties": {
+          "slug": {
+            "type": "string",
+            "title": "Slug"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "truth_adapter": {
+            "type": "string",
+            "title": "Truth Adapter"
+          },
+          "manipulator_adapter": {
+            "type": "string",
+            "title": "Manipulator Adapter"
+          },
+          "display_adapter": {
+            "type": "string",
+            "title": "Display Adapter"
+          },
+          "implementation_status": {
+            "type": "string",
+            "title": "Implementation Status"
+          },
+          "is_enabled": {
+            "type": "boolean",
+            "title": "Is Enabled"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "slug",
+          "label",
+          "truth_adapter",
+          "manipulator_adapter",
+          "display_adapter",
+          "implementation_status",
+          "is_enabled",
+          "description"
+        ],
+        "title": "StackProfileRead"
+      },
+      "TargetProjectCreate": {
+        "properties": {
+          "slug": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 2,
+            "pattern": "^[a-z0-9][a-z0-9-_]*$",
+            "title": "Slug"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "repo_path": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Repo Path"
+          },
+          "stack_profile_slug": {
+            "type": "string",
+            "title": "Stack Profile Slug",
+            "default": "fastapi-sqlalchemy-nextjs"
+          },
+          "backend_subdir": {
+            "type": "string",
+            "title": "Backend Subdir",
+            "default": "backend"
+          },
+          "frontend_subdir": {
+            "type": "string",
+            "title": "Frontend Subdir",
+            "default": "frontend"
+          },
+          "legacy_snapshot_relpath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Legacy Snapshot Relpath"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "created_by": {
+            "type": "string",
+            "title": "Created By",
+            "default": "operator"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "slug",
+          "name",
+          "repo_path"
+        ],
+        "title": "TargetProjectCreate"
+      },
+      "TargetProjectRead": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "slug": {
+            "type": "string",
+            "title": "Slug"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "repo_path": {
+            "type": "string",
+            "title": "Repo Path"
+          },
+          "stack_profile_slug": {
+            "type": "string",
+            "title": "Stack Profile Slug"
+          },
+          "backend_subdir": {
+            "type": "string",
+            "title": "Backend Subdir"
+          },
+          "frontend_subdir": {
+            "type": "string",
+            "title": "Frontend Subdir"
+          },
+          "legacy_snapshot_relpath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Legacy Snapshot Relpath"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "slug",
+          "name",
+          "repo_path",
+          "stack_profile_slug",
+          "backend_subdir",
+          "frontend_subdir",
+          "description",
+          "is_active"
+        ],
+        "title": "TargetProjectRead"
+      },
+      "TruthAtlasReport": {
+        "properties": {
+          "snapshot_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Id"
+          },
+          "target_slug": {
+            "type": "string",
+            "title": "Target Slug"
+          },
+          "target_name": {
+            "type": "string",
+            "title": "Target Name"
+          },
+          "repo_path": {
+            "type": "string",
+            "title": "Repo Path"
+          },
+          "stack_profile": {
+            "type": "string",
+            "title": "Stack Profile"
+          },
+          "source_commit": {
+            "type": "string",
+            "title": "Source Commit"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Observed At"
+          },
+          "valid_until": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Valid Until"
+          },
+          "observation_source": {
+            "type": "string",
+            "title": "Observation Source"
+          },
+          "content_digest": {
+            "type": "string",
+            "title": "Content Digest"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/AtlasSummaryStats"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/AtlasNode"
+            },
+            "type": "array",
+            "title": "Nodes"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/AtlasEdge"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "chains": {
+            "items": {
+              "$ref": "#/components/schemas/EndToEndChain"
+            },
+            "type": "array",
+            "title": "Chains"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/BoundaryFinding"
+            },
+            "type": "array",
+            "title": "Findings"
+          },
+          "gate": {
+            "$ref": "#/components/schemas/GateEvaluation"
+          },
+          "legacy_bridge": {
+            "$ref": "#/components/schemas/LegacyBridgeSummary"
+          },
+          "rulings": {
+            "items": {
+              "$ref": "#/components/schemas/AuditRulingRead"
+            },
+            "type": "array",
+            "title": "Rulings"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "target_slug",
+          "target_name",
+          "repo_path",
+          "stack_profile",
+          "source_commit",
+          "observed_at",
+          "valid_until",
+          "observation_source",
+          "content_digest",
+          "summary",
+          "nodes",
+          "edges",
+          "chains",
+          "findings",
+          "gate",
+          "legacy_bridge"
+        ],
+        "title": "TruthAtlasReport"
+      },
+      "UiFocusExplainRead": {
+        "properties": {
+          "active_slug": {
+            "type": "string",
+            "title": "Active Slug"
+          },
+          "target_name": {
+            "type": "string",
+            "title": "Target Name"
+          },
+          "source_commit": {
+            "type": "string",
+            "title": "Source Commit"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Observed At"
+          },
+          "active_tab": {
+            "type": "string",
+            "title": "Active Tab"
+          },
+          "lens": {
+            "type": "string",
+            "title": "Lens"
+          },
+          "layout_mode": {
+            "type": "string",
+            "title": "Layout Mode"
+          },
+          "blast_mode": {
+            "type": "string",
+            "title": "Blast Mode"
+          },
+          "diff_base_ref": {
+            "type": "string",
+            "title": "Diff Base Ref"
+          },
+          "headline": {
+            "type": "string",
+            "title": "Headline"
+          },
+          "color_reason": {
+            "type": "string",
+            "title": "Color Reason"
+          },
+          "focused_node": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LlmNodePointer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "focused_district": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DistrictXraySummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_findings": {
+            "items": {
+              "$ref": "#/components/schemas/BoundaryFinding"
+            },
+            "type": "array",
+            "title": "Active Findings"
+          },
+          "cone_edges": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cone Edges"
+          },
+          "has_snapshot": {
+            "type": "boolean",
+            "title": "Has Snapshot",
+            "default": false
+          },
+          "snapshot_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Path"
+          },
+          "markdown_brief": {
+            "type": "string",
+            "title": "Markdown Brief"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "active_slug",
+          "target_name",
+          "source_commit",
+          "observed_at",
+          "active_tab",
+          "lens",
+          "layout_mode",
+          "blast_mode",
+          "diff_base_ref",
+          "headline",
+          "color_reason",
+          "markdown_brief"
+        ],
+        "title": "UiFocusExplainRead"
+      },
+      "UiFocusStatePayload": {
+        "properties": {
+          "active_slug": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Active Slug"
+          },
+          "active_tab": {
+            "type": "string",
+            "maxLength": 24,
+            "title": "Active Tab",
+            "default": "3d"
+          },
+          "selected_node_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Node Id"
+          },
+          "hovered_node_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hovered Node Id"
+          },
+          "focused_district": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 80
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Focused District"
+          },
+          "tier_filter": {
+            "type": "string",
+            "maxLength": 24,
+            "title": "Tier Filter",
+            "default": "all"
+          },
+          "subkind_filter": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "Subkind Filter",
+            "default": "all"
+          },
+          "edge_filter": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "Edge Filter",
+            "default": "all"
+          },
+          "lens": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "Lens",
+            "default": "status"
+          },
+          "layout_mode": {
+            "type": "string",
+            "maxLength": 24,
+            "title": "Layout Mode",
+            "default": "cluster"
+          },
+          "blast_mode": {
+            "type": "string",
+            "maxLength": 24,
+            "title": "Blast Mode",
+            "default": "off"
+          },
+          "diff_base_ref": {
+            "type": "string",
+            "maxLength": 128,
+            "title": "Diff Base Ref",
+            "default": "HEAD~1"
+          },
+          "only_flagged": {
+            "type": "boolean",
+            "title": "Only Flagged",
+            "default": false
+          },
+          "isolate_cone": {
+            "type": "boolean",
+            "title": "Isolate Cone",
+            "default": false
+          },
+          "search_query": {
+            "type": "string",
+            "maxLength": 200,
+            "title": "Search Query",
+            "default": ""
+          },
+          "active_trace_route": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Trace Route"
+          },
+          "camera_position": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 96
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Camera Position"
+          },
+          "camera_target": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 96
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Camera Target"
+          },
+          "visible_node_count": {
+            "type": "integer",
+            "maximum": 50000.0,
+            "minimum": 0.0,
+            "title": "Visible Node Count",
+            "default": 0
+          },
+          "in_frustum_count": {
+            "type": "integer",
+            "maximum": 50000.0,
+            "minimum": 0.0,
+            "title": "In Frustum Count",
+            "default": 0
+          },
+          "visual_headline": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 320
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visual Headline"
+          },
+          "live_viewport_brief": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 16000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Live Viewport Brief"
+          },
+          "snapshot_data_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 8500000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Data Url"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "active_slug"
+        ],
+        "title": "UiFocusStatePayload"
+      },
+      "UiFocusSyncAck": {
+        "properties": {
+          "active_slug": {
+            "type": "string",
+            "title": "Active Slug"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Observed At"
+          },
+          "has_snapshot": {
+            "type": "boolean",
+            "title": "Has Snapshot"
+          },
+          "snapshot_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Path"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "active_slug",
+          "observed_at",
+          "has_snapshot"
+        ],
+        "title": "UiFocusSyncAck"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

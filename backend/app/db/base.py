@@ -1,0 +1,9 @@
+"""SQLAlchemy declarative base for Truth Atlas persisted domain truth."""
+
+from __future__ import annotations
+
+from sqlalchemy.orm import DeclarativeBase
+
+
+class Base(DeclarativeBase):
+    """Canonical SQLAlchemy 2.0 base class."""

@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+:root,
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --wythe-body-bg: #05080f;
+  --wythe-body-fg: #e2e8f0;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+  --wythe-body-bg: #f4f6fa;
+  --wythe-body-fg: #0f172a;
+  --color-slate-950: #ffffff;
+  --color-slate-900: #f1f5f9;
+  --color-slate-800: #cbd5e1;
+  --color-slate-700: #94a3b8;
+  --color-slate-400: #475569;
+  --color-slate-300: #334155;
+  --color-slate-200: #1e293b;
+  --color-slate-100: #0f172a;
+  --color-teal-300: #0f766e;
+  --color-teal-200: #115e59;
+  --color-teal-100: #134e4a;
+  --color-teal-950: #ccfbf1;
+  --color-sky-300: #0369a1;
+  --color-sky-200: #075985;
+  --color-sky-100: #0c4a6e;
+  --color-sky-950: #e0f2fe;
+  --color-blue-300: #1d4ed8;
+  --color-amber-300: #b45309;
+  --color-amber-200: #92400e;
+  --color-amber-950: #fef3c7;
+  --color-emerald-300: #047857;
+  --color-emerald-200: #065f46;
+  --color-emerald-950: #d1fae5;
+  --color-rose-300: #be123c;
+  --color-rose-200: #9f1239;
+  --color-rose-100: #881337;
+  --color-rose-950: #ffe4e6;
+}
+
+body {
+  background-color: var(--wythe-body-bg);
+  color: var(--wythe-body-fg);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
