@@ -191,7 +191,7 @@ class PythonFastApiAdapter:
                 if target_nid:
                     add_edge(nid, target_nid, "calls_helper", pm.rel_path, f"Imports and invokes `{imp}`.")
 
-            for called_sym in pm.called:
+            for called_sym in pm.symbol_calls:
                 defs = symbol_to_defining_nodes.get(called_sym, [])
                 if len(defs) == 1:
                     add_edge(nid, defs[0], "calls_helper", pm.rel_path, f"Calls `{called_sym}()` across manipulation tier.")

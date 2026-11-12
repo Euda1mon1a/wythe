@@ -29,23 +29,60 @@ _PAUSE_SECONDS = 0.02
 _TIMEOUT_SECONDS = 3.0
 _SEGMENT_PLACEHOLDER = "wythe-probe"
 _EXISTS_CODES = frozenset({200, 201, 202, 204, 301, 302, 303, 307, 308, 400, 401, 403, 409, 422})
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
 
 
-def _host_is_local(host: str) -> bool:
-    """True when every address the host resolves to is loopback, private, or otherwise non-global."""
-    if host == "localhost" or host.endswith(".localhost"):
-        return True
+def _resolve_host_ips(host: str) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Parse a literal IP or resolve DNS records for `host`."""
+    clean_host = host.split("%", 1)[0]
+    try:
+        return {ipaddress.ip_address(clean_host)}
+    except ValueError:
+        pass
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:
+        return set()
+    resolved: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    for info in infos:
+        raw_addr = str(info[4][0]).split("%", 1)[0]
+        try:
+            resolved.add(ipaddress.ip_address(raw_addr))
+        except ValueError:
+            continue
+    return resolved
+
+
+def _ip_is_local_or_private(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.is_link_local or ip.is_multicast or ip.is_unspecified:
         return False
-    addrs = {str(info[4][0]).split("%", 1)[0] for info in infos}
-    if not addrs:
-        return False
-    try:
-        return all(not ipaddress.ip_address(a).is_global for a in addrs)
-    except ValueError:
-        return False
+    if ip.is_loopback or ip.is_private:
+        return True
+    return isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NET
+
+
+def _validate_probe_host(host: str, *, allow_remote: bool) -> bool:
+    """Validate target host and return True when the host is local/private.
+
+    Link-local (e.g. 169.254.169.254 cloud metadata), multicast, and unspecified
+    addresses are always rejected regardless of `allow_remote`.
+    """
+    ips = _resolve_host_ips(host)
+    for ip in ips:
+        if ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+            raise ValueError(
+                f"--probe-url host '{host}' resolves to a link-local, multicast, or unspecified "
+                f"address ({ip}) and cannot be probed"
+            )
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    is_local = bool(ips) and all(_ip_is_local_or_private(ip) for ip in ips)
+    if not is_local and not allow_remote:
+        raise ValueError(
+            f"--probe-url host '{host}' is not loopback or private; "
+            "pass --probe-allow-remote to probe it anyway"
+        )
+    return is_local
 
 
 def _concrete_path(path: str) -> str:
@@ -112,11 +149,7 @@ def apply_live_route_probe(
     parts = urlsplit(base_url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError("--probe-url must be an absolute http(s) URL")
-    if not allow_remote and not _host_is_local(parts.hostname):
-        raise ValueError(
-            f"--probe-url host '{parts.hostname}' is not loopback or private; "
-            "pass --probe-allow-remote to probe it anyway"
-        )
+    is_local = _validate_probe_host(parts.hostname, allow_remote=allow_remote)
 
     targets = [f for f in findings if f.rule_code in _PROBED_RULES and f.http_path]
     if not targets:
@@ -126,6 +159,7 @@ def apply_live_route_probe(
     http = client or httpx.Client(
         timeout=_TIMEOUT_SECONDS,
         follow_redirects=False,
+        trust_env=not is_local,
         headers={"User-Agent": "wythe-route-probe"},
     )
     results: dict[tuple[str, str], int | None] = {}

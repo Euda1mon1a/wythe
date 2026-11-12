@@ -23,6 +23,9 @@ _SKIP_DIRS = frozenset(
 _NEXT_APP_ENTRY_STEMS = frozenset(
     {"page", "layout", "template", "loading", "error", "global-error", "not-found", "default"}
 )
+_REACT_SPA_ROOT_STEMS = frozenset(
+    {"main", "index", "app", "root", "entry.client", "entry.server", "router", "routes"}
+)
 MODULE_SYMBOL = "<module>"
 
 _IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
@@ -523,3 +526,39 @@ def build_nextjs_reachability(
     roots = {p for p in files if is_nextjs_entry(p, src_root, fe_dir)}
     index = ReachabilityIndex(modules, roots, resolve, display_root)
     return index, nextjs_route_handler_patterns(files, src_root, fe_dir)
+
+
+def is_react_spa_entry(path: Path, src_root: Path, fe_dir: Path) -> bool:
+    """True for Vite/CRA/React Router/TanStack/Remix entry points and file-routed pages."""
+    parts = _app_relative(path, src_root, fe_dir)
+    if not parts:
+        return False
+    if len(parts) == 1 and path.stem.lower() in _REACT_SPA_ROOT_STEMS:
+        return True
+    if parts[0] in ("pages", "routes", "views"):
+        return True
+    return len(parts) > 1 and parts[0] == "app" and parts[1] in ("routes", "pages", "views")
+
+
+def build_react_spa_reachability(
+    fe_dir: Path,
+    src_root: Path,
+    display_root: Path,
+    clean: Callable[[str], str],
+    pre_cleaned: dict[Path, str] | None = None,
+) -> ReachabilityIndex:
+    """Return the symbol-level reachability index for a React SPA / Vite / Remix frontend."""
+    files = collect_graph_files(fe_dir)
+    known = set(files)
+    resolve = make_resolver(fe_dir, src_root, known)
+    modules: dict[Path, _ModuleInfo] = {}
+    for path in files:
+        text = (pre_cleaned or {}).get(path)
+        if text is None:
+            try:
+                text = clean(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError):
+                continue
+        modules[path] = parse_module(path, text)
+    roots = {p for p in files if is_react_spa_entry(p, src_root, fe_dir)}
+    return ReachabilityIndex(modules, roots, resolve, display_root)

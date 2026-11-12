@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from app.adapters.base import (
@@ -13,6 +14,11 @@ from app.adapters.frontend_common import (
     extract_script_preserving_lines,
     resolve_frontend_import,
     scan_display_module_semantics,
+)
+from app.adapters.ts_reachability import (
+    MODULE_SYMBOL,
+    ReachabilityIndex,
+    build_react_spa_reachability,
 )
 from app.adapters.typescript_nextjs import _REEXPORT_NAMED_RE, _REEXPORT_STAR_RE
 from app.schemas.atlas import AtlasEdge, AtlasNode
@@ -102,6 +108,18 @@ class TypeScriptReactSpaAdapter:
                 summary=f"React {subkind.replace('_', ' ')} `{lbl}` ({rel_repo}).",
             )
 
+        reach: ReachabilityIndex | None = None
+        try:
+            reach = build_react_spa_reachability(
+                fe_dir,
+                src_root,
+                repo_root.resolve(),
+                lambda raw_text: extract_script_preserving_lines(raw_text, ".tsx"),
+                pre_cleaned=cleaned,
+            )
+        except (OSError, ValueError, RecursionError):
+            reach = None
+
         edges: list[AtlasEdge] = []
         seen_edges: set[tuple[str, str, str]] = set()
         http_calls: list[FrontendHttpCall] = []
@@ -111,7 +129,27 @@ class TypeScriptReactSpaAdapter:
             specs, calls, mod_findings = scan_display_module_semantics(
                 node, cleaned[fpath], node.source_file, raw_source=raw_sources[fpath]
             )
-            http_calls.extend(calls)
+            if reach is not None:
+                annotated_calls: list[FrontendHttpCall] = []
+                for c in calls:
+                    sym = reach.enclosing_symbol(fpath, c.line)
+                    caller_sym = None if sym == MODULE_SYMBOL else sym
+                    live: bool | None = None
+                    trail: tuple[str, ...] = ()
+                    if reach.has_roots:
+                        live = reach.is_live(fpath, sym)
+                        trail = reach.trail(fpath, sym) if live else ()
+                    annotated_calls.append(
+                        replace(
+                            c,
+                            caller_symbol=caller_sym,
+                            reachable=live,
+                            reach_trail=trail,
+                        )
+                    )
+                http_calls.extend(annotated_calls)
+            else:
+                http_calls.extend(calls)
             findings.extend(mod_findings)
             for spec in specs:
                 dst_path = resolve_frontend_import(spec, fpath, src_root, _EXTS)

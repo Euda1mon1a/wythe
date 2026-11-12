@@ -49,8 +49,8 @@ Only the dogfooded `fastapi-sqlalchemy-nextjs` trio (`postgres-sqlalchemy`, `pyt
 
 | Adapter Key | Languages & Frameworks | Surface & Contract Extraction | Status |
 | :--- | :--- | :--- | :--- |
-| `typescript-nextjs` | TypeScript / TSX · Next.js App Router & Pages Router + Tauri `invoke()` | `app/**/page.tsx` & `pages/**/*.tsx`, hooks, API clients, OpenAPI/schema type check, WCAG `DISP-005` | **Implemented** |
-| `typescript-react` | TypeScript / TSX · React SPA, Vite, React Router, TanStack Router, Remix + Tauri `invoke()` | `src/pages/**`, `src/routes/**`, `src/views/**`, `App.tsx`, hooks, `fetch`/`axios`/Tauri `invoke`, WCAG `DISP-005` | Experimental |
+| `typescript-nextjs` | TypeScript / TSX · Next.js App Router & Pages Router + Tauri `invoke()` | `app/**/page.tsx` & `pages/**/*.tsx`, hooks, API clients, per-symbol reachability (`DISP-004`/`DISP-007`), OpenAPI/schema type check, WCAG `DISP-005` | **Implemented** |
+| `typescript-react` | TypeScript / TSX · React SPA, Vite, React Router, TanStack Router, Remix + Tauri `invoke()` | `src/pages/**`, `src/routes/**`, `src/views/**`, `App.tsx`, hooks, per-symbol reachability (`DISP-004`/`DISP-007`), `fetch`/`axios`/Tauri `invoke`, WCAG `DISP-005` | Experimental |
 | `vue-sfc` | Vue 3 / TypeScript · Vue Router & Nuxt 3 (`.vue` SFCs + composables + Tauri `invoke()`) | Line-accurate `<script setup>` / `<script>` & `<template>` extraction, `pages/**/*.vue`, `$fetch`/`useFetch`, WCAG `DISP-005` | Experimental |
 | `sveltekit` | Svelte 5 / TypeScript · SvelteKit (`.svelte` + `$lib` + `+page.server.ts` + Tauri `invoke()`) | `src/routes/**/+page.svelte` & `+page.ts`, `$lib` alias resolution, line-accurate `<script>` & markup `DISP-005` | Experimental |
 | `rust-wasm` | Rust (WASM) · `Leptos`, `Dioxus`, `Yew` + `gloo-net` / `reqwest` / Tauri WASM `invoke()` | `<Route path=.../>`, `#[route]`, `#[at]`, `Request::get/post/...`, WASM `DISP-001..005` checks | Experimental |
@@ -89,7 +89,7 @@ Every adapter family is evaluated on synthetic regression suites (`backend/tests
 
 | Repository (`git rev-parse --short HEAD`) | Detected Profile | Tier-1 Truth | Tier-2 Manipulate | Tier-3 Display | Verified Edges / E2E Chains | Observed Parser & Transport Boundaries |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`Euda1mon1a/wythe`** | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 7 tables, 1 SQL fn | 51 modules | 15 modules | **213 / 29** | `PASS --strict` (0 blocking, 0 warnings) |
+| **`Euda1mon1a/wythe`** | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 7 tables, 1 SQL fn | 53 modules | 15 modules | **187 / 29** | `PASS --strict` (0 blocking, 0 warnings) |
 | **Production scheduling system** | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 294 tables, 30 SQL guards, 15 Redis | 1,362 modules | 630 modules | **10,056 / 300** | Multi-thousand-file production target |
 | **`umami-software/umami`** (`d3c62a805bed`) | `nextjs-prisma` (Experimental) | 41 Prisma tables | 156 routes, 189 query/service modules | 64 pages, 758 hooks/components | **3,162 / 294** | Resolves Next.js `(group)` route dirs, `[[...slug]]` catch-alls, `/api`-stripped `useApi` calls, and `prisma.client.<model>.*` wrappers |
 | **`sadmann7/shadcn-table`** (`f4438fda7864`) | `postgres-drizzle-nextjs` (Experimental) | 1 Drizzle table | 3 routes, 5 query/db modules | 8 pages, 88 hooks/components | **140 / 1** | `0` `DISP-004`; Next.js `"use server"` Server Actions bypass HTTP REST routes |

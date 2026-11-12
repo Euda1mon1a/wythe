@@ -1136,11 +1136,21 @@ export default function WytheWorkspacePage() {
             />
             {report && (
               <>
-                <span className="flex items-center gap-1 text-slate-300">
+                <span className="flex items-center gap-1.5 text-slate-300">
                   <GitBranch className="h-3.5 w-3.5 text-slate-400" />
-                  {report.source_commit === 'unavailable'
-                    ? 'uncommitted'
-                    : report.source_commit.slice(0, 10)}
+                  <span>
+                    {report.source_commit === 'unavailable'
+                      ? 'uncommitted'
+                      : report.source_commit.slice(0, 10)}
+                  </span>
+                  {report.worktree_dirty && (
+                    <span
+                      title="Working tree had uncommitted changes when scanned; files on disk differed from HEAD."
+                      className="border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-300"
+                    >
+                      +{report.dirty_path_count ?? 0} uncommitted
+                    </span>
+                  )}
                 </span>
                 <span className="text-slate-400">·</span>
                 <span className="text-slate-300">
@@ -1686,6 +1696,7 @@ export default function WytheWorkspacePage() {
                     slots={slots}
                     profiles={profiles}
                     legacyBridge={report.legacy_bridge}
+                    scanNotes={report.scan_notes ?? []}
                     onSelectNode={setSelectedNodeId}
                   />
                 )}
