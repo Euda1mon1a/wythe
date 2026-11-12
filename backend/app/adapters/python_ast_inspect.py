@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import functools
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from app.core.policy_context import get_active_policy_tokens
@@ -152,6 +154,74 @@ _POLICY_COLLECTION_TOKENS = (
 )
 
 
+@functools.lru_cache(maxsize=512)
+def _policy_token_re(token: str) -> re.Pattern[str]:
+    """Match a policy token on whole `_`-separated name segments, allowing a plural.
+
+    `RATIO` matches `REVIEW_RATIO` and `PGY1_RATIOS` but not `DURATION`, `ITERATIONS` or
+    `GENERATION`. A token with a leading or trailing `_` (e.g. `_CODES`) keeps requiring a
+    segment on that side.
+    """
+    core = token.strip("_")
+    if not core:
+        return re.compile(r"(?!)")
+    head = "_" if token.startswith("_") else "(?:^|_)"
+    tail = "_" if token.endswith("_") else "(?:_|$)"
+    stem = re.escape(core)
+    if core.endswith("Y"):
+        stem = re.escape(core[:-1]) + "(?:Y|IES)"
+    else:
+        stem += "(?:S|ES)?"
+    return re.compile(f"{head}{stem}{tail}")
+
+
+def _name_has_token(name: str, tokens: Iterable[str]) -> bool:
+    return any(_policy_token_re(tok).search(name) for tok in tokens)
+
+
+_CLOCK_CLASSES = frozenset({"date", "datetime"})
+
+
+def _clock_ref(node: ast.AST, classes: dict[str, str], modules: set[str]) -> tuple[str, str] | None:
+    """Resolve `date.today` / `d.today` / `dt.datetime.now` to (class, attr) via the module's imports."""
+    if not isinstance(node, ast.Attribute):
+        return None
+    base = node.value
+    if isinstance(base, ast.Name) and base.id in classes:
+        return classes[base.id], node.attr
+    if (
+        isinstance(base, ast.Attribute)
+        and base.attr in _CLOCK_CLASSES
+        and isinstance(base.value, ast.Name)
+        and base.value.id in modules
+    ):
+        return base.attr, node.attr
+    return None
+
+
+def _is_none(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+def _naive_clock_call(call: ast.Call, cls: str, attr: str) -> bool:
+    """True when the call reads the host clock without a time zone."""
+    tz_kw = next((kw.value for kw in call.keywords if kw.arg == "tz"), None)
+    has_tz_kw = any(kw.arg == "tz" for kw in call.keywords)
+    if cls == "date":
+        return attr in ("today", "fromtimestamp")
+    if attr in ("today", "utcnow", "utcfromtimestamp"):
+        return True
+    if attr == "now":
+        if call.args:
+            return _is_none(call.args[0])
+        return not has_tz_kw or _is_none(tz_kw)
+    if attr == "fromtimestamp":
+        if len(call.args) >= 2:
+            return _is_none(call.args[1])
+        return not has_tz_kw or _is_none(tz_kw)
+    return False
+
+
 @dataclass(frozen=True)
 class ParsedRouteHandler:
     func_name: str
@@ -295,6 +365,24 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     def resolve(sym: str) -> str:
         return aliases.get(sym, sym)
 
+    # Names bound to the stdlib clock classes and module (`from datetime import date as d`,
+    # `import datetime as dt`). Bare `date`/`datetime` keep counting unless another module
+    # supplies that name.
+    clock_classes: dict[str, str] = {"date": "date", "datetime": "datetime"}
+    clock_modules: set[str] = {"datetime"}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom):
+            for alias in n.names:
+                local_name = alias.asname or alias.name
+                if n.module == "datetime" and n.level == 0 and alias.name in _CLOCK_CLASSES:
+                    clock_classes[local_name] = alias.name
+                elif local_name in _CLOCK_CLASSES:
+                    clock_classes.pop(local_name, None)
+        elif isinstance(n, ast.Import):
+            for alias in n.names:
+                if alias.name == "datetime":
+                    clock_modules.add(alias.asname or "datetime")
+
     writes: set[str] = set()
     called: set[str] = set()
     symbol_calls: set[str] = set()
@@ -327,8 +415,17 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             if inc_target:
                 router_includes.append((resolve(inc_target.split(".")[0]), inc_prefix))
 
-        if dotted in ("date.today", "datetime.date.today", "datetime.utcnow", "datetime.datetime.utcnow") or dotted in ("datetime.now", "datetime.datetime.now") and not n.args and not n.keywords:
+        clock = _clock_ref(target, clock_classes, clock_modules)
+        if clock and _naive_clock_call(n, *clock):
             raw_clocks.append((f"{dotted}()", n.lineno))
+        # An uncalled clock passed as a value (`default_factory=datetime.now`,
+        # `Column(default=date.today)`) runs later with no time zone; `partial(datetime.now, tz)`
+        # binds one and is left alone.
+        if short != "partial":
+            for value in (*n.args, *(kw.value for kw in n.keywords)):
+                ref = _clock_ref(value, clock_classes, clock_modules)
+                if ref and ref[1] in ("now", "utcnow", "today"):
+                    raw_clocks.append((f"{_dotted(value)} (passed uncalled)", value.lineno))
 
         if short:
             resolved_short = resolve(short)
@@ -424,11 +521,11 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         if not target_name or val is None or not target_name.isupper() or target_name.startswith("_"):
             continue
         if isinstance(val, ast.Constant) and isinstance(val.value, (int, float)) and not isinstance(val.value, bool):
-            if any(tok in target_name for tok in active_policy_tokens):
+            if _name_has_token(target_name, active_policy_tokens):
                 policy_literals.append((target_name, stmt.lineno, repr(val.value)))
         elif isinstance(val, (ast.Dict, ast.Set, ast.List, ast.Tuple)):
             size = len(val.keys) if isinstance(val, ast.Dict) else len(val.elts)
-            if size >= 3 and any(tok in target_name for tok in _POLICY_COLLECTION_TOKENS):
+            if size >= 3 and _name_has_token(target_name, _POLICY_COLLECTION_TOKENS):
                 policy_literals.append((target_name, stmt.lineno, f"collection[{size}]"))
 
     doc = (ast.get_docstring(tree) or "").strip().splitlines()

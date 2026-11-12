@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from app.adapters.base import (
     ManipulatorExtractionResult,
@@ -239,7 +239,7 @@ class PythonFastApiAdapter:
                             remediation="Move policy threshold/vocabulary into PostgreSQL catalog truth and read via snapshot.",
                         )
                     )
-            if not pm.rel_path.endswith(_CLOCK_ALLOW_MODULES):
+            if PurePosixPath(pm.rel_path).name not in _CLOCK_ALLOW_MODULES:
                 for clock_expr, lineno in pm.raw_clock_calls:
                     if node.status == "clean":
                         node.status = "gray_zone"
