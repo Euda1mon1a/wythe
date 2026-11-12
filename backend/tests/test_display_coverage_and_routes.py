@@ -295,3 +295,97 @@ def test_glued_trailing_query_suffix_is_dropped() -> None:
     assert _normalize_ts_url("/items/${id}${querySuffix}") == "/items/{param}"
     # A whole trailing segment is still a path parameter.
     assert _normalize_ts_url("/items/${suffix}") == "/items/{param}"
+
+
+# --- id-valued segments cannot fill literal route segments ----------------------------
+
+
+def _build_id_segment_repo(root: Path) -> Path:
+    repo = root / "idsegments"
+    _write(repo, "backend/schema.sql", "CREATE TABLE users (id INTEGER PRIMARY KEY);\n")
+    _write(
+        repo,
+        "backend/app/api/routes.py",
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.get('/users/activity-log')\n"
+        "def activity_log():\n"
+        "    return []\n"
+        "@router.get('/users/choices')\n"
+        "def choices():\n"
+        "    return []\n"
+        "@router.put('/users/{user_id}')\n"
+        "def update_user(user_id: str):\n"
+        "    return {}\n"
+        "@router.get('/teams/items')\n"
+        "def team_items():\n"
+        "    return []\n"
+        "@router.get('/groups/{group_id}/members')\n"
+        "def members(group_id: str):\n"
+        "    return []\n",
+    )
+    _write(
+        repo,
+        "backend/app/main.py",
+        "from fastapi import FastAPI\n"
+        "from app.api.routes import router\n"
+        "app = FastAPI()\n"
+        "app.include_router(router)\n",
+    )
+    _write(repo, "frontend/tsconfig.json", '{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }\n')
+    _write(
+        repo,
+        "frontend/src/lib/api.ts",
+        "export async function get<T>(url: string): Promise<T> { return (await fetch(url)).json(); }\n",
+    )
+    _write(
+        repo,
+        "frontend/src/hooks/useUsers.ts",
+        "import { get } from '@/lib/api';\n"
+        "export function useUserDetail(userId: string) {\n"
+        "  return get(`/users/${userId}`);\n"
+        "}\n"
+        "export function useUserDead(id: string) {\n"
+        "  return get(`/users/${encodeURIComponent(id)}`);\n"
+        "}\n"
+        "export function useByKind(kind: string) {\n"
+        "  return get(`/${kind}/items`);\n"
+        "}\n"
+        "export function useMembers(group: { id: string }) {\n"
+        "  return get(`/groups/${group.id}/members`);\n"
+        "}\n",
+    )
+    _write(
+        repo,
+        "frontend/src/app/users/page.tsx",
+        "import { useUserDetail, useByKind, useMembers } from '@/hooks/useUsers';\n"
+        "export default function UsersPage() {\n"
+        "  void useUserDetail('u1');\n"
+        "  void useByKind('teams');\n"
+        "  void useMembers({ id: 'g1' });\n"
+        "  return <main />;\n"
+        "}\n",
+    )
+    return repo
+
+
+def test_id_valued_segment_only_fills_route_parameters(db_session: Session, tmp_path: Path) -> None:
+    repo = _build_id_segment_repo(tmp_path)
+    register_target(db_session, TargetProjectCreate(slug="idsegments", name="Id segments", repo_path=str(repo)))
+    target = get_target_by_slug(db_session, "idsegments")
+    assert target is not None
+    report = run_target_scan(db_session, target, strict_gate=True, persist_snapshot=False)
+    by_rule: dict[str, list[str]] = {}
+    for f in report.findings:
+        if f.rule_code in ("DISP-004", "DISP-006", "DISP-007"):
+            by_rule.setdefault(f.rule_code, []).append(f.title)
+
+    # `${userId}` cannot be `activity-log` or `choices`: the GET detail route is simply missing.
+    assert by_rule.get("DISP-004") == ["Frontend `GET /users/{param}` has no matching backend route"]
+    assert by_rule.get("DISP-007") == [
+        "Frontend `GET /users/{param}` has no matching backend route (unreachable code)"
+    ]
+    # A non-id runtime segment may still name a literal segment: unresolved, not missing.
+    assert by_rule.get("DISP-006") == [
+        "Frontend `GET /{param}/items` is built at runtime; it may match 1 backend route(s)"
+    ]
