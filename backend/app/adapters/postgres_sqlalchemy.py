@@ -640,24 +640,72 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         return names
 
     active_fns: set[int] = set()
+    absorbed_consts: set[str] = set()
+    sql_exec_calls = frozenset({"execute", "exec_driver_sql", "run_sql", "scalar", "scalars"})
+    non_exec_calls = frozenset(
+        {"print", "info", "debug", "warning", "warn", "error", "exception", "critical", "log", "len", "repr", "str"}
+    )
+
+    def copy_scope(
+        src: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]]]
+    ) -> dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]]]:
+        return {k: list(v) for k, v in src.items() if v}
+
+    def merge_scopes(
+        *maps: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]]]
+    ) -> dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]]]:
+        merged: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]]] = {}
+        for mp in maps:
+            for k, entries in mp.items():
+                bucket = merged.setdefault(k, [])
+                seen_ids = {id(f) for f, _ in bucket}
+                for f_node, f_env in entries:
+                    if id(f_node) not in seen_ids:
+                        seen_ids.add(id(f_node))
+                        bucket.append((f_node, f_env))
+        return merged
+
+    scoped_module_fns: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]]] = {}
+    for fname, (fnode, _) in module_fns.items():
+        scoped_module_fns[fname] = [(fnode, scoped_module_fns)]
 
     def walk_node(
         sub: ast.AST,
         ctx: tuple,
-        scope_fns: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]],
+        scope_fns: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]]],
+        local_consts: dict[str, str],
+        *,
+        in_sql_exec: bool = False,
+        in_non_exec: bool = False,
     ) -> None:
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            scope_fns[sub.name] = (sub, scope_fns)
+            scope_fns[sub.name] = [(sub, scope_fns)]
             return
         if isinstance(sub, ast.ClassDef):
             scope_fns.pop(sub.name, None)
             return
         if isinstance(sub, ast.Lambda):
             return
+        if isinstance(sub, ast.If):
+            walk_node(sub.test, ctx, scope_fns, local_consts, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+            b_fns = copy_scope(scope_fns)
+            e_fns = copy_scope(scope_fns)
+            for s_b in sub.body:
+                walk_node(s_b, ctx, b_fns, local_consts, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+            for s_e in sub.orelse:
+                walk_node(s_e, ctx, e_fns, local_consts, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+            scope_fns.clear()
+            scope_fns.update(merge_scopes(b_fns, e_fns))
+            return
         if isinstance(sub, ast.Assign):
-            walk_node(sub.value, ctx, scope_fns)
-            if len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name) and isinstance(sub.value, ast.Name) and sub.value.id in scope_fns:
-                scope_fns[sub.targets[0].id] = scope_fns[sub.value.id]
+            walk_node(sub.value, ctx, scope_fns, local_consts, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+            if (
+                len(sub.targets) == 1
+                and isinstance(sub.targets[0], ast.Name)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id in scope_fns
+            ):
+                scope_fns[sub.targets[0].id] = list(scope_fns[sub.value.id])
             else:
                 for tgt in sub.targets:
                     for bound in ast.walk(tgt):
@@ -666,10 +714,10 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             return
         if isinstance(sub, ast.AnnAssign):
             if sub.value is not None:
-                walk_node(sub.value, ctx, scope_fns)
+                walk_node(sub.value, ctx, scope_fns, local_consts, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
             if isinstance(sub.target, ast.Name):
                 if isinstance(sub.value, ast.Name) and sub.value.id in scope_fns:
-                    scope_fns[sub.target.id] = scope_fns[sub.value.id]
+                    scope_fns[sub.target.id] = list(scope_fns[sub.value.id])
                 else:
                     scope_fns.pop(sub.target.id, None)
             return
@@ -683,9 +731,9 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                     effects.fk_refs |= {(key, dst) for dst in fk_targets_in(sub) if dst != key}
                 return
             if callee == "create_foreign_key" and len(sub.args) >= 3:
-                src = _eval_str(sub.args[1], consts)
-                dst = _eval_str(sub.args[2], consts)
-                kw = {k.arg: _eval_str(k.value, consts) for k in sub.keywords if k.arg}
+                src = _eval_str(sub.args[1], local_consts)
+                dst = _eval_str(sub.args[2], local_consts)
+                kw = {k.arg: _eval_str(k.value, local_consts) for k in sub.keywords if k.arg}
                 if src and dst and _UNRESOLVED not in src + dst:
                     src_schema = (kw.get("source_schema") or "public").lower()
                     dst_schema = (kw.get("referent_schema") or "public").lower()
@@ -709,48 +757,100 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             elif callee in ("add_column", "drop_column", "alter_column"):
                 effects.touches_ddl = True
             elif isinstance(sub.func, ast.Name) and sub.func.id in scope_fns:
-                for arg_expr in (*sub.args, *(kw.value for kw in sub.keywords)):
-                    walk_node(arg_expr, ctx, scope_fns)
-                target_fn, target_env = scope_fns[sub.func.id]
-                visit(target_fn, order, target_env)
+                targets = list(scope_fns[sub.func.id])
+                pos_arg_consts: list[str | None] = [_eval_str(a, local_consts) for a in sub.args]
+                for arg_expr, ev in zip(sub.args, pos_arg_consts, strict=False):
+                    if ev is None or _UNRESOLVED in ev:
+                        walk_node(
+                            arg_expr, ctx, scope_fns, local_consts, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
+                        )
+                kw_consts: list[tuple[str | None, ast.expr, str | None]] = [
+                    (kw.arg, kw.value, _eval_str(kw.value, local_consts)) for kw in sub.keywords
+                ]
+                for _kname, kw_expr, ev in kw_consts:
+                    if ev is None or _UNRESOLVED in ev:
+                        walk_node(
+                            kw_expr, ctx, scope_fns, local_consts, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
+                        )
+                for target_fn, target_env in targets:
+                    call_consts: dict[str, str] = {}
+                    pos_params = [*target_fn.args.posonlyargs, *target_fn.args.args]
+                    for p_node, ev in zip(pos_params, pos_arg_consts, strict=False):
+                        if ev is not None and _UNRESOLVED not in ev:
+                            call_consts[p_node.arg] = ev
+                    for kname, _kw_expr, ev in kw_consts:
+                        if kname and ev is not None and _UNRESOLVED not in ev:
+                            call_consts[kname] = ev
+                    visit(target_fn, order, target_env, call_consts)
                 return
-        elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in consts:
-            cleaned_u = _blank_sql_comments(consts[sub.id]).upper()
+            next_exec = in_sql_exec or callee in sql_exec_calls
+            next_non_exec = in_non_exec or (callee in non_exec_calls and not next_exec)
+            walk_node(sub.func, ctx, scope_fns, local_consts, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+            for arg_expr in (*sub.args, *(kw.value for kw in sub.keywords)):
+                walk_node(arg_expr, ctx, scope_fns, local_consts, in_sql_exec=next_exec, in_non_exec=next_non_exec)
+            return
+        elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in local_consts:
+            if in_non_exec or (not in_sql_exec and sub.id in absorbed_consts):
+                return
+            absorbed_consts.add(sub.id)
+            sql_val = local_consts[sub.id]
+            cleaned_u = _blank_sql_comments(sql_val).upper()
             if "ALTER TABLE" in cleaned_u:
                 effects.touches_ddl = True
-            absorb_sql(consts[sub.id], const_lines.get(sub.id, sub.lineno), order)
+            absorb_sql(sql_val, const_lines.get(sub.id, sub.lineno), order)
             return
         elif isinstance(sub, (ast.Constant, ast.JoinedStr, ast.BinOp)):
-            text = _eval_str(sub, consts)
+            if in_non_exec:
+                return
+            ref_names = {
+                n.id for n in ast.walk(sub) if isinstance(n, ast.Name) and n.id in local_consts
+            }
+            if not in_sql_exec and (ref_names & absorbed_consts):
+                return
+            text = _eval_str(sub, local_consts)
             if text is not None:
                 cleaned_u = _blank_sql_comments(text).upper()
                 if "TABLE" in cleaned_u or "FUNCTION" in cleaned_u:
+                    absorbed_consts.update(ref_names)
                     if "ALTER TABLE" in cleaned_u:
                         effects.touches_ddl = True
                     absorb_sql(text, getattr(sub, "lineno", 1), order)
                 return
         for child in ast.iter_child_nodes(sub):
-            walk_node(child, ctx, scope_fns)
+            walk_node(child, ctx, scope_fns, local_consts, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
 
     def visit(
         fn: ast.FunctionDef | ast.AsyncFunctionDef,
         ctx: tuple,
-        defining_fns: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]],
+        defining_fns: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]]],
+        bound_arg_consts: dict[str, str] | None = None,
     ) -> None:
         if id(fn) in active_fns:
             return
         active_fns.add(id(fn))
-        local_fns = dict(defining_fns)
+        local_fns = copy_scope(defining_fns)
+        frame_consts = dict(consts)
         for p in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs, fn.args.vararg, fn.args.kwarg):
             if p is not None:
                 local_fns.pop(p.arg, None)
+                frame_consts.pop(p.arg, None)
+        if bound_arg_consts:
+            frame_consts.update(bound_arg_consts)
+        body_stmts = (
+            fn.body[1:]
+            if fn.body
+            and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)
+            and isinstance(fn.body[0].value.value, str)
+            else fn.body
+        )
         try:
-            for stmt in fn.body:
-                walk_node(stmt, ctx, local_fns)
+            for stmt in body_stmts:
+                walk_node(stmt, ctx, local_fns, frame_consts)
         finally:
             active_fns.discard(id(fn))
 
-    visit(upgrade_entry[0], (), upgrade_entry[1])
+    visit(upgrade_entry[0], (), scoped_module_fns)
     if (
         effects.table_events
         or effects.created_functions

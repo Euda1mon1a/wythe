@@ -760,5 +760,62 @@ def test_kwarg_injected_param_calls_and_sql_array_column_defaults(tmp_path: Path
     assert ("m:route:api.routes.dispatch", "m:service:services.dispatcher_worker") in pairs
 
 
+def test_branch_isolated_callbacks_deferred_lambda_row_writes_and_logged_sql_consts(
+    tmp_path: Path,
+) -> None:
+    readonly_pm = parse_python_module(
+        "def read_with_deferred_lambda(db):\n"
+        "    row = db.get(User, 1)\n"
+        "    callback = lambda: setattr(row, 'name', 'changed')\n"
+        "    db.commit()\n"
+        "    return row, callback\n",
+        "backend/app/services/deferred_lam.py",
+        "app.services.deferred_lam",
+    )
+    assert readonly_pm is not None
+    assert "User" not in readonly_pm.persisted
+
+    _write(
+        tmp_path,
+        "backend/app/services/branch_worker.py",
+        "class BranchWorker:\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/branch_cb.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/branch-cb')\n"
+        "def run_branch_cb(worker, flag):\n"
+        "    def callback():\n"
+        "        return worker.execute_tasks()\n"
+        "    if flag:\n"
+        "        callback = None\n"
+        "    else:\n"
+        "        return callback()\n"
+        "    return None\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.branch_cb", "m:service:services.branch_worker") in pairs
+
+    _write(
+        tmp_path,
+        "backend/alembic/versions/006_logged_const.py",
+        "from alembic import op\n\n"
+        "CREATE_WIDGETS = 'CREATE TABLE widgets (id INT PRIMARY KEY);'\n\n"
+        "def upgrade():\n"
+        "    op.execute(CREATE_WIDGETS)\n"
+        "    op.drop_table('widgets')\n"
+        "    print(CREATE_WIDGETS)\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert "t:widgets" not in by_id
+
+
+
 
 
