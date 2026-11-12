@@ -182,16 +182,18 @@ def test_uncalled_clock_attributes_only_flag_zero_arg_factories() -> None:
         "@dataclass\n"
         "class BadFactories:\n"
         "    created_at: datetime = field(default_factory=datetime.now)\n"
-        "    day_col = Column(Date, default=date.today)\n\n"
+        "    day_col = Column(Date, default=date.today)\n"
+        "    lam_at: datetime = field(default_factory=lambda: datetime.now())\n\n"
         "def bad_call_factories():\n"
         "    buckets = defaultdict(datetime.now)\n"
         "    lazy = partial(datetime.now)\n"
-        "    return buckets, lazy\n",
+        "    shadow_lam = lambda datetime: datetime.now()\n"
+        "    return buckets, lazy, shadow_lam\n",
         "backend/app/services/factories.py",
         "app.services.factories",
     )
     assert pm is not None
-    assert sorted(line for _expr, line in pm.raw_clock_calls) == [15, 16, 19, 20]
+    assert sorted(line for _expr, line in pm.raw_clock_calls) == [15, 16, 17, 20, 21]
 
 
 def test_reassigned_local_row_attributes_writes_only_to_latest_table() -> None:
@@ -211,17 +213,21 @@ def test_reassigned_local_row_attributes_writes_only_to_latest_table() -> None:
     assert reassign_pm.write_lines["Team"] == 5
 
     branch_pm = parse_python_module(
-        "def mutate_after_partial_branch(db, switch):\n"
+        "def mutate_after_partial_branch(db, switch, mode):\n"
         "    item = db.get(User, 1)\n"
         "    if switch:\n"
         "        item = db.get(Team, 2)\n"
         "    item.title = 'Merged'\n"
+        "    acct = db.get(Account, 3)\n"
+        "    match mode:\n"
+        "        case 'activate':\n"
+        "            acct.active = True\n"
         "    db.commit()\n",
         "backend/app/services/mutations_branch.py",
         "app.services.mutations_branch",
     )
     assert branch_pm is not None
-    assert {"User", "Team"} <= branch_pm.persisted
+    assert {"User", "Team", "Account"} <= branch_pm.persisted
 
 
 # --- 9-11. Module-qualified ORM/Table reads, chained wildcard exports, TYPE_CHECKING & duck types
@@ -360,8 +366,16 @@ def test_ts_url_constant_method_and_shadowed_binding_both_engines(
         "export async function createWidget() {\n"
         "  return fetch(ENDPOINT, { method: 'POST' });\n"
         "}\n"
+        "export async function loadUsers() {\n"
+        "  const USERS_URL = '/api/v1/users';\n"
+        "  return fetch(USERS_URL);\n"
+        "}\n"
         "export async function loadCustom(BASE: string) {\n"
         "  return fetch(`${BASE}/items`);\n"
+        "}\n"
+        "export async function loadDynamic(host: string) {\n"
+        "  const BASE = host;\n"
+        "  return fetch(`${BASE}/dynamic`);\n"
         "}\n"
         "export default function Page() { return null; }\n"
     )
@@ -369,13 +383,17 @@ def test_ts_url_constant_method_and_shadowed_binding_both_engines(
     ts_res = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
     ts_calls = {(c.http_method, c.normalized_path) for c in ts_res.http_calls}
     assert ("POST", "/api/v1/widgets") in ts_calls
+    assert ("GET", "/api/v1/users") in ts_calls
     assert not any(p.startswith("/api/v1/widgets/items") for _m, p in ts_calls)
+    assert not any(p.startswith("/api/v1/widgets/dynamic") for _m, p in ts_calls)
 
     monkeypatch.setattr(typescript_nextjs, "extract_ts_http_calls_cst", lambda *a, **kw: None)
     fallback_res = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
     fb_calls = {(c.http_method, c.normalized_path) for c in fallback_res.http_calls}
     assert ("POST", "/api/v1/widgets") in fb_calls
+    assert ("GET", "/api/v1/users") in fb_calls
     assert not any(p.startswith("/api/v1/widgets/items") for _m, p in fb_calls)
+    assert not any(p.startswith("/api/v1/widgets/dynamic") for _m, p in fb_calls)
 
 
 def test_jsx_open_tag_scanner_skips_regex_braces_and_angles(tmp_path: Path) -> None:

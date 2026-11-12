@@ -638,6 +638,36 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                 rows = _merge_binding_maps(*branches_r)
                 made = _merge_binding_maps(*branches_m)
                 rows, made = walk_block(s.finalbody, rows, made)
+            elif isinstance(s, ast.Match):
+                inspect_expr(s.subject, rows, made)
+                case_r: list[dict[str, set[str]]] = []
+                case_m: list[dict[str, set[str]]] = []
+                has_wildcard = False
+                for case in s.cases:
+                    cr = {k: set(v) for k, v in rows.items()}
+                    cm = {k: set(v) for k, v in made.items()}
+                    for pat_node in ast.walk(case.pattern):
+                        bound_name = (
+                            pat_node.name
+                            if isinstance(pat_node, (ast.MatchAs, ast.MatchStar))
+                            else pat_node.rest
+                            if isinstance(pat_node, ast.MatchMapping)
+                            else None
+                        )
+                        if bound_name:
+                            cr.pop(bound_name, None)
+                            cm.pop(bound_name, None)
+                    if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None:
+                        has_wildcard = True
+                    inspect_expr(case.guard, cr, cm)
+                    cr, cm = walk_block(case.body, cr, cm)
+                    case_r.append(cr)
+                    case_m.append(cm)
+                if not has_wildcard:
+                    case_r.append(rows)
+                    case_m.append(made)
+                rows = _merge_binding_maps(*case_r)
+                made = _merge_binding_maps(*case_m)
             else:
                 for ch in ast.iter_child_nodes(s):
                     if isinstance(ch, ast.expr):
@@ -657,6 +687,15 @@ _CLOCK_FACTORY_KWARGS = frozenset({"default", "default_factory", "onupdate", "in
 _CLOCK_ZERO_ARG_CALLS = frozenset({"defaultdict", "Factory", "LazyFunction"})
 
 
+def _arg_names(args: ast.arguments) -> set[str]:
+    names = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+    if args.vararg:
+        names.add(args.vararg.arg)
+    if args.kwarg:
+        names.add(args.kwarg.arg)
+    return names
+
+
 def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str, int]]:
     """Find naive clock reads/factories while keeping import bindings scoped per function/class."""
     found: list[tuple[str, int]] = []
@@ -667,7 +706,17 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
             found.append((f"{_dotted(val)} (passed uncalled)", getattr(val, "lineno", 1)))
 
     def inspect_expr(expr: ast.AST | None, classes: dict[str, str], modules: set[str]) -> None:
+        if isinstance(expr, ast.Lambda):
+            for dflt in (*expr.args.defaults, *(d for d in expr.args.kw_defaults if d is not None)):
+                inspect_expr(dflt, classes, modules)
+            lam_params = _arg_names(expr.args)
+            lam_classes = {k: v for k, v in classes.items() if k not in lam_params}
+            inspect_expr(expr.body, lam_classes, modules - lam_params)
+            return
         for n in _expr_nodes_shallow(expr, excluded):
+            if isinstance(n, ast.Lambda):
+                inspect_expr(n, classes, modules)
+                continue
             if not isinstance(n, ast.Call):
                 continue
             target = n.func
@@ -715,10 +764,15 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 for dec in stmt.decorator_list:
                     inspect_expr(dec, classes, modules)
+                sub_classes = dict(classes)
+                sub_modules = set(modules)
                 if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     for dflt in (*stmt.args.defaults, *(d for d in stmt.args.kw_defaults if d is not None)):
                         inspect_expr(dflt, classes, modules)
-                walk_stmts(stmt.body, dict(classes), set(modules))
+                    for pname in _arg_names(stmt.args):
+                        sub_classes.pop(pname, None)
+                        sub_modules.discard(pname)
+                walk_stmts(stmt.body, sub_classes, sub_modules)
                 continue
             for ch in ast.iter_child_nodes(stmt):
                 if isinstance(ch, ast.expr):

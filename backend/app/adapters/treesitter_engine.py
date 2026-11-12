@@ -242,6 +242,81 @@ def _collect_cst_pattern_idents(raw: bytes, node: Any, out: set[str]) -> None:
             _collect_cst_pattern_idents(raw, ch, out)
 
 
+def _apply_cst_block_decls(
+    raw: bytes, container: Any, outer_consts: dict[str, str], outer_bound: frozenset[str]
+) -> tuple[dict[str, str], frozenset[str]]:
+    """Update `outer_consts` with non-shadowing local `const X = '/...'` bindings and drop shadowed ones."""
+    raw_local: dict[str, str | None] = {}
+    for ch in container.named_children:
+        decl_node = (
+            (ch.child_by_field_name("declaration") or (ch.named_children[0] if ch.named_children else None))
+            if ch.type == "export_statement"
+            else ch
+        )
+        if decl_node is None:
+            continue
+        if decl_node.type in ("lexical_declaration", "variable_declaration"):
+            is_const = decl_node.type == "lexical_declaration" and any(
+                tok.type == "const" for tok in decl_node.children
+            )
+            for decl in decl_node.named_children:
+                if decl.type != "variable_declarator":
+                    continue
+                lhs = decl.child_by_field_name("name") or (
+                    decl.named_children[0] if decl.named_children else None
+                )
+                rhs = decl.child_by_field_name("value")
+                while (
+                    rhs is not None
+                    and rhs.type in ("as_expression", "satisfies_expression")
+                    and rhs.named_children
+                ):
+                    rhs = rhs.named_children[0]
+                if (
+                    is_const
+                    and lhs is not None
+                    and lhs.type == "identifier"
+                    and rhs is not None
+                    and rhs.type in ("string", "template_string")
+                ):
+                    ident = raw[lhs.start_byte : lhs.end_byte].decode("utf-8", errors="replace")
+                    val = _unquote_node(raw, rhs)
+                    if (rhs.type == "string" and "${" in val) or (
+                        ident in outer_bound
+                        and outer_consts.get(ident) != resolve_url_const_head(val, outer_consts)
+                    ):
+                        raw_local[ident] = None
+                    else:
+                        raw_local[ident] = val if raw_local.get(ident, val) == val else None
+                elif lhs is not None:
+                    bound: set[str] = set()
+                    _collect_cst_pattern_idents(raw, lhs, bound)
+                    for b in bound:
+                        raw_local[b] = None
+        elif decl_node.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
+            fn_id = decl_node.child_by_field_name("name")
+            if fn_id is not None:
+                bound_fn: set[str] = set()
+                _collect_cst_pattern_idents(raw, fn_id, bound_fn)
+                for b in bound_fn:
+                    raw_local[b] = None
+    if not raw_local:
+        return outer_consts, outer_bound
+    next_bound = outer_bound | frozenset(raw_local)
+    merged = {k: v for k, v in outer_consts.items() if k not in raw_local}
+    pending = {k: v for k, v in raw_local.items() if v is not None}
+    working = {**merged, **pending}
+    for _ in range(3):
+        for k in list(pending):
+            working[k] = resolve_url_const_head(
+                working[k], {ok: ov for ok, ov in working.items() if ok != k and ov.startswith("/")}
+            )
+    for k in pending:
+        if working[k].startswith("/"):
+            merged[k] = working[k]
+    return merged, next_bound
+
+
 def extract_ts_http_calls_cst(
     source: str,
     *,
@@ -260,11 +335,12 @@ def extract_ts_http_calls_cst(
     tree = parser.parse(raw)
     has_tauri_import = b"@tauri-apps" in raw or b"__TAURI__" in raw
     found: list[tuple[str, str, int]] = []
-    root_consts = dict(url_consts or {})
+    init_consts = dict(url_consts or {})
+    root_consts, root_bound = _apply_cst_block_decls(raw, tree.root_node, init_consts, frozenset())
 
-    def walk(node: Any, scope_consts: dict[str, str]) -> None:
+    def walk(node: Any, scope_consts: dict[str, str], scope_bound: frozenset[str]) -> None:
         ntype = node.type
-        if scope_consts and ntype in (
+        if ntype in (
             "function_declaration",
             "generator_function_declaration",
             "function",
@@ -282,21 +358,9 @@ def extract_ts_http_calls_cst(
                     _collect_cst_pattern_idents(raw, single, bound)
             if bound:
                 scope_consts = {k: v for k, v in scope_consts.items() if k not in bound}
-        elif scope_consts and ntype == "statement_block":
-            bound_blk: set[str] = set()
-            for ch in node.named_children:
-                if ch.type in ("lexical_declaration", "variable_declaration"):
-                    for decl in ch.named_children:
-                        if decl.type == "variable_declarator":
-                            lhs = decl.child_by_field_name("name") or (decl.named_children[0] if decl.named_children else None)
-                            if lhs is not None:
-                                _collect_cst_pattern_idents(raw, lhs, bound_blk)
-                elif ch.type == "function_declaration":
-                    fn_id = ch.child_by_field_name("name")
-                    if fn_id is not None:
-                        _collect_cst_pattern_idents(raw, fn_id, bound_blk)
-            if bound_blk:
-                scope_consts = {k: v for k, v in scope_consts.items() if k not in bound_blk}
+                scope_bound = scope_bound | frozenset(bound)
+        elif ntype == "statement_block":
+            scope_consts, scope_bound = _apply_cst_block_decls(raw, node, scope_consts, scope_bound)
 
         if ntype == "call_expression" and node.children:
             fn_node = node.children[0]
@@ -339,9 +403,9 @@ def extract_ts_http_calls_cst(
                                     verb = mm.group("m").upper()
                             found.append((verb, url_val, fn_node.start_point[0] + 1))
         for ch in node.children:
-            walk(ch, scope_consts)
+            walk(ch, scope_consts, scope_bound)
 
-    walk(tree.root_node, root_consts)
+    walk(tree.root_node, root_consts, root_bound)
     return found
 
 

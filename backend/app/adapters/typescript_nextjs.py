@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from app.adapters.a11y_inspect import scan_a11y_markup_findings
 from app.adapters.base import (
@@ -52,8 +54,8 @@ _TAURI_READ_CMD_PREFIXES = ("get_", "list_", "fetch_", "load_", "find_", "query_
 
 
 _URL_CONST_RE = re.compile(
-    r"""^[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
-    r"""(?P<q>['"`])(?P<val>(?:/|\$\{)[^'"`\n]*)(?P=q)\s*(?:as\s+const\s*)?;?[ \t]*$""",
+    r"""(?:^|[;{])[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
+    r"""(?P<q>['"`])(?P<val>(?:/|\$\{)[^'"`\n]*)(?P=q)\s*(?:as\s+const\s*)?(?=[;\n}])""",
     re.MULTILINE,
 )
 _TEMPLATE_HEAD_CONST_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
@@ -63,22 +65,8 @@ _URL_CALL_IDENT_RE = re.compile(
 
 
 def _collect_url_consts(txt: str) -> dict[str, str]:
-    """Same-file `const NAME = '/path'` (or `` `${OTHER}/path` ``) values usable as URL prefixes.
-
-    A name declared twice with different values is ambiguous and dropped. Chains such as
-    `` const B = `${A}/b` `` resolve through earlier constants.
-    """
-    seen: dict[str, str | None] = {}
-    for m in _URL_CONST_RE.finditer(txt):
-        name, val = m.group("name"), m.group("val")
-        if m.group("q") != "`" and "${" in val:
-            continue
-        seen[name] = val if seen.get(name, val) == val else None
-    consts = {k: v for k, v in seen.items() if v is not None}
-    for _ in range(3):
-        for name, val in list(consts.items()):
-            consts[name] = resolve_url_const_head(val, {k: v for k, v in consts.items() if k != name})
-    return {k: v for k, v in consts.items() if v.startswith("/")}
+    """Top-level `const NAME = '/path'` values usable as module-wide URL prefixes."""
+    return _build_scoped_url_consts(txt)[0]
 
 
 _FN_PARAM_HEAD_RE = re.compile(
@@ -154,33 +142,37 @@ def _find_arrow_expr_end(txt: str, start: int) -> int:
     return i
 
 
-def _shadowed_url_const_spans(txt: str, names: set[str]) -> dict[str, list[tuple[int, int]]]:
-    """Byte/char spans in `txt` where a parameter or block binding shadows a module URL constant."""
-    if not names:
-        return {}
-    spans: dict[str, list[tuple[int, int]]] = {}
-    for m in _FN_PARAM_HEAD_RE.finditer(txt):
-        raw_params = m.group("fparams") or m.group("aparams") or m.group("sparam") or ""
-        bound = {
-            (pm.group("rest") or pm.group("name"))
-            for pm in _PARAM_NAME_RE.finditer(raw_params)
-            if (pm.group("rest") or pm.group("name")) in names
-        }
-        if not bound:
-            continue
-        if m.group("fparams") is not None:
-            end_span = _find_matching_delim(txt, m.end() - 1, "{", "}")
-            span = (m.end() - 1, end_span)
-        else:
-            end_span = _find_arrow_expr_end(txt, m.end())
-            span = (m.end(), end_span)
-        for b in bound:
-            spans.setdefault(b, []).append(span)
+def _apply_url_scope_map(
+    outer: dict[str, str], outer_bound: set[str], bmap: dict[str, str | None]
+) -> tuple[dict[str, str], set[str]]:
+    next_bound = outer_bound | set(bmap)
+    merged = {k: v for k, v in outer.items() if k not in bmap}
+    pending = {
+        k: v
+        for k, v in bmap.items()
+        if v is not None and (k not in outer_bound or outer.get(k) == v)
+    }
+    if not pending:
+        return merged, next_bound
+    working = {**merged, **pending}
+    for _ in range(3):
+        for k in list(pending):
+            working[k] = resolve_url_const_head(
+                working[k],
+                {ok: ov for ok, ov in working.items() if ok != k and ov.startswith("/")},
+            )
+    for k in pending:
+        if working[k].startswith("/"):
+            merged[k] = working[k]
+    return merged, next_bound
 
-    # Inner `{ ... }` block bindings (`const`/`let`/`var` inside functions/blocks, depth >= 1)
+
+def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], dict[str, str]]]:
+    """Return `(root_consts, consts_at)` preserving local URL constants while shadowing rebindings."""
+    n = len(txt)
+    root_span = (0, n)
     block_stack: list[int] = []
     i = 0
-    n = len(txt)
     quote: str | None = None
     block_spans: list[tuple[int, int]] = []
     while i < n:
@@ -199,15 +191,76 @@ def _shadowed_url_const_spans(txt: str, names: set[str]) -> dict[str, list[tuple
             bstart = block_stack.pop()
             block_spans.append((bstart, i + 1))
         i += 1
+
+    def innermost_block(pos: int) -> tuple[int, int]:
+        return min(
+            (sp for sp in block_spans if sp[0] < pos < sp[1]),
+            key=lambda sp: sp[1] - sp[0],
+            default=root_span,
+        )
+
+    block_decls: dict[tuple[int, int], dict[str, str | None]] = {}
+    url_name_positions: set[int] = set()
+    for m in _URL_CONST_RE.finditer(txt):
+        name, val = m.group("name"), m.group("val")
+        npos = m.start("name")
+        url_name_positions.add(npos)
+        bmap = block_decls.setdefault(innermost_block(npos), {})
+        if m.group("q") != "`" and "${" in val:
+            bmap[name] = None
+        else:
+            bmap[name] = val if bmap.get(name, val) == val else None
+
     for dm in _LOCAL_BIND_RE.finditer(txt):
-        bname = dm.group("name")
-        if bname not in names:
+        npos = dm.start("name")
+        if npos in url_name_positions:
             continue
-        enclosing = [sp for sp in block_spans if sp[0] < dm.start() < sp[1]]
-        if enclosing:
-            innermost = min(enclosing, key=lambda sp: sp[1] - sp[0])
-            spans.setdefault(bname, []).append(innermost)
-    return spans
+        block_decls.setdefault(innermost_block(npos), {})[dm.group("name")] = None
+
+    param_scopes: list[tuple[int, int, set[str]]] = []
+    for m in _FN_PARAM_HEAD_RE.finditer(txt):
+        raw_params = m.group("fparams") or m.group("aparams") or m.group("sparam") or ""
+        bound = {
+            (pm.group("rest") or pm.group("name"))
+            for pm in _PARAM_NAME_RE.finditer(raw_params)
+            if (pm.group("rest") or pm.group("name"))
+        }
+        if not bound:
+            continue
+        if m.group("fparams") is not None:
+            span = (m.end() - 1, _find_matching_delim(txt, m.end() - 1, "{", "}"))
+        else:
+            span = (m.end(), _find_arrow_expr_end(txt, m.end()))
+        param_scopes.append((span[0], span[1], bound))
+
+    root_consts, root_bound = _apply_url_scope_map({}, set(), block_decls.get(root_span, {}))
+    inner_blocks = [(s, e, bmap) for (s, e), bmap in block_decls.items() if (s, e) != root_span]
+
+    def consts_at(pos: int) -> dict[str, str]:
+        if not inner_blocks and not param_scopes:
+            return root_consts
+        events: list[tuple[int, int, str, Any]] = []
+        for s, e, pnames in param_scopes:
+            if s <= pos < e:
+                events.append((e - s, 1, "params", pnames))
+        for s, e, bmap in inner_blocks:
+            if s <= pos < e:
+                events.append((e - s, 0, "block", bmap))
+        if not events:
+            return root_consts
+        events.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        env = dict(root_consts)
+        bound = set(root_bound)
+        for _span_len, _prio, kind, payload in events:
+            if kind == "params":
+                for pname in payload:
+                    env.pop(pname, None)
+                    bound.add(pname)
+            else:
+                env, bound = _apply_url_scope_map(env, bound, payload)
+        return env
+
+    return root_consts, consts_at
 
 
 def _fetch_method_from_call_tail(txt: str, pos: int) -> str:
@@ -227,8 +280,8 @@ def _fetch_method_from_call_tail(txt: str, pos: int) -> str:
 
 def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
     """Extract (verb, raw_url, lineno) via Tree-sitter TSX CST (with character-scanner fallback)."""
-    url_consts = _collect_url_consts(txt)
-    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True, url_consts=url_consts)
+    root_consts, consts_at = _build_scoped_url_consts(txt)
+    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True, url_consts=root_consts)
     if cst_calls is not None:
         results = list(cst_calls)
         if "createApi" in txt and "builder." in txt:
@@ -245,17 +298,6 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
                 lineno = txt.count("\n", 0, rm.start()) + 1
                 results.append((rverb, joined_u or "/", lineno))
         return results
-
-    shadow_spans = _shadowed_url_const_spans(txt, set(url_consts))
-
-    def consts_at(pos: int) -> dict[str, str]:
-        if not shadow_spans:
-            return url_consts
-        return {
-            k: v
-            for k, v in url_consts.items()
-            if not any(s <= pos < e for s, e in shadow_spans.get(k, ()))
-        }
 
     results = []
     n = len(txt)
