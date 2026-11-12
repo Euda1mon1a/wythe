@@ -11,7 +11,11 @@ from app.adapters.base import (
     FrontendHttpCall,
     RawCandidateFinding,
 )
-from app.adapters.treesitter_engine import blank_comments_cst, extract_ts_http_calls_cst
+from app.adapters.treesitter_engine import (
+    blank_comments_cst,
+    extract_ts_http_calls_cst,
+    resolve_url_const_head,
+)
 from app.adapters.ts_reachability import (
     MODULE_SYMBOL,
     ReachabilityIndex,
@@ -47,9 +51,40 @@ _TAURI_INVOKE_RE = re.compile(
 _TAURI_READ_CMD_PREFIXES = ("get_", "list_", "fetch_", "load_", "find_", "query_", "read_", "detect_", "estimate_", "scope_")
 
 
+_URL_CONST_RE = re.compile(
+    r"""^[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
+    r"""(?P<q>['"`])(?P<val>(?:/|\$\{)[^'"`\n]*)(?P=q)\s*(?:as\s+const\s*)?;?[ \t]*$""",
+    re.MULTILINE,
+)
+_TEMPLATE_HEAD_CONST_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
+_URL_CALL_IDENT_RE = re.compile(
+    r"""\b(?:api\.|axios\.|http\.|client\.|ky\.)?(?P<verb>get|post|put|patch|del|delete|fetch|apiRequest|request|httpClient|ofetch)\s*(?:<[^;()]{0,220}?>)?\s*\(\s*(?P<ident>[A-Za-z_$][\w$]*)\s*[,)]"""
+)
+
+
+def _collect_url_consts(txt: str) -> dict[str, str]:
+    """Same-file `const NAME = '/path'` (or `` `${OTHER}/path` ``) values usable as URL prefixes.
+
+    A name declared twice with different values is ambiguous and dropped. Chains such as
+    `` const B = `${A}/b` `` resolve through earlier constants.
+    """
+    seen: dict[str, str | None] = {}
+    for m in _URL_CONST_RE.finditer(txt):
+        name, val = m.group("name"), m.group("val")
+        if m.group("q") != "`" and "${" in val:
+            continue
+        seen[name] = val if seen.get(name, val) == val else None
+    consts = {k: v for k, v in seen.items() if v is not None}
+    for _ in range(3):
+        for name, val in list(consts.items()):
+            consts[name] = resolve_url_const_head(val, {k: v for k, v in consts.items() if k != name})
+    return {k: v for k, v in consts.items() if v.startswith("/")}
+
+
 def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
     """Extract (verb, raw_url, lineno) via Tree-sitter TSX CST (with character-scanner fallback)."""
-    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True)
+    url_consts = _collect_url_consts(txt)
+    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True, url_consts=url_consts)
     if cst_calls is not None:
         results = list(cst_calls)
         if "createApi" in txt and "builder." in txt:
@@ -75,9 +110,14 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
             verb = "DELETE"
         quote = m.group("quote")
         i = m.end()
-        if i >= n or txt[i] != "/":
-            continue
         buf: list[str] = []
+        if quote == "`":
+            hm = _TEMPLATE_HEAD_CONST_RE.match(txt, i)
+            if hm and hm.group("name") in url_consts:
+                buf.append(url_consts[hm.group("name")])
+                i = hm.end()
+        if i >= n or (not buf and txt[i] != "/"):
+            continue
         if quote != "`":
             while i < n and txt[i] not in (quote, "\n"):
                 buf.append(txt[i])
@@ -121,6 +161,11 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
         if raw_url.startswith("/"):
             lineno = txt.count("\n", 0, m.start()) + 1
             results.append((verb, raw_url, lineno))
+    for im in _URL_CALL_IDENT_RE.finditer(txt):
+        if im.group("ident") in url_consts:
+            iverb = im.group("verb").upper()
+            iverb = "DELETE" if iverb == "DEL" else ("GET" if iverb in _FETCH_LIKE_VERBS else iverb)
+            results.append((iverb, url_consts[im.group("ident")], txt.count("\n", 0, im.start()) + 1))
     if "createApi" in txt and "builder." in txt:
         bm = _RTK_BASE_URL_RE.search(txt)
         rtk_base = ("/" + bm.group("base").strip("/")) if bm and not bm.group("base").startswith("http") else ""
@@ -239,6 +284,8 @@ _QUERY_SUFFIX_NAMES = frozenset(
 )
 _QUERY_SUFFIX_CALL_RE = re.compile(r"^[\w$.]*?(?:query|querystring|searchparams)[\w$]*\s*\(", re.IGNORECASE)
 _QUOTED_QUESTION_RE = re.compile(r"""[`'"]\?""")
+# `${...}` glued onto a literal segment (`/preview${suffix}`) at the end of the URL.
+_GLUED_SUFFIX_RE = re.compile(r"(?i)(?:suffix|query|qs|params?|search)\s*$")
 
 
 def _skip_template_expr(raw_url: str, start: int) -> int:
@@ -297,7 +344,8 @@ def _normalize_ts_url(raw_url: str) -> str:
             j = _skip_template_expr(raw_url, i + 2)
             expr = raw_url[i + 2 : j - 1]
             at_end = j >= n or raw_url[j] in ("?", "#")
-            if at_end and _is_query_suffix_expr(expr):
+            glued = bool(out) and out[-1] != "/"
+            if at_end and (_is_query_suffix_expr(expr) or (glued and _GLUED_SUFFIX_RE.search(expr))):
                 break
             out.append("{param}")
             i = j

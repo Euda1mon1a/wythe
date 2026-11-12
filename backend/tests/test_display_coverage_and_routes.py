@@ -238,3 +238,60 @@ def test_feature_folders_and_lib_are_scanned_but_test_doubles_are_not(
     ]
     assert not any("mock-only" in f.title or "test-utils" in f.source_file for f in report.findings)
     assert not any("/widgets/summary" in f.title for f in report.findings)
+
+
+# --- same-file URL constants in call sites ---------------------------------------------
+
+_CONST_PREFIX_SRC = (
+    "import { get, post, del } from '@/lib/api';\n"
+    "const BASE_URL = '/widgets';\n"
+    "export const ARCHIVE = `${BASE_URL}/archive`;\n"
+    "const AMBIGUOUS = '/one';\n"
+    "export function loadWidget(id: string) {\n"
+    "  return get<Widget>(`${BASE_URL}/${id}`);\n"
+    "}\n"
+    "export function createWidget(body: unknown) {\n"
+    "  return post(BASE_URL, body);\n"
+    "}\n"
+    "export function purge(id: string) {\n"
+    "  return del(`${ARCHIVE}/${id}`);\n"
+    "}\n"
+    "function other() {\n"
+    "  const AMBIGUOUS = '/two';\n"
+    "  return get(`${AMBIGUOUS}/x`);\n"
+    "}\n"
+)
+
+
+def _const_prefix_calls() -> set[tuple[str, str, int]]:
+    from app.adapters.typescript_nextjs import _extract_ts_http_calls
+
+    return set(_extract_ts_http_calls(_CONST_PREFIX_SRC))
+
+
+def test_same_file_url_constants_resolve_in_call_urls() -> None:
+    calls = _const_prefix_calls()
+    assert ("GET", "/widgets/${id}", 6) in calls
+    assert ("POST", "/widgets", 9) in calls
+    assert ("DELETE", "/widgets/archive/${id}", 12) in calls
+    # A name bound to two different values is ambiguous: no guessed call.
+    assert not any(url.startswith(("/one", "/two")) for _v, url, _l in calls)
+
+
+def test_same_file_url_constants_resolve_without_treesitter(monkeypatch) -> None:
+    import app.adapters.typescript_nextjs as tsnext
+
+    monkeypatch.setattr(tsnext, "extract_ts_http_calls_cst", lambda *a, **k: None)
+    calls = _const_prefix_calls()
+    assert ("GET", "/widgets/${id}", 6) in calls
+    assert ("POST", "/widgets", 9) in calls
+    assert ("DELETE", "/widgets/archive/${id}", 12) in calls
+
+
+def test_glued_trailing_query_suffix_is_dropped() -> None:
+    from app.adapters.typescript_nextjs import _normalize_ts_url
+
+    assert _normalize_ts_url("/items/${id}/preview${suffix}") == "/items/{param}/preview"
+    assert _normalize_ts_url("/items/${id}${querySuffix}") == "/items/{param}"
+    # A whole trailing segment is still a path parameter.
+    assert _normalize_ts_url("/items/${suffix}") == "/items/{param}"
