@@ -712,9 +712,9 @@ def test_rebound_injected_param_excludes_post_rebind_attributes(tmp_path: Path) 
         "    worker = object()\n"
         "    return res, worker.name, show_later()\n\n"
         "@router.post('/api/v1/rebind-loop')\n"
-        "def rebind_loop(worker, employees):\n"
+        "def rebind_loop(worker, emp):\n"
         "    res = worker.execute_tasks()\n"
-        "    for worker in employees:\n"
+        "    for worker in [emp]:\n"
         "        _ = worker.badge\n"
         "    return res, worker.role\n",
     )
@@ -814,6 +814,42 @@ def test_branch_isolated_callbacks_deferred_lambda_row_writes_and_logged_sql_con
     truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
     by_id = {n.id: n for n in truth.nodes}
     assert "t:widgets" not in by_id
+
+
+def test_zero_iteration_loop_preserves_injected_param_liveness(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "backend/app/services/zero_iter_worker.py",
+        "class ZeroIterWorker:\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/zero_iter.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/zero-iter-loop')\n"
+        "def run_zero_iter(worker, candidates):\n"
+        "    for worker in candidates:\n"
+        "        _ = worker.badge\n"
+        "    return worker.execute_tasks()\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/zero_iter_comp.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/zero-iter-comp')\n"
+        "def run_zero_iter_comp(worker, candidates):\n"
+        "    seen = [(worker := c, worker.badge) for c in [*candidates]]\n"
+        "    return seen, worker.execute_tasks()\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.zero_iter", "m:service:services.zero_iter_worker") in pairs
+    assert ("m:route:api.routes.zero_iter_comp", "m:service:services.zero_iter_worker") in pairs
+
 
 
 

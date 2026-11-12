@@ -410,6 +410,16 @@ def _merge_defs(*maps: DefsMap) -> DefsMap:
     return merged
 
 
+def _is_nonempty_iter_literal(expr: ast.AST) -> bool:
+    if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        return any(not isinstance(e, ast.Starred) for e in expr.elts)
+    if isinstance(expr, ast.Dict):
+        return any(k is not None for k in expr.keys)
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, (str, bytes)):
+        return len(expr.value) > 0
+    return False
+
+
 def _live_param_expr_nodes(
     fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda, nm: str
 ) -> list[ast.AST]:
@@ -498,31 +508,41 @@ def _live_param_expr_nodes(
                     out.append(expr)
                 if expr.generators:
                     live, defs = walk_expr(expr.generators[0].iter, live, defs)
-                comp_walrus = {
-                    sub.target.id
-                    for sub in _expr_nodes_shallow(expr, set())
-                    if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name)
-                }
                 cbound = _comp_bound_names(expr)
+                eager_nonempty = (
+                    not isinstance(expr, ast.GeneratorExp)
+                    and bool(expr.generators)
+                    and _is_nonempty_iter_literal(expr.generators[0].iter)
+                )
                 if live and nm not in cbound:
                     clive = live
                     cdefs = {k: set(v) for k, v in defs.items() if k not in cbound and v}
+                    must_live = live
+                    must_defs: DefsMap | None = None
                     if expr.generators:
-                        for ifs_e in expr.generators[0].ifs:
+                        for idx_if, ifs_e in enumerate(expr.generators[0].ifs):
                             clive, cdefs = walk_expr(ifs_e, clive, cdefs)
+                            if eager_nonempty and idx_if == 0:
+                                must_live = clive
+                                must_defs = _copy_defs(cdefs)
                         for gen in expr.generators[1:]:
                             clive, cdefs = walk_expr(gen.iter, clive, cdefs)
                             for ifs_e in gen.ifs:
                                 clive, cdefs = walk_expr(ifs_e, clive, cdefs)
                     if isinstance(expr, ast.DictComp):
                         clive, cdefs = walk_expr(expr.key, clive, cdefs)
-                        walk_expr(expr.value, clive, cdefs)
+                        clive, cdefs = walk_expr(expr.value, clive, cdefs)
                     else:
-                        walk_expr(expr.elt, clive, cdefs)
-                for wname in comp_walrus:
-                    defs.pop(wname, None)
-                if nm in comp_walrus:
-                    live = False
+                        clive, cdefs = walk_expr(expr.elt, clive, cdefs)
+                    if eager_nonempty and len(expr.generators) == 1 and not expr.generators[0].ifs:
+                        must_live = clive
+                        must_defs = _copy_defs(cdefs)
+                    kept_cbound = {k: set(v) for k, v in defs.items() if k in cbound and v}
+                    if must_defs is not None:
+                        live = must_live
+                        defs = _merge_defs(kept_cbound, must_defs, cdefs)
+                    else:
+                        defs = _merge_defs(defs, cdefs)
                 return live, defs
             if isinstance(expr, ast.IfExp):
                 if live:
@@ -669,18 +689,33 @@ def _live_param_expr_nodes(
                     defs = _merge_defs(*(([db] if fb else []) + ([de] if fe else [])))
                 elif isinstance(s, (ast.For, ast.AsyncFor)):
                     live, defs = walk_expr(s.iter, live, defs)
-                    rebinds_tgt = nm in {
-                        t.id for t in ast.walk(s.target) if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)
-                    }
+                    nonempty_iter = _is_nonempty_iter_literal(s.iter)
                     body_in, body_defs = walk_target(s.target, live, _copy_defs(defs))
                     brk: list[tuple[bool, DefsMap]] = []
                     cnt: list[tuple[bool, DefsMap]] = []
                     lb, db, fb = walk_stmts(s.body, body_in, body_defs, brk, cnt)
                     iter_end_l = (lb if fb else False) or any(cl for cl, _ in cnt)
                     iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd in cnt]))
-                    else_in_l = (False if rebinds_tgt else live) or iter_end_l
-                    else_in_d = _merge_defs(defs, iter_end_d)
-                    le, de, fe = walk_stmts(s.orelse, else_in_l, else_in_d, loop_breaks, loop_continues)
+                    if fb or cnt:
+                        body2_in, body2_defs = walk_target(s.target, iter_end_l, _copy_defs(iter_end_d))
+                        merged_body_defs = _merge_defs(body_defs, body2_defs)
+                        if merged_body_defs != body_defs:
+                            brk = []
+                            cnt = []
+                            lb, db, fb = walk_stmts(s.body, body_in or body2_in, merged_body_defs, brk, cnt)
+                            iter_end_l = (lb if fb else False) or any(cl for cl, _ in cnt)
+                            iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd in cnt]))
+                    zero_iter = False if nonempty_iter else live
+                    if nonempty_iter and not fb and not cnt:
+                        le, de, fe = False, {}, False
+                    else:
+                        else_in_l = zero_iter or iter_end_l
+                        else_in_d = (
+                            iter_end_d
+                            if nonempty_iter
+                            else (_merge_defs(defs, iter_end_d) if (fb or cnt) else _copy_defs(defs))
+                        )
+                        le, de, fe = walk_stmts(s.orelse, else_in_l, else_in_d, loop_breaks, loop_continues)
                     if not fe and not brk:
                         return le, de, False
                     live = (le if fe else False) or any(bl for bl, _ in brk)
