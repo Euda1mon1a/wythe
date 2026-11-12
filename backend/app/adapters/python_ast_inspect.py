@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import ast
-import functools
 import re
-from collections.abc import Iterable
 from dataclasses import dataclass
 
-from app.core.policy_context import get_active_policy_tokens
+from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 
 _SQL_IDENT = r'(?:"?[A-Za-z_][A-Za-z0-9_]*"?\.)?"?[A-Za-z_][A-Za-z0-9_]*"?'
 _SQL_VERBS = ("select", "insert", "update", "delete", "with")
@@ -152,31 +150,6 @@ _POLICY_COLLECTION_TOKENS = (
     "_PENALTIES",
     "_EXEMPTIONS",
 )
-
-
-@functools.lru_cache(maxsize=512)
-def _policy_token_re(token: str) -> re.Pattern[str]:
-    """Match a policy token on whole `_`-separated name segments, allowing a plural.
-
-    `RATIO` matches `REVIEW_RATIO` and `PGY1_RATIOS` but not `DURATION`, `ITERATIONS` or
-    `GENERATION`. A token with a leading or trailing `_` (e.g. `_CODES`) keeps requiring a
-    segment on that side.
-    """
-    core = token.strip("_")
-    if not core:
-        return re.compile(r"(?!)")
-    head = "_" if token.startswith("_") else "(?:^|_)"
-    tail = "_" if token.endswith("_") else "(?:_|$)"
-    stem = re.escape(core)
-    if core.endswith("Y"):
-        stem = re.escape(core[:-1]) + "(?:Y|IES)"
-    else:
-        stem += "(?:S|ES)?"
-    return re.compile(f"{head}{stem}{tail}")
-
-
-def _name_has_token(name: str, tokens: Iterable[str]) -> bool:
-    return any(_policy_token_re(tok).search(name) for tok in tokens)
 
 
 _CLOCK_CLASSES = frozenset({"date", "datetime"})
@@ -521,11 +494,11 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         if not target_name or val is None or not target_name.isupper() or target_name.startswith("_"):
             continue
         if isinstance(val, ast.Constant) and isinstance(val.value, (int, float)) and not isinstance(val.value, bool):
-            if _name_has_token(target_name, active_policy_tokens):
+            if name_has_policy_token(target_name, active_policy_tokens):
                 policy_literals.append((target_name, stmt.lineno, repr(val.value)))
         elif isinstance(val, (ast.Dict, ast.Set, ast.List, ast.Tuple)):
             size = len(val.keys) if isinstance(val, ast.Dict) else len(val.elts)
-            if size >= 3 and _name_has_token(target_name, _POLICY_COLLECTION_TOKENS):
+            if size >= 3 and name_has_policy_token(target_name, _POLICY_COLLECTION_TOKENS):
                 policy_literals.append((target_name, stmt.lineno, f"collection[{size}]"))
 
     doc = (ast.get_docstring(tree) or "").strip().splitlines()

@@ -81,3 +81,20 @@ def test_clock_authority_is_exempt_by_file_name_not_suffix(tmp_path: Path) -> No
     res = PythonFastApiAdapter().extract(repo, "backend", _EMPTY_TRUTH)
     hits = sorted(f.source_file for f in res.findings if f.rule_code == "MANIP-002")
     assert hits == ["backend/app/services/stopclock.py"]
+
+
+def test_display_policy_shadow_uses_the_same_segment_match(tmp_path: Path) -> None:
+    from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+
+    page = tmp_path / "frontend" / "src" / "app" / "review"
+    page.mkdir(parents=True)
+    (page / "page.tsx").write_text(
+        "export const OPERATION_LABELS = { a: 'A', b: 'B' };\n"
+        "export const GENERATION_LIMIT_ROWS = 50;\n"
+        "export const REVIEW_RATIO = 0.5;\n"
+        "export default function Page() { return null; }\n",
+        encoding="utf-8",
+    )
+    res = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    shadows = sorted(f.title for f in res.findings if f.rule_code == "DISP-001")
+    assert len(shadows) == 1 and "REVIEW_RATIO" in shadows[0], shadows

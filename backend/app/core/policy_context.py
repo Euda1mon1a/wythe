@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import functools
+import re
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -47,3 +49,28 @@ def policy_tokens_scope(tokens: tuple[str, ...]) -> Iterator[None]:
         yield
     finally:
         _ACTIVE_TOKENS.reset(handle)
+
+
+@functools.lru_cache(maxsize=512)
+def _policy_token_re(token: str) -> re.Pattern[str]:
+    """Match a policy token on whole `_`-separated name segments, allowing a plural.
+
+    `RATIO` matches `REVIEW_RATIO` and `PGY1_RATIOS` but not `DURATION`, `ITERATIONS` or
+    `GENERATION`. A token with a leading or trailing `_` (e.g. `_CODES`) keeps requiring a
+    segment on that side.
+    """
+    core = token.strip("_")
+    if not core:
+        return re.compile(r"(?!)")
+    head = "_" if token.startswith("_") else "(?:^|_)"
+    tail = "_" if token.endswith("_") else "(?:_|$)"
+    stem = re.escape(core)
+    if core.endswith("Y"):
+        stem = re.escape(core[:-1]) + "(?:Y|IES)"
+    else:
+        stem += "(?:S|ES)?"
+    return re.compile(f"{head}{stem}{tail}")
+
+
+def name_has_policy_token(name: str, tokens: Iterable[str]) -> bool:
+    return any(_policy_token_re(tok).search(name) for tok in tokens)
