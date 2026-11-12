@@ -10,8 +10,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from sqlalchemy.orm import Session
+
 from app.adapters.base import TruthExtractionResult
 from app.adapters.python_fastapi import PythonFastApiAdapter
+from app.schemas.atlas import TargetProjectCreate
+from app.services.governance_service import get_target_by_slug, register_target
+from app.services.scanner_service import run_target_scan
 
 
 def _write(root: Path, rel: str, text: str) -> None:
@@ -123,3 +128,113 @@ def test_explicit_version_mount_stays_optional_for_base_relative_calls(tmp_path:
     assert re.match(regex, "/api/v1/status/ping")
     assert re.match(regex, "/status/ping")
     assert not re.match(regex, "/api/v2/status/ping")
+
+
+# --- display coverage outside the conventional Next.js directories ---------------------
+
+
+def _build_feature_folder_repo(root: Path) -> Path:
+    repo = root / "featurefolders"
+    _write(repo, "backend/schema.sql", "CREATE TABLE widgets (id INTEGER PRIMARY KEY);\n")
+    _write(
+        repo,
+        "backend/app/api/routes.py",
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.get('/widgets/summary')\n"
+        "def widget_summary():\n"
+        "    return {}\n",
+    )
+    _write(
+        repo,
+        "backend/app/main.py",
+        "from fastapi import FastAPI\n"
+        "from app.api.routes import router\n"
+        "app = FastAPI()\n"
+        "app.include_router(router)\n",
+    )
+    _write(repo, "frontend/tsconfig.json", '{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }\n')
+    _write(
+        repo,
+        "frontend/src/lib/api.ts",
+        "export async function get<T>(url: string): Promise<T> { return (await fetch(url)).json(); }\n",
+    )
+    _write(
+        repo,
+        "frontend/src/features/widgets/hooks.ts",
+        "import { get } from '@/lib/api';\n"
+        "export function useWidgetSummary() {\n"
+        "  return get('/widgets/summary');\n"
+        "}\n"
+        "export function useWidgetHistory() {\n"
+        "  return get('/widgets/history');\n"
+        "}\n",
+    )
+    _write(
+        repo,
+        "frontend/src/features/widgets/WidgetPanel.tsx",
+        "import { useWidgetSummary, useWidgetHistory } from './hooks';\n"
+        "import { dayLabel } from '@/lib/dayLabel';\n"
+        "export function WidgetPanel() {\n"
+        "  void useWidgetSummary();\n"
+        "  void useWidgetHistory();\n"
+        "  return <div><input type=\"text\" />{dayLabel()}</div>;\n"
+        "}\n",
+    )
+    _write(
+        repo,
+        "frontend/src/lib/dayLabel.ts",
+        "export function dayLabel(): string {\n"
+        "  const today = new Date();\n"
+        "  return String(today.getDate());\n"
+        "}\n"
+        "export const stamp = () => new Date().toISOString();\n",
+    )
+    _write(
+        repo,
+        "frontend/src/app/widgets/page.tsx",
+        "import { WidgetPanel } from '@/features/widgets/WidgetPanel';\n"
+        "export default function WidgetsPage() {\n"
+        "  return <WidgetPanel />;\n"
+        "}\n",
+    )
+    # Test doubles and fixtures are not display code.
+    _write(
+        repo,
+        "frontend/src/mocks/handlers.ts",
+        "import { get } from '@/lib/api';\n"
+        "export const mockLoad = () => get('/mock-only/endpoint');\n",
+    )
+    _write(
+        repo,
+        "frontend/src/test-utils/renderForm.tsx",
+        "export const Form = () => <input type=\"text\" />;\n",
+    )
+    return repo
+
+
+def test_feature_folders_and_lib_are_scanned_but_test_doubles_are_not(
+    db_session: Session, tmp_path: Path
+) -> None:
+    repo = _build_feature_folder_repo(tmp_path)
+    register_target(db_session, TargetProjectCreate(slug="featurefolders", name="Feature folders", repo_path=str(repo)))
+    target = get_target_by_slug(db_session, "featurefolders")
+    assert target is not None
+    report = run_target_scan(db_session, target, strict_gate=True, persist_snapshot=False)
+    by_rule: dict[str, list] = {}
+    for f in report.findings:
+        by_rule.setdefault(f.rule_code, []).append(f)
+
+    disp004 = by_rule.get("DISP-004", [])
+    assert [f.title for f in disp004] == ["Frontend `GET /widgets/history` has no matching backend route"]
+    assert disp004[0].source_file == "frontend/src/features/widgets/hooks.ts"
+    assert "app/widgets/page.tsx" in disp004[0].detail
+
+    assert [(f.source_file, f.line) for f in by_rule.get("DISP-002", [])] == [
+        ("frontend/src/lib/dayLabel.ts", 2)
+    ], "device-clock 'today' is flagged; a serialized instant is not"
+    assert [f.source_file for f in by_rule.get("DISP-005", [])] == [
+        "frontend/src/features/widgets/WidgetPanel.tsx"
+    ]
+    assert not any("mock-only" in f.title or "test-utils" in f.source_file for f in report.findings)
+    assert not any("/widgets/summary" in f.title for f in report.findings)

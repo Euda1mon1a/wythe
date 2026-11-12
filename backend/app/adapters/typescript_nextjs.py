@@ -143,6 +143,19 @@ _TS_POLICY_CONST_RE = re.compile(
 )
 _UTC_SLICE_RE = re.compile(r"""\.toISOString\(\)\s*\.\s*(?:slice\(\s*0\s*,\s*10\s*\)|split\(\s*['"]T['"]\s*\))""")
 _RAW_NEW_DATE_RE = re.compile(r"""\bnew\s+Date\s*\((?P<args>[^)\n]{0,80})\)""")
+# `new Date().toISOString()` / `.getTime()` serialize the current *instant* (UTC `Z` or epoch
+# ms): zone-free, so not a calendar "today". A sliced ISO string is caught by _UTC_SLICE_RE.
+_INSTANT_ONLY_TAIL_RE = re.compile(
+    r"""\s*\.\s*(?:toISOString\(\)(?!\s*\.\s*(?:slice|split|substring|substr)\b)|getTime\(\)|valueOf\(\))"""
+)
+
+
+def _is_raw_clock_read(txt: str, m: re.Match[str]) -> bool:
+    """True when a `new Date(...)` match reads the device clock or copies an unknown date."""
+    args_str = m.group("args").strip()
+    if args_str == "":
+        return not _INSTANT_ONLY_TAIL_RE.match(txt, m.end())
+    return "," not in args_str and "Date." not in args_str
 
 _TS_POLICY_TOKENS = (
     "CAPACITY",
@@ -162,6 +175,19 @@ _TS_POLICY_TOKENS = (
 )
 _UI_SAFE_TOKENS = ("COLOR", "STYLE", "WIDTH", "HEIGHT", "TIMEOUT", "SETTLE", "DELAY", "CAMERA", "ZOOM")
 _CLOCK_UTIL_FILES = ("date-utils.ts", "clock.ts", "time.ts", "programTime.ts")
+
+
+# Directories never scanned as display code: build output, server-only code, and tests,
+# mocks or fixtures (matched against the path inside the frontend directory only).
+_SKIP_DIR_PARTS = frozenset(
+    {
+        "node_modules", ".next", "out", "ui_dist", "dist", "build", "prisma", "drizzle", "server",
+        "__tests__", "__mocks__", "mocks", "__fixtures__", "fixtures", "test-utils", "testing", "e2e",
+        "stories", "__snapshots__",
+    }
+)
+_GENERIC_STEMS = frozenset({"hooks", "api", "client", "types", "constants", "utils", "helpers", "index"})
+_HOOK_STEM_RE = re.compile(r"^use[A-Z0-9]")
 
 
 def _strip_ts_comments(source: str) -> str:
@@ -337,10 +363,8 @@ class TypeScriptNextJsAdapter:
             for fpath in sorted(sroot.rglob("*")):
                 if not fpath.is_file() or fpath.suffix not in (".ts", ".tsx"):
                     continue
-                if any(
-                    p in fpath.parts
-                    for p in ("node_modules", ".next", "out", "ui_dist", "dist", "build", "prisma", "drizzle", "server")
-                ):
+                fe_parts = fpath.relative_to(fe_dir).parts if fpath.is_relative_to(fe_dir) else fpath.parts
+                if any(p in _SKIP_DIR_PARTS for p in fe_parts[:-1]):
                     continue
                 resolved = fpath.resolve()
                 if resolved in seen_resolved:
@@ -352,9 +376,9 @@ class TypeScriptNextJsAdapter:
                     else resolved.relative_to(fe_dir).as_posix()
                 )
                 if (
-                    "__tests__" in fpath.parts
-                    or ".test." in fpath.name
+                    ".test." in fpath.name
                     or ".spec." in fpath.name
+                    or ".stories." in fpath.name
                     or fpath.name.endswith(".d.ts")
                     or rel_src.endswith(("/route.ts", "types/api-generated.ts"))
                     or rel_src.startswith("pages/api/")
@@ -416,6 +440,12 @@ class TypeScriptNextJsAdapter:
                 subkind, label, cluster, role = "api_client", fpath.stem, "api_clients", "surface"
             elif head in ("components", "app"):
                 subkind, label, cluster, role = "component", fpath.stem, head, "surface"
+            elif len(parts) >= 2:
+                # Feature folders, lib/, utils/, constants/ ...: same rules, named by role.
+                label = f"{fpath.parent.name}/{fpath.stem}" if fpath.stem in _GENERIC_STEMS else fpath.stem
+                is_hook = fpath.stem == "hooks" or bool(_HOOK_STEM_RE.match(fpath.stem))
+                subkind = "hook" if is_hook else "component"
+                cluster, role = head, "surface"
             else:
                 continue
 
@@ -566,7 +596,7 @@ class TypeScriptNextJsAdapter:
                     )
                 for m in _RAW_NEW_DATE_RE.finditer(txt):
                     args_str = m.group("args").strip()
-                    if args_str == "" or ("," not in args_str and "Date." not in args_str):
+                    if _is_raw_clock_read(txt, m):
                         lineno = txt.count("\n", 0, m.start()) + 1
                         if node.status == "clean":
                             node.status = "gray_zone"
