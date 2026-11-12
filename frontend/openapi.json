@@ -4158,6 +4158,28 @@
             "type": "string",
             "title": "Source Commit"
           },
+          "worktree_dirty": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worktree Dirty"
+          },
+          "dirty_path_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dirty Path Count"
+          },
           "observed_at": {
             "type": "string",
             "format": "date-time",
@@ -4175,6 +4197,13 @@
           "content_digest": {
             "type": "string",
             "title": "Content Digest"
+          },
+          "scan_notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Scan Notes"
           },
           "summary": {
             "$ref": "#/components/schemas/AtlasSummaryStats"

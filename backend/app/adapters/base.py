@@ -26,6 +26,9 @@ class RawCandidateFinding:
     title: str
     detail: str
     remediation: str
+    # Set on unbacked frontend calls so an optional live probe can re-check them.
+    http_method: str | None = None
+    http_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,8 @@ class TruthExtractionResult:
     function_symbol_map: dict[str, str]  # sql function name -> node_id ("fn:...")
     findings: list[RawCandidateFinding] = field(default_factory=list)
     observation_source: str = "static_ast"
+    # Plain-language notes about what the adapter could not check (shown in reports).
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,13 @@ class FrontendHttpCall:
     normalized_path: str
     source_file: str
     line: int
+    # Top-level symbol (function/const/class) that contains the call, when known.
+    caller_symbol: str | None = None
+    # True: an entry point (page/layout) reaches `caller_symbol`; False: nothing does;
+    # None: the adapter cannot tell (treated as reachable).
+    reachable: bool | None = None
+    # Entry point -> ... -> caller, as `file#symbol` hops (empty when unknown).
+    reach_trail: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,9 @@ class DisplayExtractionResult:
     edges: list[AtlasEdge]  # page->hook, page->client, hook->client
     http_calls: list[FrontendHttpCall]
     findings: list[RawCandidateFinding] = field(default_factory=list)
+    # Regexes for paths the frontend serves itself (e.g. Next.js `route.ts` handlers);
+    # calls matching one are not backend calls.
+    local_route_patterns: list[str] = field(default_factory=list)
 
 
 class TruthTierAdapter(Protocol):
@@ -295,7 +310,8 @@ class AdapterRegistry:
                 implementation_status="implemented",
                 capabilities=[
                     "App Router & Pages Router surface, hook, and API client graph",
-                    "Template URL normalization, OpenAPI type check, and DISP-001..004",
+                    "Template URL normalization, OpenAPI type check, and DISP-001..007",
+                    "Symbol-level reachability from pages/layouts and route.ts handler awareness",
                 ],
             ),
             AdapterSlotSchema(

@@ -302,6 +302,14 @@ def build_sarif_log(
                     "id": f"wythe/{report.target_slug}/{report.stack_profile}"
                 },
                 "results": results_payload,
+                # The scan reads files from disk: record whether that matched the commit.
+                "properties": {
+                    "sourceCommit": report.source_commit,
+                    "worktreeDirty": report.worktree_dirty,
+                    "dirtyPathCount": report.dirty_path_count,
+                    "observationSource": report.observation_source,
+                    "scanNotes": list(report.scan_notes),
+                },
             }
         ],
     }

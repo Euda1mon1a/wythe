@@ -1551,6 +1551,10 @@ export interface components {
             stack_profile_status: "implemented" | "experimental" | "planned";
             /** Source Commit */
             source_commit: string;
+            /** Worktree Dirty */
+            worktree_dirty?: boolean | null;
+            /** Dirty Path Count */
+            dirty_path_count?: number | null;
             /**
              * Observed At
              * Format: date-time
@@ -1565,6 +1569,8 @@ export interface components {
             observation_source: string;
             /** Content Digest */
             content_digest: string;
+            /** Scan Notes */
+            scan_notes?: string[];
             summary: components["schemas"]["AtlasSummaryStats"];
             /** Nodes */
             nodes: components["schemas"]["AtlasNode"][];

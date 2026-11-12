@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Read first - Wythe is provided as is, with no support
+    url: https://github.com/Euda1mon1a/wythe/blob/main/SUPPORT.md
+    about: Issues may be closed without a reply. Pin an exact version and fork if you need changes.
