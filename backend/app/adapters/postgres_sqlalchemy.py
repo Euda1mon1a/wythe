@@ -11,6 +11,7 @@ from pathlib import Path
 from app.adapters.base import RawCandidateFinding, TruthExtractionResult
 from app.adapters.db_catalog_probe import (
     is_migration_meta_table,
+    parse_sql_ddl_objects,
     probe_live_catalog_tables,
 )
 from app.schemas.atlas import AtlasNode
@@ -28,6 +29,13 @@ _DROP_TABLE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _TABLE_NAME_RE = re.compile(rf"^\s*(?:(?P<schema>{_IDENT})\.)?(?P<table>{_IDENT})\s*$")
+# `ALTER TABLE [IF EXISTS] [ONLY] old RENAME TO new`. `RENAME COLUMN a TO b` and the bare
+# `RENAME a TO b` column form do not match: `TO` must follow `RENAME` directly.
+_RENAME_TABLE_RE = re.compile(
+    r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
+    rf"(?:(?P<schema>{_IDENT})\.)?(?P<old>{_IDENT})\s+RENAME\s+TO\s+(?P<new>{_IDENT})",
+    re.IGNORECASE,
+)
 _CREATE_FUNC_RE = re.compile(
     r"CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+"
     r'(?:(?P<schema>"?[A-Za-z_]\w*"?)\.)?(?P<func>"?[A-Za-z_]\w*"?)\s*\(',
@@ -354,12 +362,45 @@ def _eval_str(node: ast.AST | None, consts: dict[str, str]) -> str | None:
     return None
 
 
+def _table_key(schema: str | None, table: str) -> str:
+    schema = schema or "public"
+    return table if schema == "public" else f"{schema}.{table}"
+
+
+def _sql_table_events(sql_text: str) -> list[tuple[int, str, str, str | None, int]]:
+    """CREATE / DROP / RENAME TO table statements in `sql_text`, in text order.
+
+    Each event is (offset, kind, table, new_table, line_offset) where kind is
+    "create", "drop" or "rename" and new_table is set only for a rename.
+    """
+    events: list[tuple[int, str, str, str | None, int]] = []
+    for match in _CREATE_TABLE_RE.finditer(sql_text):
+        key = _table_key(_clean_sql_name(match.group("schema")), _clean_sql_name(match.group("table")))
+        events.append((match.start(), "create", key, None, sql_text.count("\n", 0, match.start())))
+    for match in _DROP_TABLE_RE.finditer(sql_text):
+        for raw_name in match.group("names").split(","):
+            nm = _TABLE_NAME_RE.match(raw_name)
+            if nm:
+                key = _table_key(_clean_sql_name(nm.group("schema")), _clean_sql_name(nm.group("table")))
+                events.append((match.start(), "drop", key, None, sql_text.count("\n", 0, match.start())))
+    for match in _RENAME_TABLE_RE.finditer(sql_text):
+        schema = _clean_sql_name(match.group("schema"))
+        old = _table_key(schema, _clean_sql_name(match.group("old")))
+        new = _table_key(schema, _clean_sql_name(match.group("new")))  # a rename keeps the schema
+        events.append((match.start(), "rename", old, new, sql_text.count("\n", 0, match.start())))
+    events.sort(key=lambda e: e[0])
+    return events
+
+
 @dataclass
 class _MigrationEffects:
     revision: str | None = None
     down_revisions: tuple[str, ...] = ()
-    created_tables: set[str] = field(default_factory=set)
-    dropped_tables: set[str] = field(default_factory=set)
+    # Ordered table effects: (order key, kind, table, new_table, line). The order key follows
+    # the source position inside upgrade() and, for helpers, the call site that ran them, so a
+    # create-then-rename and a rename-then-create replay the way the revision runs them.
+    table_events: list[tuple[tuple, str, str, str | None, int]] = field(default_factory=list)
+    created_columns: dict[str, list[str]] = field(default_factory=dict)
     created_functions: dict[str, int] = field(default_factory=dict)
     dropped_functions: set[str] = field(default_factory=set)
     creates_all_metadata: bool = False
@@ -377,6 +418,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
     """
     effects = _MigrationEffects()
     consts: dict[str, str] = {}
+    const_lines: dict[str, int] = {}
     functions: dict[str, ast.FunctionDef] = {}
     for stmt in tree.body:
         if isinstance(stmt, ast.FunctionDef):
@@ -404,15 +446,19 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         if evaluated is not None:
             for name in targets:
                 consts[name] = evaluated
+                const_lines[name] = value.lineno
 
     upgrade = functions.get("upgrade")
     if upgrade is None:
         return effects
 
-    def absorb_sql(sql_text: str, lineno: int) -> None:
-        tables, funcs = _parse_sql_objects(sql_text)
-        effects.created_tables |= tables
-        effects.dropped_tables |= _parse_dropped_tables(sql_text)
+    def add_event(order: tuple, kind: str, table: str, new_table: str | None, lineno: int) -> None:
+        effects.table_events.append((order, kind, table, new_table, lineno))
+
+    def absorb_sql(sql_text: str, lineno: int, order: tuple) -> None:
+        _, funcs = _parse_sql_objects(sql_text)
+        for offset, kind, table, new_table, line_offset in _sql_table_events(sql_text):
+            add_event((*order, (offset,)), kind, table, new_table, lineno + line_offset)
         for fn_name in funcs:
             effects.created_functions[fn_name] = lineno
         for drop_match in _DROP_FUNC_RE.finditer(sql_text):
@@ -434,8 +480,8 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                     found.add(fk_table)
         return found
 
-    def table_key(call: ast.Call) -> str | None:
-        name = _eval_str(call.args[0], consts) if call.args else None
+    def table_key(call: ast.Call, arg_index: int = 0) -> str | None:
+        name = _eval_str(call.args[arg_index], consts) if len(call.args) > arg_index else None
         if not name or _UNRESOLVED in name:
             return None
         schema = "public"
@@ -444,20 +490,31 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 schema = (_eval_str(kw.value, consts) or "public").lower()
         return name.lower() if schema == "public" else f"{schema}.{name.lower()}"
 
+    def column_names(call: ast.Call) -> list[str]:
+        names: list[str] = []
+        for arg in call.args[1:]:
+            if isinstance(arg, ast.Call) and _expr_name(arg.func) == "Column" and arg.args:
+                col = _eval_str(arg.args[0], consts)
+                if col and _UNRESOLVED not in col:
+                    names.append(col.lower())
+        return names
+
     visited_fns: set[str] = set()
     absorbed_consts: set[str] = set()
 
-    def visit(fn: ast.FunctionDef) -> None:
+    def visit(fn: ast.FunctionDef, ctx: tuple) -> None:
         if fn.name in visited_fns:
             return
         visited_fns.add(fn.name)
         for sub in ast.walk(fn):
+            order = (*ctx, (getattr(sub, "lineno", 0), getattr(sub, "col_offset", 0)))
             if isinstance(sub, ast.Call):
                 callee = _expr_name(sub.func)
                 if callee == "create_table":
                     key = table_key(sub)
                     if key:
-                        effects.created_tables.add(key)
+                        add_event(order, "create", key, None, sub.lineno)
+                        effects.created_columns[key] = column_names(sub)
                         effects.fk_refs |= {(key, dst) for dst in fk_targets_in(sub) if dst != key}
                 elif callee == "create_foreign_key" and len(sub.args) >= 3:
                     src = _eval_str(sub.args[1], consts)
@@ -473,30 +530,32 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 elif callee == "drop_table":
                     key = table_key(sub)
                     if key:
-                        effects.dropped_tables.add(key)
+                        add_event(order, "drop", key, None, sub.lineno)
+                elif callee == "rename_table":
+                    old, new = table_key(sub, 0), table_key(sub, 1)
+                    if old and new:
+                        add_event(order, "rename", old, new, sub.lineno)
                 elif callee == "create_all":
                     effects.creates_all_metadata = True
-                elif callee in ("add_column", "drop_column", "alter_column", "rename_table"):
+                elif callee in ("add_column", "drop_column", "alter_column"):
                     effects.touches_ddl = True
                 elif isinstance(sub.func, ast.Name) and sub.func.id in functions:
-                    visit(functions[sub.func.id])
+                    visit(functions[sub.func.id], order)
             elif isinstance(sub, ast.Name) and sub.id in consts and sub.id not in absorbed_consts:
                 absorbed_consts.add(sub.id)
                 if "ALTER TABLE" in consts[sub.id].upper():
                     effects.touches_ddl = True
-                absorb_sql(consts[sub.id], sub.lineno)
+                absorb_sql(consts[sub.id], const_lines.get(sub.id, sub.lineno), order)
             elif isinstance(sub, (ast.Constant, ast.JoinedStr, ast.BinOp)):
                 text = _eval_str(sub, consts)
                 if text and ("TABLE" in text.upper() or "FUNCTION" in text.upper()):
                     if "ALTER TABLE" in text.upper():
                         effects.touches_ddl = True
-                    absorb_sql(text, getattr(sub, "lineno", 1))
+                    absorb_sql(text, getattr(sub, "lineno", 1), order)
 
-    visit(upgrade)
-    effects.dropped_tables -= effects.created_tables  # drop-then-recreate keeps the table
+    visit(upgrade, ())
     if (
-        effects.created_tables
-        or effects.dropped_tables
+        effects.table_events
         or effects.created_functions
         or effects.dropped_functions
         or effects.creates_all_metadata
@@ -658,6 +717,8 @@ class PostgresSqlAlchemyAdapter:
         sql_functions: dict[str, tuple[str, int]] = {}
         function_reads: dict[str, set[str]] = {}
         fk_refs: dict[tuple[str, str], str] = {}  # (referencing, referenced) -> evidence path
+        # Where each DDL-only table is defined, so its node points at the CREATE TABLE.
+        table_origin: dict[str, tuple[str, int, list[str]]] = {}
         if schema_sql_path.is_file():
             rel_schema = schema_sql_path.relative_to(repo_root).as_posix()
             text = schema_sql_path.read_text(encoding="utf-8", errors="replace")
@@ -669,6 +730,11 @@ class PostgresSqlAlchemyAdapter:
             function_reads.update(schema_fn_reads)
             for pair in schema_fks:
                 fk_refs.setdefault(pair, rel_schema)
+            ddl_detail, _ = parse_sql_ddl_objects(text)
+            for offset, kind, tbl, _new, line_offset in _sql_table_events(text):
+                if kind == "create" and tbl in parsed_tables and tbl not in table_origin:
+                    cols = ddl_detail.get(tbl, (0, []))[1]
+                    table_origin[tbl] = (rel_schema, line_offset + 1, cols)
 
         migration_entries: list[tuple[Path, _MigrationEffects]] = []
         if alembic_dir.is_dir():
@@ -680,11 +746,23 @@ class PostgresSqlAlchemyAdapter:
                 migration_entries.append((mig_file, _collect_migration_effects(tree)))
 
         migrated_tables: set[str] = set()
+        mig_origin: dict[str, tuple[str, int, list[str]]] = {}
         metadata_create_all = False
         for mig_file, effects in _order_migrations(migration_entries):
             rel_mig = mig_file.relative_to(repo_root).as_posix()
-            migrated_tables -= effects.dropped_tables
-            migrated_tables |= effects.created_tables
+            # Replay in the order the revision runs them: drop-then-recreate keeps a table,
+            # and `ALTER TABLE a RENAME TO b` / `op.rename_table(a, b)` retires `a`.
+            for _order, kind, tbl, new_tbl, line in sorted(effects.table_events, key=lambda e: e[0]):
+                if kind == "create":
+                    migrated_tables.add(tbl)
+                    mig_origin[tbl] = (rel_mig, line, effects.created_columns.get(tbl, []))
+                elif kind == "drop":
+                    migrated_tables.discard(tbl)
+                elif new_tbl:
+                    migrated_tables.discard(tbl)
+                    migrated_tables.add(new_tbl)
+                    prior = mig_origin.get(tbl)
+                    mig_origin[new_tbl] = (rel_mig, line, prior[2] if prior else [])
             metadata_create_all |= effects.creates_all_metadata
             for fn_name, fn_line in effects.created_functions.items():
                 sql_functions[fn_name] = (rel_mig, fn_line)
@@ -699,6 +777,9 @@ class PostgresSqlAlchemyAdapter:
             for pair in effects.fk_refs:
                 fk_refs.setdefault(pair, rel_mig)
         sql_tables |= migrated_tables
+        for tbl in migrated_tables:
+            if tbl not in table_origin and tbl in mig_origin:
+                table_origin[tbl] = mig_origin[tbl]
         if metadata_create_all:
             # A revision runs `metadata.create_all()`: every primary-base model is created by it.
             sql_tables |= {k for k in orm_tables if k not in separate}
@@ -736,6 +817,9 @@ class PostgresSqlAlchemyAdapter:
                 if tbl_key in separate:
                     base = table_group[tbl_key] or "an imported base"
                     summary = f"{summary} (separate declarative base `{base}`; not checked against the primary schema.)"
+            elif tbl_key in table_origin:
+                src_file, lineno, cols = table_origin[tbl_key]
+                summary = f"SQL-defined table `{tbl_key}`."
             else:
                 src_file = (
                     schema_sql_path.relative_to(repo_root).as_posix()
