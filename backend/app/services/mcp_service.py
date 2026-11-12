@@ -11,6 +11,7 @@ from typing import Any, BinaryIO
 
 from sqlalchemy.orm import Session
 
+from app import __version__
 from app.adapters.autodetect import detect_repository_stack
 from app.db.session import get_session_factory
 from app.models import TargetProject
@@ -173,7 +174,7 @@ def dispatch_mcp_request(session: Session, msg: dict[str, Any]) -> dict[str, Any
             "result": {
                 "protocolVersion": proto,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "wythe", "version": "0.1.1"},
+                "serverInfo": {"name": "wythe", "version": __version__},
             },
         }
     if method == "ping":

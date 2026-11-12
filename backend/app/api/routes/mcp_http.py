@@ -8,6 +8,7 @@ from fastapi import APIRouter, Body, Depends, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from app import __version__
 from app.db.session import get_db
 from app.services.mcp_service import MCP_TOOLS, dispatch_mcp_request
 
@@ -20,7 +21,7 @@ def get_mcp_http_manifest_route() -> dict[str, Any]:
     """Return Streamable HTTP MCP discovery manifest & read-only tool schemas."""
     return {
         "name": "wythe",
-        "version": "0.1.1",
+        "version": __version__,
         "transport": "streamable-http",
         "protocolVersion": "2025-03-26",
         "endpoint": "/api/v1/mcp",

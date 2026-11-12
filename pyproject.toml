@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wythe"
-version = "0.1.1"
+version = "0.1.2"
 description = "Why -> Therefore: 3-tier architecture verifier, cross-boundary lineage solver, and 3D WebGL atlas."
 readme = "README.md"
 license = "MIT"
