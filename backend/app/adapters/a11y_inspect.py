@@ -53,6 +53,23 @@ def _can_start_js_regex(src: str, prev_sig_pos: int, expr_floor: int) -> bool:
     if prev_sig_pos < expr_floor:
         return True
     prev_ch = src[prev_sig_pos]
+    if prev_ch in ("+", "-") and prev_sig_pos > expr_floor and src[prev_sig_pos - 1] == prev_ch:
+        return False
+    if prev_ch == "!":
+        q = prev_sig_pos - 1
+        while q >= expr_floor and src[q].isspace():
+            q -= 1
+        if q < expr_floor:
+            return True
+        qch = src[q]
+        if qch in (")", "]", "}", "'", '"', "`"):
+            return False
+        if qch.isalnum() or qch in ("_", "$"):
+            w = q
+            while w >= expr_floor and (src[w].isalnum() or src[w] in ("_", "$")):
+                w -= 1
+            return src[w + 1 : q + 1] in _REGEX_PREV_KEYWORDS
+        return True
     if prev_ch in _REGEX_PREV_CHARS:
         return True
     if prev_ch.isalnum() or prev_ch in ("_", "$"):

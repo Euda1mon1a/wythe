@@ -434,3 +434,83 @@ def test_cli_dot_and_dotdot_paths_resolve_to_filesystem_over_slug_collision(
 
     dotdot_target, _ = _resolve_cli_target(db_session, "..", "auto")
     assert Path(dotdot_target.repo_path).resolve() == actual.parent.resolve()
+
+
+
+def test_loop_branch_row_bindings_and_deferred_module_clock_imports() -> None:
+    loop_pm = parse_python_module(
+        "def update_after_loop(db, ids):\n"
+        "    for uid in ids:\n"
+        "        if uid > 0:\n"
+        "            row = db.get(Widget, uid)\n"
+        "        else:\n"
+        "            row = db.get(Widget, 1)\n"
+        "    row.name = 'changed'\n"
+        "    db.commit()\n",
+        "backend/app/services/loop_mut.py",
+        "app.services.loop_mut",
+    )
+    assert loop_pm is not None
+    assert "Widget" in loop_pm.persisted
+
+    clock_pm = parse_python_module(
+        "def read_now():\n"
+        "    return dt.datetime.now()\n\n"
+        "import datetime as dt\n",
+        "backend/app/services/late_import.py",
+        "app.services.late_import",
+    )
+    assert clock_pm is not None
+    assert [line for _expr, line in clock_pm.raw_clock_calls] == [2]
+
+
+def test_nested_callback_partial_param_shadow_preserves_unshadowed_duck_type(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "backend/app/services/task_runner.py",
+        "class TaskRunner:\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/tasks.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/tasks')\n"
+        "def run_all(service, data):\n"
+        "    def callback(data):\n"
+        "        return service.execute_tasks(), data\n"
+        "    return callback(data)\n",
+    )
+    res = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in res.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.tasks", "m:service:services.task_runner") in pairs
+
+
+def test_fallback_param_defaults_and_jsx_postfix_division(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(
+        tmp_path,
+        "frontend/src/app/calc/page.tsx",
+        "const BASE = '/api/v1/calc';\n"
+        "export async function loadCalc(url: string = BASE) {\n"
+        "  return fetch(BASE);\n"
+        "}\n"
+        "export default function CalcPage({ total, count }: { total?: number; count: number }) {\n"
+        "  let idx = 1;\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <input value={total! / count} readOnly />\n"
+        "      <input value={idx++ / count} readOnly />\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    monkeypatch.setattr(typescript_nextjs, "extract_ts_http_calls_cst", lambda *a, **kw: None)
+    res = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    calls = {(c.http_method, c.normalized_path) for c in res.http_calls}
+    assert ("GET", "/api/v1/calc") in calls
+    a11y = [f for f in res.findings if f.rule_code == "DISP-005"]
+    assert len(a11y) == 2

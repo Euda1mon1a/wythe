@@ -73,7 +73,83 @@ _FN_PARAM_HEAD_RE = re.compile(
     r"""(?:\bfunction\b[A-Za-z0-9_$\s]*(?:<[^>{}()]*>)?\s*\((?P<fparams>[^)]*)\)\s*(?::[^{=]+)?\s*\{|\((?P<aparams>[^()]*)\)\s*(?::[^=]+)?=>|(?P<sparam>[A-Za-z_$][\w$]*)\s*=>)"""
 )
 _LOCAL_BIND_RE = re.compile(r"""\b(?:const|let|var|function)\s+(?P<name>[A-Za-z_$][\w$]*)\b""")
-_PARAM_NAME_RE = re.compile(r"""(?:^|[,{\[\s])\.\.\.(?P<rest>[A-Za-z_$][\w$]*)|(?:^|[,{\[\s])(?P<name>[A-Za-z_$][\w$]*)\s*(?=[,?:=\]}\s]|$)""")
+_PARAM_MODIFIER_RE = re.compile(r"^(?:(?:public|private|protected|readonly|override)\s+)+")
+
+
+def _split_top_level_ts(s: str, sep: str) -> list[str]:
+    parts: list[str] = []
+    pdepth = bdepth = cdepth = adepth = 0
+    quote: str | None = None
+    start = 0
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            pdepth = max(0, pdepth - 1)
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            bdepth = max(0, bdepth - 1)
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            cdepth = max(0, cdepth - 1)
+        elif ch == "<":
+            adepth += 1
+        elif ch == ">" and (i == 0 or s[i - 1] != "="):
+            adepth = max(0, adepth - 1)
+        elif ch == sep and pdepth == 0 and bdepth == 0 and cdepth == 0 and adepth == 0:
+            if sep == "=" and (
+                (i > 0 and s[i - 1] in ("=", "!", "<", ">"))
+                or (i + 1 < n and s[i + 1] in ("=", ">"))
+            ):
+                i += 1
+                continue
+            parts.append(s[start:i])
+            start = i + 1
+        i += 1
+    parts.append(s[start:])
+    return parts
+
+
+def _collect_pattern_bound_names(pat: str, out: set[str], *, allow_type_colon: bool) -> None:
+    lhs = _split_top_level_ts(pat, "=")[0].strip()
+    if allow_type_colon:
+        lhs = _split_top_level_ts(lhs, ":")[0].strip()
+    lhs = _PARAM_MODIFIER_RE.sub("", lhs).strip().removeprefix("...").strip().removesuffix("?").strip()
+    if not lhs:
+        return
+    if lhs.startswith("{") and lhs.endswith("}"):
+        for prop in _split_top_level_ts(lhs[1:-1], ","):
+            no_def = _split_top_level_ts(prop, "=")[0].strip()
+            if not no_def:
+                continue
+            kv = _split_top_level_ts(no_def, ":")
+            target = kv[1] if len(kv) >= 2 else kv[0]
+            _collect_pattern_bound_names(target, out, allow_type_colon=False)
+    elif lhs.startswith("[") and lhs.endswith("]"):
+        for elem in _split_top_level_ts(lhs[1:-1], ","):
+            _collect_pattern_bound_names(elem, out, allow_type_colon=False)
+    elif re.fullmatch(r"[A-Za-z_$][\w$]*", lhs) and lhs != "this":
+        out.add(lhs)
+
+
+def _extract_param_bound_names(raw_params: str) -> set[str]:
+    out: set[str] = set()
+    for item in _split_top_level_ts(raw_params, ","):
+        _collect_pattern_bound_names(item, out, allow_type_colon=True)
+    return out
 
 
 def _find_matching_delim(txt: str, open_idx: int, open_ch: str, close_ch: str) -> int:
@@ -220,11 +296,7 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
     param_scopes: list[tuple[int, int, set[str]]] = []
     for m in _FN_PARAM_HEAD_RE.finditer(txt):
         raw_params = m.group("fparams") or m.group("aparams") or m.group("sparam") or ""
-        bound = {
-            (pm.group("rest") or pm.group("name"))
-            for pm in _PARAM_NAME_RE.finditer(raw_params)
-            if (pm.group("rest") or pm.group("name"))
-        }
+        bound = _extract_param_bound_names(raw_params)
         if not bound:
             continue
         if m.group("fparams") is not None:

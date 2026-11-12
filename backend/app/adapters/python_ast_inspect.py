@@ -355,14 +355,9 @@ def _scope_expr_nodes(root: ast.AST, skip_params: frozenset[str] = frozenset()) 
         idx += 1
         out.append(node)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-            if not skip_params:
+            if not skip_params or isinstance(node, ast.ClassDef):
                 continue
-            if isinstance(node, ast.ClassDef):
-                continue
-            inner_args = {
-                p.arg for p in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
-            }
-            if inner_args & skip_params:
+            if _arg_names(node.args) & skip_params:
                 continue
         queue.extend(ast.iter_child_nodes(node))
     return out
@@ -382,19 +377,21 @@ def _injected_param_profiles(tree: ast.AST, excluded: set[int]) -> dict[int, dic
         )
         if not names:
             continue
-        subnodes = [s for s in _scope_expr_nodes(fn, names) if id(s) not in excluded]
-        attrs_by_param: dict[str, set[str]] = {nm: set() for nm in names}
-        for sub in subnodes:
-            if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id in attrs_by_param:
-                attrs_by_param[sub.value.id].add(sub.attr)
-        frozen = {nm: frozenset(atts) for nm, atts in attrs_by_param.items() if atts}
-        if not frozen:
-            continue
-        for sub in subnodes:
-            if isinstance(sub, ast.Call):
-                merged = dict(out.get(id(sub), {}))
-                merged.update(frozen)
-                out[id(sub)] = merged
+        for nm in names:
+            subnodes = [s for s in _scope_expr_nodes(fn, frozenset({nm})) if id(s) not in excluded]
+            atts = {
+                sub.attr
+                for sub in subnodes
+                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id == nm
+            }
+            if not atts:
+                continue
+            frozen_atts = frozenset(atts)
+            for sub in subnodes:
+                if isinstance(sub, ast.Call):
+                    merged = dict(out.get(id(sub), {}))
+                    merged[nm] = frozen_atts
+                    out[id(sub)] = merged
     return out
 
 
@@ -610,8 +607,24 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                     else:
                         rows.pop(s.target.id, None)
                         made.pop(s.target.id, None)
-                walk_block(s.body, rows, made)
-                walk_block(s.orelse, rows, made)
+                r_body, m_body = walk_block(
+                    s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
+                )
+                r_else, m_else = walk_block(
+                    s.orelse, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
+                )
+                rows = _merge_binding_maps(rows, r_body, r_else)
+                made = _merge_binding_maps(made, m_body, m_else)
+            elif isinstance(s, ast.While):
+                inspect_expr(s.test, rows, made)
+                r_body, m_body = walk_block(
+                    s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
+                )
+                r_else, m_else = walk_block(
+                    s.orelse, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
+                )
+                rows = _merge_binding_maps(rows, r_body, r_else)
+                made = _merge_binding_maps(made, m_body, m_else)
             elif isinstance(s, ast.If):
                 inspect_expr(s.test, rows, made)
                 r_body, m_body = walk_block(s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()})
@@ -705,17 +718,25 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
         if ref and ref[1] in ("now", "utcnow", "today"):
             found.append((f"{_dotted(val)} (passed uncalled)", getattr(val, "lineno", 1)))
 
-    def inspect_expr(expr: ast.AST | None, classes: dict[str, str], modules: set[str]) -> None:
+    def inspect_expr(
+        expr: ast.AST | None,
+        classes: dict[str, str],
+        modules: set[str],
+        deferred_lams: list[ast.Lambda] | None = None,
+    ) -> None:
         if isinstance(expr, ast.Lambda):
             for dflt in (*expr.args.defaults, *(d for d in expr.args.kw_defaults if d is not None)):
-                inspect_expr(dflt, classes, modules)
-            lam_params = _arg_names(expr.args)
-            lam_classes = {k: v for k, v in classes.items() if k not in lam_params}
-            inspect_expr(expr.body, lam_classes, modules - lam_params)
+                inspect_expr(dflt, classes, modules, deferred_lams)
+            if deferred_lams is not None:
+                deferred_lams.append(expr)
+            else:
+                lam_params = _arg_names(expr.args)
+                lam_classes = {k: v for k, v in classes.items() if k not in lam_params}
+                inspect_expr(expr.body, lam_classes, modules - lam_params, None)
             return
         for n in _expr_nodes_shallow(expr, excluded):
             if isinstance(n, ast.Lambda):
-                inspect_expr(n, classes, modules)
+                inspect_expr(n, classes, modules, deferred_lams)
                 continue
             if not isinstance(n, ast.Call):
                 continue
@@ -736,7 +757,13 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
             if (short in _CLOCK_ZERO_ARG_CALLS and n.args) or is_tzless_partial:
                 check_factory_val(n.args[0], classes, modules)
 
-    def walk_stmts(stmts: list[ast.stmt], classes: dict[str, str], modules: set[str]) -> None:
+    def walk_stmts(
+        stmts: list[ast.stmt],
+        classes: dict[str, str],
+        modules: set[str],
+        deferred_fns: list[ast.FunctionDef | ast.AsyncFunctionDef],
+        deferred_lams: list[ast.Lambda],
+    ) -> None:
         for stmt in stmts:
             if id(stmt) in excluded:
                 continue
@@ -761,32 +788,49 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
                         classes.pop(bound, None)
                         modules.discard(bound)
                 continue
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for dec in stmt.decorator_list:
-                    inspect_expr(dec, classes, modules)
-                sub_classes = dict(classes)
-                sub_modules = set(modules)
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    for dflt in (*stmt.args.defaults, *(d for d in stmt.args.kw_defaults if d is not None)):
-                        inspect_expr(dflt, classes, modules)
-                    for pname in _arg_names(stmt.args):
-                        sub_classes.pop(pname, None)
-                        sub_modules.discard(pname)
-                walk_stmts(stmt.body, sub_classes, sub_modules)
+                    inspect_expr(dec, classes, modules, deferred_lams)
+                for dflt in (*stmt.args.defaults, *(d for d in stmt.args.kw_defaults if d is not None)):
+                    inspect_expr(dflt, classes, modules, deferred_lams)
+                deferred_fns.append(stmt)
+                continue
+            if isinstance(stmt, ast.ClassDef):
+                for dec in stmt.decorator_list:
+                    inspect_expr(dec, classes, modules, deferred_lams)
+                for base_expr in (*stmt.bases, *(kw.value for kw in stmt.keywords)):
+                    inspect_expr(base_expr, classes, modules, deferred_lams)
+                walk_stmts(stmt.body, dict(classes), set(modules), deferred_fns, deferred_lams)
                 continue
             for ch in ast.iter_child_nodes(stmt):
                 if isinstance(ch, ast.expr):
-                    inspect_expr(ch, classes, modules)
+                    inspect_expr(ch, classes, modules, deferred_lams)
                 elif isinstance(ch, ast.stmt):
-                    walk_stmts([ch], classes, modules)
+                    walk_stmts([ch], classes, modules, deferred_fns, deferred_lams)
                 else:
                     for sub in ast.iter_child_nodes(ch):
                         if isinstance(sub, ast.expr):
-                            inspect_expr(sub, classes, modules)
+                            inspect_expr(sub, classes, modules, deferred_lams)
                         elif isinstance(sub, ast.stmt):
-                            walk_stmts([sub], classes, modules)
+                            walk_stmts([sub], classes, modules, deferred_fns, deferred_lams)
 
-    walk_stmts(tree.body, {"date": "date", "datetime": "datetime"}, {"datetime"})
+    def run_lexical_scope(stmts: list[ast.stmt], classes: dict[str, str], modules: set[str]) -> None:
+        fns: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        lams: list[ast.Lambda] = []
+        walk_stmts(stmts, classes, modules, fns, lams)
+        for lam in lams:
+            lam_params = _arg_names(lam.args)
+            lam_classes = {k: v for k, v in classes.items() if k not in lam_params}
+            inspect_expr(lam.body, lam_classes, modules - lam_params, None)
+        for fn in fns:
+            sub_classes = dict(classes)
+            sub_modules = set(modules)
+            for pname in _arg_names(fn.args):
+                sub_classes.pop(pname, None)
+                sub_modules.discard(pname)
+            run_lexical_scope(fn.body, sub_classes, sub_modules)
+
+    run_lexical_scope(tree.body, {"date": "date", "datetime": "datetime"}, {"datetime"})
     return found
 
 
