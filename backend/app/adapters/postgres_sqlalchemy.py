@@ -234,30 +234,148 @@ def _model_group(
     return _DEFAULT_GROUP
 
 
+_SQL_COL_SKIP_HEADS = frozenset(
+    {"constraint", "primary", "foreign", "unique", "check", "index", "key", "exclude", "like"}
+)
+
+
+def _blank_sql_comments(sql_text: str) -> str:
+    """Replace `--` and `/* ... */` SQL comments with spaces while preserving quotes, `$tag$`, and `\\n`."""
+    out: list[str] = []
+    i = 0
+    n = len(sql_text)
+    while i < n:
+        ch = sql_text[i]
+        nxt = sql_text[i + 1] if i + 1 < n else ""
+        if ch == "-" and nxt == "-":
+            while i < n and sql_text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            out.append("  ")
+            i += 2
+            depth = 1
+            while i < n and depth > 0:
+                if sql_text[i] == "/" and i + 1 < n and sql_text[i + 1] == "*":
+                    out.append("  ")
+                    i += 2
+                    depth += 1
+                elif sql_text[i] == "*" and i + 1 < n and sql_text[i + 1] == "/":
+                    out.append("  ")
+                    i += 2
+                    depth -= 1
+                else:
+                    out.append("\n" if sql_text[i] == "\n" else " ")
+                    i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = sql_text[i]
+                out.append(c)
+                if c == "\\" and quote == "'" and i + 1 < n:
+                    out.append(sql_text[i + 1])
+                    i += 2
+                    continue
+                if c == quote:
+                    if i + 1 < n and sql_text[i + 1] == quote:
+                        out.append(quote)
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "$":
+            dm = re.match(r"\$[A-Za-z0-9_]*\$", sql_text[i:])
+            if dm:
+                tag = dm.group(0)
+                end = sql_text.find(tag, i + len(tag))
+                if end >= 0:
+                    out.append(sql_text[i : end + len(tag)])
+                    i = end + len(tag)
+                    continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_create_columns_at(cleaned_sql: str, pos: int) -> list[str]:
+    """Extract column names from the `(...)` body immediately following `CREATE TABLE <name>`."""
+    n = len(cleaned_sql)
+    i = pos
+    while i < n and cleaned_sql[i].isspace():
+        i += 1
+    if i >= n or cleaned_sql[i] != "(":
+        return []
+    depth = 1
+    start = i + 1
+    j = start
+    quote: str | None = None
+    top_parts: list[str] = []
+    seg_start = start
+    while j < n and depth > 0:
+        c = cleaned_sql[j]
+        if quote:
+            if c == quote:
+                if j + 1 < n and cleaned_sql[j + 1] == quote:
+                    j += 2
+                    continue
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                top_parts.append(cleaned_sql[seg_start:j])
+                break
+        elif c == "," and depth == 1:
+            top_parts.append(cleaned_sql[seg_start:j])
+            seg_start = j + 1
+        j += 1
+    cols: list[str] = []
+    for part in top_parts:
+        stripped = part.strip()
+        if not stripped:
+            continue
+        first_raw = stripped.split()[0].rstrip("(")
+        first_tok = _clean_sql_name(first_raw)
+        if first_tok and first_tok not in _SQL_COL_SKIP_HEADS and re.match(r"^[a-z_]\w*$", first_tok):
+            cols.append(first_tok)
+    return cols[:40]
+
+
 def _clean_sql_name(raw: str | None) -> str:
     return (raw or "").replace('"', "").lower()
 
 
 def _parse_sql_objects(sql_text: str) -> tuple[set[str], dict[str, int]]:
     """Extract table names and function names -> approx line numbers from SQL text."""
+    cleaned = _blank_sql_comments(sql_text)
     tables: set[str] = set()
     functions: dict[str, int] = {}
-    for match in _CREATE_TABLE_RE.finditer(sql_text):
+    for match in _CREATE_TABLE_RE.finditer(cleaned):
         schema = _clean_sql_name(match.group("schema")) or "public"
         table = _clean_sql_name(match.group("table"))
         tables.add(table if schema == "public" else f"{schema}.{table}")
-    for match in _CREATE_FUNC_RE.finditer(sql_text):
+    for match in _CREATE_FUNC_RE.finditer(cleaned):
         schema = _clean_sql_name(match.group("schema")) or "public"
         func = _clean_sql_name(match.group("func"))
         key = func if schema == "public" else f"{schema}.{func}"
-        line = sql_text.count("\n", 0, match.start()) + 1
+        line = cleaned.count("\n", 0, match.start()) + 1
         functions[key] = line
     return tables, functions
 
 
 def _parse_dropped_tables(sql_text: str) -> set[str]:
+    cleaned = _blank_sql_comments(sql_text)
     dropped: set[str] = set()
-    for match in _DROP_TABLE_RE.finditer(sql_text):
+    for match in _DROP_TABLE_RE.finditer(cleaned):
         for raw_name in match.group("names").split(","):
             nm = _TABLE_NAME_RE.match(raw_name)
             if nm:
@@ -281,25 +399,26 @@ def _parse_sql_lineage(sql_text: str) -> tuple[dict[str, set[str]], set[tuple[st
     Returns ({function key: tables its dollar-quoted body reads}, {(referencing table,
     referenced table)} from REFERENCES clauses of CREATE/ALTER TABLE statements).
     """
+    cleaned = _blank_sql_comments(sql_text)
     function_reads: dict[str, set[str]] = {}
-    for match in _CREATE_FUNC_RE.finditer(sql_text):
+    for match in _CREATE_FUNC_RE.finditer(cleaned):
         schema = _clean_sql_name(match.group("schema")) or "public"
         func = _clean_sql_name(match.group("func"))
         key = func if schema == "public" else f"{schema}.{func}"
-        tag = _DOLLAR_BODY_RE.search(sql_text, match.end())
-        if tag is None or ";" in sql_text[match.end() : tag.start()]:
+        tag = _DOLLAR_BODY_RE.search(cleaned, match.end())
+        if tag is None or ";" in cleaned[match.end() : tag.start()]:
             continue
         body_start = tag.end()
-        body_end = sql_text.find(tag.group(1), body_start)
+        body_end = cleaned.find(tag.group(1), body_start)
         if body_end < 0:
             continue
-        body = _SQL_LINE_COMMENT_RE.sub("", sql_text[body_start:body_end])
+        body = _blank_sql_comments(cleaned[body_start:body_end])
         reads = function_reads.setdefault(key, set())
         for read in _BODY_READ_RE.finditer(body):
             if not read.group("kw").upper().startswith("DELETE"):
                 reads.add(_sql_table_key(read.group("t")))
     fk_refs: set[tuple[str, str]] = set()
-    for stmt in _FK_STMT_RE.finditer(sql_text):
+    for stmt in _FK_STMT_RE.finditer(cleaned):
         src = _sql_table_key(stmt.group("src"))
         for ref in _REFERENCES_RE.finditer(stmt.group("rest")):
             dst = _sql_table_key(ref.group("dst"))
@@ -367,27 +486,29 @@ def _table_key(schema: str | None, table: str) -> str:
     return table if schema == "public" else f"{schema}.{table}"
 
 
-def _sql_table_events(sql_text: str) -> list[tuple[int, str, str, str | None, int]]:
+def _sql_table_events(sql_text: str) -> list[tuple[int, str, str, str | None, int, list[str]]]:
     """CREATE / DROP / RENAME TO table statements in `sql_text`, in text order.
 
-    Each event is (offset, kind, table, new_table, line_offset) where kind is
+    Each event is (offset, kind, table, new_table, line_offset, columns) where kind is
     "create", "drop" or "rename" and new_table is set only for a rename.
     """
-    events: list[tuple[int, str, str, str | None, int]] = []
-    for match in _CREATE_TABLE_RE.finditer(sql_text):
+    cleaned = _blank_sql_comments(sql_text)
+    events: list[tuple[int, str, str, str | None, int, list[str]]] = []
+    for match in _CREATE_TABLE_RE.finditer(cleaned):
         key = _table_key(_clean_sql_name(match.group("schema")), _clean_sql_name(match.group("table")))
-        events.append((match.start(), "create", key, None, sql_text.count("\n", 0, match.start())))
-    for match in _DROP_TABLE_RE.finditer(sql_text):
+        cols = _extract_create_columns_at(cleaned, match.end())
+        events.append((match.start(), "create", key, None, cleaned.count("\n", 0, match.start()), cols))
+    for match in _DROP_TABLE_RE.finditer(cleaned):
         for raw_name in match.group("names").split(","):
             nm = _TABLE_NAME_RE.match(raw_name)
             if nm:
                 key = _table_key(_clean_sql_name(nm.group("schema")), _clean_sql_name(nm.group("table")))
-                events.append((match.start(), "drop", key, None, sql_text.count("\n", 0, match.start())))
-    for match in _RENAME_TABLE_RE.finditer(sql_text):
+                events.append((match.start(), "drop", key, None, cleaned.count("\n", 0, match.start()), []))
+    for match in _RENAME_TABLE_RE.finditer(cleaned):
         schema = _clean_sql_name(match.group("schema"))
         old = _table_key(schema, _clean_sql_name(match.group("old")))
         new = _table_key(schema, _clean_sql_name(match.group("new")))  # a rename keeps the schema
-        events.append((match.start(), "rename", old, new, sql_text.count("\n", 0, match.start())))
+        events.append((match.start(), "rename", old, new, cleaned.count("\n", 0, match.start()), []))
     events.sort(key=lambda e: e[0])
     return events
 
@@ -396,11 +517,9 @@ def _sql_table_events(sql_text: str) -> list[tuple[int, str, str, str | None, in
 class _MigrationEffects:
     revision: str | None = None
     down_revisions: tuple[str, ...] = ()
-    # Ordered table effects: (order key, kind, table, new_table, line). The order key follows
-    # the source position inside upgrade() and, for helpers, the call site that ran them, so a
-    # create-then-rename and a rename-then-create replay the way the revision runs them.
-    table_events: list[tuple[tuple, str, str, str | None, int]] = field(default_factory=list)
-    created_columns: dict[str, list[str]] = field(default_factory=dict)
+    # Ordered table effects: (order key, kind, table, new_table, line, columns). The order key
+    # follows source position inside upgrade() and, for helpers, each call site that runs them.
+    table_events: list[tuple[tuple, str, str, str | None, int, list[str]]] = field(default_factory=list)
     created_functions: dict[str, int] = field(default_factory=dict)
     dropped_functions: set[str] = field(default_factory=set)
     creates_all_metadata: bool = False
@@ -452,16 +571,19 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
     if upgrade is None:
         return effects
 
-    def add_event(order: tuple, kind: str, table: str, new_table: str | None, lineno: int) -> None:
-        effects.table_events.append((order, kind, table, new_table, lineno))
+    def add_event(
+        order: tuple, kind: str, table: str, new_table: str | None, lineno: int, cols: list[str] | None = None
+    ) -> None:
+        effects.table_events.append((order, kind, table, new_table, lineno, list(cols or [])))
 
     def absorb_sql(sql_text: str, lineno: int, order: tuple) -> None:
+        cleaned = _blank_sql_comments(sql_text)
         _, funcs = _parse_sql_objects(sql_text)
-        for offset, kind, table, new_table, line_offset in _sql_table_events(sql_text):
-            add_event((*order, (offset,)), kind, table, new_table, lineno + line_offset)
+        for offset, kind, table, new_table, line_offset, cols in _sql_table_events(sql_text):
+            add_event((*order, (offset,)), kind, table, new_table, lineno + line_offset, cols)
         for fn_name in funcs:
             effects.created_functions[fn_name] = lineno
-        for drop_match in _DROP_FUNC_RE.finditer(sql_text):
+        for drop_match in _DROP_FUNC_RE.finditer(cleaned):
             schema = _clean_sql_name(drop_match.group("schema")) or "public"
             fn = _clean_sql_name(drop_match.group("func"))
             effects.dropped_functions.add(fn if schema == "public" else f"{schema}.{fn}")
@@ -499,59 +621,75 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                     names.append(col.lower())
         return names
 
-    visited_fns: set[str] = set()
-    absorbed_consts: set[str] = set()
+    active_fns: set[str] = set()
 
-    def visit(fn: ast.FunctionDef, ctx: tuple) -> None:
-        if fn.name in visited_fns:
+    def walk_node(sub: ast.AST, ctx: tuple) -> None:
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return
-        visited_fns.add(fn.name)
-        for sub in ast.walk(fn):
-            order = (*ctx, (getattr(sub, "lineno", 0), getattr(sub, "col_offset", 0)))
-            if isinstance(sub, ast.Call):
-                callee = _expr_name(sub.func)
-                if callee == "create_table":
-                    key = table_key(sub)
-                    if key:
-                        add_event(order, "create", key, None, sub.lineno)
-                        effects.created_columns[key] = column_names(sub)
-                        effects.fk_refs |= {(key, dst) for dst in fk_targets_in(sub) if dst != key}
-                elif callee == "create_foreign_key" and len(sub.args) >= 3:
-                    src = _eval_str(sub.args[1], consts)
-                    dst = _eval_str(sub.args[2], consts)
-                    kw = {k.arg: _eval_str(k.value, consts) for k in sub.keywords if k.arg}
-                    if src and dst and _UNRESOLVED not in src + dst:
-                        src_schema = (kw.get("source_schema") or "public").lower()
-                        dst_schema = (kw.get("referent_schema") or "public").lower()
-                        src_key = src.lower() if src_schema == "public" else f"{src_schema}.{src.lower()}"
-                        dst_key = dst.lower() if dst_schema == "public" else f"{dst_schema}.{dst.lower()}"
-                        if src_key != dst_key:
-                            effects.fk_refs.add((src_key, dst_key))
-                elif callee == "drop_table":
-                    key = table_key(sub)
-                    if key:
-                        add_event(order, "drop", key, None, sub.lineno)
-                elif callee == "rename_table":
-                    old, new = table_key(sub, 0), table_key(sub, 1)
-                    if old and new:
-                        add_event(order, "rename", old, new, sub.lineno)
-                elif callee == "create_all":
-                    effects.creates_all_metadata = True
-                elif callee in ("add_column", "drop_column", "alter_column"):
-                    effects.touches_ddl = True
-                elif isinstance(sub.func, ast.Name) and sub.func.id in functions:
-                    visit(functions[sub.func.id], order)
-            elif isinstance(sub, ast.Name) and sub.id in consts and sub.id not in absorbed_consts:
-                absorbed_consts.add(sub.id)
-                if "ALTER TABLE" in consts[sub.id].upper():
-                    effects.touches_ddl = True
-                absorb_sql(consts[sub.id], const_lines.get(sub.id, sub.lineno), order)
-            elif isinstance(sub, (ast.Constant, ast.JoinedStr, ast.BinOp)):
-                text = _eval_str(sub, consts)
-                if text and ("TABLE" in text.upper() or "FUNCTION" in text.upper()):
-                    if "ALTER TABLE" in text.upper():
+        order = (*ctx, (getattr(sub, "lineno", 0), getattr(sub, "col_offset", 0)))
+        if isinstance(sub, ast.Call):
+            callee = _expr_name(sub.func)
+            if callee == "create_table":
+                key = table_key(sub)
+                if key:
+                    add_event(order, "create", key, None, sub.lineno, column_names(sub))
+                    effects.fk_refs |= {(key, dst) for dst in fk_targets_in(sub) if dst != key}
+                return
+            if callee == "create_foreign_key" and len(sub.args) >= 3:
+                src = _eval_str(sub.args[1], consts)
+                dst = _eval_str(sub.args[2], consts)
+                kw = {k.arg: _eval_str(k.value, consts) for k in sub.keywords if k.arg}
+                if src and dst and _UNRESOLVED not in src + dst:
+                    src_schema = (kw.get("source_schema") or "public").lower()
+                    dst_schema = (kw.get("referent_schema") or "public").lower()
+                    src_key = src.lower() if src_schema == "public" else f"{src_schema}.{src.lower()}"
+                    dst_key = dst.lower() if dst_schema == "public" else f"{dst_schema}.{dst.lower()}"
+                    if src_key != dst_key:
+                        effects.fk_refs.add((src_key, dst_key))
+                return
+            if callee == "drop_table":
+                key = table_key(sub)
+                if key:
+                    add_event(order, "drop", key, None, sub.lineno)
+                return
+            if callee == "rename_table":
+                old, new = table_key(sub, 0), table_key(sub, 1)
+                if old and new:
+                    add_event(order, "rename", old, new, sub.lineno)
+                return
+            if callee == "create_all":
+                effects.creates_all_metadata = True
+            elif callee in ("add_column", "drop_column", "alter_column"):
+                effects.touches_ddl = True
+            elif isinstance(sub.func, ast.Name) and sub.func.id in functions:
+                visit(functions[sub.func.id], order)
+        elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in consts:
+            cleaned_u = _blank_sql_comments(consts[sub.id]).upper()
+            if "ALTER TABLE" in cleaned_u:
+                effects.touches_ddl = True
+            absorb_sql(consts[sub.id], const_lines.get(sub.id, sub.lineno), order)
+            return
+        elif isinstance(sub, (ast.Constant, ast.JoinedStr, ast.BinOp)):
+            text = _eval_str(sub, consts)
+            if text is not None:
+                cleaned_u = _blank_sql_comments(text).upper()
+                if "TABLE" in cleaned_u or "FUNCTION" in cleaned_u:
+                    if "ALTER TABLE" in cleaned_u:
                         effects.touches_ddl = True
                     absorb_sql(text, getattr(sub, "lineno", 1), order)
+                return
+        for child in ast.iter_child_nodes(sub):
+            walk_node(child, ctx)
+
+    def visit(fn: ast.FunctionDef, ctx: tuple) -> None:
+        if fn.name in active_fns:
+            return
+        active_fns.add(fn.name)
+        try:
+            for stmt in fn.body:
+                walk_node(stmt, ctx)
+        finally:
+            active_fns.discard(fn.name)
 
     visit(upgrade, ())
     if (
@@ -730,10 +868,10 @@ class PostgresSqlAlchemyAdapter:
             function_reads.update(schema_fn_reads)
             for pair in schema_fks:
                 fk_refs.setdefault(pair, rel_schema)
-            ddl_detail, _ = parse_sql_ddl_objects(text)
-            for offset, kind, tbl, _new, line_offset in _sql_table_events(text):
+            ddl_detail, _ = parse_sql_ddl_objects(_blank_sql_comments(text))
+            for _offset, kind, tbl, _new, line_offset, ev_cols in _sql_table_events(text):
                 if kind == "create" and tbl in parsed_tables and tbl not in table_origin:
-                    cols = ddl_detail.get(tbl, (0, []))[1]
+                    cols = ev_cols or ddl_detail.get(tbl, (0, []))[1]
                     table_origin[tbl] = (rel_schema, line_offset + 1, cols)
 
         migration_entries: list[tuple[Path, _MigrationEffects]] = []
@@ -752,16 +890,17 @@ class PostgresSqlAlchemyAdapter:
             rel_mig = mig_file.relative_to(repo_root).as_posix()
             # Replay in the order the revision runs them: drop-then-recreate keeps a table,
             # and `ALTER TABLE a RENAME TO b` / `op.rename_table(a, b)` retires `a`.
-            for _order, kind, tbl, new_tbl, line in sorted(effects.table_events, key=lambda e: e[0]):
+            for _order, kind, tbl, new_tbl, line, ev_cols in sorted(effects.table_events, key=lambda e: e[0]):
                 if kind == "create":
                     migrated_tables.add(tbl)
-                    mig_origin[tbl] = (rel_mig, line, effects.created_columns.get(tbl, []))
+                    mig_origin[tbl] = (rel_mig, line, ev_cols)
                 elif kind == "drop":
                     migrated_tables.discard(tbl)
+                    mig_origin.pop(tbl, None)
                 elif new_tbl:
                     migrated_tables.discard(tbl)
                     migrated_tables.add(new_tbl)
-                    prior = mig_origin.get(tbl)
+                    prior = mig_origin.pop(tbl, None)
                     mig_origin[new_tbl] = (rel_mig, line, prior[2] if prior else [])
             metadata_create_all |= effects.creates_all_metadata
             for fn_name, fn_line in effects.created_functions.items():

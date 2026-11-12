@@ -46,9 +46,16 @@ def _resolve_cli_target(
     *,
     ensure_persisted: bool = False,
 ) -> tuple[TargetProject, bool]:
-    existing = get_target_by_slug(session, target_or_path)
-    if existing is not None:
-        return existing, True
+    looks_like_path = (
+        target_or_path in (".", "..")
+        or "/" in target_or_path
+        or "\\" in target_or_path
+        or target_or_path.startswith("~")
+    )
+    if not looks_like_path:
+        existing = get_target_by_slug(session, target_or_path)
+        if existing is not None:
+            return existing, True
 
     candidate = Path(target_or_path).expanduser().resolve()
     if not candidate.is_dir():

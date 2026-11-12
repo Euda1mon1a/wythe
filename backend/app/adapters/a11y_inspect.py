@@ -21,17 +21,59 @@ _LABEL_FOR_ATTR_RE = re.compile(r"""\b(?:htmlFor|for)\s*=\s*(?:['"](?P<id>[^'"]+
 _ID_ATTR_RE = re.compile(r"""(?<![\w-])id\s*=\s*(?:['"](?P<id>[^'"]+)['"]|\{(?P<expr>[^}]+)\})""")
 _HIDDEN_INPUT_RE = re.compile(r"""\btype\s*=\s*['"](?:hidden|submit|reset|button)['"]""", re.IGNORECASE)
 _OPEN_TAG_SCAN_LIMIT = 8000
+_REGEX_PREV_CHARS = frozenset("({[,;=!&|?+~^*%-<>:")
+_REGEX_PREV_KEYWORDS = frozenset(
+    {"return", "typeof", "void", "delete", "throw", "case", "in", "instanceof", "new", "yield", "await", "of", "else", "do"}
+)
+
+
+def _skip_js_regex(src: str, start: int, limit: int) -> int | None:
+    """If `/` at `start` begins a valid single-line `/.../` regex literal, return index past flags."""
+    j = start + 1
+    in_class = False
+    while j < limit and src[j] not in ("\n", "\r"):
+        ch = src[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch == "/" and not in_class:
+            j += 1
+            while j < limit and src[j].isalpha():
+                j += 1
+            return j
+        j += 1
+    return None
+
+
+def _can_start_js_regex(src: str, prev_sig_pos: int, expr_floor: int) -> bool:
+    if prev_sig_pos < expr_floor:
+        return True
+    prev_ch = src[prev_sig_pos]
+    if prev_ch in _REGEX_PREV_CHARS:
+        return True
+    if prev_ch.isalnum() or prev_ch in ("_", "$"):
+        k = prev_sig_pos
+        while k >= expr_floor and (src[k].isalnum() or src[k] in ("_", "$")):
+            k -= 1
+        return src[k + 1 : prev_sig_pos + 1] in _REGEX_PREV_KEYWORDS
+    return False
 
 
 def scan_open_tag_end(src: str, pos: int) -> int | None:
     """Index just past the `>` that closes the opening tag whose attributes start at `pos`.
 
     A `>` inside a `{...}` expression (arrow `=>`, TS generic `as Ref<T>`, comparison `a > b`),
-    a quoted attribute value, a template literal, or a comment does not end the tag. Returns
-    None for markup that never closes within the scan limit.
+    a quoted attribute value, a template literal, a regex literal, or a comment does not end the
+    tag. Returns None for markup that never closes within the scan limit.
     """
     n = min(len(src), pos + _OPEN_TAG_SCAN_LIMIT)
     stack: list[str] = []  # "{" for an expression, "`" for a template literal inside one
+    expr_floors: list[int] = []
+    prev_sig_pos = -1
     i = pos
     while i < n:
         ch = src[i]
@@ -42,8 +84,11 @@ def scan_open_tag_end(src: str, pos: int) -> int | None:
                 continue
             if ch == "`":
                 stack.pop()
+                prev_sig_pos = i
             elif src.startswith("${", i):
                 stack.append("{")
+                expr_floors.append(i + 2)
+                prev_sig_pos = i + 1
                 i += 2
                 continue
             i += 1
@@ -61,12 +106,27 @@ def scan_open_tag_end(src: str, pos: int) -> int | None:
                 j = i + 1
                 while j < n and src[j] not in (ch, "\n"):
                     j += 2 if src[j] == "\\" else 1
+                prev_sig_pos = min(j, n - 1)
                 i = j + 1
                 continue
-            if ch == "`" or ch == "{":
-                stack.append(ch)
+            if ch == "/" and _can_start_js_regex(src, prev_sig_pos, expr_floors[-1]):
+                rx_end = _skip_js_regex(src, i, n)
+                if rx_end is not None:
+                    prev_sig_pos = rx_end - 1
+                    i = rx_end
+                    continue
+            if ch == "`":
+                stack.append("`")
+            elif ch == "{":
+                stack.append("{")
+                expr_floors.append(i + 1)
+                prev_sig_pos = i
             elif ch == "}":
                 stack.pop()
+                expr_floors.pop()
+                prev_sig_pos = i
+            elif not ch.isspace():
+                prev_sig_pos = i
             i += 1
             continue
         if ch in ("'", '"'):
@@ -77,6 +137,8 @@ def scan_open_tag_end(src: str, pos: int) -> int | None:
             continue
         if ch == "{":
             stack.append("{")
+            expr_floors.append(i + 1)
+            prev_sig_pos = i
         elif ch == ">":
             return i + 1
         elif ch == "<":

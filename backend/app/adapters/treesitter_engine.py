@@ -202,6 +202,46 @@ def resolve_url_const_head(url_val: str, url_consts: dict[str, str] | None) -> s
     return url_val
 
 
+_PARAM_CONTAINERS = frozenset(
+    {
+        "formal_parameters",
+        "required_parameter",
+        "optional_parameter",
+        "rest_pattern",
+        "object_pattern",
+        "array_pattern",
+    }
+)
+
+
+def _collect_cst_pattern_idents(raw: bytes, node: Any, out: set[str]) -> None:
+    """Collect identifiers bound by a parameter or destructuring pattern (ignoring types/defaults)."""
+    ntype = node.type
+    if ntype in ("identifier", "shorthand_property_identifier_pattern"):
+        out.add(raw[node.start_byte : node.end_byte].decode("utf-8", errors="replace"))
+        return
+    if ntype in ("type_annotation", "opting_type_annotation"):
+        return
+    if ntype == "assignment_pattern":
+        left = node.child_by_field_name("left") or (node.named_children[0] if node.named_children else None)
+        if left is not None:
+            _collect_cst_pattern_idents(raw, left, out)
+        return
+    if ntype == "pair_pattern":
+        val = node.child_by_field_name("value") or (node.named_children[-1] if node.named_children else None)
+        if val is not None:
+            _collect_cst_pattern_idents(raw, val, out)
+        return
+    if ntype in ("required_parameter", "optional_parameter"):
+        pat = node.child_by_field_name("pattern") or (node.named_children[0] if node.named_children else None)
+        if pat is not None:
+            _collect_cst_pattern_idents(raw, pat, out)
+        return
+    if ntype in _PARAM_CONTAINERS:
+        for ch in node.named_children:
+            _collect_cst_pattern_idents(raw, ch, out)
+
+
 def extract_ts_http_calls_cst(
     source: str,
     *,
@@ -211,7 +251,7 @@ def extract_ts_http_calls_cst(
     """Extract `(http_method, raw_url, lineno)` from TS/TSX CST `call_expression` nodes.
 
     `url_consts` maps same-file string constants (`const BASE = '/things'`) to their values so
-    `` get(`${BASE}/${id}`) `` and `get(BASE)` resolve to a path instead of being dropped.
+    `` get(`${BASE}/${id}`) `` and `get(BASE)` resolve to a path unless shadowed in a local scope.
     """
     if not has_treesitter():
         return None
@@ -220,9 +260,45 @@ def extract_ts_http_calls_cst(
     tree = parser.parse(raw)
     has_tauri_import = b"@tauri-apps" in raw or b"__TAURI__" in raw
     found: list[tuple[str, str, int]] = []
+    root_consts = dict(url_consts or {})
 
-    def walk(node: Any) -> None:
-        if node.type == "call_expression" and node.children:
+    def walk(node: Any, scope_consts: dict[str, str]) -> None:
+        ntype = node.type
+        if scope_consts and ntype in (
+            "function_declaration",
+            "generator_function_declaration",
+            "function",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+        ):
+            bound: set[str] = set()
+            params = node.child_by_field_name("parameters")
+            if params is not None:
+                _collect_cst_pattern_idents(raw, params, bound)
+            else:
+                single = node.child_by_field_name("parameter")
+                if single is not None:
+                    _collect_cst_pattern_idents(raw, single, bound)
+            if bound:
+                scope_consts = {k: v for k, v in scope_consts.items() if k not in bound}
+        elif scope_consts and ntype == "statement_block":
+            bound_blk: set[str] = set()
+            for ch in node.named_children:
+                if ch.type in ("lexical_declaration", "variable_declaration"):
+                    for decl in ch.named_children:
+                        if decl.type == "variable_declarator":
+                            lhs = decl.child_by_field_name("name") or (decl.named_children[0] if decl.named_children else None)
+                            if lhs is not None:
+                                _collect_cst_pattern_idents(raw, lhs, bound_blk)
+                elif ch.type == "function_declaration":
+                    fn_id = ch.child_by_field_name("name")
+                    if fn_id is not None:
+                        _collect_cst_pattern_idents(raw, fn_id, bound_blk)
+            if bound_blk:
+                scope_consts = {k: v for k, v in scope_consts.items() if k not in bound_blk}
+
+        if ntype == "call_expression" and node.children:
             fn_node = node.children[0]
             # tree-sitter-typescript parses `await post<T>(url)` as a call whose function is
             # `await post`; unwrap await/parens/non-null so generic calls are not missed.
@@ -247,9 +323,9 @@ def extract_ts_http_calls_cst(
                 elif first_arg is not None and first_arg.type in ("string", "template_string", "identifier"):
                     if first_arg.type == "identifier":
                         ident = raw[first_arg.start_byte : first_arg.end_byte].decode("utf-8", errors="replace")
-                        url_val = (url_consts or {}).get(ident, "")
+                        url_val = scope_consts.get(ident, "")
                     else:
-                        url_val = resolve_url_const_head(_unquote_node(raw, first_arg), url_consts)
+                        url_val = resolve_url_const_head(_unquote_node(raw, first_arg), scope_consts)
                     if url_val.startswith("/"):
                         upper_c = "DELETE" if callee_name.lower() == "del" else callee_name.upper()
                         if upper_c in _HTTP_VERBS:
@@ -263,9 +339,9 @@ def extract_ts_http_calls_cst(
                                     verb = mm.group("m").upper()
                             found.append((verb, url_val, fn_node.start_point[0] + 1))
         for ch in node.children:
-            walk(ch)
+            walk(ch, scope_consts)
 
-    walk(tree.root_node)
+    walk(tree.root_node, root_consts)
     return found
 
 

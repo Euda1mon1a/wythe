@@ -224,6 +224,9 @@ class ParsedPythonModule:
     policy_literals: tuple[tuple[str, int, str], ...]  # (const_name, lineno, sample)
     raw_clock_calls: tuple[tuple[str, int], ...]  # (expr, lineno)
     method_calls: frozenset[str] = frozenset()  # `param.method()` on an injected, unannotated parameter
+    param_method_calls: tuple[tuple[str, frozenset[str]], ...] = ()  # (method, all attrs accessed on param)
+    class_attrs: dict[str, frozenset[str]] = field(default_factory=dict)  # ClassName -> defined methods/attrs
+    class_bases: dict[str, tuple[str, ...]] = field(default_factory=dict)  # ClassName -> base names
     top_level_defs: frozenset[str] = frozenset()
     method_defs: frozenset[str] = frozenset()
     # Package `__init__` only: (exported name, absolute "module.name" source, the initializer's own top-level
@@ -316,17 +319,17 @@ def _excluded_ids(tree: ast.AST) -> set[int]:
 _BUILTIN_NAMES = frozenset(dir(builtins))
 
 
-def _absolute_import_bindings(tree: ast.AST, module_name: str, rel_path: str) -> list[tuple[str, str, int]]:
-    """(local name, absolute "module.name", level) for every `from ... import`, relative ones resolved.
-
-    A package `__init__` is its own package; any other module resolves against its parent.
-    """
+def _absolute_import_bindings(
+    tree: ast.AST, module_name: str, rel_path: str, excluded: set[int] | None = None
+) -> list[tuple[str, str, str, str, int]]:
+    """(local_name, absolute 'module.orig', orig_name, src_mod, level) for runtime `from ... import`."""
+    skip = excluded or set()
     own_pkg = module_name.removesuffix(".__init__")
     if not rel_path.endswith("__init__.py"):
         own_pkg = own_pkg.rpartition(".")[0]
-    out: list[tuple[str, str, int]] = []
+    out: list[tuple[str, str, str, str, int]] = []
     for n in ast.walk(tree):
-        if not isinstance(n, ast.ImportFrom):
+        if not isinstance(n, ast.ImportFrom) or id(n) in skip:
             continue
         src_mod = n.module or ""
         if n.level:
@@ -335,23 +338,63 @@ def _absolute_import_bindings(tree: ast.AST, module_name: str, rel_path: str) ->
                 base = base.rpartition(".")[0]
             src_mod = ".".join(p for p in (base, n.module) if p)
         if src_mod:
-            out.extend((alias.asname or alias.name, f"{src_mod}.{alias.name}", n.level) for alias in n.names)
+            out.extend(
+                (alias.asname or alias.name, f"{src_mod}.{alias.name}", alias.name, src_mod, n.level)
+                for alias in n.names
+            )
     return out
 
 
-def _injected_params_by_call(tree: ast.AST) -> dict[int, frozenset[str]]:
-    """Map each call to the unannotated parameters (bar `self`/`cls`) of the functions enclosing it."""
-    out: dict[int, frozenset[str]] = {}
+def _scope_expr_nodes(root: ast.AST, skip_params: frozenset[str] = frozenset()) -> list[ast.AST]:
+    """Nodes inside `root` without crossing into nested defs that shadow `skip_params` (or any def if empty)."""
+    out: list[ast.AST] = []
+    queue = list(ast.iter_child_nodes(root))
+    idx = 0
+    while idx < len(queue):
+        node = queue[idx]
+        idx += 1
+        out.append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            if not skip_params:
+                continue
+            if isinstance(node, ast.ClassDef):
+                continue
+            inner_args = {
+                p.arg for p in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            }
+            if inner_args & skip_params:
+                continue
+        queue.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _injected_param_profiles(tree: ast.AST, excluded: set[int]) -> dict[int, dict[str, frozenset[str]]]:
+    """Map each call `id(call)` to `{unannotated_param: frozenset(attrs accessed on param in that fn)}`."""
+    out: dict[int, dict[str, frozenset[str]]] = {}
     for fn in ast.walk(tree):
-        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            a = fn.args
-            names = frozenset(
-                p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs) if p.annotation is None and p.arg not in ("self", "cls")
-            )
-            if names:
-                for sub in ast.walk(fn):
-                    if isinstance(sub, ast.Call):
-                        out[id(sub)] = out.get(id(sub), frozenset()) | names
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) or id(fn) in excluded:
+            continue
+        a = fn.args
+        names = frozenset(
+            p.arg
+            for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)
+            if p.annotation is None and p.arg not in ("self", "cls")
+        )
+        if not names:
+            continue
+        subnodes = [s for s in _scope_expr_nodes(fn, names) if id(s) not in excluded]
+        attrs_by_param: dict[str, set[str]] = {nm: set() for nm in names}
+        for sub in subnodes:
+            if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id in attrs_by_param:
+                attrs_by_param[sub.value.id].add(sub.attr)
+        frozen = {nm: frozenset(atts) for nm, atts in attrs_by_param.items() if atts}
+        if not frozen:
+            continue
+        for sub in subnodes:
+            if isinstance(sub, ast.Call):
+                merged = dict(out.get(id(sub), {}))
+                merged.update(frozen)
+                out[id(sub)] = merged
     return out
 
 
@@ -400,9 +443,14 @@ def _call_name(call: ast.Call) -> str:
 
 
 def _model_arg(call: ast.Call) -> str | None:
-    """`query(Model)`, `select(Model)`, `session.get(Model, pk)` -> "Model" (capitalized names only)."""
-    if call.args and isinstance(call.args[0], ast.Name) and call.args[0].id[:1].isupper():
-        return call.args[0].id
+    """`query(Model)`, `select(Model)`, `session.get(Model, pk)` -> 'Model' or 'pkg.Model'."""
+    if not call.args:
+        return None
+    arg = call.args[0]
+    if isinstance(arg, ast.Name) and arg.id[:1].isupper():
+        return arg.id
+    if isinstance(arg, ast.Attribute) and arg.attr[:1].isupper():
+        return _dotted(arg)
     return None
 
 
@@ -429,7 +477,7 @@ def _loaded_row_model(expr: ast.AST | None) -> str | None:
 
 
 def _constructed_model(expr: ast.AST | None) -> str | None:
-    """`Model(...)` or a classmethod factory `Model.create(...)` -> "Model" (capitalized names)."""
+    """`Model(...)`, `pkg.Model(...)`, or classmethod factory `Model.create(...)`."""
     if isinstance(expr, ast.Await):
         expr = expr.value
     if not isinstance(expr, ast.Call):
@@ -437,85 +485,255 @@ def _constructed_model(expr: ast.AST | None) -> str | None:
     func = expr.func
     if isinstance(func, ast.Name) and func.id[:1].isupper():
         return func.id
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id[:1].isupper():
-        return func.value.id
+    if isinstance(func, ast.Attribute):
+        if func.attr[:1].isupper():
+            return _dotted(func)
+        if isinstance(func.value, ast.Name) and func.value.id[:1].isupper():
+            return func.value.id
+        if isinstance(func.value, ast.Attribute) and func.value.attr[:1].isupper():
+            return _dotted(func.value)
     return None
 
 
-def _scope_nodes(root: ast.AST) -> list[ast.AST]:
-    """Nodes of one function (or module) scope, without descending into nested defs."""
-    out: list[ast.AST] = []
-    stack = list(ast.iter_child_nodes(root))
-    while stack:
-        node = stack.pop()
-        out.append(node)
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-            stack.extend(ast.iter_child_nodes(node))
+def _expr_nodes_shallow(stmt_expr: ast.AST | None, excluded: set[int]) -> list[ast.AST]:
+    """Walk an expression without descending into nested function/lambda/class definitions."""
+    if stmt_expr is None or id(stmt_expr) in excluded:
+        return []
+    out: list[ast.AST] = [stmt_expr]
+    idx = 0
+    while idx < len(out):
+        cur = out[idx]
+        idx += 1
+        if cur is not stmt_expr and isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        for ch in ast.iter_child_nodes(cur):
+            if id(ch) not in excluded:
+                out.append(ch)
     return out
 
 
-def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
-    """Writes to rows loaded from the session, per scope.
+def _merge_binding_maps(*maps: dict[str, set[str]]) -> dict[str, set[str]]:
+    merged: dict[str, set[str]] = {}
+    for mp in maps:
+        for k, vals in mp.items():
+            if vals:
+                merged.setdefault(k, set()).update(vals)
+    return merged
 
-    Returns (session_writes, mutations): `db.delete(row)` / `db.add(row)` / `db.merge(row)` on a
-    loaded row, and attribute stores / `setattr(row, ...)` on a loaded row, as (model, lineno).
-    """
+
+def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Statement-ordered writes to rows loaded from (or added to) the session, per lexical scope."""
     session_writes: list[tuple[str, int]] = []
     mutations: list[tuple[str, int]] = []
-    scopes: list[ast.AST] = [tree, *(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))]
-    for scope in scopes:
-        nodes = [n for n in _scope_nodes(scope) if id(n) not in excluded]
-        rows: dict[str, str] = {}
-        made: dict[str, str] = {}  # `v = Model(...)` / `v = Model.factory(...)`: only a write once added
-        for n in nodes:
-            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
-                model = _loaded_row_model(n.value)
-                if model:
-                    rows[n.targets[0].id] = model
-                maker = _constructed_model(n.value)
-                if maker:
-                    made[n.targets[0].id] = maker
-            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
-                model = _loaded_row_model(n.value)
-                if model:
-                    rows[n.target.id] = model
-            elif isinstance(n, (ast.For, ast.AsyncFor)) and isinstance(n.target, ast.Name):
-                model = _model_in_row_source(n.iter)
-                if model:
-                    rows[n.target.id] = model
-        if not rows and not made:
-            continue
-        for n in nodes:
-            if isinstance(n, ast.Call):
-                name = _call_name(n)
-                if (
-                    isinstance(n.func, ast.Attribute)
-                    and name in _SESSION_WRITES
-                    and _is_session_receiver(n.func.value)
-                ):
-                    for arg in n.args:
-                        elts = arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
-                        for elt in elts:
-                            if isinstance(elt, ast.Name) and elt.id in rows:
-                                session_writes.append((rows[elt.id], n.lineno))
-                            elif isinstance(elt, ast.Name) and elt.id in made and name != "delete":
-                                session_writes.append((made[elt.id], n.lineno))
-                elif name == "setattr" and isinstance(n.func, ast.Name) and n.args:
-                    first = n.args[0]
-                    if isinstance(first, ast.Name) and first.id in rows:
-                        mutations.append((rows[first.id], n.lineno))
-            elif isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-                for tgt in targets:
-                    for t in ast.walk(tgt):
-                        if (
-                            isinstance(t, ast.Attribute)
-                            and isinstance(t.ctx, ast.Store)
-                            and isinstance(t.value, ast.Name)
-                            and t.value.id in rows
-                        ):
-                            mutations.append((rows[t.value.id], n.lineno))
+
+    def inspect_expr(expr: ast.AST | None, rows: dict[str, set[str]], made: dict[str, set[str]]) -> None:
+        for n in _expr_nodes_shallow(expr, excluded):
+            if not isinstance(n, ast.Call):
+                continue
+            name = _call_name(n)
+            if isinstance(n.func, ast.Attribute) and name in _SESSION_WRITES and _is_session_receiver(n.func.value):
+                for arg in n.args:
+                    elts = arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
+                    for elt in elts:
+                        if isinstance(elt, ast.Name) and elt.id in rows:
+                            for m in rows[elt.id]:
+                                session_writes.append((m, n.lineno))
+                        elif isinstance(elt, ast.Name) and elt.id in made and name != "delete":
+                            for m in made[elt.id]:
+                                session_writes.append((m, n.lineno))
+            elif name == "setattr" and isinstance(n.func, ast.Name) and n.args:
+                first = n.args[0]
+                if isinstance(first, ast.Name) and first.id in rows:
+                    for m in rows[first.id]:
+                        mutations.append((m, n.lineno))
+
+    def bind_var(
+        var: str, rhs: ast.AST | None, rows: dict[str, set[str]], made: dict[str, set[str]]
+    ) -> None:
+        model = _loaded_row_model(rhs)
+        if model:
+            rows[var] = {model}
+            made.pop(var, None)
+            return
+        maker = _constructed_model(rhs)
+        if maker:
+            made[var] = {maker}
+            rows.pop(var, None)
+            return
+        rows.pop(var, None)
+        made.pop(var, None)
+
+    def record_target_mutations(tgt: ast.AST, lineno: int, rows: dict[str, set[str]]) -> None:
+        for t in ast.walk(tgt):
+            if (
+                isinstance(t, ast.Attribute)
+                and isinstance(t.ctx, ast.Store)
+                and isinstance(t.value, ast.Name)
+                and t.value.id in rows
+            ):
+                for m in rows[t.value.id]:
+                    mutations.append((m, lineno))
+
+    def walk_block(
+        stmts: list[ast.stmt], rows: dict[str, set[str]], made: dict[str, set[str]]
+    ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+        for s in stmts:
+            if id(s) in excluded or isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(s, ast.Assign):
+                inspect_expr(s.value, rows, made)
+                for tgt in s.targets:
+                    record_target_mutations(tgt, s.lineno, rows)
+                if len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
+                    bind_var(s.targets[0].id, s.value, rows, made)
+                else:
+                    for tgt in s.targets:
+                        for sub in ast.walk(tgt):
+                            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                                rows.pop(sub.id, None)
+                                made.pop(sub.id, None)
+            elif isinstance(s, ast.AnnAssign):
+                inspect_expr(s.value, rows, made)
+                record_target_mutations(s.target, s.lineno, rows)
+                if isinstance(s.target, ast.Name) and s.value is not None:
+                    bind_var(s.target.id, s.value, rows, made)
+            elif isinstance(s, ast.AugAssign):
+                inspect_expr(s.value, rows, made)
+                record_target_mutations(s.target, s.lineno, rows)
+            elif isinstance(s, (ast.For, ast.AsyncFor)):
+                inspect_expr(s.iter, rows, made)
+                if isinstance(s.target, ast.Name):
+                    m = _model_in_row_source(s.iter)
+                    if m:
+                        rows[s.target.id] = {m}
+                        made.pop(s.target.id, None)
+                    else:
+                        rows.pop(s.target.id, None)
+                        made.pop(s.target.id, None)
+                walk_block(s.body, rows, made)
+                walk_block(s.orelse, rows, made)
+            elif isinstance(s, ast.If):
+                inspect_expr(s.test, rows, made)
+                r_body, m_body = walk_block(s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()})
+                r_else, m_else = walk_block(s.orelse, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()})
+                rows = _merge_binding_maps(r_body, r_else)
+                made = _merge_binding_maps(m_body, m_else)
+            elif isinstance(s, (ast.With, ast.AsyncWith)):
+                for item in s.items:
+                    inspect_expr(item.context_expr, rows, made)
+                    if isinstance(item.optional_vars, ast.Name):
+                        bind_var(item.optional_vars.id, item.context_expr, rows, made)
+                rows, made = walk_block(s.body, rows, made)
+            elif isinstance(s, ast.Try):
+                branches_r: list[dict[str, set[str]]] = []
+                branches_m: list[dict[str, set[str]]] = []
+                rb, mb = walk_block(s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()})
+                rb, mb = walk_block(s.orelse, rb, mb)
+                branches_r.append(rb)
+                branches_m.append(mb)
+                for h in s.handlers:
+                    rh, mh = walk_block(h.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()})
+                    branches_r.append(rh)
+                    branches_m.append(mh)
+                rows = _merge_binding_maps(*branches_r)
+                made = _merge_binding_maps(*branches_m)
+                rows, made = walk_block(s.finalbody, rows, made)
+            else:
+                for ch in ast.iter_child_nodes(s):
+                    if isinstance(ch, ast.expr):
+                        inspect_expr(ch, rows, made)
+                    elif isinstance(ch, ast.stmt):
+                        rows, made = walk_block([ch], rows, made)
+        return rows, made
+
+    walk_block(tree.body, {}, {})
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and id(n) not in excluded:
+            walk_block(n.body, {}, {})
     return session_writes, mutations
+
+
+_CLOCK_FACTORY_KWARGS = frozenset({"default", "default_factory", "onupdate", "insert_default", "factory"})
+_CLOCK_ZERO_ARG_CALLS = frozenset({"defaultdict", "Factory", "LazyFunction"})
+
+
+def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str, int]]:
+    """Find naive clock reads/factories while keeping import bindings scoped per function/class."""
+    found: list[tuple[str, int]] = []
+
+    def check_factory_val(val: ast.AST, classes: dict[str, str], modules: set[str]) -> None:
+        ref = _clock_ref(val, classes, modules)
+        if ref and ref[1] in ("now", "utcnow", "today"):
+            found.append((f"{_dotted(val)} (passed uncalled)", getattr(val, "lineno", 1)))
+
+    def inspect_expr(expr: ast.AST | None, classes: dict[str, str], modules: set[str]) -> None:
+        for n in _expr_nodes_shallow(expr, excluded):
+            if not isinstance(n, ast.Call):
+                continue
+            target = n.func
+            dotted = _dotted(target) or ""
+            short = target.id if isinstance(target, ast.Name) else target.attr if isinstance(target, ast.Attribute) else ""
+            clock = _clock_ref(target, classes, modules)
+            if clock and _naive_clock_call(n, *clock):
+                found.append((f"{dotted}()", n.lineno))
+            for kw in n.keywords:
+                if kw.arg in _CLOCK_FACTORY_KWARGS:
+                    check_factory_val(kw.value, classes, modules)
+            is_tzless_partial = (
+                short == "partial"
+                and len(n.args) == 1
+                and not any(kw.arg == "tz" and not _is_none(kw.value) for kw in n.keywords)
+            )
+            if (short in _CLOCK_ZERO_ARG_CALLS and n.args) or is_tzless_partial:
+                check_factory_val(n.args[0], classes, modules)
+
+    def walk_stmts(stmts: list[ast.stmt], classes: dict[str, str], modules: set[str]) -> None:
+        for stmt in stmts:
+            if id(stmt) in excluded:
+                continue
+            if isinstance(stmt, ast.ImportFrom):
+                for alias in stmt.names:
+                    local_name = alias.asname or alias.name
+                    if stmt.module == "datetime" and stmt.level == 0 and alias.name in _CLOCK_CLASSES:
+                        classes[local_name] = alias.name
+                    else:
+                        classes.pop(local_name, None)
+                        modules.discard(local_name)
+                continue
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    if alias.name == "datetime":
+                        bound = alias.asname or "datetime"
+                        modules.add(bound)
+                        if alias.asname:
+                            classes.pop(alias.asname, None)
+                    else:
+                        bound = alias.asname or alias.name.split(".", 1)[0]
+                        classes.pop(bound, None)
+                        modules.discard(bound)
+                continue
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                for dec in stmt.decorator_list:
+                    inspect_expr(dec, classes, modules)
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for dflt in (*stmt.args.defaults, *(d for d in stmt.args.kw_defaults if d is not None)):
+                        inspect_expr(dflt, classes, modules)
+                walk_stmts(stmt.body, dict(classes), set(modules))
+                continue
+            for ch in ast.iter_child_nodes(stmt):
+                if isinstance(ch, ast.expr):
+                    inspect_expr(ch, classes, modules)
+                elif isinstance(ch, ast.stmt):
+                    walk_stmts([ch], classes, modules)
+                else:
+                    for sub in ast.iter_child_nodes(ch):
+                        if isinstance(sub, ast.expr):
+                            inspect_expr(sub, classes, modules)
+                        elif isinstance(sub, ast.stmt):
+                            walk_stmts([sub], classes, modules)
+
+    walk_stmts(tree.body, {"date": "date", "datetime": "datetime"}, {"datetime"})
+    return found
 
 
 def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedPythonModule | None:
@@ -539,19 +757,14 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     imported_modules: set[str] = set()
     external_roots: set[str] = set()
     imported_names: dict[str, set[str]] = {}
-    mod_parts = module_name.split(".")
     for n in ast.walk(tree):
+        if id(n) in excluded:
+            continue
         if isinstance(n, ast.ImportFrom) and n.module:
             imported_modules.add(n.module)
             is_ext = n.level == 0 and n.module.split(".", 1)[0] != local_pkg
-            abs_module = (
-                ".".join([*mod_parts[: max(0, len(mod_parts) - n.level)], n.module])
-                if n.level
-                else n.module
-            )
             for alias in n.names:
                 imported_modules.add(f"{n.module}.{alias.name}")
-                imported_names.setdefault(alias.name, set()).add(abs_module)
                 local_name = alias.asname or alias.name
                 aliases[local_name] = alias.name
                 import_sources[local_name] = n.module
@@ -564,33 +777,21 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                     aliases[alias.asname] = alias.name
                 if alias.name.split(".", 1)[0] != local_pkg:
                     external_roots.add(alias.asname or alias.name.split(".", 1)[0])
-    # Relative imports (`from .x import y`, `from . import x`) by their absolute module path.
-    bindings = _absolute_import_bindings(tree, module_name, rel_path)
-    for local_name, target, level in bindings:
+    # All runtime `from ... import` bindings (including `pkg/__init__.py` relative & `from . import x`).
+    bindings = _absolute_import_bindings(tree, module_name, rel_path, excluded)
+    for local_name, target, orig_name, src_mod, level in bindings:
+        imported_names.setdefault(orig_name, set()).add(src_mod)
         if level:
-            imported_modules.update((target.rpartition(".")[0], target))
-            aliases[local_name] = target.rpartition(".")[2]
+            imported_modules.update((src_mod, target))
+            aliases[local_name] = orig_name
+            import_sources.setdefault(local_name, target)
 
     def resolve(sym: str) -> str:
         return aliases.get(sym, sym)
 
-    # Names bound to the stdlib clock classes and module (`from datetime import date as d`,
-    # `import datetime as dt`). Bare `date`/`datetime` keep counting unless another module
-    # supplies that name.
-    clock_classes: dict[str, str] = {"date": "date", "datetime": "datetime"}
-    clock_modules: set[str] = {"datetime"}
-    for n in ast.walk(tree):
-        if isinstance(n, ast.ImportFrom):
-            for alias in n.names:
-                local_name = alias.asname or alias.name
-                if n.module == "datetime" and n.level == 0 and alias.name in _CLOCK_CLASSES:
-                    clock_classes[local_name] = alias.name
-                elif local_name in _CLOCK_CLASSES:
-                    clock_classes.pop(local_name, None)
-        elif isinstance(n, ast.Import):
-            for alias in n.names:
-                if alias.name == "datetime":
-                    clock_modules.add(alias.asname or "datetime")
+    def resolve_qual(sym: str) -> str:
+        h, _, t = sym.partition(".")
+        return f"{resolve(h)}.{t}" if t else resolve(sym)
 
     writes: set[str] = set()
     constructed: set[str] = set()
@@ -600,13 +801,15 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     called: set[str] = set()
     symbol_calls: set[str] = set()
     method_calls: set[str] = set()
-    injected_params = _injected_params_by_call(tree)
+    param_method_calls: set[tuple[str, frozenset[str]]] = set()
+    param_profiles = _injected_param_profiles(tree, excluded)
     write_only: set[int] = set()
 
     def note_write(sym: str, lineno: int) -> None:
         if sym not in write_lines or lineno < write_lines[sym]:
             write_lines[sym] = lineno
-    raw_clocks: list[tuple[str, int]] = []
+
+    raw_clocks = _collect_raw_clocks(tree, excluded)
     router_prefix = ""
     router_includes: list[tuple[str, str]] = []
     nested_router_includes: list[tuple[str, str]] = []
@@ -640,18 +843,6 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                 if dotted.rsplit(".", 1)[0] in router_vars:
                     nested_router_includes.append((child, inc_prefix))
 
-        clock = _clock_ref(target, clock_classes, clock_modules)
-        if clock and _naive_clock_call(n, *clock):
-            raw_clocks.append((f"{dotted}()", n.lineno))
-        # An uncalled clock passed as a value (`default_factory=datetime.now`,
-        # `Column(default=date.today)`) runs later with no time zone; `partial(datetime.now, tz)`
-        # binds one and is left alone.
-        if short != "partial":
-            for value in (*n.args, *(kw.value for kw in n.keywords)):
-                ref = _clock_ref(value, clock_classes, clock_modules)
-                if ref and ref[1] in ("now", "utcnow", "today"):
-                    raw_clocks.append((f"{_dotted(value)} (passed uncalled)", value.lineno))
-
         if short:
             resolved_short = resolve(short)
             called.add(resolved_short)
@@ -660,15 +851,18 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                 if target.id not in external_roots and target.id not in aliases and target.id not in _BUILTIN_NAMES:
                     symbol_calls.add(resolved_short)
             elif isinstance(target, ast.Attribute):
-                # Only an injected, unannotated parameter hides its class from the imports. Any
-                # other receiver resolves through an import edge or is a library object
-                # (`logger.error()`, `session.query()`), so a name match there is a coincidence.
+                # Only an injected, unannotated parameter hides its class from the imports.
                 recv = target.value
-                if isinstance(recv, ast.Name) and recv.id in injected_params.get(id(n), ()) and short not in _GENERIC_ATTR_METHODS:
+                prof = param_profiles.get(id(n), {})
+                if isinstance(recv, ast.Name) and recv.id in prof and short not in _GENERIC_ATTR_METHODS:
                     method_calls.add(short)
+                    param_method_calls.add((short, prof[recv.id]))
             if dotted:
-                head, _, tail = dotted.partition(".")
-                called.add(f"{resolve(head)}.{tail}" if tail else resolve(head))
+                qual = resolve_qual(dotted)
+                called.add(qual)
+                writes.add(qual)
+                constructed.add(qual)
+                note_write(qual, n.lineno)
             writes.add(resolved_short)
             constructed.add(resolved_short)
             note_write(resolved_short, n.lineno)
@@ -685,14 +879,15 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         if is_construct or is_sess:
             for sub in [*n.args, *(kw.value for kw in n.keywords)]:
                 for child in ast.walk(sub):
-                    sym = (
-                        resolve(child.id)
-                        if isinstance(child, ast.Name)
-                        else child.attr
-                        if isinstance(child, ast.Attribute)
-                        else None
-                    )
-                    if sym:
+                    syms: list[str] = []
+                    if isinstance(child, ast.Name):
+                        syms.append(resolve(child.id))
+                    elif isinstance(child, ast.Attribute):
+                        syms.append(child.attr)
+                        d = _dotted(child)
+                        if d:
+                            syms.append(resolve_qual(d))
+                    for sym in syms:
                         writes.add(sym)
                         persisted.add(sym)
                         note_write(sym, n.lineno)
@@ -725,14 +920,14 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         has_session_writes = True
     row_session_writes, row_mutations = _loaded_row_writes(tree, excluded)
     for model, lineno in row_session_writes:
-        sym = resolve(model)
+        sym = resolve_qual(model)
         writes.add(sym)
         persisted.add(sym)
         note_write(sym, lineno)
     if has_session_writes:
         # A loaded row's attribute change is only an UPDATE if this module flushes/commits.
         for model, lineno in row_mutations:
-            sym = resolve(model)
+            sym = resolve_qual(model)
             writes.add(sym)
             persisted.add(sym)
             note_write(sym, lineno)
@@ -741,6 +936,8 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     defined: set[str] = set()
     top_level_defs: set[str] = set()
     method_defs: set[str] = set()
+    class_attrs: dict[str, frozenset[str]] = {}
+    class_bases: dict[str, tuple[str, ...]] = {}
     for stmt in tree.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             defined.add(stmt.name)
@@ -748,10 +945,34 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         elif isinstance(stmt, ast.ClassDef):
             defined.add(stmt.name)
             top_level_defs.add(stmt.name)
+            cattrs: set[str] = set()
+            bases: list[str] = []
+            for b in stmt.bases:
+                bname = b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else ""
+                if bname:
+                    bases.append(resolve(bname))
+            class_bases[stmt.name] = tuple(bases)
             for member in stmt.body:
-                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and not member.name.startswith("_"):
-                    defined.add(member.name)
-                    method_defs.add(member.name)
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    cattrs.add(member.name)
+                    if not member.name.startswith("_"):
+                        defined.add(member.name)
+                        method_defs.add(member.name)
+                    for sub in ast.walk(member):
+                        if (
+                            isinstance(sub, ast.Attribute)
+                            and isinstance(sub.ctx, ast.Store)
+                            and isinstance(sub.value, ast.Name)
+                            and sub.value.id == "self"
+                        ):
+                            cattrs.add(sub.attr)
+                elif isinstance(member, ast.Assign):
+                    for t in member.targets:
+                        if isinstance(t, ast.Name):
+                            cattrs.add(t.id)
+                elif isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
+                    cattrs.add(member.target.id)
+            class_attrs[stmt.name] = frozenset(cattrs)
 
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -819,6 +1040,9 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         policy_literals=tuple(policy_literals),
         raw_clock_calls=tuple(raw_clocks),
         method_calls=frozenset(method_calls),
+        param_method_calls=tuple(sorted(param_method_calls, key=lambda x: (x[0], tuple(sorted(x[1]))))),
+        class_attrs=class_attrs,
+        class_bases=class_bases,
         top_level_defs=frozenset(top_level_defs),
         method_defs=frozenset(method_defs),
         package_exports=package_exports,

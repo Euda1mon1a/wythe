@@ -81,6 +81,150 @@ def _collect_url_consts(txt: str) -> dict[str, str]:
     return {k: v for k, v in consts.items() if v.startswith("/")}
 
 
+_FN_PARAM_HEAD_RE = re.compile(
+    r"""(?:\bfunction\b[A-Za-z0-9_$\s]*(?:<[^>{}()]*>)?\s*\((?P<fparams>[^)]*)\)\s*(?::[^{=]+)?\s*\{|\((?P<aparams>[^()]*)\)\s*(?::[^=]+)?=>|(?P<sparam>[A-Za-z_$][\w$]*)\s*=>)"""
+)
+_LOCAL_BIND_RE = re.compile(r"""\b(?:const|let|var|function)\s+(?P<name>[A-Za-z_$][\w$]*)\b""")
+_PARAM_NAME_RE = re.compile(r"""(?:^|[,{\[\s])\.\.\.(?P<rest>[A-Za-z_$][\w$]*)|(?:^|[,{\[\s])(?P<name>[A-Za-z_$][\w$]*)\s*(?=[,?:=\]}\s]|$)""")
+
+
+def _find_matching_delim(txt: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+    n = len(txt)
+    depth = 1
+    i = open_idx + 1
+    quote: str | None = None
+    while i < n and depth > 0:
+        ch = txt[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+        i += 1
+    return i
+
+
+def _find_arrow_expr_end(txt: str, start: int) -> int:
+    n = len(txt)
+    i = start
+    while i < n and txt[i].isspace():
+        i += 1
+    if i < n and txt[i] == "{":
+        return _find_matching_delim(txt, i, "{", "}")
+    pdepth = bdepth = cdepth = 0
+    quote: str | None = None
+    while i < n:
+        ch = txt[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            if pdepth == 0:
+                break
+            pdepth -= 1
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            if bdepth == 0:
+                break
+            bdepth -= 1
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            if cdepth == 0:
+                break
+            cdepth -= 1
+        elif ch in (";", ",") and pdepth == 0 and bdepth == 0 and cdepth == 0:
+            break
+        i += 1
+    return i
+
+
+def _shadowed_url_const_spans(txt: str, names: set[str]) -> dict[str, list[tuple[int, int]]]:
+    """Byte/char spans in `txt` where a parameter or block binding shadows a module URL constant."""
+    if not names:
+        return {}
+    spans: dict[str, list[tuple[int, int]]] = {}
+    for m in _FN_PARAM_HEAD_RE.finditer(txt):
+        raw_params = m.group("fparams") or m.group("aparams") or m.group("sparam") or ""
+        bound = {
+            (pm.group("rest") or pm.group("name"))
+            for pm in _PARAM_NAME_RE.finditer(raw_params)
+            if (pm.group("rest") or pm.group("name")) in names
+        }
+        if not bound:
+            continue
+        if m.group("fparams") is not None:
+            end_span = _find_matching_delim(txt, m.end() - 1, "{", "}")
+            span = (m.end() - 1, end_span)
+        else:
+            end_span = _find_arrow_expr_end(txt, m.end())
+            span = (m.end(), end_span)
+        for b in bound:
+            spans.setdefault(b, []).append(span)
+
+    # Inner `{ ... }` block bindings (`const`/`let`/`var` inside functions/blocks, depth >= 1)
+    block_stack: list[int] = []
+    i = 0
+    n = len(txt)
+    quote: str | None = None
+    block_spans: list[tuple[int, int]] = []
+    while i < n:
+        ch = txt[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "{":
+            block_stack.append(i)
+        elif ch == "}" and block_stack:
+            bstart = block_stack.pop()
+            block_spans.append((bstart, i + 1))
+        i += 1
+    for dm in _LOCAL_BIND_RE.finditer(txt):
+        bname = dm.group("name")
+        if bname not in names:
+            continue
+        enclosing = [sp for sp in block_spans if sp[0] < dm.start() < sp[1]]
+        if enclosing:
+            innermost = min(enclosing, key=lambda sp: sp[1] - sp[0])
+            spans.setdefault(bname, []).append(innermost)
+    return spans
+
+
+def _fetch_method_from_call_tail(txt: str, pos: int) -> str:
+    n = len(txt)
+    pdepth = 1
+    j = pos
+    limit = min(n, pos + 260)
+    while j < limit and pdepth > 0:
+        if txt[j] == "(":
+            pdepth += 1
+        elif txt[j] == ")":
+            pdepth -= 1
+        j += 1
+    mm = _FETCH_METHOD_RE.search(txt[pos:j])
+    return mm.group("m").upper() if mm else "GET"
+
+
 def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
     """Extract (verb, raw_url, lineno) via Tree-sitter TSX CST (with character-scanner fallback)."""
     url_consts = _collect_url_consts(txt)
@@ -102,9 +246,21 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
                 results.append((rverb, joined_u or "/", lineno))
         return results
 
+    shadow_spans = _shadowed_url_const_spans(txt, set(url_consts))
+
+    def consts_at(pos: int) -> dict[str, str]:
+        if not shadow_spans:
+            return url_consts
+        return {
+            k: v
+            for k, v in url_consts.items()
+            if not any(s <= pos < e for s, e in shadow_spans.get(k, ()))
+        }
+
     results = []
     n = len(txt)
     for m in _HTTP_CALL_START_RE.finditer(txt):
+        local_consts = consts_at(m.start())
         verb = m.group("verb").upper()
         if verb == "DEL":
             verb = "DELETE"
@@ -113,8 +269,8 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
         buf: list[str] = []
         if quote == "`":
             hm = _TEMPLATE_HEAD_CONST_RE.match(txt, i)
-            if hm and hm.group("name") in url_consts:
-                buf.append(url_consts[hm.group("name")])
+            if hm and hm.group("name") in local_consts:
+                buf.append(local_consts[hm.group("name")])
                 i = hm.end()
         if i >= n or (not buf and txt[i] != "/"):
             continue
@@ -145,27 +301,21 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
                     buf.append(ch)
                     i += 1
         if verb in _FETCH_LIKE_VERBS:
-            pdepth = 1
-            j = i
-            limit = min(n, i + 260)
-            while j < limit and pdepth > 0:
-                if txt[j] == "(":
-                    pdepth += 1
-                elif txt[j] == ")":
-                    pdepth -= 1
-                j += 1
-            tail = txt[i:j]
-            mm = _FETCH_METHOD_RE.search(tail)
-            verb = mm.group("m").upper() if mm else "GET"
+            verb = _fetch_method_from_call_tail(txt, i)
         raw_url = "".join(buf)
         if raw_url.startswith("/"):
             lineno = txt.count("\n", 0, m.start()) + 1
             results.append((verb, raw_url, lineno))
     for im in _URL_CALL_IDENT_RE.finditer(txt):
-        if im.group("ident") in url_consts:
+        local_consts = consts_at(im.start())
+        ident = im.group("ident")
+        if ident in local_consts:
             iverb = im.group("verb").upper()
-            iverb = "DELETE" if iverb == "DEL" else ("GET" if iverb in _FETCH_LIKE_VERBS else iverb)
-            results.append((iverb, url_consts[im.group("ident")], txt.count("\n", 0, im.start()) + 1))
+            if iverb == "DEL":
+                iverb = "DELETE"
+            elif iverb in _FETCH_LIKE_VERBS:
+                iverb = _fetch_method_from_call_tail(txt, im.end()) if txt[im.end() - 1] == "," else "GET"
+            results.append((iverb, local_consts[ident], txt.count("\n", 0, im.start()) + 1))
     if "createApi" in txt and "builder." in txt:
         bm = _RTK_BASE_URL_RE.search(txt)
         rtk_base = ("/" + bm.group("base").strip("/")) if bm and not bm.group("base").startswith("http") else ""

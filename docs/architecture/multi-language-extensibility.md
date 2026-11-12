@@ -89,7 +89,7 @@ Every adapter family is evaluated on synthetic regression suites (`backend/tests
 
 | Repository (`git rev-parse --short HEAD`) | Detected Profile | Tier-1 Truth | Tier-2 Manipulate | Tier-3 Display | Verified Edges / E2E Chains | Observed Parser & Transport Boundaries |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`Euda1mon1a/wythe`** | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 7 tables, 1 SQL fn | 53 modules | 15 modules | **187 / 29** | `PASS --strict` (0 blocking, 0 warnings) |
+| **`Euda1mon1a/wythe`** | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 7 tables, 1 SQL fn | 53 modules | 23 modules | **260 / 29** | `PASS --strict` (0 blocking, 0 warnings) |
 | **Production scheduling system** | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 294 tables, 30 SQL guards, 15 Redis | 1,362 modules | 630 modules | **10,056 / 300** | Multi-thousand-file production target |
 | **`umami-software/umami`** (`d3c62a805bed`) | `nextjs-prisma` (Experimental) | 41 Prisma tables | 156 routes, 189 query/service modules | 64 pages, 758 hooks/components | **3,162 / 294** | Resolves Next.js `(group)` route dirs, `[[...slug]]` catch-alls, `/api`-stripped `useApi` calls, and `prisma.client.<model>.*` wrappers |
 | **`sadmann7/shadcn-table`** (`f4438fda7864`) | `postgres-drizzle-nextjs` (Experimental) | 1 Drizzle table | 3 routes, 5 query/db modules | 8 pages, 88 hooks/components | **140 / 1** | `0` `DISP-004`; Next.js `"use server"` Server Actions bypass HTTP REST routes |
