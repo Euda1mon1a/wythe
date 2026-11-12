@@ -345,20 +345,117 @@ def _absolute_import_bindings(
     return out
 
 
+def _comp_bound_names(comp: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> set[str]:
+    return {
+        t.id
+        for g in comp.generators
+        for t in ast.walk(g.target)
+        if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)
+    }
+
+
+def _fn_local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    bound = _arg_names(fn.args)
+    nonlocals: set[str] = set()
+    queue: list[ast.AST] = list(fn.body)
+    idx = 0
+    while idx < len(queue):
+        cur = queue[idx]
+        idx += 1
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(cur.name)
+            continue
+        if isinstance(cur, ast.Lambda):
+            continue
+        if isinstance(cur, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            if cur.generators:
+                queue.append(cur.generators[0].iter)
+            for sub in _expr_nodes_shallow(cur, set()):
+                if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name):
+                    bound.add(sub.target.id)
+            continue
+        if isinstance(cur, ast.Name) and isinstance(cur.ctx, ast.Store):
+            bound.add(cur.id)
+        elif isinstance(cur, ast.ExceptHandler) and cur.name:
+            bound.add(cur.name)
+        elif isinstance(cur, (ast.Import, ast.ImportFrom)):
+            for alias in cur.names:
+                if alias.name != "*":
+                    bound.add((alias.asname or alias.name).split(".", 1)[0])
+        elif isinstance(cur, (ast.MatchAs, ast.MatchStar)) and cur.name:
+            bound.add(cur.name)
+        elif isinstance(cur, ast.MatchMapping) and cur.rest:
+            bound.add(cur.rest)
+        elif isinstance(cur, ast.Nonlocal):
+            nonlocals.update(cur.names)
+        elif isinstance(cur, ast.Global):
+            bound.update(cur.names)
+        queue.extend(ast.iter_child_nodes(cur))
+    return bound - nonlocals
+
+
 def _scope_expr_nodes(root: ast.AST, skip_params: frozenset[str] = frozenset()) -> list[ast.AST]:
-    """Nodes inside `root` without crossing into nested defs that shadow `skip_params` (or any def if empty)."""
+    """Nodes inside `root` without crossing into inner scopes that shadow `skip_params`."""
     out: list[ast.AST] = []
-    queue = list(ast.iter_child_nodes(root))
+    if skip_params and isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        queue: list[ast.AST] = list(root.body)
+    elif skip_params and isinstance(root, ast.Lambda):
+        queue = [root.body]
+    else:
+        queue = list(ast.iter_child_nodes(root))
     idx = 0
     while idx < len(queue):
         node = queue[idx]
         idx += 1
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.append(node)
+            if not skip_params:
+                continue
+            queue.extend(node.decorator_list)
+            queue.extend(node.args.defaults)
+            queue.extend(d for d in node.args.kw_defaults if d is not None)
+            if not (_fn_local_names(node) & skip_params):
+                queue.extend(node.body)
+            continue
+        if isinstance(node, ast.Lambda):
+            out.append(node)
+            if not skip_params:
+                continue
+            queue.extend(node.args.defaults)
+            queue.extend(d for d in node.args.kw_defaults if d is not None)
+            lam_bound = _arg_names(node.args) | {
+                sub.target.id
+                for sub in _expr_nodes_shallow(node.body, set())
+                if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name)
+            }
+            if not (lam_bound & skip_params):
+                queue.append(node.body)
+            continue
+        if isinstance(node, ast.ClassDef):
+            out.append(node)
+            if skip_params:
+                queue.extend(node.decorator_list)
+            continue
+        if skip_params and isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            out.append(node)
+            if node.generators:
+                queue.append(node.generators[0].iter)
+            if _comp_bound_names(node) & skip_params:
+                continue
+            if node.generators:
+                queue.append(node.generators[0].target)
+                queue.extend(node.generators[0].ifs)
+                for gen in node.generators[1:]:
+                    queue.append(gen.iter)
+                    queue.append(gen.target)
+                    queue.extend(gen.ifs)
+            if isinstance(node, ast.DictComp):
+                queue.append(node.key)
+                queue.append(node.value)
+            else:
+                queue.append(node.elt)
+            continue
         out.append(node)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-            if not skip_params or isinstance(node, ast.ClassDef):
-                continue
-            if _arg_names(node.args) & skip_params:
-                continue
         queue.extend(ast.iter_child_nodes(node))
     return out
 
@@ -599,19 +696,21 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                 record_target_mutations(s.target, s.lineno, rows)
             elif isinstance(s, (ast.For, ast.AsyncFor)):
                 inspect_expr(s.iter, rows, made)
+                r_loop_in = {k: set(v) for k, v in rows.items()}
+                m_loop_in = {k: set(v) for k, v in made.items()}
                 if isinstance(s.target, ast.Name):
                     m = _model_in_row_source(s.iter)
                     if m:
-                        rows[s.target.id] = {m}
-                        made.pop(s.target.id, None)
+                        r_loop_in[s.target.id] = {m}
+                        m_loop_in.pop(s.target.id, None)
                     else:
-                        rows.pop(s.target.id, None)
-                        made.pop(s.target.id, None)
-                r_body, m_body = walk_block(
-                    s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
-                )
+                        r_loop_in.pop(s.target.id, None)
+                        m_loop_in.pop(s.target.id, None)
+                r_body, m_body = walk_block(s.body, r_loop_in, m_loop_in)
                 r_else, m_else = walk_block(
-                    s.orelse, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
+                    s.orelse,
+                    _merge_binding_maps(rows, r_body),
+                    _merge_binding_maps(made, m_body),
                 )
                 rows = _merge_binding_maps(rows, r_body, r_else)
                 made = _merge_binding_maps(made, m_body, m_else)
@@ -621,7 +720,9 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                     s.body, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
                 )
                 r_else, m_else = walk_block(
-                    s.orelse, {k: set(v) for k, v in rows.items()}, {k: set(v) for k, v in made.items()}
+                    s.orelse,
+                    _merge_binding_maps(rows, r_body),
+                    _merge_binding_maps(made, m_body),
                 )
                 rows = _merge_binding_maps(rows, r_body, r_else)
                 made = _merge_binding_maps(made, m_body, m_else)

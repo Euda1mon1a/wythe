@@ -616,3 +616,75 @@ def test_dollar_quoted_sql_column_defaults_string_literal_bind_ignore_and_eof_ur
     calls = {(c.http_method, c.normalized_path) for c in disp.http_calls}
     assert ("GET", "/api/v1/users") in calls
 
+
+def test_loop_else_mutations_comprehension_param_shadow_and_lexical_migration_helpers(
+    tmp_path: Path,
+) -> None:
+    for_else_pm = parse_python_module(
+        "def finalize_for(db, ids):\n"
+        "    for uid in ids:\n"
+        "        row = db.get(Widget, uid)\n"
+        "    else:\n"
+        "        row.name = 'done'\n"
+        "    db.commit()\n",
+        "backend/app/services/for_else.py",
+        "app.services.for_else",
+    )
+    assert for_else_pm is not None
+    assert "Widget" in for_else_pm.persisted
+
+    while_else_pm = parse_python_module(
+        "def finalize_while(db, pending):\n"
+        "    while pending:\n"
+        "        row = db.get(Gadget, pending.pop())\n"
+        "    else:\n"
+        "        row.status = 'done'\n"
+        "    db.commit()\n",
+        "backend/app/services/while_else.py",
+        "app.services.while_else",
+    )
+    assert while_else_pm is not None
+    assert "Gadget" in while_else_pm.persisted
+
+    _write(
+        tmp_path,
+        "backend/app/services/worker_svc.py",
+        "class WorkerService:\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/jobs.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/jobs')\n"
+        "def run_jobs(worker, employees):\n"
+        "    labels = [worker.name for worker in employees]\n"
+        "    by_id = {worker.id: worker.role for worker in employees}\n"
+        "    return worker.execute_tasks(), labels, by_id\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.jobs", "m:service:services.worker_svc") in pairs
+
+    _write(
+        tmp_path,
+        "backend/alembic/versions/005_lexical_helper.py",
+        "from alembic import op\n"
+        "import sqlalchemy as sa\n\n"
+        "def build_widgets():\n"
+        "    op.create_table('live_widgets', sa.Column('id', sa.Integer()))\n\n"
+        "def run_helper():\n"
+        "    build_widgets()\n\n"
+        "def upgrade():\n"
+        "    def build_widgets():\n"
+        "        op.create_table('local_widgets', sa.Column('id', sa.Integer()))\n\n"
+        "    run_helper()\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert "t:live_widgets" in by_id
+    assert "t:local_widgets" not in by_id
+
+

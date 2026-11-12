@@ -7,6 +7,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from app.adapters.base import RawCandidateFinding, TruthExtractionResult
 from app.adapters.db_catalog_probe import (
@@ -550,10 +551,10 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
     effects = _MigrationEffects()
     consts: dict[str, str] = {}
     const_lines: dict[str, int] = {}
-    functions: dict[str, ast.FunctionDef] = {}
+    module_fns: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]] = {}
     for stmt in tree.body:
-        if isinstance(stmt, ast.FunctionDef):
-            functions[stmt.name] = stmt
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            module_fns[stmt.name] = (stmt, module_fns)
             continue
         targets: list[str] = []
         value: ast.expr | None = None
@@ -579,8 +580,8 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 consts[name] = evaluated
                 const_lines[name] = value.lineno
 
-    upgrade = functions.get("upgrade")
-    if upgrade is None:
+    upgrade_entry = module_fns.get("upgrade")
+    if upgrade_entry is None:
         return effects
 
     def add_event(
@@ -636,10 +637,36 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
     active_fns: set[int] = set()
 
     def walk_node(
-        sub: ast.AST, ctx: tuple, scope_fns: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]
+        sub: ast.AST,
+        ctx: tuple,
+        scope_fns: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]],
     ) -> None:
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            scope_fns[sub.name] = sub
+            scope_fns[sub.name] = (sub, scope_fns)
+            return
+        if isinstance(sub, ast.ClassDef):
+            scope_fns.pop(sub.name, None)
+            return
+        if isinstance(sub, ast.Lambda):
+            return
+        if isinstance(sub, ast.Assign):
+            walk_node(sub.value, ctx, scope_fns)
+            if len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name) and isinstance(sub.value, ast.Name) and sub.value.id in scope_fns:
+                scope_fns[sub.targets[0].id] = scope_fns[sub.value.id]
+            else:
+                for tgt in sub.targets:
+                    for bound in ast.walk(tgt):
+                        if isinstance(bound, ast.Name) and isinstance(bound.ctx, ast.Store):
+                            scope_fns.pop(bound.id, None)
+            return
+        if isinstance(sub, ast.AnnAssign):
+            if sub.value is not None:
+                walk_node(sub.value, ctx, scope_fns)
+            if isinstance(sub.target, ast.Name):
+                if isinstance(sub.value, ast.Name) and sub.value.id in scope_fns:
+                    scope_fns[sub.target.id] = scope_fns[sub.value.id]
+                else:
+                    scope_fns.pop(sub.target.id, None)
             return
         order = (*ctx, (getattr(sub, "lineno", 0), getattr(sub, "col_offset", 0)))
         if isinstance(sub, ast.Call):
@@ -677,7 +704,11 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             elif callee in ("add_column", "drop_column", "alter_column"):
                 effects.touches_ddl = True
             elif isinstance(sub.func, ast.Name) and sub.func.id in scope_fns:
-                visit(scope_fns[sub.func.id], order, scope_fns)
+                for arg_expr in (*sub.args, *(kw.value for kw in sub.keywords)):
+                    walk_node(arg_expr, ctx, scope_fns)
+                target_fn, target_env = scope_fns[sub.func.id]
+                visit(target_fn, order, target_env)
+                return
         elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in consts:
             cleaned_u = _blank_sql_comments(consts[sub.id]).upper()
             if "ALTER TABLE" in cleaned_u:
@@ -699,19 +730,22 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
     def visit(
         fn: ast.FunctionDef | ast.AsyncFunctionDef,
         ctx: tuple,
-        outer_fns: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+        defining_fns: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]],
     ) -> None:
         if id(fn) in active_fns:
             return
         active_fns.add(id(fn))
-        local_fns = dict(outer_fns)
+        local_fns = dict(defining_fns)
+        for p in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs, fn.args.vararg, fn.args.kwarg):
+            if p is not None:
+                local_fns.pop(p.arg, None)
         try:
             for stmt in fn.body:
                 walk_node(stmt, ctx, local_fns)
         finally:
             active_fns.discard(id(fn))
 
-    visit(upgrade, (), functions)
+    visit(upgrade_entry[0], (), upgrade_entry[1])
     if (
         effects.table_events
         or effects.created_functions
