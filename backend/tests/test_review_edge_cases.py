@@ -582,3 +582,37 @@ def test_try_handler_row_bindings_inherited_method_profiles_and_local_migration_
     by_id = {n.id: n for n in truth.nodes}
     assert "t:nested_live" in by_id
     assert "t:nested_dead" not in by_id
+
+
+def test_dollar_quoted_sql_column_defaults_string_literal_bind_ignore_and_eof_url_const(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(
+        tmp_path,
+        "backend/schema.sql",
+        "CREATE TABLE scripts (\n"
+        "    id INT,\n"
+        "    body TEXT DEFAULT $$it's, (here)$$,\n"
+        "    title TEXT\n"
+        ");\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert by_id["t:scripts"].columns == ["id", "body", "title"]
+
+    _write(
+        tmp_path,
+        "frontend/src/app/users/page.tsx",
+        "const label = 'const URL placeholder';\n"
+        "const rx = /'const URL = 1'/g;\n"
+        "const note = `${[1].map((x) => { let URL = '/shadow'; return x; })}`;\n"
+        "export function UsersPage() {\n"
+        "  return <div><p>Don't drop URL</p><button onClick={() => fetch(URL)}>Go</button></div>;\n"
+        "}\n"
+        "const URL = '/api/v1/users'",
+    )
+    monkeypatch.setattr(typescript_nextjs, "extract_ts_http_calls_cst", lambda *a, **kw: None)
+    disp = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    calls = {(c.http_method, c.normalized_path) for c in disp.http_calls}
+    assert ("GET", "/api/v1/users") in calls
+

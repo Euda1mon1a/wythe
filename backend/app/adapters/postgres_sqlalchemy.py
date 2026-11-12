@@ -49,6 +49,7 @@ _DROP_FUNC_RE = re.compile(
 _QUALIFIED = rf"{_IDENT}(?:\.{_IDENT})?"
 # Body of `CREATE FUNCTION ... AS $tag$ <body> $tag$` (dollar-quoted; the header has no `;`).
 _DOLLAR_BODY_RE = re.compile(r"\bAS\s+(\$[A-Za-z0-9_]*\$)", re.IGNORECASE)
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 # Tables a SQL body reads. `DELETE FROM t` is a write, so it is matched (and skipped) as a unit;
 # `FROM fn(...)` is a set-returning function call, not a table.
 _BODY_READ_RE = re.compile(
@@ -290,7 +291,7 @@ def _blank_sql_comments(sql_text: str) -> str:
                 i += 1
             continue
         if ch == "$":
-            dm = re.match(r"\$[A-Za-z0-9_]*\$", sql_text[i:])
+            dm = _DOLLAR_TAG_RE.match(sql_text, i)
             if dm:
                 tag = dm.group(0)
                 end = sql_text.find(tag, i + len(tag))
@@ -320,6 +321,9 @@ def _extract_create_columns_at(cleaned_sql: str, pos: int) -> list[str]:
     while j < n and depth > 0:
         c = cleaned_sql[j]
         if quote:
+            if c == "\\" and quote == "'" and j + 1 < n:
+                j += 2
+                continue
             if c == quote:
                 if j + 1 < n and cleaned_sql[j + 1] == quote:
                     j += 2
@@ -327,6 +331,14 @@ def _extract_create_columns_at(cleaned_sql: str, pos: int) -> list[str]:
                 quote = None
         elif c in ("'", '"'):
             quote = c
+        elif c == "$":
+            dm = _DOLLAR_TAG_RE.match(cleaned_sql, j)
+            if dm:
+                tag = dm.group(0)
+                end = cleaned_sql.find(tag, j + len(tag))
+                if end >= 0:
+                    j = end + len(tag)
+                    continue
         elif c == "(":
             depth += 1
         elif c == ")":

@@ -7,7 +7,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from app.adapters.a11y_inspect import scan_a11y_markup_findings
+from app.adapters.a11y_inspect import (
+    _REGEX_PREV_CHARS,
+    _can_start_js_regex,
+    _skip_js_regex,
+    scan_a11y_markup_findings,
+)
 from app.adapters.base import (
     DisplayExtractionResult,
     FrontendHttpCall,
@@ -55,7 +60,7 @@ _TAURI_READ_CMD_PREFIXES = ("get_", "list_", "fetch_", "load_", "find_", "query_
 
 _URL_CONST_RE = re.compile(
     r"""(?:^|[;{])[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
-    r"""(?P<q>['"`])(?P<val>(?:/|\$\{)[^'"`\n]*)(?P=q)\s*(?:as\s+const\s*)?(?=[;\n}])""",
+    r"""(?P<q>['"`])(?P<val>(?:/|\$\{)[^'"`\n]*)(?P=q)[ \t]*(?:as\s+const[ \t]*)?(?:[ \t]*/\*[^*\r\n]*\*/)*[ \t]*(?://[^\r\n]*)?(?=[;\r\n}]|$)""",
     re.MULTILINE,
 )
 _TEMPLATE_HEAD_CONST_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
@@ -243,30 +248,140 @@ def _apply_url_scope_map(
     return merged, next_bound
 
 
+def _has_closing_line_quote(src: str, start: int, quote_ch: str) -> bool:
+    k = start + 1
+    limit = len(src)
+    while k < limit:
+        ch = src[k]
+        if ch == "\\":
+            k += 2
+            continue
+        if ch == quote_ch:
+            return True
+        if ch in ("\n", "\r"):
+            return False
+        k += 1
+    return False
+
+
 def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], dict[str, str]]]:
     """Return `(root_consts, consts_at)` preserving local URL constants while shadowing rebindings."""
     n = len(txt)
     root_span = (0, n)
     block_stack: list[int] = []
+    tpl_brace_depths: list[int] = []
+    code_chars: list[str] = []
     i = 0
+    prev_sig_pos = -1
     quote: str | None = None
     block_spans: list[tuple[int, int]] = []
     while i < n:
         ch = txt[i]
-        if quote:
-            if ch == "\\":
+        if quote in ("'", '"'):
+            if ch == "\\" and i + 1 < n:
+                code_chars.append(" ")
+                code_chars.append("\n" if txt[i + 1] == "\n" else " ")
                 i += 2
+                continue
+            if ch in ("\n", "\r"):
+                quote = None
+                code_chars.append(ch)
+                i += 1
                 continue
             if ch == quote:
                 quote = None
-        elif ch in ("'", '"', "`"):
+                prev_sig_pos = i
+                code_chars.append(ch)
+            else:
+                code_chars.append(" ")
+            i += 1
+            continue
+        if quote == "`":
+            if ch == "\\" and i + 1 < n:
+                code_chars.append(" ")
+                code_chars.append("\n" if txt[i + 1] == "\n" else " ")
+                i += 2
+                continue
+            if ch == "`":
+                quote = None
+                prev_sig_pos = i
+                code_chars.append("`")
+                i += 1
+                continue
+            if ch == "$" and i + 1 < n and txt[i + 1] == "{":
+                tpl_brace_depths.append(0)
+                quote = None
+                prev_sig_pos = i + 1
+                code_chars.append(" ")
+                code_chars.append(" ")
+                i += 2
+                continue
+            code_chars.append("\n" if ch == "\n" else " ")
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and txt[i + 1] == "/":
+            while i < n and txt[i] != "\n":
+                code_chars.append(" ")
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and txt[i + 1] == "*":
+            end = txt.find("*/", i + 2)
+            stop = n if end < 0 else end + 2
+            while i < stop:
+                code_chars.append("\n" if txt[i] == "\n" else " ")
+                i += 1
+            continue
+        if (
+            ch == "/"
+            and not (i > 0 and txt[i - 1] == "<")
+            and not (
+                i + 1 < n
+                and txt[i + 1] == ">"
+                and (prev_sig_pos < 0 or txt[prev_sig_pos] not in _REGEX_PREV_CHARS)
+            )
+            and _can_start_js_regex(txt, prev_sig_pos, 0)
+        ):
+            reg_end = _skip_js_regex(txt, i, n)
+            if reg_end is not None:
+                code_chars.extend(" " * (reg_end - i))
+                prev_sig_pos = reg_end - 1
+                i = reg_end
+                continue
+        if ch in ("'", '"') and _has_closing_line_quote(txt, i, ch):
             quote = ch
+            prev_sig_pos = i
+            code_chars.append(ch)
+        elif ch == "`":
+            quote = "`"
+            prev_sig_pos = i
+            code_chars.append("`")
         elif ch == "{":
+            if tpl_brace_depths:
+                tpl_brace_depths[-1] += 1
             block_stack.append(i)
-        elif ch == "}" and block_stack:
-            bstart = block_stack.pop()
-            block_spans.append((bstart, i + 1))
+            prev_sig_pos = i
+            code_chars.append("{")
+        elif ch == "}":
+            if tpl_brace_depths and tpl_brace_depths[-1] == 0:
+                tpl_brace_depths.pop()
+                quote = "`"
+                prev_sig_pos = i
+                code_chars.append(" ")
+                i += 1
+                continue
+            if tpl_brace_depths:
+                tpl_brace_depths[-1] -= 1
+            if block_stack:
+                bstart = block_stack.pop()
+                block_spans.append((bstart, i + 1))
+            prev_sig_pos = i
+            code_chars.append("}")
+        else:
+            if not ch.isspace():
+                prev_sig_pos = i
+            code_chars.append(ch)
         i += 1
+    code_only = "".join(code_chars)
 
     def innermost_block(pos: int) -> tuple[int, int]:
         return min(
@@ -280,6 +395,8 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
     for m in _URL_CONST_RE.finditer(txt):
         name, val = m.group("name"), m.group("val")
         npos = m.start("name")
+        if code_only[npos : m.end("name")] != name:
+            continue
         url_name_positions.add(npos)
         bmap = block_decls.setdefault(innermost_block(npos), {})
         if m.group("q") != "`" and "${" in val:
@@ -287,22 +404,22 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
         else:
             bmap[name] = val if bmap.get(name, val) == val else None
 
-    for dm in _LOCAL_BIND_RE.finditer(txt):
+    for dm in _LOCAL_BIND_RE.finditer(code_only):
         npos = dm.start("name")
         if npos in url_name_positions:
             continue
         block_decls.setdefault(innermost_block(npos), {})[dm.group("name")] = None
 
     param_scopes: list[tuple[int, int, set[str]]] = []
-    for m in _FN_PARAM_HEAD_RE.finditer(txt):
+    for m in _FN_PARAM_HEAD_RE.finditer(code_only):
         raw_params = m.group("fparams") or m.group("aparams") or m.group("sparam") or ""
         bound = _extract_param_bound_names(raw_params)
         if not bound:
             continue
         if m.group("fparams") is not None:
-            span = (m.end() - 1, _find_matching_delim(txt, m.end() - 1, "{", "}"))
+            span = (m.end() - 1, _find_matching_delim(code_only, m.end() - 1, "{", "}"))
         else:
-            span = (m.end(), _find_arrow_expr_end(txt, m.end()))
+            span = (m.end(), _find_arrow_expr_end(code_only, m.end()))
         param_scopes.append((span[0], span[1], bound))
 
     root_consts, root_bound = _apply_url_scope_map({}, set(), block_decls.get(root_span, {}))
