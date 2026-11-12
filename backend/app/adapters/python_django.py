@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from app.adapters.base import (
     ManipulatorExtractionResult,
@@ -331,7 +331,7 @@ class PythonDjangoAdapter:
                         remediation="Persist mutable thresholds in database truth.",
                     )
                 )
-            if not node.source_file.endswith(_CLOCK_ALLOW_MODULES):
+            if PurePosixPath(node.source_file).name not in _CLOCK_ALLOW_MODULES:
                 for clk, lineno in pm.raw_clock_calls:  # type: ignore[attr-defined]
                     if node.status == "clean":
                         node.status = "gray_zone"

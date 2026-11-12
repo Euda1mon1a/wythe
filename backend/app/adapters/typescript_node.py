@@ -16,7 +16,7 @@ from app.adapters.treesitter_engine import (
     extract_ts_backend_routes_cst,
     extract_ts_imports_cst,
 )
-from app.core.policy_context import get_active_policy_tokens
+from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _COMMENT_STRIP_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
@@ -416,7 +416,7 @@ class TypeScriptNodeAdapter:
             active_tokens = get_active_policy_tokens()
             for cm in _TS_POLICY_RE.finditer(txt):
                 cname = cm.group("name")
-                if any(w in cname for w in active_tokens):
+                if name_has_policy_token(cname, active_tokens):
                     lineno = txt.count("\n", 0, cm.start()) + 1
                     node.status = "policy_in_code"
                     findings.append(

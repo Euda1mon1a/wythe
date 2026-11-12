@@ -19,7 +19,7 @@ from app.adapters.typescript_nextjs import (
     _normalize_ts_url,
     _strip_ts_comments,
 )
-from app.core.policy_context import get_active_policy_tokens
+from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 from app.schemas.atlas import AtlasNode
 
 _SFC_SCRIPT_RE = re.compile(r"<script\b[^>]*>(?P<body>[\s\S]*?)</script>", re.IGNORECASE)
@@ -150,7 +150,7 @@ def scan_display_module_semantics(
     active_tokens = get_active_policy_tokens()
     for m in _TS_POLICY_CONST_RE.finditer(cleaned_txt):
         cname = m.group("name")
-        if any(tok in cname for tok in active_tokens) and not any(
+        if name_has_policy_token(cname, active_tokens) and not any(
             safe in cname for safe in _UI_SAFE_TOKENS
         ):
             lineno = cleaned_txt.count("\n", 0, m.start()) + 1

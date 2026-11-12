@@ -21,7 +21,7 @@ from app.adapters.ts_reachability import (
     ReachabilityIndex,
     build_nextjs_reachability,
 )
-from app.core.policy_context import get_active_policy_tokens
+from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _IMPORT_RE = re.compile(
@@ -609,7 +609,7 @@ class TypeScriptNextJsAdapter:
             active_tokens = get_active_policy_tokens()
             for m in _TS_POLICY_CONST_RE.finditer(txt):
                 cname = m.group("name")
-                if any(tok in cname for tok in active_tokens) and not any(
+                if name_has_policy_token(cname, active_tokens) and not any(
                     safe in cname for safe in _UI_SAFE_TOKENS
                 ):
                     lineno = txt.count("\n", 0, m.start()) + 1
