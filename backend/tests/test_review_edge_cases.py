@@ -1128,4 +1128,114 @@ def test_conditional_rebound_chained_migration_sql_and_try_row_writes(tmp_path: 
     assert "t:chained_sql_tbl" in write_targets
 
 
+def test_subscript_migration_sql_imported_base_disambiguation_and_ts_shadow_and_prop_div(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(
+        tmp_path,
+        "backend/alembic/versions/009_subscripts.py",
+        "from alembic import op\n\n"
+        "def upgrade():\n"
+        "    statements = {}\n"
+        "    statements['create'] = 'CREATE TABLE dict_sub_tbl (id INT PRIMARY KEY);'\n"
+        "    op.execute(statements['create'])\n\n"
+        "    items = [\n"
+        "        'CREATE TABLE stale_item_tbl (id INT PRIMARY KEY);',\n"
+        "        'CREATE TABLE unexecuted_item_tbl (id INT PRIMARY KEY);',\n"
+        "    ]\n"
+        "    items[0] = 'CREATE TABLE list_sub_tbl (id INT PRIMARY KEY);'\n"
+        "    op.execute(items[0])\n\n"
+        "    extra: list[str] = []\n"
+        "    extra.append('CREATE TABLE appended_sub_tbl (id INT PRIMARY KEY);')\n"
+        "    op.execute(extra[0])\n",
+    )
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id: n for n in truth.nodes}
+    assert "t:dict_sub_tbl" in by_id
+    assert "t:list_sub_tbl" in by_id
+    assert "t:appended_sub_tbl" in by_id
+    assert "t:stale_item_tbl" not in by_id
+    assert "t:unexecuted_item_tbl" not in by_id
+
+    _write(
+        tmp_path,
+        "backend/app/services/decoy.py",
+        "class Base:\n"
+        "    pass\n\n"
+        "class SharedBase:\n"
+        "    pass\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/services/base.py",
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        self.config = {}\n\n"
+        "class SharedBase:\n"
+        "    def __init__(self):\n"
+        "        self.token = 'secret'\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/services/reexport.py",
+        "from app.services.base import SharedBase\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/services/worker.py",
+        "from app.services.base import Base\n"
+        "from app.services.reexport import SharedBase\n\n"
+        "class Worker(Base):\n"
+        "    def execute_tasks(self):\n"
+        "        return 1\n\n"
+        "class TokenWorker(SharedBase):\n"
+        "    def rotate_tokens(self):\n"
+        "        return 1\n",
+    )
+    _write(
+        tmp_path,
+        "backend/app/api/routes/dispatch.py",
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/v1/dispatch')\n"
+        "def dispatch_job(worker, token_worker):\n"
+        "    _ = worker.config\n"
+        "    _ = token_worker.token\n"
+        "    return worker.execute_tasks(), token_worker.rotate_tokens()\n",
+    )
+    manip = _extract_manip(tmp_path)
+    pairs = {(e.source_id, e.target_id) for e in manip.edges if e.kind == "calls_helper"}
+    assert ("m:route:api.routes.dispatch", "m:service:services.worker") in pairs
+    assert ("m:route:api.routes.dispatch", "m:service:services.decoy") not in pairs
+
+    _write(
+        tmp_path,
+        "frontend/src/app/shadow/page.tsx",
+        "function getUrl() { return window.location.pathname; }\n"
+        "const URL = getUrl();\n"
+        "export async function loadShadowedUsers() {\n"
+        "  const URL = '/api/v1/shadowed-users';\n"
+        "  return fetch(URL);\n"
+        "}\n"
+        "export default function ShadowPage({ stats }: { stats: { in: number } }) {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <input value={stats.in / 2} readOnly />\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    cst_disp = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    cst_calls = {(c.http_method, c.normalized_path) for c in cst_disp.http_calls}
+    assert ("GET", "/api/v1/shadowed-users") in cst_calls
+    assert len([f for f in cst_disp.findings if f.rule_code == "DISP-005"]) == 1
+
+    monkeypatch.setattr(typescript_nextjs, "extract_ts_http_calls_cst", lambda *a, **kw: None)
+    fb_disp = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    fb_calls = {(c.http_method, c.normalized_path) for c in fb_disp.http_calls}
+    assert ("GET", "/api/v1/shadowed-users") in fb_calls
+    assert len([f for f in fb_disp.findings if f.rule_code == "DISP-005"]) == 1
+
+
+
 

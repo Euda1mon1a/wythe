@@ -49,6 +49,15 @@ def _skip_js_regex(src: str, start: int, limit: int) -> int | None:
     return None
 
 
+def _is_property_access(src: str, before_ident: int, floor: int) -> bool:
+    p = before_ident
+    while p >= floor and src[p].isspace():
+        p -= 1
+    if p < floor or src[p] != ".":
+        return False
+    return not (p >= floor + 2 and src[p - 2 : p + 1] == "...")
+
+
 def _can_start_js_regex(src: str, prev_sig_pos: int, expr_floor: int) -> bool:
     if prev_sig_pos < expr_floor:
         return True
@@ -68,6 +77,8 @@ def _can_start_js_regex(src: str, prev_sig_pos: int, expr_floor: int) -> bool:
             w = q
             while w >= expr_floor and (src[w].isalnum() or src[w] in ("_", "$")):
                 w -= 1
+            if _is_property_access(src, w, expr_floor):
+                return False
             return src[w + 1 : q + 1] in _REGEX_PREV_KEYWORDS
         return True
     if prev_ch in _REGEX_PREV_CHARS:
@@ -76,6 +87,8 @@ def _can_start_js_regex(src: str, prev_sig_pos: int, expr_floor: int) -> bool:
         k = prev_sig_pos
         while k >= expr_floor and (src[k].isalnum() or src[k] in ("_", "$")):
             k -= 1
+        if _is_property_access(src, k, expr_floor):
+            return False
         return src[k + 1 : prev_sig_pos + 1] in _REGEX_PREV_KEYWORDS
     return False
 

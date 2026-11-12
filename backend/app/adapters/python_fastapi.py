@@ -219,6 +219,39 @@ class _ImportResolver:
         target = self._export(parent, sym) if parent in self.exports else None
         return self.node_for(target, depth + 1) if target and target != qualified else None
 
+    def resolve_class(
+        self,
+        qualified: str,
+        raw_class_attrs: dict[tuple[str, str], set[str]],
+        depth: int = 0,
+    ) -> tuple[str, str] | None:
+        """Resolve `pkg.mod.ClassName` through module and package re-exports to `(node_id, class_name)`."""
+        if depth > 8 or "." not in qualified:
+            return None
+        parent, _, sym = qualified.rpartition(".")
+        nid = self.mod_to_node.get(parent)
+        if nid is not None and (nid, sym) in raw_class_attrs:
+            return (nid, sym)
+        pm_parent = self.parsed_by_mod.get(parent)
+        if pm_parent is not None:
+            reexp = pm_parent.import_targets.get(sym)
+            if reexp and reexp != qualified:
+                return self.resolve_class(reexp, raw_class_attrs, depth + 1)
+            star_hits = {
+                sh
+                for m in pm_parent.imported_modules
+                if m.endswith(".*")
+                for sh in (self.resolve_class(f"{m[:-2]}.{sym}", raw_class_attrs, depth + 1),)
+                if sh is not None
+            }
+            if len(star_hits) == 1:
+                return next(iter(star_hits))
+        if parent in self.exports:
+            target = self._export(parent, sym)
+            if target and target != qualified:
+                return self.resolve_class(target, raw_class_attrs, depth + 1)
+        return None
+
     def targets(self, imp: str, pm: ParsedPythonModule) -> list[tuple[str, str]]:
         """(node id, evidence) pairs that the import entry `imp` of module `pm` reaches."""
         target_nid = self.mod_to_node.get(imp)
@@ -306,6 +339,7 @@ class PythonFastApiAdapter:
         raw_class_attrs: dict[tuple[str, str], set[str]] = {}
         raw_class_methods: dict[tuple[str, str], dict[str, str]] = {}
         raw_class_bases: dict[tuple[str, str], tuple[str, ...]] = {}
+        star_sources_by_key: dict[tuple[str, str], tuple[str, ...]] = {}
         classes_by_name: dict[str, list[tuple[str, str]]] = {}
 
         for rel_app, pm in parsed_modules.items():
@@ -316,6 +350,7 @@ class PythonFastApiAdapter:
             for sym in pm.top_level_defs:
                 if len(sym) > 3 and not sym.startswith("_"):
                     symbol_to_defining_nodes.setdefault(sym, []).append(node_id)
+            star_mods = tuple(sorted(m[:-2] for m in pm.imported_modules if m.endswith(".*")))
             for cname, cattrs in pm.class_attrs.items():
                 key = (node_id, cname)
                 raw_class_attrs[key] = set(cattrs)
@@ -323,6 +358,8 @@ class PythonFastApiAdapter:
                     m: node_id for m in cattrs if len(m) > 3 and not m.startswith("_") and m in pm.method_defs
                 }
                 raw_class_bases[key] = pm.class_bases.get(cname, ())
+                if star_mods:
+                    star_sources_by_key[key] = star_mods
                 classes_by_name.setdefault(cname, []).append(key)
 
             nodes_by_rel[rel_app] = AtlasNode(
@@ -348,12 +385,26 @@ class PythonFastApiAdapter:
         for _ in range(4):
             for key, bases in raw_class_bases.items():
                 for bname in bases:
-                    bshort = bname.rpartition(".")[2] if "." in bname else bname
-                    resolved_nid = import_resolver.node_for(bname) if "." in bname else None
-                    if resolved_nid is not None and (resolved_nid, bshort) in raw_class_attrs:
-                        bkeys = [(resolved_nid, bshort)]
+                    if "." in bname:
+                        hit = import_resolver.resolve_class(bname, raw_class_attrs)
+                        if hit is None and not bname.startswith("app."):
+                            hit = import_resolver.resolve_class(f"app.{bname}", raw_class_attrs)
+                        bkeys = [hit] if hit is not None else []
                     else:
-                        bkeys = classes_by_name.get(bshort, ())
+                        star_hits = {
+                            sh
+                            for smod in star_sources_by_key.get(key, ())
+                            for sh in (
+                                import_resolver.resolve_class(f"{smod}.{bname}", raw_class_attrs)
+                                or (
+                                    import_resolver.resolve_class(f"app.{smod}.{bname}", raw_class_attrs)
+                                    if not smod.startswith("app.")
+                                    else None
+                                ),
+                            )
+                            if sh is not None
+                        }
+                        bkeys = list(star_hits) if len(star_hits) == 1 else classes_by_name.get(bname, ())
                     if len(bkeys) == 1:
                         raw_class_attrs[key].update(raw_class_attrs[bkeys[0]])
                         for mname, def_nid in raw_class_methods[bkeys[0]].items():

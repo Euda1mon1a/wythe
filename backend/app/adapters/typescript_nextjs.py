@@ -257,18 +257,11 @@ def _find_arrow_expr_end(txt: str, start: int) -> int:
     return i
 
 
-def _apply_url_scope_map(
-    outer: dict[str, str], outer_bound: set[str], bmap: dict[str, str | None]
-) -> tuple[dict[str, str], set[str]]:
-    next_bound = outer_bound | set(bmap)
+def _apply_url_scope_map(outer: dict[str, str], bmap: dict[str, str | None]) -> dict[str, str]:
     merged = {k: v for k, v in outer.items() if k not in bmap}
-    pending = {
-        k: v
-        for k, v in bmap.items()
-        if v is not None and (k not in outer_bound or outer.get(k) == v)
-    }
+    pending = {k: v for k, v in bmap.items() if v is not None}
     if not pending:
-        return merged, next_bound
+        return merged
     working = {**merged, **pending}
     for _ in range(3):
         for k in list(pending):
@@ -279,7 +272,7 @@ def _apply_url_scope_map(
     for k in pending:
         if working[k].startswith("/"):
             merged[k] = working[k]
-    return merged, next_bound
+    return merged
 
 
 def _has_closing_line_quote(src: str, start: int, quote_ch: str) -> bool:
@@ -456,7 +449,7 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
             span = (m.end(), _find_arrow_expr_end(code_only, m.end()))
         param_scopes.append((span[0], span[1], bound))
 
-    root_consts, root_bound = _apply_url_scope_map({}, set(), block_decls.get(root_span, {}))
+    root_consts = _apply_url_scope_map({}, block_decls.get(root_span, {}))
     inner_blocks = [(s, e, bmap) for (s, e), bmap in block_decls.items() if (s, e) != root_span]
 
     def consts_at(pos: int) -> dict[str, str]:
@@ -473,14 +466,12 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
             return root_consts
         events.sort(key=lambda item: (item[0], item[1]), reverse=True)
         env = dict(root_consts)
-        bound = set(root_bound)
         for _span_len, _prio, kind, payload in events:
             if kind == "params":
                 for pname in payload:
                     env.pop(pname, None)
-                    bound.add(pname)
             else:
-                env, bound = _apply_url_scope_map(env, bound, payload)
+                env = _apply_url_scope_map(env, payload)
         return env
 
     return root_consts, consts_at

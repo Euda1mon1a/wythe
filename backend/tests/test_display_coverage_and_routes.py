@@ -246,7 +246,7 @@ _CONST_PREFIX_SRC = (
     "import { get, post, del } from '@/lib/api';\n"
     "const BASE_URL = '/widgets';\n"
     "export const ARCHIVE = `${BASE_URL}/archive`;\n"
-    "const AMBIGUOUS = '/one';\n"
+    "const SHADOWED = '/one';\n"
     "export function loadWidget(id: string) {\n"
     "  return get<Widget>(`${BASE_URL}/${id}`);\n"
     "}\n"
@@ -257,8 +257,11 @@ _CONST_PREFIX_SRC = (
     "  return del(`${ARCHIVE}/${id}`);\n"
     "}\n"
     "function other() {\n"
-    "  const AMBIGUOUS = '/two';\n"
-    "  return get(`${AMBIGUOUS}/x`);\n"
+    "  const SHADOWED = '/two';\n"
+    "  let mutableUrl = '/three';\n"
+    "  mutableUrl = '/four';\n"
+    "  get(`${mutableUrl}/x`);\n"
+    "  return get(`${SHADOWED}/x`);\n"
     "}\n"
 )
 
@@ -274,8 +277,9 @@ def test_same_file_url_constants_resolve_in_call_urls() -> None:
     assert ("GET", "/widgets/${id}", 6) in calls
     assert ("POST", "/widgets", 9) in calls
     assert ("DELETE", "/widgets/archive/${id}", 12) in calls
-    # A name bound to two different values is ambiguous: no guessed call.
-    assert not any(url.startswith(("/one", "/two")) for _v, url, _l in calls)
+    # Inner `const` lexically shadows outer `const`; mutable `let` is never guessed.
+    assert ("GET", "/two/x", 19) in calls
+    assert not any(url.startswith(("/one", "/three", "/four")) for _v, url, _l in calls)
 
 
 def test_same_file_url_constants_resolve_without_treesitter(monkeypatch) -> None:
@@ -286,6 +290,8 @@ def test_same_file_url_constants_resolve_without_treesitter(monkeypatch) -> None
     assert ("GET", "/widgets/${id}", 6) in calls
     assert ("POST", "/widgets", 9) in calls
     assert ("DELETE", "/widgets/archive/${id}", 12) in calls
+    assert ("GET", "/two/x", 19) in calls
+    assert not any(url.startswith(("/one", "/three", "/four")) for _v, url, _l in calls)
 
 
 def test_glued_trailing_query_suffix_is_dropped() -> None:

@@ -241,10 +241,8 @@ def _collect_cst_pattern_idents(raw: bytes, node: Any, out: set[str]) -> None:
             _collect_cst_pattern_idents(raw, ch, out)
 
 
-def _apply_cst_block_decls(
-    raw: bytes, container: Any, outer_consts: dict[str, str], outer_bound: frozenset[str]
-) -> tuple[dict[str, str], frozenset[str]]:
-    """Update `outer_consts` with non-shadowing local `const X = '/...'` bindings and drop shadowed ones."""
+def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, str]) -> dict[str, str]:
+    """Update `outer_consts` with lexical local `const X = '/...'` bindings and drop shadowed ones."""
     raw_local: dict[str, str | None] = {}
     for ch in container.named_children:
         decl_node = (
@@ -280,10 +278,7 @@ def _apply_cst_block_decls(
                 ):
                     ident = raw[lhs.start_byte : lhs.end_byte].decode("utf-8", errors="replace")
                     val = _unquote_node(raw, rhs)
-                    if (rhs.type == "string" and "${" in val) or (
-                        ident in outer_bound
-                        and outer_consts.get(ident) != resolve_url_const_head(val, outer_consts)
-                    ):
+                    if rhs.type == "string" and "${" in val:
                         raw_local[ident] = None
                     else:
                         raw_local[ident] = val if raw_local.get(ident, val) == val else None
@@ -300,10 +295,11 @@ def _apply_cst_block_decls(
                 for b in bound_fn:
                     raw_local[b] = None
     if not raw_local:
-        return outer_consts, outer_bound
-    next_bound = outer_bound | frozenset(raw_local)
+        return outer_consts
     merged = {k: v for k, v in outer_consts.items() if k not in raw_local}
     pending = {k: v for k, v in raw_local.items() if v is not None}
+    if not pending:
+        return merged
     working = {**merged, **pending}
     for _ in range(3):
         for k in list(pending):
@@ -313,7 +309,7 @@ def _apply_cst_block_decls(
     for k in pending:
         if working[k].startswith("/"):
             merged[k] = working[k]
-    return merged, next_bound
+    return merged
 
 
 def _unwrap_cst_expr(node: Any) -> Any:
@@ -388,9 +384,9 @@ def extract_ts_http_calls_cst(
     has_tauri_import = b"@tauri-apps" in raw or b"__TAURI__" in raw
     found: list[tuple[str, str, int]] = []
     init_consts = dict(url_consts or {})
-    root_consts, root_bound = _apply_cst_block_decls(raw, tree.root_node, init_consts, frozenset())
+    root_consts = _apply_cst_block_decls(raw, tree.root_node, init_consts)
 
-    def walk(node: Any, scope_consts: dict[str, str], scope_bound: frozenset[str]) -> None:
+    def walk(node: Any, scope_consts: dict[str, str]) -> None:
         ntype = node.type
         if ntype in (
             "function_declaration",
@@ -410,9 +406,8 @@ def extract_ts_http_calls_cst(
                     _collect_cst_pattern_idents(raw, single, bound)
             if bound:
                 scope_consts = {k: v for k, v in scope_consts.items() if k not in bound}
-                scope_bound = scope_bound | frozenset(bound)
         elif ntype == "statement_block":
-            scope_consts, scope_bound = _apply_cst_block_decls(raw, node, scope_consts, scope_bound)
+            scope_consts = _apply_cst_block_decls(raw, node, scope_consts)
 
         if ntype == "call_expression" and node.children:
             fn_node = node.children[0]
@@ -450,9 +445,9 @@ def extract_ts_http_calls_cst(
                             verb = _extract_cst_fetch_method(raw, arg_items[1]) if len(arg_items) >= 2 else "GET"
                             found.append((verb, url_val, fn_node.start_point[0] + 1))
         for ch in node.children:
-            walk(ch, scope_consts, scope_bound)
+            walk(ch, scope_consts)
 
-    walk(tree.root_node, root_consts, root_bound)
+    walk(tree.root_node, root_consts)
     return found
 
 

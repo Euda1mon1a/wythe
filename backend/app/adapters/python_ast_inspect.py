@@ -242,6 +242,8 @@ class ParsedPythonModule:
     has_session_writes: bool = False
     # Original imported name -> absolute modules it is imported from (`from M import name`).
     imported_names: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Module-scope local symbol/alias -> qualified target (`pkg.mod.Name` or `pkg.mod`).
+    import_targets: dict[str, str] = field(default_factory=dict)
     # First line of write evidence per symbol (constructors, session writes, SQL write targets).
     write_lines: dict[str, int] = field(default_factory=dict)
     # Includes made into this module's own `APIRouter` (`router.include_router(sub)`): the
@@ -2329,41 +2331,129 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     method_defs: set[str] = set()
     class_attrs: dict[str, frozenset[str]] = {}
     class_bases: dict[str, tuple[str, ...]] = {}
-    for stmt in tree.body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            defined.add(stmt.name)
-            top_level_defs.add(stmt.name)
-        elif isinstance(stmt, ast.ClassDef):
-            defined.add(stmt.name)
-            top_level_defs.add(stmt.name)
-            cattrs: set[str] = set()
-            bases: list[str] = []
-            for b in stmt.bases:
-                bname = b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else ""
-                if bname:
-                    bases.append(resolve(bname))
-            class_bases[stmt.name] = tuple(bases)
-            for member in stmt.body:
-                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    cattrs.add(member.name)
-                    if not member.name.startswith("_"):
-                        defined.add(member.name)
-                        method_defs.add(member.name)
-                    for sub in ast.walk(member):
-                        if (
-                            isinstance(sub, ast.Attribute)
-                            and isinstance(sub.ctx, ast.Store)
-                            and isinstance(sub.value, ast.Name)
-                            and sub.value.id in ("self", "cls")
-                        ):
-                            cattrs.add(sub.attr)
-                elif isinstance(member, ast.Assign):
-                    for t in member.targets:
-                        if isinstance(t, ast.Name):
-                            cattrs.add(t.id)
-                elif isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
-                    cattrs.add(member.target.id)
-            class_attrs[stmt.name] = frozenset(cattrs)
+    own_pkg = module_name if rel_path.endswith("__init__.py") else module_name.rpartition(".")[0]
+    scope_base_targets: dict[str, str] = {}
+    import_targets: dict[str, str] = {}
+
+    def walk_module_scope(stmts: list[ast.stmt], *, top_level: bool) -> None:
+        for stmt in stmts:
+            if id(stmt) in excluded:
+                continue
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    bound_nm = alias.asname or alias.name.split(".", 1)[0]
+                    target_nm = alias.name if alias.asname else bound_nm
+                    if top_level:
+                        scope_base_targets[bound_nm] = target_nm
+                        import_targets[bound_nm] = target_nm
+                    else:
+                        scope_base_targets.setdefault(bound_nm, target_nm)
+                        import_targets.setdefault(bound_nm, target_nm)
+            elif isinstance(stmt, ast.ImportFrom):
+                src_mod = stmt.module or ""
+                if stmt.level:
+                    base_pkg = own_pkg
+                    for _ in range(stmt.level - 1):
+                        base_pkg = base_pkg.rpartition(".")[0]
+                    src_mod = ".".join(p for p in (base_pkg, stmt.module) if p)
+                if src_mod:
+                    for alias in stmt.names:
+                        if alias.name == "*":
+                            continue
+                        lname = alias.asname or alias.name
+                        qual_t = f"{src_mod}.{alias.name}"
+                        if top_level:
+                            scope_base_targets[lname] = qual_t
+                            import_targets[lname] = qual_t
+                        else:
+                            scope_base_targets.setdefault(lname, qual_t)
+                            import_targets.setdefault(lname, qual_t)
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if top_level:
+                    scope_base_targets.pop(stmt.name, None)
+                    import_targets.pop(stmt.name, None)
+                    defined.add(stmt.name)
+                    top_level_defs.add(stmt.name)
+            elif isinstance(stmt, ast.ClassDef):
+                if top_level:
+                    defined.add(stmt.name)
+                    top_level_defs.add(stmt.name)
+                    cattrs: set[str] = set()
+                    bases: list[str] = []
+                    for b in stmt.bases:
+                        b_inner = b.value if isinstance(b, ast.Subscript) else b
+                        bdotted = _dotted(b_inner)
+                        if not bdotted:
+                            continue
+                        head, _, tail = bdotted.partition(".")
+                        if tail:
+                            qual_head = scope_base_targets.get(head)
+                            bases.append(f"{qual_head}.{tail}" if qual_head else resolve_qual(bdotted))
+                        elif head in scope_base_targets:
+                            bases.append(scope_base_targets[head])
+                        else:
+                            bases.append(resolve(head))
+                    class_bases[stmt.name] = tuple(bases)
+                    for member in stmt.body:
+                        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            cattrs.add(member.name)
+                            if not member.name.startswith("_"):
+                                defined.add(member.name)
+                                method_defs.add(member.name)
+                            for sub in ast.walk(member):
+                                if (
+                                    isinstance(sub, ast.Attribute)
+                                    and isinstance(sub.ctx, ast.Store)
+                                    and isinstance(sub.value, ast.Name)
+                                    and sub.value.id in ("self", "cls")
+                                ):
+                                    cattrs.add(sub.attr)
+                        elif isinstance(member, ast.Assign):
+                            for t in member.targets:
+                                if isinstance(t, ast.Name):
+                                    cattrs.add(t.id)
+                        elif isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
+                            cattrs.add(member.target.id)
+                    class_attrs[stmt.name] = frozenset(cattrs)
+                    scope_base_targets[stmt.name] = f"{module_name}.{stmt.name}"
+                    import_targets.pop(stmt.name, None)
+                else:
+                    scope_base_targets.setdefault(stmt.name, f"{module_name}.{stmt.name}")
+            elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                tname = stmt.targets[0].id
+                rhs_d = _dotted(stmt.value)
+                qual_rhs: str | None = None
+                if rhs_d:
+                    rh, _, rt = rhs_d.partition(".")
+                    if rt and rh in scope_base_targets:
+                        qual_rhs = f"{scope_base_targets[rh]}.{rt}"
+                    elif not rt and rh in scope_base_targets:
+                        qual_rhs = scope_base_targets[rh]
+                if qual_rhs:
+                    if top_level:
+                        scope_base_targets[tname] = qual_rhs
+                        import_targets[tname] = qual_rhs
+                    else:
+                        scope_base_targets.setdefault(tname, qual_rhs)
+                        import_targets.setdefault(tname, qual_rhs)
+                elif top_level:
+                    scope_base_targets.pop(tname, None)
+                    import_targets.pop(tname, None)
+            elif isinstance(stmt, ast.If):
+                walk_module_scope(stmt.body, top_level=False)
+                walk_module_scope(stmt.orelse, top_level=False)
+            elif isinstance(stmt, (ast.Try, ast.TryStar)):
+                walk_module_scope(stmt.body, top_level=False)
+                for h in stmt.handlers:
+                    walk_module_scope(h.body, top_level=False)
+                walk_module_scope(stmt.orelse, top_level=False)
+                walk_module_scope(stmt.finalbody, top_level=False)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)):
+                walk_module_scope(stmt.body, top_level=False)
+                if hasattr(stmt, "orelse"):
+                    walk_module_scope(stmt.orelse, top_level=False)
+
+    walk_module_scope(tree.body, top_level=True)
 
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2442,6 +2532,7 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         persisted=frozenset(persisted),
         has_session_writes=has_session_writes,
         imported_names={k: frozenset(v) for k, v in imported_names.items()},
+        import_targets=import_targets,
         write_lines=write_lines,
     )
 
