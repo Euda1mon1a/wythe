@@ -15,6 +15,19 @@ from app.models import PolicyVocabulary, RulePolicy, StackProfile, TargetProject
 
 INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
     {
+        "slug": "python-services",
+        "label": "Python scripts / services + SQL DDL + launchd declarations",
+        "truth_adapter": "sql-ddl",
+        "manipulator_adapter": "python-services",
+        "display_adapter": "no-display",
+        "implementation_status": "experimental",
+        "is_enabled": True,
+        "description": (
+            "Static Python imports, script and launchd references. No inference of "
+            "installed/running services, registry admission, or safe removal."
+        ),
+    },
+    {
         "slug": "fastapi-sqlalchemy-nextjs",
         "label": "PostgreSQL/SQLite + FastAPI/SQLAlchemy + Next.js/TypeScript",
         "truth_adapter": "postgres-sqlalchemy",
@@ -200,6 +213,26 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
 )
 
 INITIAL_RULE_POLICIES: tuple[dict[str, object], ...] = (
+    {
+        "rule_code": "MANIP-005",
+        "tier": "manipulate",
+        "category": "missing_deployment_source",
+        "title": "Deployment declaration references an absent source file",
+        "rationale": "Source recovery requires the files named by deployment declarations.",
+        "severity": "warning",
+        "enabled": True,
+        "blocks_gate": False,
+    },
+    {
+        "rule_code": "MANIP-004",
+        "tier": "manipulate",
+        "category": "invalid_launch_declaration",
+        "title": "Launchd declaration has an invalid command or literal unexpanded path",
+        "rationale": "launchd executes argument arrays without shell expansion.",
+        "severity": "warning",
+        "enabled": True,
+        "blocks_gate": False,
+    },
     {
         "rule_code": "TRUTH-001",
         "tier": "truth",
