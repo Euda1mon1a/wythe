@@ -10,6 +10,7 @@ from app.adapters.postgres_sqlalchemy import PostgresSqlAlchemyAdapter
 from app.adapters.prisma_truth import PrismaSchemaAdapter
 from app.adapters.python_django import PythonDjangoAdapter
 from app.adapters.python_fastapi import PythonFastApiAdapter
+from app.adapters.python_services import NoDisplayAdapter, PythonServicesAdapter
 from app.adapters.rust_http import RustHttpAdapter
 from app.adapters.rust_sql_truth import RustSqlTruthAdapter
 from app.adapters.rust_wasm_display import RustWasmDisplayAdapter
@@ -35,6 +36,7 @@ def build_default_registry() -> AdapterRegistry:
 
     # Tier 2: Backend Manipulation
     registry.register_manipulator(PythonFastApiAdapter())
+    registry.register_manipulator(PythonServicesAdapter())
     registry.register_manipulator(TypeScriptNodeAdapter())
     registry.register_manipulator(PythonDjangoAdapter())
     registry.register_manipulator(GoHttpAdapter())
@@ -42,6 +44,7 @@ def build_default_registry() -> AdapterRegistry:
 
     # Tier 3: Frontend Display
     registry.register_display(TypeScriptNextJsAdapter())
+    registry.register_display(NoDisplayAdapter())
     registry.register_display(TypeScriptReactSpaAdapter())
     registry.register_display(VueSfcDisplayAdapter())
     registry.register_display(SvelteKitDisplayAdapter())

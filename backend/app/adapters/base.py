@@ -76,6 +76,7 @@ class ManipulatorExtractionResult:
     edges: list[AtlasEdge]  # manipulate->truth and manipulate->manipulate
     routes: list[RouteDescriptor]
     findings: list[RawCandidateFinding] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -184,6 +185,20 @@ class AdapterRegistry:
     def list_slots(self) -> list[AdapterSlotSchema]:
         """Return implemented multi-language adapters alongside planned extension slots."""
         return [
+            AdapterSlotSchema(
+                name="python-services", tier="manipulate", language="Python / Shell / plist",
+                frameworks=["Python scripts", "launchd"], implementation_status="experimental",
+                capabilities=[
+                    "Python import and package-initializer dependency declarations",
+                    "Shell script references and launchd command declarations",
+                    "Explicit coverage exclusions; no runtime or safe-removal inference",
+                ],
+            ),
+            AdapterSlotSchema(
+                name="no-display", tier="display", language="None", frameworks=[],
+                implementation_status="experimental",
+                capabilities=["Explicitly unobserved display tier for service-only profiles"],
+            ),
             AdapterSlotSchema(
                 name="postgres-sqlalchemy",
                 tier="truth",

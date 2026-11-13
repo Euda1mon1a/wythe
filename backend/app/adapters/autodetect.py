@@ -127,6 +127,9 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
         any((d / f).is_file() for d in (be_dir, repo_root) for f in ("drizzle.config.ts", "drizzle.config.js"))
         or "drizzle-orm" in js_deps
     )
+    has_python_services = bool(pyproj.strip() or reqs.strip()) or any(repo_root.glob("*.py")) or (
+        (repo_root / "scripts").is_dir() and next((repo_root / "scripts").rglob("*.py"), None) is not None
+    )
 
     if has_rust:
         manip_adapter = "rust-http"
@@ -152,6 +155,12 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
         manip_adapter = "typescript-node"
         truth_adapter = "drizzle-orm"
         signals.append("Drizzle ORM + TypeScript/Node")
+    elif has_python_services and not js_deps.strip():
+        manip_adapter = "python-services"
+        truth_adapter = "sql-ddl"
+        disp_adapter = "no-display"
+        backend_sub = "."
+        signals.append("Python source or dependency manifest without a recognized web stack")
     else:
         manip_adapter = "python-fastapi"
         truth_adapter = "postgres-sqlalchemy"

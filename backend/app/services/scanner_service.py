@@ -546,7 +546,7 @@ def run_target_scan(
             *disp_res.findings,
             *cross_findings,
         ]
-        scan_notes = [*truth_res.notes, *disp_res.notes]
+        scan_notes = [*truth_res.notes, *manip_res.notes, *disp_res.notes]
         commit_sha = git_fp[0] if git_fp is not None else _resolve_git_commit(repo_root)
         if cache_key is not None:
             _EXTRACTION_CACHE[cache_key] = _CachedStaticExtraction(

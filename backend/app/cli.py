@@ -132,7 +132,7 @@ def _print_report_summary(report) -> None:
     )
     if getattr(report, "stack_profile_status", "implemented") == "experimental":
         print(
-            "  Maturity: Experimental polyglot profile — prefer 'wythe diff' or ratchets over '--strict' until tuned for your repo."
+            "  Maturity: Experimental profile — prefer 'wythe diff' or ratchets over '--strict' until tuned for your repo."
         )
     print(f"  Digest  : {report.content_digest[:16]}...")
     print(
@@ -145,7 +145,9 @@ def _print_report_summary(report) -> None:
         f"  Tier 3 (Display)         : {s.display_pages} pages, {s.display_hooks_and_clients} hooks/clients/components"
     )
     print(
-        f"  Lineage                  : {s.verified_edges} verified edges, {s.end_to_end_chains} end-to-end 3-tier chains"
+        f"  Lineage                  : {s.verified_edges} verified edges, "
+        f"{sum(e.verification == 'declared' for e in report.edges)} declared edges, "
+        f"{s.end_to_end_chains} end-to-end 3-tier chains"
     )
     if report.legacy_bridge.present:
         lb = report.legacy_bridge

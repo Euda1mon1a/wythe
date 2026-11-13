@@ -298,7 +298,10 @@ class PythonFastApiAdapter:
     ) -> ManipulatorExtractionResult:
         app_dir = repo_root / backend_subdir / "app"
         if not app_dir.is_dir():
-            return ManipulatorExtractionResult(nodes=[], edges=[], routes=[], findings=[])
+            return ManipulatorExtractionResult(nodes=[], edges=[], routes=[], findings=[], notes=[
+                ("Python/FastAPI adapter found no app/ directory under the backend root; "
+                 "backend coverage is absent. For script-based services, use python-services.")
+            ])
 
         packages: dict[str, ParsedPythonModule] = {}
         caller_only: list[ParsedPythonModule] = []

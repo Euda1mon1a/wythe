@@ -11,7 +11,7 @@ The core lineage solver (`_solve_cross_tier_lineage`), database policy filter (`
 1. **`TruthTierAdapter` (`tier="truth"`)** -> `TruthExtractionResult`
    - Emits normalized `AtlasNode` objects (`subkind="table"` or `"sql_function"`), `table_symbol_map` (mapping ORM class names, query symbols, and physical table names to `t:table:<name>`), `function_symbol_map`, `TRUTH-002` schema/catalog drift findings, and `observation_source`.
 2. **`ManipulatorTierAdapter` (`tier="manipulate"`)** -> `ManipulatorExtractionResult`
-   - Emits route/service/solver/CLI `AtlasNode` objects, intra-tier `calls_helper` edges, `reads_truth` / `writes_truth` / `guards_truth` edges into `TruthExtractionResult`, normalized `RouteDescriptor` regexes (`http_method`, `full_path`, `path_regex`), and `TRUTH-001`, `TRUTH-003`, `MANIP-001..003` candidate findings.
+   - Emits route/service/solver/CLI `AtlasNode` objects, intra-tier `calls_helper` edges, `reads_truth` / `writes_truth` / `guards_truth` edges into `TruthExtractionResult`, normalized `RouteDescriptor` regexes (`http_method`, `full_path`, `path_regex`), candidate findings, and explicit coverage notes. `MANIP-004` and `MANIP-005` review launchd command validity and missing declared deployment sources.
 3. **`DisplayTierAdapter` (`tier="display"`)** -> `DisplayExtractionResult`
    - Emits page/hook/api_client/component `AtlasNode` objects, intra-tier `uses_hook` / `uses_client` edges, normalized `FrontendHttpCall` records (`http_method`, `normalized_path`), and `DISP-001..003` candidate findings (while the cross-tier solver emits `DISP-004` when a frontend call has no matching `RouteDescriptor`).
 
@@ -21,7 +21,19 @@ Because `StackProfile` rows compose any `(truth_adapter, manipulator_adapter, di
 
 ## 2. Popularity-Ranked Tier Matrix & Maturity Classification
 
-Only the dogfooded `fastapi-sqlalchemy-nextjs` trio (`postgres-sqlalchemy`, `python-fastapi`, `typescript-nextjs`) is marked **`Implemented`** in `atlas_stack_profiles` and `/api/v1/adapters/slots`. All 13 secondary polyglot adapters (and their 16 composed stack profiles) are marked **`Experimental`** so operators know to start with `wythe diff` or ratchets before strict gating.
+Only the dogfooded `fastapi-sqlalchemy-nextjs` trio (`postgres-sqlalchemy`, `python-fastapi`, `typescript-nextjs`) is marked **`Implemented`** in `atlas_stack_profiles` and `/api/v1/adapters/slots`. The 15 secondary adapter slots and 17 other enabled profiles are **`Experimental`**, including the service-only `python-services` profile. Start with `wythe diff` or ratchets before strict gating.
+
+The service profile composes `sql-ddl`, `python-services`, and `no-display`. It retains
+Python imports and package initializers, shell references, launchd commands, JSON
+command fields and literal deployment mappings as `declared` dependencies. A
+constructor with leading `repo_path` / `live_path` fields can supply a source-to-install
+mapping; supported path expressions are literals, previously bound names, `Path`,
+symbolic `Path.home()` and `/` joins. This is deliberately not an installer interpreter.
+Disabled and conditional references remain visible. Module summaries distinguish
+ordinary source references, deployment-only references and absent discovered references.
+Host selection, job admission, dynamic imports, installed state and execution remain
+unknown, and the display tier is explicitly unobserved. A passing gate or a narrow
+blast radius does not certify safe removal.
 
 ### Tier 1 — Database & Schema/ORM Truth
 
@@ -39,6 +51,7 @@ Only the dogfooded `fastapi-sqlalchemy-nextjs` trio (`postgres-sqlalchemy`, `pyt
 | Adapter Key | Languages & Frameworks | Route & Truth-Door Extraction | Status |
 | :--- | :--- | :--- | :--- |
 | `python-fastapi` | Python · FastAPI, SQLAlchemy, Celery/CLI | `APIRouter` mount + decorator synthesis, Python AST ORM/SQL read vs. write, helper call graph | **Implemented** |
+| `python-services` | Python, shell, launchd, JSON declarations | Module imports, package initialization, script/deployment references; no HTTP route inference | Experimental |
 | `typescript-node` | TypeScript / JS · Next.js Route Handlers (`route.ts`), Express, Hono, Fastify, NestJS | File-convention & router/decorator URL synthesis; Prisma (`prisma.*` & `prisma.client.*`), Drizzle, and raw SQL read vs. write; TS service/query graph | Experimental |
 | `python-django` | Python · Django, Django REST Framework (`ViewSet`/routers), Django Ninja | `urls.py` (`path`, `re_path`, `include`, DRF `router.register`), `Model.objects` read vs. write AST, service/view split | Experimental |
 | `go-http` | Go · `net/http` (Go 1.22+ ServeMux), `chi`, `gin`, `echo`, `fiber` + `sqlc` / `pgx` / `GORM` | Router group + verb handler synthesis, `sqlc` query symbol binding, GORM & SQL `Query` vs. `Exec`, package call graph | Experimental |
@@ -50,6 +63,7 @@ Only the dogfooded `fastapi-sqlalchemy-nextjs` trio (`postgres-sqlalchemy`, `pyt
 | Adapter Key | Languages & Frameworks | Surface & Contract Extraction | Status |
 | :--- | :--- | :--- | :--- |
 | `typescript-nextjs` | TypeScript / TSX · Next.js App Router & Pages Router + Tauri `invoke()` | `app/**/page.tsx` & `pages/**/*.tsx`, hooks, API clients, per-symbol reachability (`DISP-004`/`DISP-007`), OpenAPI/schema type check, WCAG `DISP-005` | **Implemented** |
+| `no-display` | Service-only profile | Explicitly unobserved UI, including embedded HTML and native clients | Experimental |
 | `typescript-react` | TypeScript / TSX · React SPA, Vite, React Router, TanStack Router, Remix + Tauri `invoke()` | `src/pages/**`, `src/routes/**`, `src/views/**`, `App.tsx`, hooks, per-symbol reachability (`DISP-004`/`DISP-007`), `fetch`/`axios`/Tauri `invoke`, WCAG `DISP-005` | Experimental |
 | `vue-sfc` | Vue 3 / TypeScript · Vue Router & Nuxt 3 (`.vue` SFCs + composables + Tauri `invoke()`) | Line-accurate `<script setup>` / `<script>` & `<template>` extraction, `pages/**/*.vue`, `$fetch`/`useFetch`, WCAG `DISP-005` | Experimental |
 | `sveltekit` | Svelte 5 / TypeScript · SvelteKit (`.svelte` + `$lib` + `+page.server.ts` + Tauri `invoke()`) | `src/routes/**/+page.svelte` & `+page.ts`, `$lib` alias resolution, line-accurate `<script>` & markup `DISP-005` | Experimental |
