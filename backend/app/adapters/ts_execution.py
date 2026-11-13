@@ -1,0 +1,159 @@
+"""Conservative TypeScript import execution and dynamic export selection.
+
+Unknown selectors keep every export reachable. Refinement is enabled only with
+a valid CST; importing a selected export still evaluates the other modules in
+its barrel, including their top-level initializers and registration calls.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.adapters.treesitter_engine import _get_parser, _unwrap_cst_expr, has_treesitter
+
+
+def _parse(source: str) -> tuple[bytes, Any] | None:
+    if not has_treesitter():
+        return None
+    raw = source.encode("utf-8")
+    root = _get_parser("tsx").parse(raw).root_node
+    return None if root.has_error else (raw, root)
+
+
+def _text(raw: bytes, node: Any) -> str:
+    return raw[node.start_byte:node.end_byte].decode("utf-8")
+
+
+def module_execution(source: str) -> tuple[set[str], str, list[tuple[str, int, int]]] | None:
+    """Return eager declaration names and top-level statements, excluding lazy functions."""
+    parsed = _parse(source)
+    if parsed is None:
+        return None
+    raw, root = parsed
+    eager: set[str] = set()
+    statements: list[str] = []
+    ranges: list[tuple[str, int, int]] = []
+    for statement in root.named_children:
+        node = statement
+        if node.type == "export_statement":
+            node = node.child_by_field_name("declaration")
+            if node is None:
+                # Default expressions can execute at import time too.
+                value = statement.child_by_field_name("value")
+                if value is not None:
+                    unwrapped = _unwrap_cst_expr(value)
+                    if unwrapped.type not in ("identifier", "arrow_function", "function_expression"):
+                        statements.append(_text(raw, value))
+                    ranges.append(("default", statement.start_point[0] + 1, statement.end_point[0] + 1))
+                continue
+        name = node.child_by_field_name("name")
+        if name is not None and name.type in ("identifier", "type_identifier"):
+            ranges.append((_text(raw, name), statement.start_point[0] + 1, statement.end_point[0] + 1))
+        if node.type in ("lexical_declaration", "variable_declaration"):
+            for decl in node.named_children:
+                if decl.type != "variable_declarator":
+                    continue
+                name = decl.child_by_field_name("name")
+                if name is not None and name.type == "identifier":
+                    ranges.append((_text(raw, name), decl.start_point[0] + 1, decl.end_point[0] + 1))
+                value = decl.child_by_field_name("value")
+                if value is None:
+                    continue
+                value = _unwrap_cst_expr(value)
+                if value.type in ("arrow_function", "function_expression", "generator_function"):
+                    continue
+                if name is not None and name.type == "identifier":
+                    eager.add(_text(raw, name))
+                else:
+                    statements.append(_text(raw, decl))
+        elif node.type in ("class_declaration", "abstract_class_declaration"):
+            # Static fields, static blocks and decorators can execute now.
+            name = node.child_by_field_name("name")
+            if name is not None:
+                eager.add(_text(raw, name))
+        elif node.type not in (
+            "import_statement", "comment", "function_declaration",
+            "generator_function_declaration", "interface_declaration",
+            "type_alias_declaration", "ambient_declaration",
+        ):
+            statements.append(_text(raw, node))
+    return eager, "\n".join(statements), ranges
+
+
+def _selected_export(raw: bytes, import_node: Any) -> str:
+    member = import_node.parent
+    if member is None or member.type != "member_expression":
+        return "*"
+    prop = member.child_by_field_name("property")
+    if prop is None or _text(raw, prop) != "then":
+        return "*"
+    call = member.parent
+    if call is None or call.type != "call_expression":
+        return "*"
+    args = call.child_by_field_name("arguments")
+    callbacks = [n for n in args.named_children if n.type != "comment"] if args else []
+    if len(callbacks) != 1 or callbacks[0].type != "arrow_function":
+        return "*"
+    callback = callbacks[0]
+    param = callback.child_by_field_name("parameter")
+    if param is None:
+        params = callback.child_by_field_name("parameters")
+        parts = [n for n in params.named_children if n.type != "comment"] if params else []
+        if len(parts) != 1:
+            return "*"
+        param = parts[0]
+        if param.type == "required_parameter":
+            param = param.child_by_field_name("pattern")
+    if param is None or param.type != "identifier":
+        return "*"
+    value = callback.child_by_field_name("body")
+    if value is None:
+        return "*"
+    if value.type == "statement_block":
+        stmts = [n for n in value.named_children if n.type != "comment"]
+        if len(stmts) != 1 or stmts[0].type != "return_statement":
+            return "*"
+        values = [n for n in stmts[0].named_children if n.type != "comment"]
+        if len(values) != 1:
+            return "*"
+        value = values[0]
+    value = _unwrap_cst_expr(value)
+    if value.type != "member_expression":
+        return "*"
+    obj, prop = value.child_by_field_name("object"), value.child_by_field_name("property")
+    if obj is None or prop is None or obj.type != "identifier":
+        return "*"
+    if _text(raw, obj) != _text(raw, param) or prop.type != "property_identifier":
+        return "*"
+    return _text(raw, prop)
+
+
+def dynamic_imports(source: str) -> list[tuple[str | None, str]] | None:
+    """Return (literal module or unknown, selected export or wildcard) for dynamic imports."""
+    parsed = _parse(source)
+    if parsed is None:
+        return None
+    raw, root = parsed
+    result: list[tuple[str | None, str]] = []
+
+    def walk(node: Any) -> None:
+        if node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is not None and (
+                function.type == "import" or
+                (function.type == "identifier" and _text(raw, function) == "require")
+            ):
+                args = node.child_by_field_name("arguments")
+                values = [n for n in args.named_children if n.type != "comment"] if args else []
+                spec = None
+                if values and values[0].type == "string":
+                    literal = _text(raw, values[0])
+                    # Escaped specifiers require JS decoding; leave them unresolved.
+                    if "\\" not in literal:
+                        spec = literal[1:-1]
+                result.append((spec, _selected_export(raw, node) if function.type == "import" else "*"))
+        for child in node.named_children:
+            walk(child)
+
+    walk(root)
+    return result

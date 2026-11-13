@@ -108,6 +108,7 @@ class DisplayExtractionResult:
     # Regexes for paths the frontend serves itself (e.g. Next.js `route.ts` handlers);
     # calls matching one are not backend calls.
     local_route_patterns: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 class TruthTierAdapter(Protocol):

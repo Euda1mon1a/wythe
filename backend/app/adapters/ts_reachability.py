@@ -16,6 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.adapters.ts_execution import dynamic_imports, module_execution
+
 GRAPH_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs")
 _SKIP_DIRS = frozenset(
     {"node_modules", ".next", "out", "ui_dist", "dist", "build", "coverage", "public", "storybook-static"}
@@ -66,6 +68,8 @@ class _ModuleInfo:
     side_effect_specs: list[str] = field(default_factory=list)
     # Names exported as types only (`export type {...}`, `export { type X }`): known, never runtime.
     type_exports: set[str] = field(default_factory=set)
+    eager_symbols: set[str] = field(default_factory=set)
+    execution_known: bool = False
 
 
 def _blank_spans(text: str, spans: list[tuple[int, int]]) -> str:
@@ -128,6 +132,8 @@ def parse_module(path: Path, text: str) -> _ModuleInfo:
                 info.reexports[exported] = (m.group("spec"), imported)
     for m in _REEXPORT_STAR_RE.finditer(text):
         statement_spans.append(m.span())
+        if m.group(0).lstrip().startswith("export type"):
+            continue
         if m.group("ns"):
             info.reexports[m.group("ns")] = (m.group("spec"), "*")
         else:
@@ -165,6 +171,16 @@ def parse_module(path: Path, text: str) -> _ModuleInfo:
             info.exports.setdefault(name, name)
         if is_default:
             info.exports["default"] = name
+    execution = module_execution(text)
+    if execution is not None:
+        info.execution_known = True
+        info.eager_symbols, statements, ranges = execution
+        info.module_body += "\n" + statements
+        exact_names = {name for name, _, _ in ranges}
+        info.decl_ranges = ranges + [r for r in info.decl_ranges if r[0] not in exact_names]
+        for name, first, last in ranges:
+            if name in info.bodies:
+                info.bodies[name] = "\n".join(lines[first - 1:last])
     return info
 
 
@@ -369,7 +385,9 @@ class ReachabilityIndex:
         self._display_root = display_root
         self.has_roots = bool(roots)
         self._live: dict[tuple[Path, str], tuple[Path, str] | None] = {}
+        self._parents: dict[tuple[Path, str], set[tuple[Path, str]]] = {}
         self._queue: deque[tuple[Path, str]] = deque()
+        self._dynamic_sites: set[tuple[Path, str, str, str]] = set()
         for root in sorted(roots):
             self._mark(root, MODULE_SYMBOL, None)
             info = modules.get(root)
@@ -380,6 +398,8 @@ class ReachabilityIndex:
 
     def _mark(self, path: Path, sym: str, parent: tuple[Path, str] | None) -> None:
         key = (path, sym)
+        if parent is not None:
+            self._parents.setdefault(key, set()).add(parent)
         if key not in self._live:
             self._live[key] = parent
             self._queue.append(key)
@@ -460,16 +480,75 @@ class ReachabilityIndex:
                 body = info.bodies.get(sym, "")
             else:
                 body = info.module_body
+                for name in info.eager_symbols if info.execution_known else info.bodies:
+                    self._mark(path, name, (path, sym))
+                # Even a selective barrel import evaluates all its runtime dependencies.
+                specs = {s for s, _ in info.bindings.values()}
+                specs.update(s for s, _ in info.reexports.values())
+                specs.update(info.star_specs)
+                for spec in sorted(specs):
+                    target = self._resolve(spec, path)
+                    if target is not None:
+                        self._mark(target, MODULE_SYMBOL, (path, sym))
                 for spec in info.side_effect_specs:
                     self._mark_import(path, spec, "*", (path, sym))
-            for dm in _DYNAMIC_IMPORT_RE.finditer(body):
-                self._mark_import(path, dm.group("spec"), "*", (path, sym))
+            imports = dynamic_imports(body)
+            if imports is None:
+                imports = [(m.group("spec"), "*") for m in _DYNAMIC_IMPORT_RE.finditer(body)]
+                if len(re.findall(r"\b(?:import|require)\s*\(", body)) > len(imports):
+                    imports.append((None, "*"))
+            for spec, selected in imports:
+                self._dynamic_sites.add((path, sym, spec or "<runtime specifier>", selected))
+                if spec is not None:
+                    self._mark_import(path, spec, selected, (path, sym))
             for tok in set(_IDENT_RE.findall(body)):
                 if tok != sym and tok in info.bodies:
                     self._mark(path, tok, (path, sym))
                 binding = info.bindings.get(tok)
                 if binding is not None:
                     self._mark_import(path, binding[0], binding[1], (path, sym))
+
+    def import_edges(self) -> list[tuple[Path, Path]]:
+        """Cross-file import paths, including dynamic imports and barrel initialization."""
+        edges: set[tuple[Path, Path]] = set()
+        for path, symbol in self._live:
+            if symbol == MODULE_SYMBOL and not self._modules[path].module_body.strip():
+                continue
+            seen: set[tuple[Path, str]] = set()
+            pending = list(self._parents.get((path, symbol), set()))
+            # Walk through barrel/module evaluation hops to the importing declaration.
+            while pending:
+                parent = pending.pop()
+                if parent in seen:
+                    continue
+                seen.add(parent)
+                if parent[0] != path and parent[1] != MODULE_SYMBOL:
+                    edges.add((parent[0], path))
+                else:
+                    pending.extend(self._parents.get(parent, set()))
+        return sorted(edges)
+
+    def node_summary(self, path: Path) -> str:
+        if not self.has_roots:
+            return "Entry-point reachability is unknown (no entry modules discovered)."
+        if any(p == path and s != MODULE_SYMBOL for p, s in self._live):
+            return "An entry path reaches declarations here (including eager initialization)."
+        if (path, MODULE_SYMBOL) in self._live:
+            return "Imported for module evaluation; no declaration use was discovered."
+        return "No discovered entry path; external callers and runtime registration remain unproven."
+
+    def analysis_notes(self) -> list[str]:
+        notes = [
+            ("Display reachability is static evidence, not removal approval. Import-time initializers "
+            "and barrel dependencies are retained; external entry points and runtime registration "
+            "require separate checks. Blast radius follows the extracted graph, including declared import edges.")
+        ]
+        for path, symbol, spec, selected in sorted(self._dynamic_sites):
+            mode = "all exports conservatively retained" if selected == "*" else f"selected export {selected}"
+            if spec == "<runtime specifier>":
+                mode = "target unresolved; absence of an edge is not evidence of no caller"
+            notes.append(f"Dynamic import {path.relative_to(self._display_root)}#{symbol}: {spec}; {mode}.")
+        return notes
 
     def enclosing_symbol(self, path: Path, line: int) -> str:
         info = self._modules.get(path)
@@ -479,8 +558,12 @@ class ReachabilityIndex:
                     return name
         return MODULE_SYMBOL
 
-    def is_live(self, path: Path, sym: str) -> bool:
-        return (path, sym) in self._live
+    def is_live(self, path: Path, sym: str) -> bool | None:
+        if (path, sym) in self._live:
+            return True
+        if any(spec == "<runtime specifier>" for _, _, spec, _ in self._dynamic_sites):
+            return None  # A runtime-selected module could be this one; do not assert dead code.
+        return False
 
     def trail(self, path: Path, sym: str, limit: int = 8) -> tuple[str, ...]:
         hops: list[str] = []

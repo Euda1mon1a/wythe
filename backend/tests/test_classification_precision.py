@@ -219,7 +219,7 @@ def test_unbacked_calls_split_into_reachable_dead_unresolved_and_local(
 
     disp007 = by_rule.get("DISP-007", [])
     assert [f.title for f in disp007] == [
-        "Frontend `POST /api/v1/things` has no matching backend route (unreachable code)"
+        "Frontend `POST /api/v1/things` has no matching backend route (no discovered entry path)"
     ]
     assert "`useThingCreate`" in disp007[0].detail
     assert disp007[0].blocks_gate is False

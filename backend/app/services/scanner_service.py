@@ -276,12 +276,14 @@ def _classify_unbacked_call(
                 node_id=call.caller_node_id,
                 source_file=call.source_file,
                 line=call.line,
-                title=f"Frontend `{method_path}` has no matching backend route (unreachable code)",
+                title=f"Frontend `{method_path}` has no matching backend route (no discovered entry path)",
                 detail=(
                     f"{call.source_file}:{call.line} calls `{call.raw_path}`, which matched zero backend routes. "
-                    f"No page, layout, or code they reach imports {where}, so users cannot trigger it today."
+                    f"No discovered page, layout, or code they reach uses {where}. "
+                    "External entry points, unresolved dynamic imports and runtime registration "
+                    "must be checked before treating this as safe to remove."
                 ),
-                remediation="Remove the dead call, or repoint it to a real route before a page starts using it.",
+                remediation="Use blast radius and entry-point evidence to decide whether to remove this inactive call or reconnect its useful behavior to a real route.",
                 http_method=call.http_method,
                 http_path=call.normalized_path,
             )
@@ -544,7 +546,7 @@ def run_target_scan(
             *disp_res.findings,
             *cross_findings,
         ]
-        scan_notes = list(truth_res.notes)
+        scan_notes = [*truth_res.notes, *disp_res.notes]
         commit_sha = git_fp[0] if git_fp is not None else _resolve_git_commit(repo_root)
         if cache_key is not None:
             _EXTRACTION_CACHE[cache_key] = _CachedStaticExtraction(
