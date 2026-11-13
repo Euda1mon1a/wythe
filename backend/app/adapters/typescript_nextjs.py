@@ -942,7 +942,7 @@ def _is_raw_clock_read(txt: str, m: re.Match[str]) -> bool:
         return not _INSTANT_ONLY_TAIL_RE.match(txt, m.end())
     return "," not in args_str and "Date." not in args_str
 
-_TS_POLICY_TOKENS = (
+_TS_POLICY_TOKENS = (  # @secret-ok static policy vocabulary
     "CAPACITY",
     "DUTY_HOUR",
     "WORK_HOUR",
@@ -1249,13 +1249,15 @@ class TypeScriptNextJsAdapter:
                 cluster=cluster,
                 summary=f"TypeScript {subkind.replace('_', ' ')} `{label}` ({rel_repo}).",
             )
+            if reach is not None:
+                nodes_by_path[fpath].summary += " " + reach.node_summary(fpath)
 
         edges: list[AtlasEdge] = []
         seen_edges: set[tuple[str, str, str]] = set()
         http_calls: list[FrontendHttpCall] = []
         findings: list[RawCandidateFinding] = []
 
-        def add_edge(src: str, dst: str, kind: str, path: str, note: str) -> None:
+        def add_edge(src: str, dst: str, kind: str, path: str, note: str, *, declared: bool = False) -> None:
             key = (src, dst, kind)
             if src == dst or key in seen_edges:
                 return
@@ -1266,7 +1268,7 @@ class TypeScriptNextJsAdapter:
                     source_id=src,
                     target_id=dst,
                     kind=kind,  # type: ignore[arg-type]
-                    verification="verified",
+                    verification="declared" if declared else "verified",
                     evidence_path=path,
                     evidence_note=note,
                 )
@@ -1408,10 +1410,24 @@ class TypeScriptNextJsAdapter:
                         node.status = "gray_zone"
                     findings.extend(a11y_hits)
 
+        if reach is not None:
+            for source, target in reach.import_edges():
+                src_node, dst_node = nodes_by_path.get(source), nodes_by_path.get(target)
+                if src_node is not None and dst_node is not None:
+                    kind = "uses_hook" if dst_node.subkind == "hook" else "uses_client"
+                    add_edge(
+                        src_node.id, dst_node.id, kind, src_node.source_file,
+                        "Static entry-path dependency, including module evaluation; not proof of runtime invocation.",
+                        declared=True,
+                    )
+
         return DisplayExtractionResult(
             nodes=list(nodes_by_path.values()),
             edges=edges,
             http_calls=http_calls,
             findings=findings,
             local_route_patterns=local_route_patterns,
+            notes=reach.analysis_notes() if reach is not None else [
+                "Display reachability could not be analyzed; unbacked calls remain blocking."
+            ],
         )

@@ -389,7 +389,7 @@ def test_id_valued_segment_only_fills_route_parameters(db_session: Session, tmp_
     # `${userId}` cannot be `activity-log` or `choices`: the GET detail route is simply missing.
     assert by_rule.get("DISP-004") == ["Frontend `GET /users/{param}` has no matching backend route"]
     assert by_rule.get("DISP-007") == [
-        "Frontend `GET /users/{param}` has no matching backend route (unreachable code)"
+        "Frontend `GET /users/{param}` has no matching backend route (no discovered entry path)"
     ]
     # A non-id runtime segment may still name a literal segment: unresolved, not missing.
     assert by_rule.get("DISP-006") == [

@@ -3,7 +3,7 @@
   "info": {
     "title": "Wythe API",
     "description": "Why -> Therefore: 3-tier architecture & lineage verifier. PostgreSQL holds truth, Backend manipulates truth, UI displays truth.",
-    "version": "0.1.3"
+    "version": "0.1.4"
   },
   "paths": {
     "/api/v1/adapters/slots": {
@@ -2317,6 +2317,42 @@
             "type": "string",
             "title": "Base Ref"
           },
+          "base_commit": {
+            "type": "string",
+            "title": "Base Commit",
+            "default": ""
+          },
+          "base_graph_status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "not_needed",
+              "unavailable"
+            ],
+            "title": "Base Graph Status",
+            "default": "unavailable"
+          },
+          "base_impacted_node_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Base Impacted Node Ids"
+          },
+          "removed_nodes": {
+            "items": {
+              "$ref": "#/components/schemas/AtlasNode"
+            },
+            "type": "array",
+            "title": "Removed Nodes"
+          },
+          "analysis_notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Analysis Notes"
+          },
           "head_commit": {
             "type": "string",
             "title": "Head Commit"
@@ -2386,7 +2422,8 @@
             "type": "string",
             "enum": [
               "PASS",
-              "FAIL"
+              "FAIL",
+              "INCOMPLETE"
             ],
             "title": "Diff Verdict"
           }

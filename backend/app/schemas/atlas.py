@@ -356,6 +356,11 @@ class PolicyVocabularyUpdate(StrictSchema):
 class DiffBlastRadiusReport(StrictSchema):
     target_slug: str
     base_ref: str
+    base_commit: str = ""
+    base_graph_status: Literal["available", "not_needed", "unavailable"] = "unavailable"
+    base_impacted_node_ids: list[str] = Field(default_factory=list)
+    removed_nodes: list[AtlasNode] = Field(default_factory=list)
+    analysis_notes: list[str] = Field(default_factory=list)
     head_commit: str
     commits_in_range: list[str] = Field(default_factory=list)
     changed_files: list[str] = Field(default_factory=list)
@@ -366,7 +371,7 @@ class DiffBlastRadiusReport(StrictSchema):
     impacted_chains: list[EndToEndChain] = Field(default_factory=list)
     new_findings: list[BoundaryFinding] = Field(default_factory=list)
     blocking_new_findings: int = 0
-    diff_verdict: Literal["PASS", "FAIL"]
+    diff_verdict: Literal["PASS", "FAIL", "INCOMPLETE"]
 
 
 class SnapshotComparisonReport(StrictSchema):

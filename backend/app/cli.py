@@ -20,7 +20,7 @@ from app.models import TargetProject
 from app.schemas.atlas import TargetProjectCreate
 from app.services.diff_and_sarif_service import (
     build_sarif_log,
-    compute_diff_and_blast_radius,
+    run_target_diff,
 )
 from app.services.governance_service import get_target_by_slug, register_target
 from app.services.llm_context_service import (
@@ -425,9 +425,7 @@ def main(argv: list[str] | None = None) -> int:
                     probe_url=args.probe_url,
                     probe_allow_remote=args.probe_allow_remote,
                 )
-                diff_rep = compute_diff_and_blast_radius(
-                    Path(target.repo_path).resolve(), report, base_ref=args.base
-                )
+                diff_rep = run_target_diff(session, target, report, args.base)
                 print(
                     f"Wythe Diff :: {diff_rep.target_slug} (base={diff_rep.base_ref} -> {_commit_label(report)})"
                 )
@@ -444,12 +442,15 @@ def main(argv: list[str] | None = None) -> int:
                     f"  Diff Verdict   : {diff_rep.diff_verdict} "
                     f"(new findings={len(diff_rep.new_findings)}, blocking={diff_rep.blocking_new_findings})"
                 )
+                print(f"  Base Graph     : {diff_rep.base_graph_status} ({diff_rep.base_commit[:12]})")
+                for note in diff_rep.analysis_notes:
+                    print(f"  Note           : {note}")
                 if args.json_out:
                     _write_json_file(args.json_out, diff_rep.model_dump_json(indent=2))
                 if args.sarif_out:
-                    sarif = build_sarif_log(report, findings_override=diff_rep.new_findings)
+                    sarif = build_sarif_log(report, findings_override=diff_rep.new_findings, diff=diff_rep)
                     _write_json_file(args.sarif_out, json.dumps(sarif, indent=2))
-                return 0 if diff_rep.diff_verdict == "PASS" else 1
+                return {"PASS": 0, "FAIL": 1, "INCOMPLETE": 2}[diff_rep.diff_verdict]
 
             report = run_target_scan(
                 session,

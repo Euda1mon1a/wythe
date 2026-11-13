@@ -77,13 +77,17 @@ Rule severity, enablement, gate-blocking behavior, and effective-date windows li
 | `DISP-004` | `display` | Blocking | Frontend HTTP/IPC call targets a path absent from backend router graph, in code a page can reach |
 | `DISP-005` | `display` | Warning | Display markup violates core WCAG semantics (missing `alt`, unlabeled form input, nameless icon button, non-keyboard `<div onClick>`) |
 | `DISP-006` | `display` | Warning | Call path is built at runtime (`/${kind}/items`) and could match real routes: reported for review, not called broken |
-| `DISP-007` | `display` | Warning | Call to a missing route in code no page, layout, or code they reach imports (dead code) |
+| `DISP-007` | `display` | Warning | Call to a missing route with no discovered entry path; retained for removal or reconnection review |
 
 **How a frontend call with no matching route is classified.** A call served by the frontend's own Next.js `route.ts` / `pages/api` handler is not a backend call and is not reported. A path built at runtime that could match real routes is `DISP-006`. On the `typescript-nextjs` and `typescript-react` display adapters, Wythe follows imports per exported symbol from entry pages/layouts/roots (honoring `tsconfig` path aliases, barrels, re-exports, and dynamic imports); a call in a symbol nothing reaches is `DISP-007`. Everything else is `DISP-004`, and its detail names the page/entry trail that reaches it. When the analysis cannot tell, it treats the call as reachable, so a real defect is never demoted to a warning by a parsing gap. Other display profiles keep `DISP-004` for every unmatched call.
 
 **Separate databases and migration DDL.** SQLAlchemy models on a second declarative base (their own metadata, often another database or schema) are not checked for drift against the primary schema and are listed in the scan notes. Alembic `upgrade()` DDL is read from literals, module-level constants (including f-strings), and helper functions it calls, in `down_revision` order, so a table a later revision drops is no longer counted as created.
 
 ---
+
+**Reachability and removal decisions.** With the Tree-sitter extra, a lazy import such as `import('./widgets').then(m => m.Chart)` reaches the selected export while retaining barrel dependencies and import-time initializers. Unknown export selectors conservatively retain all exports; runtime-selected module paths are explicitly unresolved. Scan notes record these distinctions, and additional import dependencies appear as `declared` edges in the existing blast-radius graph. `DISP-007` keeps inactive broken calls visible. A small blast radius or a missing caller is evidence for review, not proof that deletion is safe: check external entry points, registration side effects and the relevant build/tests before removing code or reconnecting its useful behavior. Without a usable CST, import execution stays conservative.
+
+**Deletion and rename diffs.** `wythe diff` resolves the requested base to an exact commit and scans its committed files in a temporary directory, without checking out or executing target code. It traverses the base and current graphs separately, retaining removed nodes, their old callers and import-time dependencies. Renames include both paths. New violation counts still use current-side changed lines. `PASS` means the diff gate found no blocking findings on those lines; it does not certify safe deletion. Invalid bases exit with code 2. If the base cannot be reconstructed (including unresolved symlinks or submodules), JSON and SARIF explicitly report incomplete evidence and the CLI exits 2.
 
 ## CLI Commands
 
