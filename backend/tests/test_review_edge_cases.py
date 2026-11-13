@@ -1493,8 +1493,107 @@ def test_global_migration_rebind_callable_factories_redis_expireat_and_ts_for_sc
     }
 
 
+def test_migration_try_finally_return_popped_sql_partial_fstring_and_fallback_row_provenance(
+    tmp_path: Path,
+) -> None:
+    import ast
 
+    from app.adapters.postgres_sqlalchemy import _collect_migration_effects
 
+    finally_return_mig = (
+        "from alembic import op\n\n"
+        "def upgrade():\n"
+        "    try:\n"
+        "        sql = 'CREATE TABLE finally_widgets (id INT PRIMARY KEY);'\n"
+        "        return\n"
+        "    finally:\n"
+        "        op.execute(sql)\n"
+    )
+    finally_sep_mig = (
+        "from alembic import op\n\n"
+        "def upgrade(cond=False):\n"
+        "    after_sql = 'CREATE TABLE fallthrough_widgets (id INT PRIMARY KEY);'\n"
+        "    try:\n"
+        "        if cond:\n"
+        "            after_sql = 'CREATE TABLE leaked_widgets (id INT PRIMARY KEY);'\n"
+        "            return\n"
+        "    finally:\n"
+        "        fin_note = 'done'\n"
+        "    op.execute(after_sql)\n"
+    )
+    pop_exec_mig = (
+        "from alembic import op\n\n"
+        "def upgrade():\n"
+        "    statements = [\n"
+        "        'CREATE TABLE popped_list_widgets (id INT PRIMARY KEY);',\n"
+        "        'CREATE TABLE discarded_list_widgets (id INT PRIMARY KEY);',\n"
+        "    ]\n"
+        "    statements.pop()\n"
+        "    op.execute(statements.pop())\n"
+        "    d = {\n"
+        "        'run': 'CREATE TABLE popped_dict_widgets (id INT PRIMARY KEY);',\n"
+        "        'drop': 'CREATE TABLE discarded_dict_widgets (id INT PRIMARY KEY);',\n"
+        "    }\n"
+        "    d.pop('drop')\n"
+        "    picked = d.pop('run')\n"
+        "    op.execute(picked)\n"
+    )
+    pop_only_mig = (
+        "def upgrade():\n"
+        "    statements = ['CREATE TABLE never_executed (id INT);']\n"
+        "    statements.pop()\n"
+    )
+    partial_fstring_mig = (
+        "from alembic import op\n\n"
+        "NAME = 'partial_fstring_widgets'\n\n"
+        "def upgrade():\n"
+        "    op.execute(f'CREATE TABLE {NAME} (id INT DEFAULT {get_default()});')\n"
+        "    op.execute(f'CREATE TABLE {get_unknown()}_tainted (id INT);')\n"
+        "    op.execute(f'CREATE TABLE tainted_{get_unknown()} (id INT);')\n"
+        "    op.execute(f'CREATE TABLE {get_unknown()}.scoped_tainted (id INT);')\n"
+    )
 
+    fin_eff = _collect_migration_effects(ast.parse(finally_return_mig))
+    assert fin_eff.touches_ddl is True
+    pop_eff = _collect_migration_effects(ast.parse(pop_exec_mig))
+    assert pop_eff.touches_ddl is True
+    pop_only_eff = _collect_migration_effects(ast.parse(pop_only_mig))
+    assert pop_only_eff.touches_ddl is False
+    assert pop_only_eff.table_events == []
+    part_eff = _collect_migration_effects(ast.parse(partial_fstring_mig))
+    assert part_eff.touches_ddl is True
 
+    _write(tmp_path, "backend/alembic/versions/016_finally_return.py", finally_return_mig)
+    _write(tmp_path, "backend/alembic/versions/017_finally_sep.py", finally_sep_mig)
+    _write(tmp_path, "backend/alembic/versions/018_pop_exec.py", pop_exec_mig)
+    _write(tmp_path, "backend/alembic/versions/019_pop_only.py", pop_only_mig)
+    _write(tmp_path, "backend/alembic/versions/020_partial_fstring.py", partial_fstring_mig)
+
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id for n in truth.nodes}
+    assert "t:finally_widgets" in by_id
+    assert "t:fallthrough_widgets" in by_id
+    assert "t:leaked_widgets" not in by_id
+    assert "t:popped_list_widgets" in by_id
+    assert "t:discarded_list_widgets" not in by_id
+    assert "t:popped_dict_widgets" in by_id
+    assert "t:discarded_dict_widgets" not in by_id
+    assert "t:never_executed" not in by_id
+    assert "t:partial_fstring_widgets" in by_id
+    assert not any("tainted" in nid for nid in by_id)
+
+    fallback_pm = parse_python_module(
+        "def update_with_fallback(db, ident, fallback_id, use_existing):\n"
+        "    row = db.get(User, ident)\n"
+        "    row = row or db.get(Account, fallback_id)\n"
+        "    row.name = 'updated'\n"
+        "    item = db.get(Team, ident) if use_existing else Project(title='new')\n"
+        "    item.title = 'changed'\n"
+        "    db.add(item)\n"
+        "    db.commit()\n",
+        "backend/app/services/fallback_rows.py",
+        "app.services.fallback_rows",
+    )
+    assert fallback_pm is not None
+    assert {"User", "Account", "Team", "Project"} <= fallback_pm.persisted
 

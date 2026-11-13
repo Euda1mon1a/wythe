@@ -1473,23 +1473,57 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
             else:
                 inspect_expr(expr.elt, crows, cmade)
             return
+        if isinstance(expr, ast.IfExp):
+            inspect_expr(expr.test, rows, made)
+            b_rows = {k: set(v) for k, v in rows.items()}
+            b_made = {k: set(v) for k, v in made.items()}
+            o_rows = {k: set(v) for k, v in rows.items()}
+            o_made = {k: set(v) for k, v in made.items()}
+            inspect_expr(expr.body, b_rows, b_made)
+            inspect_expr(expr.orelse, o_rows, o_made)
+            merged_r = _merge_binding_maps(b_rows, o_rows)
+            merged_m = _merge_binding_maps(b_made, o_made)
+            rows.clear()
+            rows.update(merged_r)
+            made.clear()
+            made.update(merged_m)
+            return
+        if isinstance(expr, ast.BoolOp) and expr.values:
+            inspect_expr(expr.values[0], rows, made)
+            arm_rows = [{k: set(v) for k, v in rows.items()}]
+            arm_made = [{k: set(v) for k, v in made.items()}]
+            cur_r = {k: set(v) for k, v in rows.items()}
+            cur_m = {k: set(v) for k, v in made.items()}
+            for arm in expr.values[1:]:
+                inspect_expr(arm, cur_r, cur_m)
+                arm_rows.append({k: set(v) for k, v in cur_r.items()})
+                arm_made.append({k: set(v) for k, v in cur_m.items()})
+            merged_r = _merge_binding_maps(*arm_rows)
+            merged_m = _merge_binding_maps(*arm_made)
+            rows.clear()
+            rows.update(merged_r)
+            made.clear()
+            made.update(merged_m)
+            return
         if isinstance(expr, ast.Call):
             name = _call_name(expr)
             if isinstance(expr.func, ast.Attribute) and name in _SESSION_WRITES and _is_session_receiver(expr.func.value):
                 for arg in expr.args:
                     elts = arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
                     for elt in elts:
-                        if isinstance(elt, ast.Name) and elt.id in rows:
-                            for m in rows[elt.id]:
-                                session_writes.append((m, expr.lineno))
-                        elif isinstance(elt, ast.Name) and elt.id in made and name != "delete":
-                            for m in made[elt.id]:
-                                session_writes.append((m, expr.lineno))
+                        r_prov, m_prov = _eval_expr_provenance(elt, rows, made)
+                        recorded: set[str] = set()
+                        for m in r_prov:
+                            session_writes.append((m, expr.lineno))
+                            recorded.add(m)
+                        if name != "delete":
+                            for m in m_prov:
+                                if m not in recorded:
+                                    session_writes.append((m, expr.lineno))
             elif name in ("setattr", "delattr") and isinstance(expr.func, ast.Name) and expr.args:
-                first = expr.args[0]
-                if isinstance(first, ast.Name) and first.id in rows:
-                    for m in rows[first.id]:
-                        mutations.append((m, expr.lineno))
+                r_first, _ = _eval_expr_provenance(expr.args[0], rows, made)
+                for m in r_first:
+                    mutations.append((m, expr.lineno))
             inspect_expr(expr.func, rows, made)
             for arg_e in expr.args:
                 inspect_expr(arg_e, rows, made)
@@ -1499,27 +1533,51 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
         if isinstance(expr, ast.NamedExpr):
             inspect_expr(expr.value, rows, made)
             if isinstance(expr.target, ast.Name):
-                bind_expr_to_name(expr.target.id, expr.value, rows, made, rows, made)
+                snap_r = {k: set(v) for k, v in rows.items()}
+                snap_m = {k: set(v) for k, v in made.items()}
+                bind_expr_to_name(expr.target.id, expr.value, rows, made, snap_r, snap_m)
             return
         for ch in ast.iter_child_nodes(expr):
             if isinstance(ch, ast.expr):
                 inspect_expr(ch, rows, made)
 
-    def bind_var(
-        var: str, rhs: ast.AST | None, rows: dict[str, set[str]], made: dict[str, set[str]]
-    ) -> None:
+    def _eval_expr_provenance(
+        rhs: ast.AST | None,
+        snap_rows: dict[str, set[str]],
+        snap_made: dict[str, set[str]],
+    ) -> tuple[set[str], set[str]]:
+        if rhs is None or id(rhs) in excluded:
+            return set(), set()
+        if isinstance(rhs, ast.Await):
+            return _eval_expr_provenance(rhs.value, snap_rows, snap_made)
+        if isinstance(rhs, ast.NamedExpr):
+            return _eval_expr_provenance(rhs.value, snap_rows, snap_made)
+        if isinstance(rhs, ast.Name):
+            return set(snap_rows.get(rhs.id, ())), set(snap_made.get(rhs.id, ()))
+        if isinstance(rhs, ast.IfExp):
+            b_r, b_m = _eval_expr_provenance(rhs.body, snap_rows, snap_made)
+            o_r, o_m = _eval_expr_provenance(rhs.orelse, snap_rows, snap_made)
+            return b_r | o_r, b_m | o_m
+        if isinstance(rhs, ast.BoolOp) and rhs.values:
+            if isinstance(rhs.op, ast.Or):
+                out_r: set[str] = set()
+                out_m: set[str] = set()
+                for val in rhs.values:
+                    v_r, v_m = _eval_expr_provenance(val, snap_rows, snap_made)
+                    out_r.update(v_r)
+                    out_m.update(v_m)
+                return out_r, out_m
+            if isinstance(rhs.op, ast.And):
+                return _eval_expr_provenance(rhs.values[-1], snap_rows, snap_made)
+        if isinstance(rhs, ast.Call) and _call_name(rhs) == "cast" and len(rhs.args) == 2:
+            return _eval_expr_provenance(rhs.args[1], snap_rows, snap_made)
         model = _loaded_row_model(rhs)
         if model:
-            rows[var] = {model}
-            made.pop(var, None)
-            return
+            return {model}, set()
         maker = _constructed_model(rhs)
         if maker:
-            made[var] = {maker}
-            rows.pop(var, None)
-            return
-        rows.pop(var, None)
-        made.pop(var, None)
+            return set(), {maker}
+        return set(), set()
 
     def bind_expr_to_name(
         var: str,
@@ -1529,17 +1587,15 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
         snap_rows: dict[str, set[str]],
         snap_made: dict[str, set[str]],
     ) -> None:
-        if isinstance(rhs, ast.Name) and (rhs.id in snap_rows or rhs.id in snap_made):
-            if rhs.id in snap_rows:
-                rows[var] = set(snap_rows[rhs.id])
-            else:
-                rows.pop(var, None)
-            if rhs.id in snap_made:
-                made[var] = set(snap_made[rhs.id])
-            else:
-                made.pop(var, None)
-            return
-        bind_var(var, rhs, rows, made)
+        r_models, m_models = _eval_expr_provenance(rhs, snap_rows, snap_made)
+        if r_models:
+            rows[var] = r_models
+        else:
+            rows.pop(var, None)
+        if m_models:
+            made[var] = m_models
+        else:
+            made.pop(var, None)
 
     def bind_target_tree(
         tgt: ast.AST,
@@ -1562,13 +1618,9 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
 
     def record_target_mutations(tgt: ast.AST, lineno: int, rows: dict[str, set[str]]) -> None:
         for t in ast.walk(tgt):
-            if (
-                isinstance(t, ast.Attribute)
-                and isinstance(t.ctx, ast.Store)
-                and isinstance(t.value, ast.Name)
-                and t.value.id in rows
-            ):
-                for m in rows[t.value.id]:
+            if isinstance(t, ast.Attribute) and isinstance(t.ctx, ast.Store):
+                r_val, _ = _eval_expr_provenance(t.value, rows, {})
+                for m in r_val:
                     mutations.append((m, lineno))
 
     def walk_block(
