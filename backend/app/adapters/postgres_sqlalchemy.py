@@ -15,6 +15,7 @@ from app.adapters.db_catalog_probe import (
     parse_sql_ddl_objects,
     probe_live_catalog_tables,
 )
+from app.adapters.python_layout import discover_python_app
 from app.schemas.atlas import AtlasNode
 
 _IDENT = r'(?<![\w"\x00])(?:"[A-Za-z_]\w*"|[A-Za-z_]\w*)(?![\w"\x00])'
@@ -3722,14 +3723,15 @@ def _model_source_files(app_dir: Path, models_dir: Path) -> list[Path]:
     packages, and so on).
     """
     files = (
-        [p for p in sorted(models_dir.rglob("*.py")) if "__pycache__" not in p.parts]
+        [p for p in sorted(models_dir.rglob("*.py")) if "__pycache__" not in p.parts and not p.is_symlink()]
         if models_dir.is_dir()
         else []
     )
     seen = set(files)
     if app_dir.is_dir():
         for py_file in sorted(app_dir.rglob("*.py")):
-            if py_file in seen or _MODEL_SCAN_SKIP_PARTS.intersection(py_file.relative_to(app_dir).parts):
+            if (py_file in seen or py_file.is_symlink()
+                    or _MODEL_SCAN_SKIP_PARTS.intersection(py_file.relative_to(app_dir).parts)):
                 continue
             try:
                 text = py_file.read_text(encoding="utf-8")
@@ -3779,7 +3781,8 @@ class PostgresSqlAlchemyAdapter:
         pg_dsn: str | None = None,
     ) -> TruthExtractionResult:
         backend_dir = repo_root / backend_subdir
-        models_dir = backend_dir / "app" / "models"
+        app_dir, layout_notes = discover_python_app(backend_dir)
+        models_dir = app_dir / "models" if app_dir else backend_dir / "app" / "models"
         schema_sql_path = backend_dir / "schema.sql"
         alembic_dir = backend_dir / "alembic" / "versions"
 
@@ -3787,7 +3790,13 @@ class PostgresSqlAlchemyAdapter:
         table_symbol_map: dict[str, str] = {}
         function_symbol_map: dict[str, str] = {}
         findings: list[RawCandidateFinding] = []
-        notes: list[str] = []
+        notes: list[str] = list(layout_notes)
+        if app_dir and app_dir.name != "app":
+            notes.append(
+                f"SQLAlchemy models use the {app_dir.name}/ package. Migration discovery still "
+                "uses backend/schema.sql and backend/alembic/versions; package-internal "
+                "migrations are not inspected."
+            )
 
         # 1. Models, grouped by the declarative base they inherit from.
         orm_tables: dict[str, tuple[str, int, list[str], str, list[str]]] = {}
@@ -3797,8 +3806,9 @@ class PostgresSqlAlchemyAdapter:
         model_modules: set[str] = set()
         model_fk_refs: list[tuple[str, str, str, str]] = []  # (src table, kind, target, evidence path)
         roots: set[str] = set()
-        app_dir = backend_dir / "app"
-        for py_file in _model_source_files(app_dir, models_dir):
+        for py_file in _model_source_files(app_dir, models_dir) if app_dir else []:
+            if py_file.is_symlink():
+                continue
             rel_path = py_file.relative_to(repo_root).as_posix()
             scan = _scan_model_module(py_file, rel_path)
             class_bases.update(scan.class_bases)

@@ -12,11 +12,12 @@ from app.adapters.base import (
     TruthExtractionResult,
 )
 from app.adapters.python_ast_inspect import ParsedPythonModule, parse_python_module
+from app.adapters.python_layout import discover_python_app
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _CLOCK_ALLOW_MODULES = ("clock.py", "program_time.py", "sql_clock.py")
-_INFRA_SKIP_PARTS = ("models", "schemas", "__pycache__", "tests")
-# Not mechanisms of their own, but their imports still count as callers of the modules they use.
+_INFRA_SKIP_PARTS = ("__pycache__", "tests", "test")
+# Declaration-only files are callers, not mechanisms; mixed repository modules are retained.
 _CALLER_ONLY_PARTS = ("models", "schemas")
 _CALLER_ONLY_FILES = ("core/config.py", "db/base.py", "db/session.py")
 
@@ -133,32 +134,13 @@ def _ast_table_id(
 def _classify_manipulator(rel_inside_app: str) -> tuple[str, str]:
     parts = Path(rel_inside_app).parts
     head = parts[0] if parts else ""
-    if head == "api" or "routes" in parts:
+    if head == "api" or "routes" in parts or "routers" in parts:
         return "route", "api"
     if head in ("scheduling", "solvers", "constraints", "resilience"):
         return "solver", head
     if head in ("cli", "tasks") or rel_inside_app.endswith(("cli.py", "seed.py")):
         return "cli", head or "ops"
     return "service", head or "services"
-
-
-def _parse_caller_only_parts(app_dir: Path, repo_root: Path) -> list[ParsedPythonModule]:
-    """Parse `models/` and `schemas/` modules (never `tests/`): not mechanisms, but callers."""
-    out: list[ParsedPythonModule] = []
-    for py_file in sorted(app_dir.rglob("*.py")):
-        dirs = set(py_file.relative_to(app_dir).parts)  # same test as the main loop's skip
-        if not dirs & set(_CALLER_ONLY_PARTS) or dirs & (set(_INFRA_SKIP_PARTS) - set(_CALLER_ONLY_PARTS)):
-            continue
-        parts = py_file.relative_to(app_dir).with_suffix("").parts
-        mod_name = ".".join(("app", *(parts[:-1] if parts[-1] == "__init__" else parts)))
-        try:
-            text = py_file.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            continue
-        parsed = parse_python_module(text, py_file.relative_to(repo_root).as_posix(), mod_name)
-        if parsed is not None:
-            out.append(parsed)
-    return out
 
 
 class _ImportResolver:
@@ -296,12 +278,10 @@ class PythonFastApiAdapter:
         backend_subdir: str,
         truth: TruthExtractionResult,
     ) -> ManipulatorExtractionResult:
-        app_dir = repo_root / backend_subdir / "app"
-        if not app_dir.is_dir():
-            return ManipulatorExtractionResult(nodes=[], edges=[], routes=[], findings=[], notes=[
-                ("Python/FastAPI adapter found no app/ directory under the backend root; "
-                 "backend coverage is absent. For script-based services, use python-services.")
-            ])
+        app_dir, notes = discover_python_app(repo_root / backend_subdir)
+        if app_dir is None:
+            return ManipulatorExtractionResult(nodes=[], edges=[], routes=[], findings=[], notes=notes)
+        package_name = app_dir.name
 
         packages: dict[str, ParsedPythonModule] = {}
         caller_only: list[ParsedPythonModule] = []
@@ -310,13 +290,13 @@ class PythonFastApiAdapter:
 
         for py_file in sorted(app_dir.rglob("*.py")):
             rel_app = py_file.relative_to(app_dir).as_posix()
-            if any(part in _INFRA_SKIP_PARTS for part in Path(rel_app).parts):
+            if py_file.is_symlink() or any(part in _INFRA_SKIP_PARTS for part in Path(rel_app).parts):
                 continue
             rel_repo = py_file.relative_to(repo_root).as_posix()
             mod_parts = list(Path(rel_app).with_suffix("").parts)
             if mod_parts and mod_parts[-1] == "__init__":
                 mod_parts = mod_parts[:-1]
-            mod_name = ".".join(["app", *mod_parts]) if mod_parts else "app"
+            mod_name = ".".join([package_name, *mod_parts]) if mod_parts else package_name
             try:
                 text = py_file.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
@@ -325,6 +305,14 @@ class PythonFastApiAdapter:
             if parsed is None:
                 continue
             all_parsed.append((Path(rel_app).stem, parsed))
+            if any(p in _CALLER_ONLY_PARTS for p in Path(rel_app).parts) and not (
+                parsed.has_session_reads or parsed.has_session_writes or parsed.sql_reads or parsed.sql_writes
+                or parsed.route_handlers
+            ):
+                caller_only.append(parsed)
+                if Path(rel_app).name == "__init__.py":
+                    packages[mod_name] = parsed
+                continue
             if Path(rel_app).name == "__init__.py" and not parsed.route_handlers:
                 packages[mod_name] = parsed
                 continue
@@ -332,7 +320,6 @@ class PythonFastApiAdapter:
                 caller_only.append(parsed)
                 continue
             parsed_modules[rel_app] = parsed
-        caller_only.extend(_parse_caller_only_parts(app_dir, repo_root))
 
         router_mounts = _resolve_router_mounts(all_parsed)
 
@@ -390,8 +377,8 @@ class PythonFastApiAdapter:
                 for bname in bases:
                     if "." in bname:
                         hit = import_resolver.resolve_class(bname, raw_class_attrs)
-                        if hit is None and not bname.startswith("app."):
-                            hit = import_resolver.resolve_class(f"app.{bname}", raw_class_attrs)
+                        if hit is None and not bname.startswith(f"{package_name}."):
+                            hit = import_resolver.resolve_class(f"{package_name}.{bname}", raw_class_attrs)
                         bkeys = [hit] if hit is not None else []
                     else:
                         star_hits = {
@@ -400,8 +387,8 @@ class PythonFastApiAdapter:
                             for sh in (
                                 import_resolver.resolve_class(f"{smod}.{bname}", raw_class_attrs)
                                 or (
-                                    import_resolver.resolve_class(f"app.{smod}.{bname}", raw_class_attrs)
-                                    if not smod.startswith("app.")
+                                    import_resolver.resolve_class(f"{package_name}.{smod}.{bname}", raw_class_attrs)
+                                    if not smod.startswith(f"{package_name}.")
                                     else None
                                 ),
                             )
@@ -648,9 +635,11 @@ class PythonFastApiAdapter:
                         node_id=node.id,
                         source_file=node.source_file,
                         line=node.line,
-                        title=f"Manipulator `{node.label}` has no inbound callers",
-                        detail=f"`{node.source_file}` is not invoked by any route, CLI, task, or peer service.",
-                        remediation="Wire the mechanism into an active execution door or quarantine dormant code.",
+                        title=f"Manipulator `{node.label}` has no discovered inbound callers",
+                        detail=(f"No static route, CLI, task, or peer service reference to `{node.source_file}` "
+                                "was resolved. Dynamic registration and external entry points may be unobserved; "
+                                "this is not proof that the module is unused or safe to delete."),
+                        remediation="Check dynamic and external callers before wiring, refactoring, or removing the module.",
                     )
                 )
 

@@ -4,6 +4,8 @@
  * backend server, and supports multimodal image input when Chrome's multimodal Prompt API is active.
  */
 
+import { version } from '../../package.json';
+
 export type ChromeEngineState = 'ready' | 'downloadable' | 'downloading' | 'unavailable';
 
 export interface ChromeEngineProbe {
@@ -357,7 +359,7 @@ export function registerWytheWebMcpBridge(handlers: WythePageBridgeHandlers): ()
   if (typeof window === 'undefined') return () => {};
   const win = window as unknown as Record<string, unknown>;
   win.wythe = {
-    version: '0.1.4',
+    version,
     mcpHttpEndpoint: `${window.location.origin}/api/v1/mcp`,
     openapiEndpoint: `${window.location.origin}/openapi.json`,
     whatIsThis: () => handlers.getWhatIsThis(),

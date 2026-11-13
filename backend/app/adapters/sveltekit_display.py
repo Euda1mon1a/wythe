@@ -66,7 +66,7 @@ class SvelteKitDisplayAdapter:
                 subkind, cluster = "page", "pages"
             elif "stores" in parts or fpath.stem.startswith("use"):
                 lbl, subkind, cluster = fpath.stem, "hook", "stores"
-            elif "api" in parts or "clients" in parts or fpath.stem in ("api", "client", "http"):
+            elif "api" in parts or "apis" in parts or "clients" in parts or fpath.stem in ("api", "client", "http"):
                 lbl, subkind, cluster = fpath.stem, "api_client", "api_clients"
             elif fpath.suffix == ".svelte" or "components" in parts:
                 lbl, subkind, cluster = fpath.stem, "component", "components"
@@ -165,4 +165,12 @@ class SvelteKitDisplayAdapter:
             edges=edges,
             http_calls=http_calls,
             findings=findings,
+            notes=[
+                (
+                    "SvelteKit HTTP extraction covers literal paths and local URL constants; "
+                    "imported URL prefixes and custom request wrappers are not resolved. "
+                    "Import edges describe module dependencies, not per-function reachability. "
+                    "Layout and server modules are outside this display adapter's coverage."
+                )
+            ] if nodes_by_path else [],
         )
