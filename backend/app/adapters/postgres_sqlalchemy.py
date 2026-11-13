@@ -627,6 +627,7 @@ class _MigrationEffects:
 class _MigrationEnv:
     scope_id: int = 0
     fns: dict[str, list[_MigrationHelper]] = field(default_factory=dict)
+    fn_tuples: dict[str, list[list[_MigrationHelper]]] = field(default_factory=dict)
     consts: dict[str, str] = field(default_factory=dict)
     lines: dict[str, int] = field(default_factory=dict)
     alts: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
@@ -641,6 +642,7 @@ class _MigrationEnv:
     local_defs: set[str] = field(default_factory=set)
     globals_set: set[str] = field(default_factory=set)
     dirty_globals: set[str] = field(default_factory=set)
+    ancestors: dict[int, _MigrationEnv] = field(default_factory=dict)
 
     def alloc_cid(self) -> int:
         cid = self._next_cid[0]
@@ -711,6 +713,7 @@ class _MigrationEnv:
         return _MigrationEnv(
             scope_id=self.scope_id if scope_id is None else scope_id,
             fns={k: list(v) for k, v in self.fns.items() if v},
+            fn_tuples={k: [list(col) for col in v] for k, v in self.fn_tuples.items() if v},
             consts=dict(self.consts),
             lines=dict(self.lines),
             alts={k: list(v) for k, v in self.alts.items() if v},
@@ -725,10 +728,12 @@ class _MigrationEnv:
             local_defs=set(self.local_defs),
             globals_set=set(self.globals_set),
             dirty_globals=set(self.dirty_globals),
+            ancestors=dict(self.ancestors),
         )
 
     def pop_name(self, name: str) -> None:
         self.fns.pop(name, None)
+        self.fn_tuples.pop(name, None)
         self.consts.pop(name, None)
         self.lines.pop(name, None)
         self.alts.pop(name, None)
@@ -774,28 +779,53 @@ def _stmts_always_exit(stmts: list[ast.stmt]) -> bool:
 def _merge_migration_envs(target: _MigrationEnv, branches: list[_MigrationEnv]) -> None:
     if not branches:
         return
+    unique_branches: list[_MigrationEnv] = []
+    seen_env_ids: set[int] = set()
+    for br in branches:
+        if id(br) not in seen_env_ids:
+            seen_env_ids.add(id(br))
+            unique_branches.append(br)
+    branches = unique_branches
     if len(branches) == 1:
         only = branches[0]
-        for entries in only.fns.values():
-            for h in entries:
-                if h.captured is only:
-                    h.captured = target
+        if only is target:
+            return
+        new_fns = {
+            k: [replace(h, captured=target) if h.captured is only else h for h in v]
+            for k, v in only.fns.items()
+            if v
+        }
+        new_fn_tuples = {
+            k: [[replace(h, captured=target) if h.captured is only else h for h in col] for col in v]
+            for k, v in only.fn_tuples.items()
+            if v
+        }
+        new_consts = dict(only.consts)
+        new_lines = dict(only.lines)
+        new_alts = {k: list(v) for k, v in only.alts.items() if v}
+        new_seq_heap = {cid: list(v) for cid, v in only.seq_heap.items()}
+        new_dict_heap = {cid: dict(v) for cid, v in only.dict_heap.items()}
+        new_seq_ids = dict(only.seq_ids)
+        new_dict_ids = dict(only.dict_ids)
+        new_dirty_globals = set(only.dirty_globals)
         target.fns.clear()
-        target.fns.update({k: list(v) for k, v in only.fns.items() if v})
+        target.fns.update(new_fns)
+        target.fn_tuples.clear()
+        target.fn_tuples.update(new_fn_tuples)
         target.consts.clear()
-        target.consts.update(only.consts)
+        target.consts.update(new_consts)
         target.lines.clear()
-        target.lines.update(only.lines)
+        target.lines.update(new_lines)
         target.alts.clear()
-        target.alts.update({k: list(v) for k, v in only.alts.items() if v})
+        target.alts.update(new_alts)
         target.seq_heap.clear()
-        target.seq_heap.update({cid: list(v) for cid, v in only.seq_heap.items()})
+        target.seq_heap.update(new_seq_heap)
         target.dict_heap.clear()
-        target.dict_heap.update({cid: dict(v) for cid, v in only.dict_heap.items()})
+        target.dict_heap.update(new_dict_heap)
         target.seq_ids.clear()
-        target.seq_ids.update(only.seq_ids)
+        target.seq_ids.update(new_seq_ids)
         target.dict_ids.clear()
-        target.dict_ids.update(only.dict_ids)
+        target.dict_ids.update(new_dict_ids)
         target.seqs.clear()
         target.seqs.update(
             {k: target.seq_heap[cid] for k, cid in target.seq_ids.items() if cid in target.seq_heap}
@@ -804,7 +834,7 @@ def _merge_migration_envs(target: _MigrationEnv, branches: list[_MigrationEnv]) 
         target.dicts.update(
             {k: target.dict_heap[cid] for k, cid in target.dict_ids.items() if cid in target.dict_heap}
         )
-        target.dirty_globals.update(only.dirty_globals)
+        target.dirty_globals.update(new_dirty_globals)
         return
 
     branch_set = tuple(branches)
@@ -812,13 +842,32 @@ def _merge_migration_envs(target: _MigrationEnv, branches: list[_MigrationEnv]) 
     for br in branches:
         for k, entries in br.fns.items():
             bucket = merged_fns.setdefault(k, [])
-            seen_ids = {id(h.fn) for h in bucket}
+            seen_ids = {(id(h.fn), id(h.captured)) for h in bucket}
             for h in entries:
-                if any(h.captured is b for b in branch_set):
-                    h.captured = target
-                if id(h.fn) not in seen_ids:
-                    seen_ids.add(id(h.fn))
-                    bucket.append(h)
+                h_out = replace(h, captured=target) if any(h.captured is b for b in branch_set) else h
+                key_h = (id(h_out.fn), id(h_out.captured))
+                if key_h not in seen_ids:
+                    seen_ids.add(key_h)
+                    bucket.append(h_out)
+
+    merged_fn_tuples: dict[str, list[list[_MigrationHelper]]] = {}
+    for k in {k for br in branches for k in br.fn_tuples}:
+        tup_holders = [br.fn_tuples[k] for br in branches if k in br.fn_tuples]
+        if tup_holders and len({len(t) for t in tup_holders}) == 1:
+            tlen = len(tup_holders[0])
+            cols_out: list[list[_MigrationHelper]] = []
+            for idx_col in range(tlen):
+                col_bucket: list[_MigrationHelper] = []
+                seen_col: set[tuple[int, int]] = set()
+                for t_hold in tup_holders:
+                    for h in t_hold[idx_col]:
+                        h_out = replace(h, captured=target) if any(h.captured is b for b in branch_set) else h
+                        key_c = (id(h_out.fn), id(h_out.captured))
+                        if key_c not in seen_col:
+                            seen_col.add(key_c)
+                            col_bucket.append(h_out)
+                cols_out.append(col_bucket)
+            merged_fn_tuples[k] = cols_out
 
     all_str_keys: set[str] = set()
     for br in branches:
@@ -922,6 +971,8 @@ def _merge_migration_envs(target: _MigrationEnv, branches: list[_MigrationEnv]) 
 
     target.fns.clear()
     target.fns.update(merged_fns)
+    target.fn_tuples.clear()
+    target.fn_tuples.update(merged_fn_tuples)
     target.consts.clear()
     target.consts.update(merged_consts)
     target.lines.clear()
@@ -1116,6 +1167,10 @@ def _eval_seq_items(node: ast.AST | None, env: _MigrationEnv) -> list[tuple[str,
         r_seq = _eval_seq_items(node.right, env)
         if l_seq is not None and r_seq is not None:
             return [*l_seq, *r_seq]
+        if l_seq is not None and not isinstance(node.right, (ast.Constant, ast.JoinedStr, ast.Dict)):
+            return [*l_seq, (_UNRESOLVED, 0)]
+        if r_seq is not None and not isinstance(node.left, (ast.Constant, ast.JoinedStr, ast.Dict)):
+            return [(_UNRESOLVED, 0), *r_seq]
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
@@ -1306,6 +1361,8 @@ def _copy_env_binding(dst: _MigrationEnv, src: _MigrationEnv, name: str) -> None
     dst.pop_name(name)
     if name in src.fns:
         dst.fns[name] = list(src.fns[name])
+    if name in src.fn_tuples:
+        dst.fn_tuples[name] = [list(col) for col in src.fn_tuples[name]]
     if name in src.consts:
         dst.consts[name] = src.consts[name]
     if name in src.lines:
@@ -1408,6 +1465,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
     absorbed_consts: set[tuple[str, str]] = set()
     return_collectors: list[tuple[int, list[_MigrationHelper], list[list[list[_MigrationHelper]]]]] = []
     abrupt_stack: list[list[tuple[str, _MigrationEnv]]] = []
+    dead_envs: set[int] = set()
     active_consumed_pops: set[int] = set()
     sql_exec_calls = frozenset({"execute", "exec_driver_sql", "run_sql", "scalar", "scalars"})
     non_exec_calls = frozenset(
@@ -1546,20 +1604,50 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 out.append(h)
         return out
 
-    def _snapshot_helper_closure(
-        h: _MigrationHelper, cur_env: _MigrationEnv, fn_scope_id: int | None
-    ) -> _MigrationHelper:
-        if fn_scope_id is None or h.scope_id != fn_scope_id:
-            return h
-        cap_snap = cur_env.clone(scope_id=h.scope_id)
+    def _get_scope_snap(
+        cur_env: _MigrationEnv,
+        fn_scope_id: int,
+        snap_cache: dict[int, _MigrationEnv],
+    ) -> _MigrationEnv:
+        existing = snap_cache.get(fn_scope_id)
+        if existing is not None:
+            return existing
+        cap_snap = cur_env.clone(scope_id=fn_scope_id)
+        snap_cache[fn_scope_id] = cap_snap
         for k_fn, entries in list(cap_snap.fns.items()):
             cap_snap.fns[k_fn] = [
-                replace(sh, captured=cap_snap) if sh.scope_id == fn_scope_id else sh
-                for sh in entries
+                _snapshot_helper_closure(sh, cur_env, fn_scope_id, snap_cache) for sh in entries
             ]
-        return replace(h, captured=cap_snap)
+        for k_tup, cols in list(cap_snap.fn_tuples.items()):
+            cap_snap.fn_tuples[k_tup] = [
+                [_snapshot_helper_closure(sh, cur_env, fn_scope_id, snap_cache) for sh in col]
+                for col in cols
+            ]
+        return cap_snap
 
-    def _lambda_to_helper(lam: ast.Lambda, cur_env: _MigrationEnv, fn_scope_id: int | None = None) -> _MigrationHelper:
+    def _snapshot_helper_closure(
+        h: _MigrationHelper,
+        cur_env: _MigrationEnv,
+        fn_scope_id: int | None,
+        snap_cache: dict[int, _MigrationEnv] | None = None,
+    ) -> _MigrationHelper:
+        if fn_scope_id is None:
+            return h
+        cache = snap_cache if snap_cache is not None else {}
+        if h.scope_id == fn_scope_id:
+            return replace(h, captured=_get_scope_snap(cur_env, fn_scope_id, cache))
+        if fn_scope_id in h.captured.ancestors and h.captured.ancestors[fn_scope_id] is not cache.get(fn_scope_id):
+            new_anc = dict(h.captured.ancestors)
+            new_anc[fn_scope_id] = _get_scope_snap(cur_env, fn_scope_id, cache)
+            h.captured.ancestors = new_anc
+        return h
+
+    def _lambda_to_helper(
+        lam: ast.Lambda,
+        cur_env: _MigrationEnv,
+        fn_scope_id: int | None = None,
+        snap_cache: dict[int, _MigrationEnv] | None = None,
+    ) -> _MigrationHelper:
         syn_fn = ast.FunctionDef(
             name="<lambda>",
             args=lam.args,
@@ -1583,34 +1671,28 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             default_dict_ids=d_dict_ids,
             default_fns=d_fns,
         )
-        return _snapshot_helper_closure(h, cur_env, fn_scope_id)
+        return _snapshot_helper_closure(h, cur_env, fn_scope_id, snap_cache)
 
     def _eval_callable_expr(
-        expr: ast.AST | None, cur_env: _MigrationEnv, fn_scope_id: int | None = None
+        expr: ast.AST | None,
+        cur_env: _MigrationEnv,
+        fn_scope_id: int | None = None,
+        snap_cache: dict[int, _MigrationEnv] | None = None,
     ) -> list[_MigrationHelper]:
         if expr is None:
             return []
         if isinstance(expr, ast.Name) and expr.id in cur_env.fns:
-            return [_snapshot_helper_closure(h, cur_env, fn_scope_id) for h in cur_env.fns[expr.id]]
+            cache = snap_cache if snap_cache is not None else ({} if fn_scope_id is not None else None)
+            return [_snapshot_helper_closure(h, cur_env, fn_scope_id, cache) for h in cur_env.fns[expr.id]]
         if isinstance(expr, ast.Lambda):
-            return [_lambda_to_helper(expr, cur_env, fn_scope_id)]
+            return [_lambda_to_helper(expr, cur_env, fn_scope_id, snap_cache)]
         if isinstance(expr, ast.IfExp):
+            cache = snap_cache if snap_cache is not None else ({} if fn_scope_id is not None else None)
             return _dedup_helpers(
-                _eval_callable_expr(expr.body, cur_env, fn_scope_id)
-                + _eval_callable_expr(expr.orelse, cur_env, fn_scope_id)
+                _eval_callable_expr(expr.body, cur_env, fn_scope_id, cache)
+                + _eval_callable_expr(expr.orelse, cur_env, fn_scope_id, cache)
             )
         return []
-
-    def has_shallow_break(stmts: list[ast.stmt]) -> bool:
-        stack: list[ast.AST] = list(stmts)
-        while stack:
-            n = stack.pop()
-            if isinstance(n, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
-            if isinstance(n, ast.Break):
-                return True
-            stack.extend(ast.iter_child_nodes(n))
-        return False
 
     def run_in_branch_env(
         stmts: list[ast.stmt],
@@ -1625,7 +1707,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         try:
             for s_item in stmts:
                 walk_node(s_item, ctx_b, br_env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-                if _stmts_always_exit([s_item]):
+                if _stmts_always_exit([s_item]) or id(br_env) in dead_envs:
                     break
         finally:
             if prev is not None:
@@ -1734,6 +1816,11 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                         (elt_f or None, None, None, [], None, expr, None, None, False, True)
                         for elt_f in c_tup
                     ]
+        elif isinstance(expr, ast.Name) and expr.id in cur_env.fn_tuples:
+            call_tuple_snaps = [
+                (list(elt_f) or None, None, None, [], None, expr, None, None, False, True)
+                for elt_f in cur_env.fn_tuples[expr.id]
+            ]
         sub_snaps = (
             call_tuple_snaps
             if call_tuple_snaps is not None
@@ -1834,6 +1921,20 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 if not _eval_str_variants(dv, cur_env, allow_partial=True):
                     walk_node(dv, ctx_r, cur_env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
             return
+        if seq is not None and isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+            if _eval_seq_items(expr.left, cur_env) is None:
+                walk_node(expr.left, ctx_r, cur_env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+            if _eval_seq_items(expr.right, cur_env) is None:
+                walk_node(expr.right, ctx_r, cur_env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+            return
+        if seq is not None and isinstance(expr, (ast.Tuple, ast.List)):
+            for elt_u in expr.elts:
+                if isinstance(elt_u, ast.Starred):
+                    if not (isinstance(elt_u.value, ast.Name) and elt_u.value.id in cur_env.seqs):
+                        walk_node(elt_u.value, ctx_r, cur_env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+                elif not _eval_str_variants(elt_u, cur_env, allow_partial=True):
+                    walk_node(elt_u, ctx_r, cur_env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+            return
         if (
             fns is None
             and (seq is None or (seq and all(not _has_known_text(s) for s, _ in seq)))
@@ -1847,6 +1948,8 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         if isinstance(tgt, ast.Name):
             if fns is not None:
                 cur_env.fns[tgt.id] = list(fns)
+            if sub_snaps is not None and any(s_elt[0] for s_elt in sub_snaps):
+                cur_env.fn_tuples[tgt.id] = [list(s_elt[0] or []) for s_elt in sub_snaps]
             if seq is not None:
                 cur_env.bind_seq(tgt.id, seq, cid=seq_cid, mutable=is_mut_seq)
             if dmap is not None:
@@ -1907,27 +2010,47 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             ]
             return
         if isinstance(sub, ast.Return):
+            ret_snap_cache: dict[int, _MigrationEnv] = {}
+            collector = (
+                return_collectors[-1]
+                if return_collectors and return_collectors[-1][0] == env.scope_id
+                else None
+            )
+            target_scope = collector[0] if collector is not None else None
             if sub.value is not None:
-                collector = (
-                    return_collectors[-1]
-                    if return_collectors and return_collectors[-1][0] == env.scope_id
-                    else None
-                )
                 if isinstance(sub.value, ast.Call):
                     handled_r, r_fns, r_tup = eval_call_fns(
                         sub.value, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
                     )
                     if handled_r:
                         if collector is not None:
-                            collector[1].extend(r_fns)
+                            collector[1].extend(
+                                _snapshot_helper_closure(fh, env, target_scope, ret_snap_cache) for fh in r_fns
+                            )
                             if r_tup is not None:
-                                collector[2].append(r_tup)
+                                collector[2].append(
+                                    [
+                                        [
+                                            _snapshot_helper_closure(fh, env, target_scope, ret_snap_cache)
+                                            for fh in col
+                                        ]
+                                        for col in r_tup
+                                    ]
+                                )
                     else:
                         walk_node(sub.value, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+                elif isinstance(sub.value, ast.Name) and sub.value.id in env.fn_tuples:
+                    if collector is not None:
+                        collector[2].append(
+                            [
+                                [_snapshot_helper_closure(fh, env, target_scope, ret_snap_cache) for fh in col]
+                                for col in env.fn_tuples[sub.value.id]
+                            ]
+                        )
                 elif isinstance(sub.value, (ast.Tuple, ast.List)) and not any(
                     isinstance(e, ast.Starred) for e in sub.value.elts
                 ):
-                    tup_fns: list[list[_MigrationHelper]] = []
+                    raw_tup_fns: list[list[_MigrationHelper]] = []
                     any_fn = False
                     for elt in sub.value.elts:
                         if isinstance(elt, ast.Call):
@@ -1935,21 +2058,24 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                                 elt, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
                             )
                             if eh:
-                                tup_fns.append(efns)
+                                raw_tup_fns.append(efns)
                                 any_fn = any_fn or bool(efns)
                                 continue
-                        efns = _eval_callable_expr(elt, env, collector[0] if collector is not None else None)
-                        tup_fns.append(efns)
+                        efns = _eval_callable_expr(elt, env, None)
+                        raw_tup_fns.append(efns)
                         if efns:
                             any_fn = True
                         else:
                             walk_node(elt, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
                     if any_fn and collector is not None:
-                        collector[2].append(tup_fns)
+                        collector[2].append(
+                            [
+                                [_snapshot_helper_closure(fh, env, target_scope, ret_snap_cache) for fh in col]
+                                for col in raw_tup_fns
+                            ]
+                        )
                 else:
-                    direct_fns = _eval_callable_expr(
-                        sub.value, env, collector[0] if collector is not None else None
-                    )
+                    direct_fns = _eval_callable_expr(sub.value, env, target_scope, ret_snap_cache)
                     if direct_fns:
                         if isinstance(sub.value, ast.IfExp):
                             walk_node(sub.value.test, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
@@ -1957,7 +2083,13 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                             collector[1].extend(direct_fns)
                     else:
                         walk_node(sub.value, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-            record_abrupt_exit("return", env)
+            if abrupt_stack:
+                exit_env = (
+                    ret_snap_cache[target_scope]
+                    if target_scope is not None and target_scope in ret_snap_cache
+                    else env.clone()
+                )
+                abrupt_stack[-1].append(("return", exit_env))
             return
         if isinstance(sub, ast.Raise):
             if sub.exc is not None:
@@ -2003,7 +2135,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                             env.pop_name(bound.id)
             for s_w in sub.body:
                 walk_node(s_w, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-                if _stmts_always_exit([s_w]):
+                if _stmts_always_exit([s_w]) or id(env) in dead_envs:
                     break
             return
         if isinstance(sub, ast.If):
@@ -2013,11 +2145,14 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             run_in_branch_env(sub.body, b_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
             run_in_branch_env(sub.orelse, e_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
             live_branches: list[_MigrationEnv] = []
-            if not _stmts_always_exit(sub.body):
+            if not _stmts_always_exit(sub.body) and id(b_env) not in dead_envs:
                 live_branches.append(b_env)
-            if not _stmts_always_exit(sub.orelse):
+            if not _stmts_always_exit(sub.orelse) and id(e_env) not in dead_envs:
                 live_branches.append(e_env)
-            _merge_migration_envs(env, live_branches)
+            if live_branches:
+                _merge_migration_envs(env, live_branches)
+            else:
+                dead_envs.add(id(env))
             return
         if isinstance(sub, (ast.Try, ast.TryStar)):
             b_env = env.clone()
@@ -2027,16 +2162,17 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 run_in_branch_env(sub.body, b_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
             finally:
                 abrupt_stack.pop()
+            body_dead = _stmts_always_exit(sub.body) or id(b_env) in dead_envs
             o_env = b_env.clone()
             orelse_exits: list[tuple[str, _MigrationEnv]] = []
-            if not _stmts_always_exit(sub.body):
+            if not body_dead:
                 abrupt_stack.append(orelse_exits)
                 try:
                     run_in_branch_env(sub.orelse, o_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
                 finally:
                     abrupt_stack.pop()
             live_try: list[_MigrationEnv] = []
-            if not _stmts_always_exit(sub.body) and not _stmts_always_exit(sub.orelse):
+            if not body_dead and not _stmts_always_exit(sub.orelse) and id(o_env) not in dead_envs:
                 live_try.append(o_env)
             handler_exits: list[tuple[str, _MigrationEnv]] = []
             if sub.handlers:
@@ -2051,7 +2187,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                         if h.name:
                             h_env.pop_name(h.name)
                         run_in_branch_env(h.body, h_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-                        if not _stmts_always_exit(h.body):
+                        if not _stmts_always_exit(h.body) and id(h_env) not in dead_envs:
                             live_try.append(h_env)
                 finally:
                     abrupt_stack.pop()
@@ -2066,6 +2202,8 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             if not sub.finalbody:
                 if live_try:
                     _merge_migration_envs(env, live_try)
+                else:
+                    dead_envs.add(id(env))
                 if abrupt_stack:
                     abrupt_stack[-1].extend(escaping_exits)
                 return
@@ -2078,25 +2216,23 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 run_in_branch_env(sub.finalbody, fin_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
             finally:
                 abrupt_stack.pop()
-            if _stmts_always_exit(sub.finalbody):
+            if _stmts_always_exit(sub.finalbody) or id(fin_env) in dead_envs:
                 _merge_migration_envs(env, [fin_env])
+                dead_envs.add(id(env))
                 if abrupt_stack:
                     abrupt_stack[-1].extend(fin_exits)
                 return
             if abrupt_stack:
                 abrupt_stack[-1].extend(fin_exits)
-                exit_kinds = list(dict.fromkeys(k for k, _ in escaping_exits))
-                for kind in exit_kinds:
-                    if not live_try and len(exit_kinds) == 1:
-                        abrupt_stack[-1].append((kind, fin_env.clone()))
-                    else:
-                        k_env = env.clone()
-                        _merge_migration_envs(k_env, [e for k, e in escaping_exits if k == kind])
-                        replay_silent_stmts(
-                            sub.finalbody, k_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
-                        )
-                        abrupt_stack[-1].append((kind, k_env))
-            if not live_try or not escaping_exits:
+                for kind, orig_exit_env in escaping_exits:
+                    replay_silent_stmts(
+                        sub.finalbody, orig_exit_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
+                    )
+                    abrupt_stack[-1].append((kind, orig_exit_env))
+            if not live_try:
+                _merge_migration_envs(env, [fin_env])
+                dead_envs.add(id(env))
+            elif not escaping_exits:
                 _merge_migration_envs(env, [fin_env])
             else:
                 fall_env = env.clone()
@@ -2127,31 +2263,119 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 if case.guard is not None:
                     walk_node(case.guard, ctx, c_env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
                 run_in_branch_env(case.body, c_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-                if not _stmts_always_exit(case.body):
+                if not _stmts_always_exit(case.body) and id(c_env) not in dead_envs:
                     live_cases.append(c_env)
             if not has_wildcard:
                 live_cases.append(env.clone())
-            _merge_migration_envs(env, live_cases)
+            if live_cases:
+                _merge_migration_envs(env, live_cases)
+            else:
+                dead_envs.add(id(env))
             return
         if isinstance(sub, ast.While):
+            while_order = (*ctx, (getattr(sub, "lineno", 0), getattr(sub, "col_offset", 0)))
             walk_node(sub.test, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+            if isinstance(sub.test, ast.Name) and (sub.test.id in env.seqs or sub.test.id in env.dicts):
+                coll_name = sub.test.id
+                cur_w_env = env.clone()
+                w_all_exits: list[tuple[str, _MigrationEnv]] = []
+                w_completed = True
+                w_progressed = False
+                for step_idx in range(32):
+                    cur_len = (
+                        len(cur_w_env.seqs[coll_name])
+                        if coll_name in cur_w_env.seqs
+                        else len(cur_w_env.dicts.get(coll_name, {}))
+                    )
+                    if cur_len == 0:
+                        break
+                    step_env = cur_w_env.clone()
+                    step_exits: list[tuple[str, _MigrationEnv]] = []
+                    abrupt_stack.append(step_exits)
+                    try:
+                        run_in_branch_env(
+                            sub.body,
+                            step_env,
+                            (*while_order, (step_idx,)),
+                            in_sql_exec=in_sql_exec,
+                            in_non_exec=in_non_exec,
+                        )
+                    finally:
+                        abrupt_stack.pop()
+                    w_all_exits.extend(it for it in step_exits if it[0] != "continue")
+                    step_next = [
+                        *([] if _stmts_always_exit(sub.body) or id(step_env) in dead_envs else [step_env]),
+                        *(e for k, e in step_exits if k == "continue"),
+                    ]
+                    if not step_next:
+                        w_completed = False
+                        break
+                    merged_step = cur_w_env.clone()
+                    _merge_migration_envs(merged_step, step_next)
+                    cur_w_env = merged_step
+                    next_len = (
+                        len(cur_w_env.seqs[coll_name])
+                        if coll_name in cur_w_env.seqs
+                        else len(cur_w_env.dicts.get(coll_name, {}))
+                    )
+                    if next_len >= cur_len:
+                        break
+                    w_progressed = True
+                if abrupt_stack:
+                    abrupt_stack[-1].extend(it for it in w_all_exits if it[0] not in ("break", "continue"))
+                w_breaks = [e for k, e in w_all_exits if k == "break"]
+                init_len = len(env.seqs[coll_name]) if coll_name in env.seqs else len(env.dicts.get(coll_name, {}))
+                if init_len == 0:
+                    run_in_branch_env(
+                        sub.orelse, env, while_order, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
+                    )
+                    if _stmts_always_exit(sub.orelse):
+                        dead_envs.add(id(env))
+                    return
+                if not w_completed and not w_breaks:
+                    dead_envs.add(id(env))
+                    return
+                base_candidates = (
+                    ([cur_w_env] if w_completed else [])
+                    if w_progressed
+                    else ([env, cur_w_env] if w_completed else [])
+                )
+                if w_completed and sub.orelse:
+                    w_orelse_env = env.clone()
+                    if base_candidates:
+                        _merge_migration_envs(w_orelse_env, base_candidates)
+                    run_in_branch_env(
+                        sub.orelse, w_orelse_env, while_order, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
+                    )
+                    post_w_orelse = (
+                        []
+                        if _stmts_always_exit(sub.orelse) or id(w_orelse_env) in dead_envs
+                        else [w_orelse_env]
+                    )
+                    w_merge = [*post_w_orelse, *w_breaks]
+                else:
+                    w_merge = [*base_candidates, *w_breaks]
+                if w_merge:
+                    _merge_migration_envs(env, w_merge)
+                else:
+                    dead_envs.add(id(env))
+                return
             w_env = env.clone()
             w_exits: list[tuple[str, _MigrationEnv]] = []
             abrupt_stack.append(w_exits)
             try:
-                run_in_branch_env(sub.body, w_env, ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+                run_in_branch_env(sub.body, w_env, while_order, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
             finally:
                 abrupt_stack.pop()
             if abrupt_stack:
                 abrupt_stack[-1].extend(it for it in w_exits if it[0] not in ("break", "continue"))
+            w_continues = [e for k, e in w_exits if k == "continue"]
             w_breaks = [e for k, e in w_exits if k == "break"]
-            _merge_migration_envs(
-                env,
-                [env, *([] if _stmts_always_exit(sub.body) else [w_env]), *w_breaks],
-            )
+            w_fall = [] if _stmts_always_exit(sub.body) or id(w_env) in dead_envs else [w_env]
+            _merge_migration_envs(env, [env, *w_fall, *w_continues, *w_breaks])
             for s_we in sub.orelse:
-                walk_node(s_we, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-                if _stmts_always_exit([s_we]):
+                walk_node(s_we, while_order, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+                if _stmts_always_exit([s_we]) or id(env) in dead_envs:
                     break
             return
         if isinstance(sub, (ast.For, ast.AsyncFor)):
@@ -2237,40 +2461,67 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 it_envs: list[_MigrationEnv] = []
                 cur_it_env = env.clone()
                 f_exits: list[tuple[str, _MigrationEnv]] = []
-                abrupt_stack.append(f_exits)
-                try:
-                    for idx_i, binds in enumerate(iter_bindings):
-                        it_env = cur_it_env.clone()
-                        for bound in ast.walk(sub.target):
-                            if isinstance(bound, ast.Name) and isinstance(bound.ctx, ast.Store):
-                                it_env.pop_name(bound.id)
-                        for b_name, b_sql, b_ln in binds:
-                            it_env.consts[b_name] = b_sql
-                            it_env.lines[b_name] = b_ln
-                        it_ctx = (*for_order, (idx_i,))
+                completed_all = True
+                for idx_i, binds in enumerate(iter_bindings):
+                    it_env = cur_it_env.clone()
+                    for bound in ast.walk(sub.target):
+                        if isinstance(bound, ast.Name) and isinstance(bound.ctx, ast.Store):
+                            it_env.pop_name(bound.id)
+                    for b_name, b_sql, b_ln in binds:
+                        it_env.consts[b_name] = b_sql
+                        it_env.lines[b_name] = b_ln
+                    it_ctx = (*for_order, (idx_i,))
+                    iter_exits: list[tuple[str, _MigrationEnv]] = []
+                    abrupt_stack.append(iter_exits)
+                    try:
                         run_in_branch_env(
                             sub.body, it_env, it_ctx, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
                         )
-                        if not _stmts_always_exit(sub.body):
-                            it_envs.append(it_env)
-                            cur_it_env = it_env
-                        else:
-                            break
-                finally:
-                    abrupt_stack.pop()
+                    finally:
+                        abrupt_stack.pop()
+                    f_exits.extend(it for it in iter_exits if it[0] != "continue")
+                    next_iter_envs = [
+                        *([] if _stmts_always_exit(sub.body) or id(it_env) in dead_envs else [it_env]),
+                        *(e for k, e in iter_exits if k == "continue"),
+                    ]
+                    if next_iter_envs:
+                        step_env = cur_it_env.clone()
+                        _merge_migration_envs(step_env, next_iter_envs)
+                        it_envs.append(step_env)
+                        cur_it_env = step_env
+                    else:
+                        completed_all = False
+                        break
                 if abrupt_stack:
                     abrupt_stack[-1].extend(it for it in f_exits if it[0] not in ("break", "continue"))
                 f_breaks = [e for k, e in f_exits if k == "break"]
-                merge_list = [
-                    *(it_envs if has_shallow_break(sub.body) else ([it_envs[-1]] if it_envs else [])),
-                    *f_breaks,
-                ]
+                if iter_bindings and not completed_all and not f_breaks:
+                    dead_envs.add(id(env))
+                    return
+                normal_end_envs = (
+                    ([it_envs[-1]] if it_envs else [env.clone()])
+                    if completed_all
+                    else []
+                )
+                if completed_all and sub.orelse:
+                    orelse_env = env.clone()
+                    if normal_end_envs:
+                        _merge_migration_envs(orelse_env, normal_end_envs)
+                    run_in_branch_env(
+                        sub.orelse, orelse_env, for_order, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
+                    )
+                    post_orelse = (
+                        []
+                        if _stmts_always_exit(sub.orelse) or id(orelse_env) in dead_envs
+                        else [orelse_env]
+                    )
+                    merge_list = [*post_orelse, *f_breaks]
+                else:
+                    merge_list = [*normal_end_envs, *f_breaks]
                 if merge_list:
                     _merge_migration_envs(env, merge_list)
-                for s_e in sub.orelse:
-                    walk_node(s_e, for_order, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-                    if _stmts_always_exit([s_e]):
-                        break
+                elif sub.orelse:
+                    dead_envs.add(id(env))
                 return
             walk_node(sub.iter, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
             dyn_env = env.clone()
@@ -2285,14 +2536,13 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 abrupt_stack.pop()
             if abrupt_stack:
                 abrupt_stack[-1].extend(it for it in d_exits if it[0] not in ("break", "continue"))
+            d_continues = [e for k, e in d_exits if k == "continue"]
             d_breaks = [e for k, e in d_exits if k == "break"]
-            _merge_migration_envs(
-                env,
-                [env, *([] if _stmts_always_exit(sub.body) else [dyn_env]), *d_breaks],
-            )
+            d_fall = [] if _stmts_always_exit(sub.body) or id(dyn_env) in dead_envs else [dyn_env]
+            _merge_migration_envs(env, [env, *d_fall, *d_continues, *d_breaks])
             for s_e in sub.orelse:
                 walk_node(s_e, for_order, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
-                if _stmts_always_exit([s_e]):
+                if _stmts_always_exit([s_e]) or id(env) in dead_envs:
                     break
             return
         if isinstance(sub, ast.Assign):
@@ -2328,12 +2578,27 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 if tname in env.seqs:
                     rhs_seq = _eval_seq_items(sub.value, env)
                     if rhs_seq is not None:
+                        if isinstance(sub.value, (ast.Tuple, ast.List)):
+                            for elt_a in sub.value.elts:
+                                if isinstance(elt_a, ast.Starred):
+                                    if not (isinstance(elt_a.value, ast.Name) and elt_a.value.id in env.seqs):
+                                        walk_node(
+                                            elt_a.value, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
+                                        )
+                                elif not _eval_str_variants(elt_a, env, allow_partial=True):
+                                    walk_node(elt_a, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
                         if env.seq_ids.get(tname) in env.mutable_seq_cids:
                             env.seqs[tname].extend(rhs_seq)
                         else:
                             env.bind_seq(tname, [*env.seqs[tname], *rhs_seq], mutable=False)
-                        _sync_seq_const(env, tname)
-                        return
+                    else:
+                        walk_node(sub.value, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+                        if env.seq_ids.get(tname) in env.mutable_seq_cids:
+                            env.seqs[tname].append((_UNRESOLVED, 0))
+                        else:
+                            env.bind_seq(tname, [*env.seqs[tname], (_UNRESOLVED, 0)], mutable=False)
+                    _sync_seq_const(env, tname)
+                    return
                 aug_vars, aug_pops = eval_str_expr(
                     ast.BinOp(left=ast.Name(id=tname, ctx=ast.Load()), op=ast.Add(), right=sub.value),
                     env,
@@ -2379,6 +2644,13 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 if _bind_subscript(sub.target, aug_vars, env) and (aug_vars or aug_pops):
                     return
             elif isinstance(sub.target, ast.Name):
+                if isinstance(sub.op, ast.BitOr) and sub.target.id in env.dicts:
+                    rhs_d = _eval_dict_items(sub.value, env)
+                    if rhs_d is not None:
+                        env.dicts[sub.target.id].update(rhs_d)
+                    else:
+                        walk_node(sub.value, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
+                    return
                 env.pop_name(sub.target.id)
             walk_node(sub.value, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec)
             return
@@ -3017,10 +3289,15 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         active_fns.add(id(fn))
         nonlocals, globals_ = _shallow_scope_decls(fn)
         fn_locals = _local_assigned_names(fn, nonlocals, globals_)
-        enclosing = active_scope_envs.get(helper.scope_id, helper.captured)
+        enclosing = (
+            active_scope_envs.get(helper.scope_id)
+            or (caller_env.ancestors.get(helper.scope_id) if caller_env is not None else None)
+            or helper.captured
+        )
         fn_scope_id = next_scope_seq
         next_scope_seq += 1
         frame = enclosing.clone(scope_id=fn_scope_id)
+        frame.ancestors = {**enclosing.ancestors, helper.scope_id: enclosing}
         frame.local_defs = fn_locals
         frame.globals_set = set(globals_)
         frame.dirty_globals = set()
@@ -3109,17 +3386,50 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         try:
             for stmt in body_stmts:
                 walk_node(stmt, ctx, frame)
-                if _stmts_always_exit([stmt]):
+                if _stmts_always_exit([stmt]) or id(frame) in dead_envs:
                     break
             out_frames = [
-                *([] if _stmts_always_exit(body_stmts) else [frame]),
+                *([] if _stmts_always_exit(body_stmts) or id(frame) in dead_envs else [frame]),
                 *(e_env for kind, e_env in fn_exits if kind == "return"),
             ]
             out_frame = frame.clone()
             if out_frames:
                 _merge_migration_envs(out_frame, out_frames)
+            shared_cap = out_frames[0] if len(out_frames) == 1 else out_frame
+            for k_fn, entries in list(out_frame.fns.items()):
+                out_frame.fns[k_fn] = [
+                    replace(sh, captured=shared_cap)
+                    if sh.scope_id == fn_scope_id and (sh.captured is frame or sh.captured is out_frame)
+                    else sh
+                    for sh in entries
+                ]
+            for k_tup, cols in list(out_frame.fn_tuples.items()):
+                out_frame.fn_tuples[k_tup] = [
+                    [
+                        replace(sh, captured=shared_cap)
+                        if sh.scope_id == fn_scope_id and (sh.captured is frame or sh.captured is out_frame)
+                        else sh
+                        for sh in col
+                    ]
+                    for col in cols
+                ]
+            for scid, s_items in out_frame.seq_heap.items():
+                if scid in enclosing.seq_heap:
+                    enclosing.seq_heap[scid] = list(s_items)
+                    enclosing.sync_seq_cid(scid)
+            for dcid, d_items in out_frame.dict_heap.items():
+                if dcid in enclosing.dict_heap:
+                    enclosing.dict_heap[dcid] = dict(d_items)
+                    enclosing.sync_dict_cid(dcid)
             for nl_name in nonlocals:
                 _copy_env_binding(enclosing, out_frame, nl_name)
+                if (
+                    caller_env is not None
+                    and caller_env.ancestors.get(helper.scope_id) is enclosing
+                    and nl_name not in caller_env.local_defs
+                    and nl_name not in caller_env.globals_set
+                ):
+                    _copy_env_binding(caller_env, out_frame, nl_name)
             for gl_name in globals_:
                 _copy_env_binding(module_env, out_frame, gl_name)
                 out_frame.dirty_globals.add(gl_name)
@@ -3190,7 +3500,11 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                             module_env.seqs[mt_name].extend(m_rhs)
                         else:
                             module_env.bind_seq(mt_name, [*module_env.seqs[mt_name], *m_rhs], mutable=False)
-                        _sync_seq_const(module_env, mt_name)
+                    elif module_env.seq_ids.get(mt_name) in module_env.mutable_seq_cids:
+                        module_env.seqs[mt_name].append((_UNRESOLVED, 0))
+                    else:
+                        module_env.bind_seq(mt_name, [*module_env.seqs[mt_name], (_UNRESOLVED, 0)], mutable=False)
+                    _sync_seq_const(module_env, mt_name)
                 else:
                     m_aug, _ = eval_str_expr(
                         ast.BinOp(left=ast.Name(id=mt_name, ctx=ast.Load()), op=ast.Add(), right=stmt.value),
@@ -3264,7 +3578,9 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 m_ext = _eval_seq_items(m_call.args[0], module_env)
                 if m_ext is not None:
                     module_env.seqs[m_recv].extend(m_ext)
-                    _sync_seq_const(module_env, m_recv)
+                else:
+                    module_env.seqs[m_recv].append((_UNRESOLVED, 0))
+                _sync_seq_const(module_env, m_recv)
             elif m_attr == "setdefault" and m_recv in module_env.dicts and len(m_call.args) == 2 and not m_call.keywords:
                 m_keys = _eval_str_variants(m_call.args[0], module_env)
                 m_vals, _ = eval_str_expr(m_call.args[1], module_env, allow_partial=True, mutate_pops=True)

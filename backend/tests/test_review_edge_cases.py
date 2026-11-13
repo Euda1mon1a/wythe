@@ -1597,3 +1597,84 @@ def test_migration_try_finally_return_popped_sql_partial_fstring_and_fallback_ro
     assert fallback_pm is not None
     assert {"User", "Account", "Team", "Project"} <= fallback_pm.persisted
 
+
+def test_migration_self_merge_continue_loop_unresolved_iadd_and_shared_closures(
+    tmp_path: Path,
+) -> None:
+    import ast
+
+    from app.adapters.postgres_sqlalchemy import _collect_migration_effects
+
+    self_merge_mig = (
+        "from alembic import op\n\n"
+        "SQL = 'CREATE TABLE self_merge_widgets (id INT PRIMARY KEY);'\n\n"
+        "def upgrade():\n"
+        "    while should_skip():\n"
+        "        return\n"
+        "    op.execute(SQL)\n"
+    )
+    continue_loop_mig = (
+        "from alembic import op\n\n"
+        "def upgrade():\n"
+        "    statements = [\n"
+        "        'CREATE TABLE continue_alpha_widgets (id INT PRIMARY KEY);',\n"
+        "        'CREATE TABLE continue_beta_widgets (id INT PRIMARY KEY);',\n"
+        "    ]\n"
+        "    for sql in statements:\n"
+        "        op.execute(sql)\n"
+        "        continue\n"
+        "    queued = [\n"
+        "        'CREATE TABLE while_continue_first (id INT PRIMARY KEY);',\n"
+        "        'CREATE TABLE while_continue_second (id INT PRIMARY KEY);',\n"
+        "    ]\n"
+        "    while queued:\n"
+        "        op.execute(queued.pop(0))\n"
+        "        continue\n"
+    )
+    unresolved_iadd_mig = (
+        "from alembic import op\n\n"
+        "CREATE_KNOWN = 'CREATE TABLE extend_aug_widgets (id INT PRIMARY KEY);'\n\n"
+        "def upgrade(extra_names=()):\n"
+        "    statements = [CREATE_KNOWN]\n"
+        "    statements += [build_sql(name) for name in extra_names]\n"
+        "    for stmt in statements:\n"
+        "        op.execute(stmt)\n"
+    )
+    shared_closure_mig = (
+        "from alembic import op\n\n"
+        "def factory():\n"
+        "    sql = 'CREATE TABLE stale_closure_widgets (id INT PRIMARY KEY);'\n\n"
+        "    def prepare():\n"
+        "        nonlocal sql\n"
+        "        sql = 'CREATE TABLE shared_closure_widgets (id INT PRIMARY KEY);'\n\n"
+        "    def run():\n"
+        "        op.execute(sql)\n\n"
+        "    return prepare, run\n\n"
+        "def upgrade():\n"
+        "    prepare, run = factory()\n"
+        "    prepare()\n"
+        "    run()\n"
+    )
+
+    sm_eff = _collect_migration_effects(ast.parse(self_merge_mig))
+    assert sm_eff.touches_ddl is True
+    iadd_eff = _collect_migration_effects(ast.parse(unresolved_iadd_mig))
+    assert iadd_eff.touches_ddl is True
+
+    _write(tmp_path, "backend/alembic/versions/021_self_merge.py", self_merge_mig)
+    _write(tmp_path, "backend/alembic/versions/022_continue_loop.py", continue_loop_mig)
+    _write(tmp_path, "backend/alembic/versions/023_unresolved_iadd.py", unresolved_iadd_mig)
+    _write(tmp_path, "backend/alembic/versions/024_shared_closure.py", shared_closure_mig)
+
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id for n in truth.nodes}
+    assert "t:self_merge_widgets" in by_id
+    assert "t:continue_alpha_widgets" in by_id
+    assert "t:continue_beta_widgets" in by_id
+    assert "t:while_continue_first" in by_id
+    assert "t:while_continue_second" in by_id
+    assert "t:extend_aug_widgets" in by_id
+    assert "t:shared_closure_widgets" in by_id
+    assert "t:stale_closure_widgets" not in by_id
+
+
