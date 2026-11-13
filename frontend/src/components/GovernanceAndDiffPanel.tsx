@@ -57,6 +57,7 @@ export function GovernanceAndDiffPanel({
 
   const {
     data: diffReport,
+    error: diffError,
     isFetching: loadingDiff,
     refetch: refetchDiff,
   } = useScanDiff(activeSlug, committedBaseRef);
@@ -172,7 +173,7 @@ export function GovernanceAndDiffPanel({
           {diffReport && (
             <span
               className={`ml-auto border px-2 py-0.5 font-semibold ${
-                diffReport.diff_verdict === 'FAIL'
+                diffReport.diff_verdict !== 'PASS'
                   ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
                   : 'border-teal-500/40 bg-teal-500/10 text-teal-300'
               }`}
@@ -181,6 +182,14 @@ export function GovernanceAndDiffPanel({
             </span>
           )}
         </div>
+
+        {diffError && <p role="alert" className="text-xs text-rose-300">{diffError.message}</p>}
+        {diffReport && (
+          <div className="space-y-1 text-xs text-slate-400">
+            <p>Base graph: {diffReport.base_graph_status}; removed nodes: {diffReport.removed_nodes?.length ?? 0}.</p>
+            {(diffReport.analysis_notes ?? []).map((note) => <p key={note}>{note}</p>)}
+          </div>
+        )}
 
         {diffReport && (
           <div className="grid grid-cols-4 gap-2 border border-slate-800/80 bg-slate-950 p-2.5 font-mono text-[11px]">
@@ -217,10 +226,11 @@ export function GovernanceAndDiffPanel({
               <button
                 key={nid}
                 type="button"
+                disabled={diffReport.removed_nodes?.some((node) => node.id === nid)}
                 onClick={() => onSelectNode(nid)}
                 className="border border-slate-800 bg-slate-900 px-1.5 py-0.5 text-teal-300 hover:border-teal-400"
               >
-                {nid}
+                {nid}{diffReport.removed_nodes?.some((node) => node.id === nid) ? ' (removed)' : ''}
               </button>
             ))}
           </div>

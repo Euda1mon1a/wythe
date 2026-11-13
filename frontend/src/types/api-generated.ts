@@ -792,6 +792,23 @@ export interface components {
             target_slug: string;
             /** Base Ref */
             base_ref: string;
+            /**
+             * Base Commit
+             * @default
+             */
+            base_commit: string;
+            /**
+             * Base Graph Status
+             * @default unavailable
+             * @enum {string}
+             */
+            base_graph_status: "available" | "not_needed" | "unavailable";
+            /** Base Impacted Node Ids */
+            base_impacted_node_ids?: string[];
+            /** Removed Nodes */
+            removed_nodes?: components["schemas"]["AtlasNode"][];
+            /** Analysis Notes */
+            analysis_notes?: string[];
             /** Head Commit */
             head_commit: string;
             /** Commits In Range */
@@ -819,7 +836,7 @@ export interface components {
              * Diff Verdict
              * @enum {string}
              */
-            diff_verdict: "PASS" | "FAIL";
+            diff_verdict: "PASS" | "FAIL" | "INCOMPLETE";
         };
         /** DistrictXraySummary */
         DistrictXraySummary: {

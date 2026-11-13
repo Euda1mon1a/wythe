@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import subprocess
+import tempfile
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -12,74 +12,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import __version__
-from app.models import ScanSnapshot
+from app.models import ScanSnapshot, TargetProject
 from app.schemas.atlas import (
     BoundaryFinding,
     DiffBlastRadiusReport,
     SnapshotComparisonReport,
     TruthAtlasReport,
 )
-
-_DIFF_FILE_RE = re.compile(r"^\+\+\+\s+b/(?P<path>.+)$")
-_DIFF_HUNK_RE = re.compile(r"^@@\s+-[0-9,]+\s+\+(?P<start>\d+)(?:,(?P<count>\d+))?\s+@@")
-
-
-def _collect_git_changed_ranges(
-    repo_root: Path, base_ref: str
-) -> dict[str, list[tuple[int, int]]]:
-    """Return `{rel_posix_path: [(start_line, end_line), ...]}` relative to `base_ref`."""
-    ref = "HEAD" if base_ref.upper() == "WORKING" else base_ref
-    diff_text = ""
-    for candidate_ref in (ref, "HEAD"):
-        try:
-            proc = subprocess.run(
-                ["git", "diff", "--unified=0", candidate_ref],
-                cwd=repo_root,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            diff_text = proc.stdout
-            break
-        except (OSError, subprocess.SubprocessError):
-            continue
-
-    changed: dict[str, list[tuple[int, int]]] = {}
-    current_path: str | None = None
-    for raw_line in diff_text.splitlines():
-        fm = _DIFF_FILE_RE.match(raw_line)
-        if fm is not None:
-            p = fm.group("path").strip()
-            current_path = None if p == "/dev/null" else p
-            if current_path is not None:
-                changed.setdefault(current_path, [])
-            continue
-        hm = _DIFF_HUNK_RE.match(raw_line)
-        if hm is not None and current_path is not None:
-            start = int(hm.group("start"))
-            count = int(hm.group("count")) if hm.group("count") is not None else 1
-            if count > 0:
-                changed.setdefault(current_path, []).append((start, start + count - 1))
-
-    # Include untracked working-tree files so uncommitted files are gated before `git add`.
-    try:
-        untracked = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=4,
-        )
-        for rel in untracked.stdout.splitlines():
-            clean_rel = rel.strip()
-            if clean_rel:
-                changed[clean_rel] = [(1, 1_000_000)]
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-    return changed
+from app.services.git_diff import GitChanges, collect_git_changes, materialize_base_tree
+from app.services.scanner_service import run_target_scan
 
 
 def _directional_slice(start_ids: set[str], adj: dict[str, set[str]]) -> set[str]:
@@ -98,28 +39,54 @@ def compute_diff_and_blast_radius(
     repo_root: Path,
     report: TruthAtlasReport,
     base_ref: str = "HEAD~1",
+    *,
+    base_report: TruthAtlasReport | None = None,
+    changes: GitChanges | None = None,
+    analysis_notes: list[str] | None = None,
 ) -> DiffBlastRadiusReport:
     """Compute changed-line boundary findings + upstream/downstream 3-tier blast radius."""
-    changed_ranges = _collect_git_changed_ranges(repo_root, base_ref)
-    changed_files = sorted(changed_ranges.keys())
-    changed_set = set(changed_files)
-
-    touched_ids: set[str] = {
-        n.id for n in report.nodes if n.source_file in changed_set
-    }
-
-    fwd_adj: dict[str, set[str]] = {}
-    rev_adj: dict[str, set[str]] = {}
-    for edge in report.edges:
-        fwd_adj.setdefault(edge.source_id, set()).add(edge.target_id)
-        rev_adj.setdefault(edge.target_id, set()).add(edge.source_id)
-
-    # Separate forward (downstream) and backward (upstream) slices prevent false sibling bleed.
-    impacted_all = _directional_slice(touched_ids, fwd_adj) | _directional_slice(
-        touched_ids, rev_adj
+    changes = changes or collect_git_changes(repo_root, base_ref)
+    if base_report is not None and base_report.source_commit != changes.base_commit:
+        raise ValueError("Base graph does not match the requested Git commit")
+    changed_ranges = changes.after
+    changed_files = sorted(changes.before.keys() | changes.after.keys())
+    notes = list(analysis_notes or [])
+    incomplete = bool(changes.before) and base_report is None
+    if incomplete:
+        notes.append("Base graph unavailable: removed dependencies may be missing from the blast radius.")
+    notes.append(
+        "Static dependency evidence is not proof of safe deletion; "
+        "check external entry points and runtime effects."
     )
-    nodes_by_id = {n.id: n for n in report.nodes}
 
+    touched_ids: set[str] = set()
+    impacted_all: set[str] = set()
+    base_impacted: set[str] = set()
+    nodes_by_id = {}
+    chains_by_id = {}
+    # Traverse each graph separately: joining old and new edges can invent paths
+    # that never existed in either source tree.
+    for graph, paths in ((base_report, changes.before), (report, changes.after)):
+        if graph is None:
+            continue
+        touched = {n.id for n in graph.nodes if n.source_file in paths}
+        fwd_adj: dict[str, set[str]] = {}
+        rev_adj: dict[str, set[str]] = {}
+        for edge in graph.edges:
+            fwd_adj.setdefault(edge.source_id, set()).add(edge.target_id)
+            rev_adj.setdefault(edge.target_id, set()).add(edge.source_id)
+        impacted = _directional_slice(touched, fwd_adj) | _directional_slice(touched, rev_adj)
+        if graph is base_report:
+            base_impacted = impacted
+        touched_ids.update(touched)
+        impacted_all.update(impacted)
+        nodes_by_id.update({n.id: n for n in graph.nodes})
+        for ch in graph.chains:
+            if ch.display_node_id in impacted and ch.route_node_id in impacted and touched.intersection(
+                [ch.display_node_id, ch.route_node_id, *ch.via_node_ids,
+                 *ch.manipulator_node_ids, *ch.truth_table_ids]
+            ):
+                chains_by_id[ch.id] = ch
     impacted_truth = sorted(
         nid for nid in impacted_all if nid in nodes_by_id and nodes_by_id[nid].tier == "truth"
     )
@@ -129,22 +96,6 @@ def compute_diff_and_blast_radius(
     impacted_disp = sorted(
         nid for nid in impacted_all if nid in nodes_by_id and nodes_by_id[nid].tier == "display"
     )
-
-    impacted_chains = [
-        ch
-        for ch in report.chains
-        if (
-            ch.display_node_id in impacted_all
-            and ch.route_node_id in impacted_all
-            and (
-                ch.display_node_id in touched_ids
-                or ch.route_node_id in touched_ids
-                or any(v in touched_ids for v in ch.via_node_ids)
-                or any(m in touched_ids for m in ch.manipulator_node_ids)
-                or any(t in touched_ids for t in ch.truth_table_ids)
-            )
-        )
-    ]
 
     new_findings: list[BoundaryFinding] = []
     for f in report.findings:
@@ -159,7 +110,7 @@ def compute_diff_and_blast_radius(
     if base_ref.upper() != "WORKING":
         try:
             log_proc = subprocess.run(
-                ["git", "log", "--oneline", "--first-parent", "-n", "25", f"{base_ref}..HEAD"],
+                ["git", "log", "--oneline", "--first-parent", "-n", "25", f"{changes.base_commit}..HEAD", "--"],
                 cwd=repo_root,
                 check=True,
                 capture_output=True,
@@ -172,9 +123,16 @@ def compute_diff_and_blast_radius(
         except (OSError, subprocess.SubprocessError):
             commits_in_range = []
 
+    head_ids = {node.id for node in report.nodes}
     return DiffBlastRadiusReport(
         target_slug=report.target_slug,
         base_ref=base_ref,
+        base_commit=changes.base_commit,
+        base_graph_status="unavailable" if incomplete else "available" if base_report else "not_needed",
+        base_impacted_node_ids=sorted(base_impacted),
+        removed_nodes=[n for n in (base_report.nodes if base_report else [])
+                       if n.id in touched_ids and n.id not in head_ids],
+        analysis_notes=notes,
         head_commit=report.source_commit,
         commits_in_range=commits_in_range,
         changed_files=changed_files,
@@ -182,10 +140,39 @@ def compute_diff_and_blast_radius(
         impacted_truth_nodes=impacted_truth,
         impacted_manipulator_nodes=impacted_manip,
         impacted_display_nodes=impacted_disp,
-        impacted_chains=impacted_chains,
+        impacted_chains=list(chains_by_id.values()),
         new_findings=new_findings,
         blocking_new_findings=blocking_new,
-        diff_verdict="FAIL" if blocking_new > 0 else "PASS",
+        diff_verdict="INCOMPLETE" if incomplete else "FAIL" if blocking_new > 0 else "PASS",
+    )
+
+
+def run_target_diff(
+    session: Session, target: TargetProject, report: TruthAtlasReport, base_ref: str,
+) -> DiffBlastRadiusReport:
+    """Scan the requested base in isolation; never modify or execute the target tree."""
+    root = Path(target.repo_path).resolve()
+    changes = collect_git_changes(root, base_ref)
+    base_report = None
+    notes: list[str] = []
+    if changes.before:
+        try:
+            with tempfile.TemporaryDirectory(prefix="wythe-base-") as directory:
+                base_root = Path(directory)
+                materialize_base_tree(root, changes.base_commit, base_root)
+                base_target = TargetProject(
+                    id=0, slug=target.slug, name=target.name, repo_path=directory,
+                    stack_profile_slug=target.stack_profile_slug,
+                    backend_subdir=target.backend_subdir, frontend_subdir=target.frontend_subdir,
+                    legacy_snapshot_relpath=target.legacy_snapshot_relpath,
+                )
+                base_report = run_target_scan(
+                    session, base_target, strict_gate=True, persist_snapshot=False,
+                ).model_copy(update={"source_commit": changes.base_commit})
+        except Exception as exc:  # noqa: BLE001 - incomplete evidence must never become PASS
+            notes.append(f"Base graph could not be recovered: {exc}")
+    return compute_diff_and_blast_radius(
+        root, report, base_ref, base_report=base_report, changes=changes, analysis_notes=notes,
     )
 
 
@@ -250,6 +237,8 @@ def compare_recorded_snapshots(
 def build_sarif_log(
     report: TruthAtlasReport,
     findings_override: list[BoundaryFinding] | None = None,
+    *,
+    diff: DiffBlastRadiusReport | None = None,
 ) -> dict[str, Any]:
     """Serialize findings into OASIS SARIF 2.1.0 format for GitHub/Gitea/GitLab code scanning."""
     active_findings = findings_override if findings_override is not None else report.findings
@@ -286,7 +275,7 @@ def build_sarif_log(
         }
         for f in active_findings
     ]
-    return {
+    payload = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [
@@ -314,3 +303,17 @@ def build_sarif_log(
             }
         ],
     }
+    if diff is not None:
+        run = payload["runs"][0]
+        run["properties"].update(
+            baseCommit=diff.base_commit, baseGraphStatus=diff.base_graph_status,
+            diffVerdict=diff.diff_verdict, analysisNotes=diff.analysis_notes,
+        )
+        run["invocations"] = [{
+            "executionSuccessful": diff.diff_verdict != "INCOMPLETE",
+            "toolExecutionNotifications": [
+                {"level": "error", "message": {"text": note}}
+                for note in diff.analysis_notes if diff.diff_verdict == "INCOMPLETE"
+            ],
+        }]
+    return payload

@@ -176,13 +176,103 @@ class _PyRedisCalls:
         return None
 
     def has_ttl(self, call: ast.Call, op: str) -> bool:
+        options: dict[str, ast.AST] = {}
         for kw in call.keywords:
-            if kw.arg in _PY_TTL_KWARGS and not _is_falsy_const(kw.value):
+            values = {kw.arg: kw.value} if kw.arg is not None else self._keyword_mapping(kw.value, call)
+            if values is None or options.keys() & values.keys():
+                # Unknown unpacking and duplicate call keywords are not TTL evidence.
+                return False
+            options.update(values)
+        for name, value in options.items():
+            if name in _PY_TTL_KWARGS and not _is_falsy_const(value):
                 return True
-            if kw.arg == "keepttl" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+            if name == "keepttl" and isinstance(value, ast.Constant) and value.value is True:
                 return True
         # redis-py: set(name, value, ex=None, px=None, ...) -> a third positional is `ex`.
         return op == "set" and len(call.args) >= 3 and not _is_falsy_const(call.args[2])
+
+    def _constant_binding(self, name: str, use: ast.AST) -> ast.AST | None:
+        """Only single, straight-line bindings with no observed mutation or escape."""
+        scope = self._enclosing(use, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module))
+        while scope is not None:
+            nodes = [n for n in ast.walk(scope) if self._enclosing(
+                n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)
+            ) is scope]
+            if any(isinstance(n, ast.arg) and n.arg == name for n in nodes):
+                return None
+            stores = [n for n in nodes if isinstance(n, ast.Name) and n.id == name
+                      and isinstance(n.ctx, (ast.Store, ast.Del))]
+            if stores:
+                if len(stores) != 1:
+                    return None
+                assignment = self._parent.get(id(stores[0]))
+                if not isinstance(assignment, (ast.Assign, ast.AnnAssign)) or self._parent.get(id(assignment)) is not scope:
+                    return None
+                if (assignment.lineno, assignment.col_offset) >= (use.lineno, use.col_offset):
+                    return None
+                if isinstance(assignment, ast.Assign) and len(assignment.targets) != 1:
+                    return None
+                for node in ast.walk(scope):
+                    if not isinstance(node, ast.Name) or node.id != name:
+                        continue
+                    if isinstance(node.ctx, (ast.Store, ast.Del)) and node is not stores[0]:
+                        return None
+                    if not isinstance(node.ctx, ast.Load):
+                        continue
+                    parent = self._parent.get(id(node))
+                    if isinstance(parent, (ast.Attribute, ast.Subscript, ast.Assign, ast.AnnAssign,
+                                           ast.List, ast.Tuple, ast.Set, ast.Return)):
+                        return None
+                    if isinstance(parent, ast.Call):
+                        return None
+                    if isinstance(parent, ast.keyword) and parent.arg is not None:
+                        return None
+                return assignment.value
+            scope = self._enclosing(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module))
+        return None
+
+    def _keyword_mapping(
+        self, node: ast.AST, use: ast.AST, seen: frozenset[str] = frozenset(),
+    ) -> dict[str, ast.AST] | None:
+        if isinstance(node, ast.Name):
+            if node.id in seen:
+                return None
+            binding = self._constant_binding(node.id, use)
+            return self._keyword_mapping(binding, use, seen | {node.id}) if binding is not None else None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            left = self._keyword_mapping(node.left, use, seen)
+            right = self._keyword_mapping(node.right, use, seen)
+            return {**left, **right} if left is not None and right is not None else None
+        result: dict[str, ast.AST] = {}
+        if isinstance(node, ast.Dict):
+            pairs = [(key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) else None,
+                      value, key is None) for key, value in zip(node.keys, node.values)]
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
+            if len(node.args) > 1:
+                return None
+            if node.args:
+                base = self._keyword_mapping(node.args[0], use, seen)
+                if base is None:
+                    return None
+                result.update(base)
+            pairs = [(kw.arg, kw.value, kw.arg is None) for kw in node.keywords]
+        else:
+            return None
+        for key, value, unpacked in pairs:
+            if unpacked:
+                nested = self._keyword_mapping(value, use, seen)
+                if nested is None:
+                    return None
+                result.update(nested)
+            elif key is not None:
+                if isinstance(value, ast.Name):
+                    value = self._constant_binding(value.id, use)
+                if not isinstance(value, ast.Constant):
+                    return None
+                result[key] = value
+            else:
+                return None
+        return result
 
     def expired_after(self, call: ast.Call) -> bool:
         """`expire(<same key expression>)` later in the same block on the same Redis client."""

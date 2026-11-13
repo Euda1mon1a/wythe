@@ -174,13 +174,13 @@ def parse_module(path: Path, text: str) -> _ModuleInfo:
     execution = module_execution(text)
     if execution is not None:
         info.execution_known = True
-        info.eager_symbols, statements, ranges = execution
-        info.module_body += "\n" + statements
+        info.eager_symbols = execution.eager_symbols
+        info.module_body += "\n" + execution.statements
+        ranges = execution.ranges
         exact_names = {name for name, _, _ in ranges}
         info.decl_ranges = ranges + [r for r in info.decl_ranges if r[0] not in exact_names]
-        for name, first, last in ranges:
-            if name in info.bodies:
-                info.bodies[name] = "\n".join(lines[first - 1:last])
+        info.bodies.update(execution.bodies)
+        info.exports.update(execution.exports)
     return info
 
 
@@ -379,10 +379,12 @@ class ReachabilityIndex:
         roots: set[Path],
         resolve: Callable[[str, Path], Path | None],
         display_root: Path,
+        unreadable: set[Path] | None = None,
     ) -> None:
         self._modules = modules
         self._resolve = resolve
         self._display_root = display_root
+        self._unreadable = unreadable or set()
         self.has_roots = bool(roots)
         self._live: dict[tuple[Path, str], tuple[Path, str] | None] = {}
         self._parents: dict[tuple[Path, str], set[tuple[Path, str]]] = {}
@@ -512,7 +514,8 @@ class ReachabilityIndex:
         """Cross-file import paths, including dynamic imports and barrel initialization."""
         edges: set[tuple[Path, Path]] = set()
         for path, symbol in self._live:
-            if symbol == MODULE_SYMBOL and not self._modules[path].module_body.strip():
+            info = self._modules.get(path)
+            if info is None or (symbol == MODULE_SYMBOL and not info.module_body.strip()):
                 continue
             seen: set[tuple[Path, str]] = set()
             pending = list(self._parents.get((path, symbol), set()))
@@ -535,6 +538,8 @@ class ReachabilityIndex:
             return "An entry path reaches declarations here (including eager initialization)."
         if (path, MODULE_SYMBOL) in self._live:
             return "Imported for module evaluation; no declaration use was discovered."
+        if self._unreadable:
+            return "Entry-point reachability is unknown because some source files could not be read."
         return "No discovered entry path; external callers and runtime registration remain unproven."
 
     def analysis_notes(self) -> list[str]:
@@ -543,6 +548,8 @@ class ReachabilityIndex:
             "and barrel dependencies are retained; external entry points and runtime registration "
             "require separate checks. Blast radius follows the extracted graph, including declared import edges.")
         ]
+        for path in sorted(self._unreadable):
+            notes.append(f"Unreadable source {path.relative_to(self._display_root)}: absence of a caller is unresolved.")
         for path, symbol, spec, selected in sorted(self._dynamic_sites):
             mode = "all exports conservatively retained" if selected == "*" else f"selected export {selected}"
             if spec == "<runtime specifier>":
@@ -553,14 +560,18 @@ class ReachabilityIndex:
     def enclosing_symbol(self, path: Path, line: int) -> str:
         info = self._modules.get(path)
         if info is not None:
-            for name, first, last in info.decl_ranges:
-                if first <= line <= last:
-                    return name
+            matches = [name for name, first, last in info.decl_ranges if first <= line <= last]
+            if len(matches) == 1:
+                return matches[0]
+            # Calls currently carry line numbers, not columns. Shared-line declarations
+            # cannot be separated reliably and must retain module-level reachability.
         return MODULE_SYMBOL
 
     def is_live(self, path: Path, sym: str) -> bool | None:
         if (path, sym) in self._live:
             return True
+        if self._unreadable:
+            return None
         if any(spec == "<runtime specifier>" for _, _, spec, _ in self._dynamic_sites):
             return None  # A runtime-selected module could be this one; do not assert dead code.
         return False
@@ -607,7 +618,7 @@ def build_nextjs_reachability(
                 continue
         modules[path] = parse_module(path, text)
     roots = {p for p in files if is_nextjs_entry(p, src_root, fe_dir)}
-    index = ReachabilityIndex(modules, roots, resolve, display_root)
+    index = ReachabilityIndex(modules, roots, resolve, display_root, known - modules.keys())
     return index, nextjs_route_handler_patterns(files, src_root, fe_dir)
 
 
@@ -644,4 +655,4 @@ def build_react_spa_reachability(
                 continue
         modules[path] = parse_module(path, text)
     roots = {p for p in files if is_react_spa_entry(p, src_root, fe_dir)}
-    return ReachabilityIndex(modules, roots, resolve, display_root)
+    return ReachabilityIndex(modules, roots, resolve, display_root, known - modules.keys())

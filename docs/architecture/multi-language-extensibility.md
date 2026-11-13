@@ -79,6 +79,7 @@ Storing Wythe's own rules, ratchets, or audit rulings in Redis would violate the
 2. **DB-Backed Domain Policy Vocabularies (`atlas_policy_vocabularies`)**: `MANIP-001` and `DISP-001` query active domain packs (`scheduling`, `fintech`, `commerce`, `saas`, `custom`) dynamically from database truth across all 16 adapters — adding a token like `ROYALTY_BPS` flags hardcoded literals across Python, TypeScript, Go, and Rust with zero code changes.
 3. **PR Diff Slicer, SARIF 2.1.0 & Git-Portable Config (`diff_and_sarif_service.py`, `portable_config_service.py`)**:
    - `wythe diff <target> --base origin/main --sarif results.sarif` gates **only newly introduced violations on changed hunks** while computing directional upstream/downstream 3-tier blast radius.
+   - Base and current graphs are traversed separately. Deleted and renamed paths retain their before-image nodes and dependencies; invalid bases are rejected, and an unavailable base graph produces `INCOMPLETE` (CLI exit 2), never a passing removal certificate.
    - `wythe export-config` / `sync-config` (`gate --sync-config`) round-trip `.wythe/governance.json` so ephemeral CI runners hydrate DB rule policies, vocabularies, ratchets, and rulings from Git.
 
 ---

@@ -24,7 +24,7 @@ from app.schemas.atlas import (
 from app.services.diff_and_sarif_service import (
     build_sarif_log,
     compare_recorded_snapshots,
-    compute_diff_and_blast_radius,
+    run_target_diff,
 )
 from app.services.gate_service import list_recent_snapshots
 from app.services.governance_service import (
@@ -140,9 +140,10 @@ def inspect_target_diff(
     if target is None:
         raise HTTPException(status_code=404, detail=f"Target '{target_slug}' not found")
     report = run_target_scan(db, target, strict_gate=True, persist_snapshot=False)
-    return compute_diff_and_blast_radius(
-        Path(target.repo_path).resolve(), report, base_ref=base_ref
-    )
+    try:
+        return run_target_diff(db, target, report, base_ref)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{target_slug}/sarif")
@@ -156,10 +157,11 @@ def export_target_sarif(
         raise HTTPException(status_code=404, detail=f"Target '{target_slug}' not found")
     report = run_target_scan(db, target, strict_gate=True, persist_snapshot=False)
     if base_ref:
-        diff_report = compute_diff_and_blast_radius(
-            Path(target.repo_path).resolve(), report, base_ref=base_ref
-        )
-        return build_sarif_log(report, findings_override=diff_report.new_findings)
+        try:
+            diff_report = run_target_diff(db, target, report, base_ref)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return build_sarif_log(report, findings_override=diff_report.new_findings, diff=diff_report)
     return build_sarif_log(report)
 
 

@@ -12,6 +12,28 @@ from app.services.governance_service import get_target_by_slug, register_target
 from app.services.scanner_service import run_target_scan
 
 
+@pytest.mark.parametrize("separator", ["\n ", " "])
+def test_each_multi_declaration_export_keeps_its_live_call(tmp_path: Path, separator: str) -> None:
+    _write(tmp_path, "frontend/src/app/page.tsx", (
+        "import { Second } from '../features/widgets';\n"
+        "export default function Page() { return Second(); }\n"
+    ))
+    _write(tmp_path, "frontend/src/features/widgets.ts", (
+        f"export const First = () => 1,{separator}Second = () => fetch('/missing');\n"
+    ))
+    result = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    assert next(c for c in result.http_calls if c.raw_path == "/missing").reachable is True
+
+
+def test_unreadable_entry_does_not_crash_or_prove_other_code_unused(tmp_path: Path) -> None:
+    _write(tmp_path, "frontend/src/app/page.tsx", "")
+    (tmp_path / "frontend/src/app/page.tsx").write_bytes(b"\xff\xfe")
+    _write(tmp_path, "frontend/src/features/feature.ts", "export const load = () => fetch('/missing');\n")
+    result = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    assert next(c for c in result.http_calls if c.raw_path == "/missing").reachable is None
+    assert any("Unreadable source" in note for note in result.notes)
+
+
 def _write(root: Path, name: str, source: str) -> None:
     path = root / name
     path.parent.mkdir(parents=True, exist_ok=True)

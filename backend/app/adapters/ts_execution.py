@@ -7,6 +7,7 @@ its barrel, including their top-level initializers and registration calls.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from app.adapters.treesitter_engine import _get_parser, _unwrap_cst_expr, has_treesitter
@@ -24,7 +25,16 @@ def _text(raw: bytes, node: Any) -> str:
     return raw[node.start_byte:node.end_byte].decode("utf-8")
 
 
-def module_execution(source: str) -> tuple[set[str], str, list[tuple[str, int, int]]] | None:
+@dataclass
+class ModuleExecution:
+    eager_symbols: set[str]
+    statements: str
+    ranges: list[tuple[str, int, int]]
+    bodies: dict[str, str]
+    exports: dict[str, str]
+
+
+def module_execution(source: str) -> ModuleExecution | None:
     """Return eager declaration names and top-level statements, excluding lazy functions."""
     parsed = _parse(source)
     if parsed is None:
@@ -33,8 +43,12 @@ def module_execution(source: str) -> tuple[set[str], str, list[tuple[str, int, i
     eager: set[str] = set()
     statements: list[str] = []
     ranges: list[tuple[str, int, int]] = []
+    bodies: dict[str, str] = {}
+    exports: dict[str, str] = {}
     for statement in root.named_children:
         node = statement
+        exported = node.type == "export_statement"
+        default = exported and any(child.type == "default" for child in statement.children)
         if node.type == "export_statement":
             node = node.child_by_field_name("declaration")
             if node is None:
@@ -45,17 +59,27 @@ def module_execution(source: str) -> tuple[set[str], str, list[tuple[str, int, i
                     if unwrapped.type not in ("identifier", "arrow_function", "function_expression"):
                         statements.append(_text(raw, value))
                     ranges.append(("default", statement.start_point[0] + 1, statement.end_point[0] + 1))
+                    bodies["default"] = _text(raw, statement)
+                    exports["default"] = "default"
                 continue
         name = node.child_by_field_name("name")
         if name is not None and name.type in ("identifier", "type_identifier"):
-            ranges.append((_text(raw, name), statement.start_point[0] + 1, statement.end_point[0] + 1))
+            symbol = _text(raw, name)
+            ranges.append((symbol, statement.start_point[0] + 1, statement.end_point[0] + 1))
+            bodies[symbol] = _text(raw, statement)
+            if exported:
+                exports["default" if default else symbol] = symbol
         if node.type in ("lexical_declaration", "variable_declaration"):
             for decl in node.named_children:
                 if decl.type != "variable_declarator":
                     continue
                 name = decl.child_by_field_name("name")
                 if name is not None and name.type == "identifier":
-                    ranges.append((_text(raw, name), decl.start_point[0] + 1, decl.end_point[0] + 1))
+                    symbol = _text(raw, name)
+                    ranges.append((symbol, decl.start_point[0] + 1, decl.end_point[0] + 1))
+                    bodies[symbol] = "const " + _text(raw, decl) + ";"
+                    if exported:
+                        exports[symbol] = symbol
                 value = decl.child_by_field_name("value")
                 if value is None:
                     continue
@@ -77,7 +101,7 @@ def module_execution(source: str) -> tuple[set[str], str, list[tuple[str, int, i
             "type_alias_declaration", "ambient_declaration",
         ):
             statements.append(_text(raw, node))
-    return eager, "\n".join(statements), ranges
+    return ModuleExecution(eager, "\n".join(statements), ranges, bodies, exports)
 
 
 def _selected_export(raw: bytes, import_node: Any) -> str:

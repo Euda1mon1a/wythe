@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import re
 import subprocess
 from dataclasses import dataclass, field, replace
@@ -1184,6 +1185,12 @@ def _eval_seq_items(node: ast.AST | None, env: _MigrationEnv) -> list[tuple[str,
     return None
 
 
+def _known_dict_key(node: ast.AST | None, env: _MigrationEnv) -> str | None:
+    variants = _eval_str_variants(node, env)
+    keys = {value for value, _line in variants if _UNRESOLVED not in value}
+    return next(iter(keys)) if len(keys) == 1 and len(variants) == 1 else None
+
+
 def _eval_dict_items(node: ast.AST | None, env: _MigrationEnv) -> dict[str, tuple[str, int]] | None:
     if isinstance(node, ast.Name) and node.id in env.dicts:
         return dict(env.dicts[node.id])
@@ -1192,9 +1199,9 @@ def _eval_dict_items(node: ast.AST | None, env: _MigrationEnv) -> dict[str, tupl
         for dk, dv in zip(node.keys, node.values, strict=False):
             if dk is None and isinstance(dv, ast.Name) and dv.id in env.dicts:
                 dmap.update(env.dicts[dv.id])
-            elif isinstance(dk, ast.Constant) and isinstance(dk.value, str):
+            elif (key := _known_dict_key(dk, env)) is not None:
                 variants = _eval_str_variants(dv, env, allow_partial=True)
-                dmap[dk.value] = (
+                dmap[key] = (
                     (
                         variants[0]
                         if len(variants) == 1
@@ -1857,7 +1864,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             for dk, dv in zip(expr.keys, expr.values, strict=False):
                 if dk is None and isinstance(dv, ast.Name) and dv.id in cur_env.dicts:
                     dmap_lit.update(cur_env.dicts[dv.id])
-                elif isinstance(dk, ast.Constant) and isinstance(dk.value, str):
+                elif (key := _known_dict_key(dk, cur_env)) is not None:
                     dv_vars, dv_pops = eval_str_expr(dv, cur_env, allow_partial=True, mutate_pops=True)
                     if dv_pops or (dv_vars and any(_UNRESOLVED in v for v, _ in dv_vars)) or not dv_vars:
                         active_consumed_pops.update(dv_pops)
@@ -1865,7 +1872,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                             walk_partial_subexprs(dv, ctx_s, cur_env, in_non_exec=in_non_exec, skip_ids=dv_pops)
                         finally:
                             active_consumed_pops.difference_update(dv_pops)
-                    dmap_lit[dk.value] = (
+                    dmap_lit[key] = (
                         (
                             dv_vars[0]
                             if len(dv_vars) == 1
@@ -1990,8 +1997,34 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
         in_non_exec: bool = False,
     ) -> None:
         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            d_consts, d_lines, d_alts, d_seqs, d_dicts, d_seq_ids, d_dict_ids = _extract_fn_defaults(sub, env)
-            d_fns = _extract_fn_default_callables(sub, env)
+            # Decorator expressions and defaults run now; the function body stays lazy.
+            # Snapshot each default once, in order, so mutations such as pop() cannot
+            # change the captured value or be replayed when the helper is called.
+            for decorator in sub.decorator_list:
+                walk_node(decorator, ctx, env, in_sql_exec=False, in_non_exec=in_non_exec)
+            captured = copy.copy(sub)
+            captured.args = copy.copy(sub.args)
+            temporary_names: list[str] = []
+
+            def capture_default(expr: ast.expr | None) -> ast.expr | None:
+                if expr is None:
+                    return None
+                snap = snapshot_rhs(expr, env, ctx, in_sql_exec=False, in_non_exec=in_non_exec)
+                walk_unresolved_rhs(snap, ctx, env, in_sql_exec=False, in_non_exec=in_non_exec)
+                name = f"__wythe_default_{id(expr)}"
+                temporary_names.append(name)
+                ref = ast.copy_location(ast.Name(id=name, ctx=ast.Load()), expr)
+                bind_target(ref, snap, env)
+                return ref
+
+            try:
+                captured.args.defaults = [capture_default(expr) for expr in sub.args.defaults]
+                captured.args.kw_defaults = [capture_default(expr) for expr in sub.args.kw_defaults]
+                d_consts, d_lines, d_alts, d_seqs, d_dicts, d_seq_ids, d_dict_ids = _extract_fn_defaults(captured, env)
+                d_fns = _extract_fn_default_callables(captured, env)
+            finally:
+                for name in temporary_names:
+                    env.pop_name(name)
             env.pop_name(sub.name)
             env.fns[sub.name] = [
                 _MigrationHelper(
@@ -3055,9 +3088,9 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                                     set(),
                                 )
                             )
-                    elif isinstance(dk, ast.Constant) and isinstance(dk.value, str):
+                    elif (key := _known_dict_key(dk, env)) is not None:
                         dv_vars, dv_pops = eval_str_expr(dv, env, allow_partial=True, mutate_pops=True)
-                        kw_items.append((dk.value, dv, dv_vars, dv_pops))
+                        kw_items.append((key, dv, dv_vars, dv_pops))
                     else:
                         unknown_kwstar = True
             elif isinstance(kw.value, ast.Name) and kw.value.id in env.dicts:

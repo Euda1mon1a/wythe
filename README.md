@@ -87,6 +87,8 @@ Rule severity, enablement, gate-blocking behavior, and effective-date windows li
 
 **Reachability and removal decisions.** With the Tree-sitter extra, a lazy import such as `import('./widgets').then(m => m.Chart)` reaches the selected export while retaining barrel dependencies and import-time initializers. Unknown export selectors conservatively retain all exports; runtime-selected module paths are explicitly unresolved. Scan notes record these distinctions, and additional import dependencies appear as `declared` edges in the existing blast-radius graph. `DISP-007` keeps inactive broken calls visible. A small blast radius or a missing caller is evidence for review, not proof that deletion is safe: check external entry points, registration side effects and the relevant build/tests before removing code or reconnecting its useful behavior. Without a usable CST, import execution stays conservative.
 
+**Deletion and rename diffs.** `wythe diff` resolves the requested base to an exact commit and scans its committed files in a temporary directory, without checking out or executing target code. It traverses the base and current graphs separately, retaining removed nodes, their old callers and import-time dependencies. Renames include both paths. New violation counts still use current-side changed lines. `PASS` means the diff gate found no blocking findings on those lines; it does not certify safe deletion. Invalid bases exit with code 2. If the base cannot be reconstructed (including unresolved symlinks or submodules), JSON and SARIF explicitly report incomplete evidence and the CLI exits 2.
+
 ## CLI Commands
 
 ```bash
