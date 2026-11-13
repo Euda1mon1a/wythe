@@ -33,6 +33,8 @@ EXCLUDED_PARTS = frozenset(
 
 def source_files(root: Path, suffixes: set[str]) -> tuple[list[Path], int]:
     """Return eligible regular source files and number of excluded directories/links."""
+    if root.is_symlink():
+        return [], 1
     files: list[Path] = []
     excluded = 0
     for parent, dirs, names in os.walk(root, followlinks=False):

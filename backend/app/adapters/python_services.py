@@ -10,7 +10,11 @@ from app.adapters.base import (
     ManipulatorExtractionResult,
     TruthExtractionResult,
 )
-from app.adapters.deployment_sources import add_deployment_edges, deployment_mappings
+from app.adapters.deployment_sources import (
+    add_deployment_edges,
+    deployment_mappings,
+    normalize_home,
+)
 from app.adapters.launchd_sources import add_launchd_sources, shell_references
 from app.adapters.python_ast_inspect import parse_python_module
 from app.adapters.registry_sources import add_registry_sources
@@ -37,7 +41,8 @@ def _imports(tree: ast.Module, rel: str, paths: set[str], roots: list[list[str]]
                 parent,
             ]  # script-directory imports are possible; all edges are declared
         elif isinstance(node, ast.ImportFrom):
-            names = [node.module] if node.module else []
+            # Even `from . import *` evaluates the relative package initializer.
+            names = [node.module or ""]
             names += [
                 ".".join(filter(None, (node.module, a.name))) for a in node.names if a.name != "*"
             ]
@@ -51,7 +56,7 @@ def _imports(tree: ast.Module, rel: str, paths: set[str], roots: list[list[str]]
             continue
         for base in bases:
             for name in names:
-                hits.update(_module_paths([*base, *name.split(".")], paths))
+                hits.update(_module_paths([*base, *(name.split(".") if name else [])], paths))
     hits.discard(rel)
     return hits
 
@@ -252,11 +257,18 @@ class PythonServicesAdapter:
                         evidence_note="Static Python import or literal importlib target, including possible package initialization; conditional imports and search-path precedence are not evaluated.",
                     )
                 )
+        deployments, references = deployment_mappings(repo_root, trees, result)
         for rel, text in shell.items():
-            targets = {source_reference(ref, rel, paths) for ref in shell_references(text)} - {
-                None,
-                rel,
-            }
+            targets = set()
+            for ref in shell_references(text):
+                mapped = deployments.get(normalize_home(ref), set())
+                if mapped:
+                    targets.update(mapped & paths)
+                else:
+                    target = source_reference(ref, rel, paths)
+                    if target:
+                        targets.add(target)
+            targets.discard(rel)
             for target in sorted(targets):
                 result.edges.append(
                     AtlasEdge(
@@ -269,7 +281,6 @@ class PythonServicesAdapter:
                         evidence_note="Shell source contains a script reference; this does not prove invocation or resolve variable values.",
                     )
                 )
-        deployments, references = deployment_mappings(repo_root, trees, result)
         add_launchd_sources(repo_root, result, deployments)
         add_registry_sources(repo_root, result, deployments)
         add_deployment_edges(result, references)

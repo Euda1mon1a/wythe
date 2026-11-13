@@ -10,6 +10,7 @@ from xml.parsers.expat import ExpatError
 
 from app.adapters.base import ManipulatorExtractionResult, RawCandidateFinding
 from app.adapters.deployment_sources import normalize_home
+from app.adapters.plist_locations import command_locations
 from app.adapters.service_sources import script_id, source_files, source_reference
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
@@ -46,7 +47,8 @@ def add_launchd_sources(
     for path in files:
         rel = path.relative_to(repo_root).as_posix()
         try:
-            data = plistlib.loads(path.read_bytes())
+            raw = path.read_bytes()
+            data = plistlib.loads(raw)
         except (OSError, ValueError, plistlib.InvalidFileException, ExpatError):
             if "launchagents" in path.parts or "LaunchAgents" in path.parts:
                 result.notes.append(
@@ -75,19 +77,31 @@ def add_launchd_sources(
         )
         program = data.get("Program")
         args = data.get("ProgramArguments", [])
+        fields, argument_lines = command_locations(raw)
+        problem_line = fields.get("ProgramArguments", 1)
         problem = None
         if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
             problem = "ProgramArguments must be an array of strings."
+            if isinstance(args, list):
+                index = next(i for i, arg in enumerate(args) if not isinstance(arg, str))
+                if index < len(argument_lines):
+                    problem_line = argument_lines[index]
             args = []
         if program is not None and (not isinstance(program, str) or not program):
             problem = "Program must be a nonempty executable path."
+            problem_line = fields.get("Program", 1)
             program = None
-        if not program and (not args or not args[0]):
+        if not problem and not program and (not args or not args[0]):
             problem = "No executable is supplied by Program or ProgramArguments."
         command = program or (args[0] if args else "")
         # Program selects the executable; argv[0] may be an arbitrary process name.
         if command.startswith(("~", "$")):
             problem = "The executable path requires expansion, but launchd does not invoke a shell."
+            problem_line = (
+                fields.get("Program", 1)
+                if program
+                else (argument_lines[0] if argument_lines else 1)
+            )
         candidates = {command} if command else set()
         # Non-Python tools can load scripts too (for example a plugin flag). These
         # are references, not proof that launchd directly executes the script.
@@ -103,7 +117,7 @@ def add_launchd_sources(
                 candidates.update(a for a in args[1:] if a.endswith(".sh"))
         elif re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
             # Only the interpreter's script operand matters; later args are application data.
-            for arg in args[1:]:
+            for index, arg in enumerate(args[1:], 1):
                 if arg in {"-c", "-m", "-W", "-X"}:
                     break  # unsupported modes/options with operands remain unobserved
                 if arg.startswith("-"):
@@ -112,6 +126,7 @@ def add_launchd_sources(
                     candidates.add(arg)
                     if arg.startswith(("~", "$")):
                         problem = "The Python script path is literal; launchd does not expand home or environment variables."
+                        problem_line = argument_lines[index] if index < len(argument_lines) else 1
                 break
         if problem:
             result.findings.append(
@@ -119,7 +134,7 @@ def add_launchd_sources(
                     rule_code="MANIP-004",
                     node_id=nid,
                     source_file=rel,
-                    line=1,
+                    line=problem_line,
                     title="Review invalid launchd command declaration",
                     detail=problem,
                     remediation="Check installation-time rendering; use concrete arguments or an explicit shell wrapper. Verify on the owning host before changing a service.",
