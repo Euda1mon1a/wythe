@@ -209,6 +209,41 @@ def _label_spans_and_targets(src: str) -> tuple[list[tuple[int, int]], set[str]]
     return spans, targets
 
 
+def _has_svelte_shorthand(attrs: str, name: str) -> bool:
+    """Find a top-level `{name}` attribute, not text inside another attribute's value."""
+    depth = 0
+    quote: str | None = None
+    i = 0
+    while i < len(attrs):
+        ch = attrs[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif depth and attrs.startswith("//", i):
+            end = attrs.find("\n", i + 2)
+            i = len(attrs) if end < 0 else end
+            continue
+        elif depth and attrs.startswith("/*", i):
+            end = attrs.find("*/", i + 2)
+            i = len(attrs) if end < 0 else end + 2
+            continue
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "{":
+            if depth == 0 and (i == 0 or attrs[i - 1].isspace()):
+                match = re.match(r"\{\s*([A-Za-z_$][\w$]*)\s*\}", attrs[i:])
+                if match and match.group(1) == name:
+                    return True
+            depth += 1
+        elif ch == "}":
+            depth = max(0, depth - 1)
+        i += 1
+    return False
+
+
 def scan_a11y_markup_findings(
     raw_source: str,
     node_id: str,
@@ -236,6 +271,8 @@ def scan_a11y_markup_findings(
 
     # 1. <img> without alt attribute (unless decorative aria-hidden="true" or role="presentation"/"none")
     for m, attrs, _end in _open_tags(raw_source, _IMG_OPEN_RE):
+        if rel_repo.endswith(".svelte") and _has_svelte_shorthand(attrs, "alt"):
+            continue
         if re.search(r"\balt\s*=", attrs) or re.search(r"""\baria-hidden\s*=\s*['"]true['"]""", attrs):
             continue
         if re.search(r"""\brole\s*=\s*['"](?:presentation|none)['"]""", attrs):

@@ -27,7 +27,6 @@ _VUE_SFC_FETCH_RE = re.compile(
     r"""\b(?:\$fetch|useFetch|useLazyFetch)\s*(?:<[^;()]{0,180}?>)?\s*\(\s*(?P<quote>['"`])(?P<url>/[^'"`\n]+)(?P=quote)(?P<tail>[\s\S]{0,160})"""
 )
 _METHOD_OPT_RE = re.compile(r"""method\s*:\s*['"](?P<m>GET|POST|PUT|PATCH|DELETE)['"]""", re.IGNORECASE)
-_API_ENDPOINT_LIT_RE = re.compile(r"""(?P<q>['"`])(?P<url>/api/[A-Za-z0-9_./{}$?=&-]+)(?P=q)""")
 _SCHEMA_BIND_MARKERS = ("api-generated", "openapi", ".schema", "generated/", "/types", "./types")
 
 
@@ -100,11 +99,6 @@ def scan_display_module_semantics(
         verb = mm.group("m").upper() if mm else "GET"
         lineno = cleaned_txt.count("\n", 0, vm.start()) + 1
         raw_calls.append((verb, vm.group("url"), lineno))
-
-    if not raw_calls and node.subkind in ("api_client", "hook"):
-        for em in _API_ENDPOINT_LIT_RE.finditer(cleaned_txt):
-            lineno = cleaned_txt.count("\n", 0, em.start()) + 1
-            raw_calls.append(("GET", em.group("url"), lineno))
 
     http_calls: list[FrontendHttpCall] = []
     methods_seen: list[str] = []

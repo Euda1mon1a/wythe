@@ -31,8 +31,14 @@ from app.adapters.ts_reachability import (
 from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
+_IMPORT_IDENT = r"[A-Za-z_$][\w$]*"
+_IMPORT_BINDINGS = rf"(?:\{{[^{{}};]*\}}|\*(?:\s+as\s+{_IMPORT_IDENT})?)"
+# A static declaration's binding clause cannot wander through arbitrary statements.
+# In particular, `export let` plus blanked Svelte markup must not scan/backtrack to EOF.
 _IMPORT_RE = re.compile(
-    r"""(?:import|export)\s+(?:type\s+)?(?:[\s\S]*?\s+from\s+)?['"](?P<spec>[^'"]+)['"]""",
+    rf"\b(?:import\s+(?=['\"])|(?:import|export)\s+(?:type\s+)?"
+    rf"(?:{_IMPORT_IDENT}(?:\s*,\s*{_IMPORT_BINDINGS})?|{_IMPORT_BINDINGS})\s+from\s+)"
+    r"""(?P<quote>['"])(?P<spec>[^'"\r\n]+)(?P=quote)""",
     re.MULTILINE,
 )
 _REEXPORT_NAMED_RE = re.compile(

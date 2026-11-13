@@ -17,7 +17,7 @@ Wythe supports **19 stack profiles** via `--profile auto` (**1 production-dogfoo
 
 > [!IMPORTANT]
 > **Status, Maturity & Zero-Maintenance Notice (`"AS IS"`)**
-> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.3` or `wythe==0.1.3`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
+> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.7` or `wythe==0.1.7`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
 > - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **17 experimental profiles** (`nextjs-prisma`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, `django-react`, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
 
 ---
@@ -48,7 +48,7 @@ Pin an explicit release tag (do not track unpinned branches if you want zero-sur
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0
-- uses: Euda1mon1a/wythe@v0.1.3
+- uses: Euda1mon1a/wythe@v0.1.7
   with:
     mode: diff
     base-ref: origin/main
@@ -197,6 +197,8 @@ Only the dogfooded Python/SQLAlchemy/Next.js trio is classified **`Implemented`*
 ---
 
 ## Empirical Corpus Benchmarks (Dogfood + Wild Open-Source Repos)
+
+The [Open WebUI source audit](docs/audits/open-webui.md) records the 0.1.7 repairs, measured coverage and remaining gaps. Its FastAPI/Svelte profile remains experimental.
 
 Every stack family has been scanned against synthetic test fixtures and multi-thousand-line real-world repositories (`wythe[treesitter]`):
 

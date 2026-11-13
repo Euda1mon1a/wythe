@@ -240,6 +240,8 @@ class ParsedPythonModule:
     persisted: frozenset[str] = frozenset()
     # True when the module itself calls a session write/flush/commit or emits write SQL.
     has_session_writes: bool = False
+    # Query/execute/get on a db/session receiver (same exclusions as other AST evidence).
+    has_session_reads: bool = False
     # Original imported name -> absolute modules it is imported from (`from M import name`).
     imported_names: dict[str, frozenset[str]] = field(default_factory=dict)
     # Module-scope local symbol/alias -> qualified target (`pkg.mod.Name` or `pkg.mod`).
@@ -300,7 +302,10 @@ def _excluded_ids(tree: ast.AST) -> set[int]:
     for node in ast.walk(tree):
         if isinstance(node, ast.If):
             t = node.test
-            if (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING") or (
+            if isinstance(t, ast.Constant):
+                for s in node.orelse if t.value else node.body:
+                    mark(s)
+            elif (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING") or (
                 isinstance(t, ast.Attribute) and t.attr == "TYPE_CHECKING"
             ):
                 for s in node.body:
@@ -2557,6 +2562,7 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     persisted: set[str] = set()
     write_lines: dict[str, int] = {}
     has_session_writes = False
+    has_session_reads = False
     called: set[str] = set()
     symbol_calls: set[str] = set()
     method_calls: set[str] = set()
@@ -2589,6 +2595,9 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         target = n.func
         dotted = _dotted(target) or ""
         short = target.id if isinstance(target, ast.Name) else target.attr if isinstance(target, ast.Attribute) else ""
+        if (isinstance(target, ast.Attribute) and _is_session_receiver(target.value)
+                and short in {"query", "get", "execute", "scalar", "scalars"}):
+            has_session_reads = True
 
         if dotted.endswith(".include_router") and n.args:
             inc_target = _dotted(n.args[0]) or ""
@@ -2946,6 +2955,7 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         constructed=frozenset(constructed),
         persisted=frozenset(persisted),
         has_session_writes=has_session_writes,
+        has_session_reads=has_session_reads,
         imported_names={k: frozenset(v) for k, v in imported_names.items()},
         import_targets=import_targets,
         write_lines=write_lines,
