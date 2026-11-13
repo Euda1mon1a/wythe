@@ -224,6 +224,9 @@ class ParsedPythonModule:
     policy_literals: tuple[tuple[str, int, str], ...]  # (const_name, lineno, sample)
     raw_clock_calls: tuple[tuple[str, int], ...]  # (expr, lineno)
     method_calls: frozenset[str] = frozenset()  # `param.method()` on an injected, unannotated parameter
+    param_method_calls: tuple[tuple[str, frozenset[str]], ...] = ()  # (method, all attrs accessed on param)
+    class_attrs: dict[str, frozenset[str]] = field(default_factory=dict)  # ClassName -> defined methods/attrs
+    class_bases: dict[str, tuple[str, ...]] = field(default_factory=dict)  # ClassName -> base names
     top_level_defs: frozenset[str] = frozenset()
     method_defs: frozenset[str] = frozenset()
     # Package `__init__` only: (exported name, absolute "module.name" source, the initializer's own top-level
@@ -239,6 +242,8 @@ class ParsedPythonModule:
     has_session_writes: bool = False
     # Original imported name -> absolute modules it is imported from (`from M import name`).
     imported_names: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Module-scope local symbol/alias -> qualified target (`pkg.mod.Name` or `pkg.mod`).
+    import_targets: dict[str, str] = field(default_factory=dict)
     # First line of write evidence per symbol (constructors, session writes, SQL write targets).
     write_lines: dict[str, int] = field(default_factory=dict)
     # Includes made into this module's own `APIRouter` (`router.include_router(sub)`): the
@@ -316,17 +321,17 @@ def _excluded_ids(tree: ast.AST) -> set[int]:
 _BUILTIN_NAMES = frozenset(dir(builtins))
 
 
-def _absolute_import_bindings(tree: ast.AST, module_name: str, rel_path: str) -> list[tuple[str, str, int]]:
-    """(local name, absolute "module.name", level) for every `from ... import`, relative ones resolved.
-
-    A package `__init__` is its own package; any other module resolves against its parent.
-    """
+def _absolute_import_bindings(
+    tree: ast.AST, module_name: str, rel_path: str, excluded: set[int] | None = None
+) -> list[tuple[str, str, str, str, int]]:
+    """(local_name, absolute 'module.orig', orig_name, src_mod, level) for runtime `from ... import`."""
+    skip = excluded or set()
     own_pkg = module_name.removesuffix(".__init__")
     if not rel_path.endswith("__init__.py"):
         own_pkg = own_pkg.rpartition(".")[0]
-    out: list[tuple[str, str, int]] = []
+    out: list[tuple[str, str, str, str, int]] = []
     for n in ast.walk(tree):
-        if not isinstance(n, ast.ImportFrom):
+        if not isinstance(n, ast.ImportFrom) or id(n) in skip:
             continue
         src_mod = n.module or ""
         if n.level:
@@ -335,23 +340,980 @@ def _absolute_import_bindings(tree: ast.AST, module_name: str, rel_path: str) ->
                 base = base.rpartition(".")[0]
             src_mod = ".".join(p for p in (base, n.module) if p)
         if src_mod:
-            out.extend((alias.asname or alias.name, f"{src_mod}.{alias.name}", n.level) for alias in n.names)
+            out.extend(
+                (alias.asname or alias.name, f"{src_mod}.{alias.name}", alias.name, src_mod, n.level)
+                for alias in n.names
+            )
     return out
 
 
-def _injected_params_by_call(tree: ast.AST) -> dict[int, frozenset[str]]:
-    """Map each call to the unannotated parameters (bar `self`/`cls`) of the functions enclosing it."""
-    out: dict[int, frozenset[str]] = {}
-    for fn in ast.walk(tree):
-        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            a = fn.args
-            names = frozenset(
-                p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs) if p.annotation is None and p.arg not in ("self", "cls")
+def _comp_bound_names(comp: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> set[str]:
+    return {
+        t.id
+        for g in comp.generators
+        for t in ast.walk(g.target)
+        if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)
+    }
+
+
+def _fn_local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    bound = _arg_names(fn.args)
+    nonlocals: set[str] = set()
+    queue: list[ast.AST] = list(fn.body)
+    idx = 0
+    while idx < len(queue):
+        cur = queue[idx]
+        idx += 1
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(cur.name)
+            continue
+        if isinstance(cur, ast.Lambda):
+            continue
+        if isinstance(cur, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            if cur.generators:
+                queue.append(cur.generators[0].iter)
+            for sub in _expr_nodes_shallow(cur, set()):
+                if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name):
+                    bound.add(sub.target.id)
+            continue
+        if isinstance(cur, ast.Name) and isinstance(cur.ctx, ast.Store):
+            bound.add(cur.id)
+        elif isinstance(cur, ast.ExceptHandler) and cur.name:
+            bound.add(cur.name)
+        elif isinstance(cur, (ast.Import, ast.ImportFrom)):
+            for alias in cur.names:
+                if alias.name != "*":
+                    bound.add((alias.asname or alias.name).split(".", 1)[0])
+        elif isinstance(cur, (ast.MatchAs, ast.MatchStar)) and cur.name:
+            bound.add(cur.name)
+        elif isinstance(cur, ast.MatchMapping) and cur.rest:
+            bound.add(cur.rest)
+        elif isinstance(cur, ast.Nonlocal):
+            nonlocals.update(cur.names)
+        elif isinstance(cur, ast.Global):
+            bound.update(cur.names)
+        queue.extend(ast.iter_child_nodes(cur))
+    return bound - nonlocals
+
+
+DefsMap = dict[str, set[ast.FunctionDef | ast.AsyncFunctionDef]]
+
+
+def _copy_defs(defs: DefsMap) -> DefsMap:
+    return {k: set(v) for k, v in defs.items() if v}
+
+
+def _merge_defs(*maps: DefsMap) -> DefsMap:
+    merged: DefsMap = {}
+    for mp in maps:
+        for k, vals in mp.items():
+            if vals:
+                merged.setdefault(k, set()).update(vals)
+    return merged
+
+
+def _is_nonempty_iter_literal(expr: ast.AST) -> bool:
+    if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        return any(not isinstance(e, ast.Starred) for e in expr.elts)
+    if isinstance(expr, ast.Dict):
+        return any(k is not None for k in expr.keys)
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, (str, bytes)):
+        return len(expr.value) > 0
+    return False
+
+
+_OBJECT_ATTRS = frozenset(dir(object)) | frozenset(
+    {"__dict__", "__weakref__", "__module__", "__annotations__", "__name__", "__qualname__"}
+)
+
+
+def _merge_stored(branches: list[tuple[bool, frozenset[str]]]) -> frozenset[str]:
+    live_sets = [st for lv, st in branches if lv]
+    if not live_sets:
+        return frozenset()
+    acc = set(live_sets[0])
+    for st in live_sets[1:]:
+        acc &= st
+    return frozenset(acc)
+
+
+def _hasattr_guarded(
+    test: ast.AST | None, nm: str, defs: DefsMap
+) -> tuple[frozenset[str], frozenset[str]]:
+    if test is None or "hasattr" in defs:
+        return frozenset(), frozenset()
+    if (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == "hasattr"
+        and len(test.args) == 2
+        and not test.keywords
+        and isinstance(test.args[0], ast.Name)
+        and test.args[0].id == nm
+        and isinstance(test.args[1], ast.Constant)
+        and isinstance(test.args[1].value, str)
+    ):
+        return frozenset({test.args[1].value}), frozenset()
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        wt, wf = _hasattr_guarded(test.operand, nm, defs)
+        return wf, wt
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        wt_all: set[str] = set()
+        for v in test.values:
+            wt_v, _ = _hasattr_guarded(v, nm, defs)
+            wt_all.update(wt_v)
+        return frozenset(wt_all), frozenset()
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or) and test.values:
+        wf_all: set[str] = set()
+        wt_common: set[str] | None = None
+        for v in test.values:
+            wt_v, wf_v = _hasattr_guarded(v, nm, defs)
+            wf_all.update(wf_v)
+            wt_common = set(wt_v) if wt_common is None else (wt_common & set(wt_v))
+        return frozenset(wt_common or ()), frozenset(wf_all)
+    return frozenset(), frozenset()
+
+
+StateTriple = tuple[bool, DefsMap, frozenset[str]]
+
+
+def _live_param_expr_nodes(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    nm: str,
+    excluded: set[int] | None = None,
+) -> tuple[dict[int, str], frozenset[str]]:
+    """Return `(live_method_calls, required_attrs)` for `fn`'s initial parameter `nm`."""
+    skip = excluded or set()
+    live_calls: dict[int, str] = {}
+    required_attrs: set[str] = set()
+    activated_states: dict[
+        tuple[int, frozenset[tuple[str, frozenset[int]]], frozenset[str], frozenset[str]],
+        frozenset[str],
+    ] = {}
+    active_fn_stack: set[int] = set()
+
+    def run_scope(
+        body: list[ast.stmt] | ast.expr,
+        outer_defs: DefsMap | None = None,
+        init_stored: frozenset[str] = frozenset(),
+        init_guarded: frozenset[str] = frozenset(),
+    ) -> frozenset[str]:
+        init_defs: DefsMap = _copy_defs(outer_defs or {})
+        dead_refs: set[int] = set()
+
+        def activate_defs(
+            name: str,
+            cur_defs: DefsMap,
+            cur_stored: frozenset[str],
+            cur_guarded: frozenset[str],
+        ) -> frozenset[str] | None:
+            fn_list = list(cur_defs.get(name, ()))
+            exit_sets: list[frozenset[str]] = []
+            for fn_def in fn_list:
+                if id(fn_def) in active_fn_stack:
+                    continue
+                fn_locals = _fn_local_names(fn_def)
+                if nm in fn_locals:
+                    exit_sets.append(cur_stored)
+                    continue
+                scoped_defs = {k: set(v) for k, v in cur_defs.items() if k not in fn_locals and v}
+                sig = frozenset((k, frozenset(id(x) for x in v)) for k, v in scoped_defs.items())
+                state_key = (id(fn_def), sig, cur_stored, cur_guarded)
+                if state_key in activated_states:
+                    exit_sets.append(activated_states[state_key])
+                    continue
+                activated_states[state_key] = cur_stored
+                active_fn_stack.add(id(fn_def))
+                try:
+                    res_st = run_scope(fn_def.body, scoped_defs, cur_stored, cur_guarded)
+                finally:
+                    active_fn_stack.discard(id(fn_def))
+                activated_states[state_key] = res_st
+                exit_sets.append(res_st)
+            if not exit_sets:
+                return None
+            acc = set(exit_sets[0])
+            for st in exit_sets[1:]:
+                acc &= st
+            return frozenset(acc)
+
+        def walk_target(
+            tgt: ast.AST,
+            live: bool,
+            defs: DefsMap,
+            stored: frozenset[str],
+            guarded: frozenset[str],
+            *,
+            is_delete: bool = False,
+        ) -> StateTriple:
+            if isinstance(tgt, ast.Name):
+                defs.pop(tgt.id, None)
+                if tgt.id == nm:
+                    return False, defs, frozenset()
+                return live, defs, stored
+            if isinstance(tgt, (ast.Tuple, ast.List)):
+                for elt in tgt.elts:
+                    live, defs, stored = walk_target(elt, live, defs, stored, guarded, is_delete=is_delete)
+                return live, defs, stored
+            if isinstance(tgt, ast.Starred):
+                return walk_target(tgt.value, live, defs, stored, guarded, is_delete=is_delete)
+            if isinstance(tgt, ast.Attribute):
+                is_direct = isinstance(tgt.value, ast.Name) and tgt.value.id == nm
+                live, defs, stored = walk_expr(tgt.value, live, defs, stored, guarded)
+                if live and is_direct:
+                    stored = (stored - {tgt.attr}) if is_delete else (stored | {tgt.attr})
+                return live, defs, stored
+            if isinstance(tgt, ast.Subscript):
+                live, defs, stored = walk_expr(tgt.value, live, defs, stored, guarded)
+                return walk_expr(tgt.slice, live, defs, stored, guarded)
+            return live, defs, stored
+
+        def walk_expr(
+            expr: ast.AST | None,
+            live: bool,
+            defs: DefsMap,
+            stored: frozenset[str],
+            guarded: frozenset[str],
+        ) -> StateTriple:
+            if expr is None or id(expr) in skip:
+                return live, defs, stored
+            if isinstance(expr, ast.NamedExpr):
+                rhs_defs = set(defs.get(expr.value.id, ())) if isinstance(expr.value, ast.Name) else set()
+                live, defs, stored = walk_expr(expr.value, live, defs, stored, guarded)
+                live, defs, stored = walk_target(expr.target, live, defs, stored, guarded)
+                if rhs_defs and isinstance(expr.target, ast.Name) and expr.target.id != nm:
+                    defs[expr.target.id] = rhs_defs
+                return live, defs, stored
+            if isinstance(expr, ast.Lambda):
+                for dflt in (*expr.args.defaults, *(d for d in expr.args.kw_defaults if d is not None)):
+                    live, defs, stored = walk_expr(dflt, live, defs, stored, guarded)
+                lam_bound = _arg_names(expr.args) | {
+                    sub.target.id
+                    for sub in _expr_nodes_shallow(expr.body, skip)
+                    if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name)
+                }
+                if live and nm not in lam_bound:
+                    lam_defs = {k: set(v) for k, v in defs.items() if k not in lam_bound and v}
+                    run_scope(expr.body, lam_defs, stored, guarded)
+                return live, defs, stored
+            if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+                if expr.generators:
+                    live, defs, stored = walk_expr(expr.generators[0].iter, live, defs, stored, guarded)
+                cbound = _comp_bound_names(expr)
+                eager_nonempty = (
+                    not isinstance(expr, ast.GeneratorExp)
+                    and bool(expr.generators)
+                    and _is_nonempty_iter_literal(expr.generators[0].iter)
+                )
+                if live and nm not in cbound:
+                    clive = live
+                    cdefs = {k: set(v) for k, v in defs.items() if k not in cbound and v}
+                    cstored = stored
+                    must_live = live
+                    must_defs: DefsMap | None = None
+                    must_stored: frozenset[str] | None = None
+                    if expr.generators:
+                        for idx_if, ifs_e in enumerate(expr.generators[0].ifs):
+                            clive, cdefs, cstored = walk_expr(ifs_e, clive, cdefs, cstored, guarded)
+                            if eager_nonempty and idx_if == 0:
+                                must_live = clive
+                                must_defs = _copy_defs(cdefs)
+                                must_stored = cstored
+                        for gen in expr.generators[1:]:
+                            clive, cdefs, cstored = walk_expr(gen.iter, clive, cdefs, cstored, guarded)
+                            for ifs_e in gen.ifs:
+                                clive, cdefs, cstored = walk_expr(ifs_e, clive, cdefs, cstored, guarded)
+                    if isinstance(expr, ast.DictComp):
+                        clive, cdefs, cstored = walk_expr(expr.key, clive, cdefs, cstored, guarded)
+                        clive, cdefs, cstored = walk_expr(expr.value, clive, cdefs, cstored, guarded)
+                    else:
+                        clive, cdefs, cstored = walk_expr(expr.elt, clive, cdefs, cstored, guarded)
+                    if eager_nonempty and len(expr.generators) == 1 and not expr.generators[0].ifs:
+                        must_live = clive
+                        must_defs = _copy_defs(cdefs)
+                        must_stored = cstored
+                    kept_cbound = {k: set(v) for k, v in defs.items() if k in cbound and v}
+                    if must_defs is not None and must_stored is not None:
+                        live = must_live
+                        defs = _merge_defs(kept_cbound, must_defs, cdefs)
+                        stored = _merge_stored([(must_live, must_stored), (clive, cstored)])
+                    else:
+                        defs = _merge_defs(defs, cdefs)
+                        stored = _merge_stored([(live, stored), (clive, cstored)])
+                return live, defs, stored
+            if isinstance(expr, ast.IfExp):
+                lt, dt, st = walk_expr(expr.test, live, defs, stored, guarded)
+                wt, wf = _hasattr_guarded(expr.test, nm, dt)
+                lb, db, sb = walk_expr(expr.body, lt, _copy_defs(dt), st, guarded | wt)
+                le, de, se = walk_expr(expr.orelse, lt, _copy_defs(dt), st, guarded | wf)
+                return (lb or le), _merge_defs(db, de), _merge_stored([(lb, sb), (le, se)])
+            if isinstance(expr, ast.BoolOp):
+                cur_l, cur_d, cur_s = walk_expr(expr.values[0], live, defs, stored, guarded)
+                wt0, wf0 = _hasattr_guarded(expr.values[0], nm, cur_d)
+                cur_g = guarded | (wt0 if isinstance(expr.op, ast.And) else wf0)
+                any_sc = cur_l
+                snaps = [_copy_defs(cur_d)]
+                st_branches: list[tuple[bool, frozenset[str]]] = [(cur_l, cur_s)]
+                for val in expr.values[1:]:
+                    cur_l, cur_d, cur_s = walk_expr(val, cur_l, _copy_defs(cur_d), cur_s, cur_g)
+                    wt_v, wf_v = _hasattr_guarded(val, nm, cur_d)
+                    cur_g = cur_g | (wt_v if isinstance(expr.op, ast.And) else wf_v)
+                    any_sc = any_sc or cur_l
+                    snaps.append(_copy_defs(cur_d))
+                    st_branches.append((cur_l, cur_s))
+                return any_sc, _merge_defs(*snaps), _merge_stored(st_branches)
+            if isinstance(expr, ast.Name) and isinstance(expr.ctx, ast.Load):
+                if live:
+                    if expr.id in defs:
+                        activate_defs(expr.id, defs, stored, guarded)
+                elif expr.id in defs:
+                    for fn_node in defs[expr.id]:
+                        dead_refs.add(id(fn_node))
+                return live, defs, stored
+            if isinstance(expr, ast.Attribute) and isinstance(expr.ctx, ast.Load):
+                if (
+                    live
+                    and isinstance(expr.value, ast.Name)
+                    and expr.value.id == nm
+                    and expr.attr not in stored
+                    and expr.attr not in guarded
+                    and expr.attr not in _OBJECT_ATTRS
+                ):
+                    required_attrs.add(expr.attr)
+                return walk_expr(expr.value, live, defs, stored, guarded)
+            if isinstance(expr, ast.Call):
+                if (
+                    live
+                    and isinstance(expr.func, ast.Attribute)
+                    and isinstance(expr.func.value, ast.Name)
+                    and expr.func.value.id == nm
+                    and expr.func.attr not in stored
+                ):
+                    live_calls[id(expr)] = expr.func.attr
+                is_direct_helper_call = isinstance(expr.func, ast.Name) and expr.func.id in defs
+                helper_name = expr.func.id if isinstance(expr.func, ast.Name) else ""
+                live, defs, stored = walk_expr(expr.func, live, defs, stored, guarded)
+                for arg_e in expr.args:
+                    live, defs, stored = walk_expr(arg_e, live, defs, stored, guarded)
+                for kw in expr.keywords:
+                    live, defs, stored = walk_expr(kw.value, live, defs, stored, guarded)
+                if live and is_direct_helper_call and helper_name in defs:
+                    post_st = activate_defs(helper_name, defs, stored, guarded)
+                    if post_st is not None:
+                        stored = post_st
+                if (
+                    live
+                    and isinstance(expr.func, ast.Name)
+                    and expr.func.id == "setattr"
+                    and "setattr" not in defs
+                    and len(expr.args) == 3
+                    and not expr.keywords
+                    and isinstance(expr.args[0], ast.Name)
+                    and expr.args[0].id == nm
+                    and isinstance(expr.args[1], ast.Constant)
+                    and isinstance(expr.args[1].value, str)
+                ):
+                    stored = stored | {expr.args[1].value}
+                if (
+                    live
+                    and isinstance(expr.func, ast.Name)
+                    and expr.func.id == "delattr"
+                    and "delattr" not in defs
+                    and len(expr.args) == 2
+                    and not expr.keywords
+                    and isinstance(expr.args[0], ast.Name)
+                    and expr.args[0].id == nm
+                    and isinstance(expr.args[1], ast.Constant)
+                    and isinstance(expr.args[1].value, str)
+                ):
+                    stored = stored - {expr.args[1].value}
+                return live, defs, stored
+            if isinstance(expr, ast.Dict):
+                for k_e, v_e in zip(expr.keys, expr.values, strict=False):
+                    live, defs, stored = walk_expr(k_e, live, defs, stored, guarded)
+                    live, defs, stored = walk_expr(v_e, live, defs, stored, guarded)
+                return live, defs, stored
+            for ch in ast.iter_child_nodes(expr):
+                if isinstance(ch, ast.expr):
+                    live, defs, stored = walk_expr(ch, live, defs, stored, guarded)
+            return live, defs, stored
+
+        def walk_stmts(
+            stmts: list[ast.stmt],
+            live: bool,
+            defs: DefsMap,
+            stored: frozenset[str],
+            guarded: frozenset[str],
+            loop_breaks: list[StateTriple] | None = None,
+            loop_continues: list[StateTriple] | None = None,
+            abrupt_returns: list[StateTriple] | None = None,
+            abrupt_raises: list[StateTriple] | None = None,
+        ) -> tuple[bool, DefsMap, frozenset[str], bool]:
+            for s in stmts:
+                if id(s) in skip:
+                    continue
+                if isinstance(s, ast.Return):
+                    live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                    if abrupt_returns is not None:
+                        abrupt_returns.append((live, _copy_defs(defs), stored))
+                    return live, defs, stored, False
+                if isinstance(s, ast.Raise):
+                    live, defs, stored = walk_expr(s.exc, live, defs, stored, guarded)
+                    live, defs, stored = walk_expr(s.cause, live, defs, stored, guarded)
+                    if abrupt_raises is not None:
+                        abrupt_raises.append((live, _copy_defs(defs), stored))
+                    return live, defs, stored, False
+                if isinstance(s, ast.Break):
+                    if loop_breaks is not None:
+                        loop_breaks.append((live, _copy_defs(defs), stored))
+                    return live, defs, stored, False
+                if isinstance(s, ast.Continue):
+                    if loop_continues is not None:
+                        loop_continues.append((live, _copy_defs(defs), stored))
+                    return live, defs, stored, False
+                if isinstance(s, ast.Assign):
+                    rhs_defs = set(defs.get(s.value.id, ())) if isinstance(s.value, ast.Name) else set()
+                    live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                    for tgt in s.targets:
+                        live, defs, stored = walk_target(tgt, live, defs, stored, guarded)
+                    if rhs_defs and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name) and s.targets[0].id != nm:
+                        defs[s.targets[0].id] = rhs_defs
+                elif isinstance(s, ast.AnnAssign):
+                    if s.value is not None:
+                        rhs_defs = set(defs.get(s.value.id, ())) if isinstance(s.value, ast.Name) else set()
+                        live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                        live, defs, stored = walk_target(s.target, live, defs, stored, guarded)
+                        if rhs_defs and isinstance(s.target, ast.Name) and s.target.id != nm:
+                            defs[s.target.id] = rhs_defs
+                elif isinstance(s, ast.AugAssign):
+                    if isinstance(s.target, ast.Name):
+                        live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                        live, defs, stored = walk_target(s.target, live, defs, stored, guarded)
+                    elif (
+                        isinstance(s.target, ast.Attribute)
+                        and isinstance(s.target.value, ast.Name)
+                        and s.target.value.id == nm
+                    ):
+                        if (
+                            live
+                            and s.target.attr not in stored
+                            and s.target.attr not in guarded
+                            and s.target.attr not in _OBJECT_ATTRS
+                        ):
+                            required_attrs.add(s.target.attr)
+                        live, defs, stored = walk_expr(s.target.value, live, defs, stored, guarded)
+                        live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                        if live:
+                            stored = stored | {s.target.attr}
+                    else:
+                        live, defs, stored = walk_target(s.target, live, defs, stored, guarded)
+                        live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                elif isinstance(s, ast.Delete):
+                    for tgt in s.targets:
+                        live, defs, stored = walk_target(tgt, live, defs, stored, guarded, is_delete=True)
+                elif isinstance(s, ast.Expr):
+                    live, defs, stored = walk_expr(s.value, live, defs, stored, guarded)
+                elif isinstance(s, ast.Assert):
+                    live, defs, stored = walk_expr(s.test, live, defs, stored, guarded)
+                    wt_a, _ = _hasattr_guarded(s.test, nm, defs)
+                    live, defs, stored = walk_expr(s.msg, live, defs, stored, guarded)
+                    guarded = guarded | wt_a
+                elif isinstance(s, (ast.Import, ast.ImportFrom)):
+                    for alias in s.names:
+                        if alias.name != "*":
+                            bound_nm = (alias.asname or alias.name).split(".", 1)[0]
+                            defs.pop(bound_nm, None)
+                            if bound_nm == nm:
+                                live = False
+                                stored = frozenset()
+                elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for dec in s.decorator_list:
+                        live, defs, stored = walk_expr(dec, live, defs, stored, guarded)
+                    for dflt in (*s.args.defaults, *(d for d in s.args.kw_defaults if d is not None)):
+                        live, defs, stored = walk_expr(dflt, live, defs, stored, guarded)
+                    if s.decorator_list:
+                        defs.pop(s.name, None)
+                        s_locals = _fn_local_names(s)
+                        if live and nm not in s_locals:
+                            run_scope(
+                                s.body,
+                                {k: set(v) for k, v in defs.items() if k not in s_locals and v},
+                                stored,
+                                guarded,
+                            )
+                    else:
+                        defs[s.name] = {s}
+                    if s.name == nm:
+                        defs.pop(nm, None)
+                        live = False
+                        stored = frozenset()
+                elif isinstance(s, ast.ClassDef):
+                    for dec in s.decorator_list:
+                        live, defs, stored = walk_expr(dec, live, defs, stored, guarded)
+                    defs.pop(s.name, None)
+                    if s.name == nm:
+                        live = False
+                        stored = frozenset()
+                elif isinstance(s, ast.TypeAlias):
+                    if isinstance(s.name, ast.Name):
+                        defs.pop(s.name.id, None)
+                        if s.name.id == nm:
+                            live = False
+                            stored = frozenset()
+                elif isinstance(s, ast.If):
+                    live, defs, stored = walk_expr(s.test, live, defs, stored, guarded)
+                    wt_i, wf_i = _hasattr_guarded(s.test, nm, defs)
+                    lb, db, sb, fb = walk_stmts(
+                        s.body,
+                        live,
+                        _copy_defs(defs),
+                        stored,
+                        guarded | wt_i,
+                        loop_breaks,
+                        loop_continues,
+                        abrupt_returns,
+                        abrupt_raises,
+                    )
+                    le, de, se, fe = walk_stmts(
+                        s.orelse,
+                        live,
+                        _copy_defs(defs),
+                        stored,
+                        guarded | wf_i,
+                        loop_breaks,
+                        loop_continues,
+                        abrupt_returns,
+                        abrupt_raises,
+                    )
+                    if not fb and not fe:
+                        return (lb or le), _merge_defs(db, de), _merge_stored([(lb, sb), (le, se)]), False
+                    live = (lb if fb else False) or (le if fe else False)
+                    defs = _merge_defs(*(([db] if fb else []) + ([de] if fe else [])))
+                    stored = _merge_stored(([(lb, sb)] if fb else []) + ([(le, se)] if fe else []))
+                elif isinstance(s, (ast.For, ast.AsyncFor)):
+                    live, defs, stored = walk_expr(s.iter, live, defs, stored, guarded)
+                    nonempty_iter = _is_nonempty_iter_literal(s.iter)
+                    body_in, body_defs, body_st = walk_target(s.target, live, _copy_defs(defs), stored, guarded)
+                    brk: list[StateTriple] = []
+                    cnt: list[StateTriple] = []
+                    lb, db, sb, fb = walk_stmts(
+                        s.body, body_in, body_defs, body_st, guarded, brk, cnt, abrupt_returns, abrupt_raises
+                    )
+                    iter_branches = ([(lb, sb)] if fb else []) + [(cl, cs) for cl, _, cs in cnt]
+                    iter_end_l = any(bl for bl, _ in iter_branches)
+                    iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd, _ in cnt]))
+                    iter_end_s = _merge_stored(iter_branches)
+                    if fb or cnt:
+                        body2_in, body2_defs, body2_st = walk_target(
+                            s.target, iter_end_l, _copy_defs(iter_end_d), iter_end_s, guarded
+                        )
+                        merged_body_defs = _merge_defs(body_defs, body2_defs)
+                        merged_body_st = _merge_stored([(body_in, body_st), (body2_in, body2_st)])
+                        if merged_body_defs != body_defs or merged_body_st != body_st:
+                            brk = []
+                            cnt = []
+                            lb, db, sb, fb = walk_stmts(
+                                s.body,
+                                body_in or body2_in,
+                                merged_body_defs,
+                                merged_body_st,
+                                guarded,
+                                brk,
+                                cnt,
+                                abrupt_returns,
+                                abrupt_raises,
+                            )
+                            iter_branches = ([(lb, sb)] if fb else []) + [(cl, cs) for cl, _, cs in cnt]
+                            iter_end_l = any(bl for bl, _ in iter_branches)
+                            iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd, _ in cnt]))
+                            iter_end_s = _merge_stored(iter_branches)
+                    zero_iter = False if nonempty_iter else live
+                    if nonempty_iter and not fb and not cnt:
+                        le, de, se, fe = False, {}, frozenset(), False
+                    else:
+                        else_in_l = zero_iter or iter_end_l
+                        else_in_d = (
+                            iter_end_d
+                            if nonempty_iter
+                            else (_merge_defs(defs, iter_end_d) if (fb or cnt) else _copy_defs(defs))
+                        )
+                        else_in_s = (
+                            iter_end_s
+                            if nonempty_iter
+                            else (
+                                _merge_stored([(live, stored), (iter_end_l, iter_end_s)])
+                                if (fb or cnt)
+                                else stored
+                            )
+                        )
+                        le, de, se, fe = walk_stmts(
+                            s.orelse,
+                            else_in_l,
+                            else_in_d,
+                            else_in_s,
+                            guarded,
+                            loop_breaks,
+                            loop_continues,
+                            abrupt_returns,
+                            abrupt_raises,
+                        )
+                    if not fe and not brk:
+                        return le, de, se, False
+                    live = (le if fe else False) or any(bl for bl, _, _ in brk)
+                    defs = _merge_defs(*(([de] if fe else []) + [bd for _, bd, _ in brk]))
+                    stored = _merge_stored(([(le, se)] if fe else []) + [(bl, bs) for bl, _, bs in brk])
+                elif isinstance(s, ast.While):
+                    w_entry_l, w_entry_d, w_entry_s = live, _copy_defs(defs), stored
+                    live, defs, stored = walk_expr(s.test, w_entry_l, _copy_defs(w_entry_d), w_entry_s, guarded)
+                    wt_w, wf_w = _hasattr_guarded(s.test, nm, defs)
+                    always_true = isinstance(s.test, ast.Constant) and bool(s.test.value) is True
+                    brk = []
+                    cnt = []
+                    lb, db, sb, fb = walk_stmts(
+                        s.body, live, _copy_defs(defs), stored, guarded | wt_w, brk, cnt, abrupt_returns, abrupt_raises
+                    )
+                    iter_branches = ([(lb, sb)] if fb else []) + [(cl, cs) for cl, _, cs in cnt]
+                    iter_end_l = any(bl for bl, _ in iter_branches)
+                    iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd, _ in cnt]))
+                    iter_end_s = _merge_stored(iter_branches)
+                    if fb or cnt:
+                        merged_w_d = _merge_defs(w_entry_d, iter_end_d)
+                        merged_w_s = _merge_stored([(w_entry_l, w_entry_s), (iter_end_l, iter_end_s)])
+                        if merged_w_d != w_entry_d or merged_w_s != w_entry_s:
+                            brk = []
+                            cnt = []
+                            live2, defs2, stored2 = walk_expr(
+                                s.test, w_entry_l or iter_end_l, _copy_defs(merged_w_d), merged_w_s, guarded
+                            )
+                            lb, db, sb, fb = walk_stmts(
+                                s.body,
+                                live2,
+                                _copy_defs(defs2),
+                                stored2,
+                                guarded | wt_w,
+                                brk,
+                                cnt,
+                                abrupt_returns,
+                                abrupt_raises,
+                            )
+                            live, defs, stored = live2, defs2, stored2
+                            iter_branches = ([(lb, sb)] if fb else []) + [(cl, cs) for cl, _, cs in cnt]
+                            iter_end_l = any(bl for bl, _ in iter_branches)
+                            iter_end_d = _merge_defs(*(([db] if fb else []) + [cd for _, cd, _ in cnt]))
+                            iter_end_s = _merge_stored(iter_branches)
+                    zero_iter = False if always_true else live
+                    if not zero_iter and not fb and not cnt:
+                        le, de, se, fe = False, {}, frozenset(), False
+                    else:
+                        else_in_d = iter_end_d if always_true else _merge_defs(defs, iter_end_d)
+                        else_in_s = (
+                            iter_end_s
+                            if always_true
+                            else _merge_stored([(live, stored), (iter_end_l, iter_end_s)])
+                        )
+                        le, de, se, fe = walk_stmts(
+                            s.orelse,
+                            zero_iter or iter_end_l,
+                            else_in_d,
+                            else_in_s,
+                            guarded | wf_w,
+                            loop_breaks,
+                            loop_continues,
+                            abrupt_returns,
+                            abrupt_raises,
+                        )
+                    if not fe and not brk:
+                        return le, de, se, False
+                    live = (le if fe else False) or any(bl for bl, _, _ in brk)
+                    defs = _merge_defs(*(([de] if fe else []) + [bd for _, bd, _ in brk]))
+                    stored = _merge_stored(([(le, se)] if fe else []) + [(bl, bs) for bl, _, bs in brk])
+                elif isinstance(s, (ast.With, ast.AsyncWith)):
+                    for item in s.items:
+                        live, defs, stored = walk_expr(item.context_expr, live, defs, stored, guarded)
+                        if item.optional_vars is not None:
+                            live, defs, stored = walk_target(item.optional_vars, live, defs, stored, guarded)
+                    live, defs, stored, fw = walk_stmts(
+                        s.body, live, defs, stored, guarded, loop_breaks, loop_continues, abrupt_returns, abrupt_raises
+                    )
+                    if not fw:
+                        return live, defs, stored, False
+                elif isinstance(s, (ast.Try, ast.TryStar)):
+                    entry_live = live
+                    entry_defs = _copy_defs(defs)
+                    entry_stored = stored
+                    body_returns: list[StateTriple] = []
+                    body_raises: list[StateTriple] = []
+                    post_returns: list[StateTriple] = []
+                    post_raises: list[StateTriple] = []
+                    try_breaks: list[StateTriple] = []
+                    try_continues: list[StateTriple] = []
+                    lt, dt, st_t, ft = walk_stmts(
+                        s.body,
+                        entry_live,
+                        _copy_defs(entry_defs),
+                        entry_stored,
+                        guarded,
+                        try_breaks,
+                        try_continues,
+                        body_returns,
+                        body_raises,
+                    )
+                    le, de, se, fe = (
+                        walk_stmts(
+                            s.orelse,
+                            lt,
+                            _copy_defs(dt),
+                            st_t,
+                            guarded,
+                            try_breaks,
+                            try_continues,
+                            post_returns,
+                            post_raises,
+                        )
+                        if ft
+                        else (False, {}, frozenset(), False)
+                    )
+                    h_branches: list[StateTriple] = [(le, de, se)] if fe else []
+                    any_fall = fe
+                    exc_base_defs = _merge_defs(entry_defs, dt)
+                    exc_base_st = _merge_stored([(entry_live, entry_stored), (lt, st_t)])
+                    for h in s.handlers:
+                        if h.type is not None:
+                            walk_expr(h.type, entry_live or lt, _copy_defs(exc_base_defs), exc_base_st, guarded)
+                        hd = _copy_defs(exc_base_defs)
+                        if h.name:
+                            hd.pop(h.name, None)
+                        h_in = False if h.name == nm else (entry_live or lt)
+                        h_st_in = frozenset() if h.name == nm else exc_base_st
+                        lh, dh, sh, fh = walk_stmts(
+                            h.body,
+                            h_in,
+                            hd,
+                            h_st_in,
+                            guarded,
+                            try_breaks,
+                            try_continues,
+                            post_returns,
+                            post_raises,
+                        )
+                        if fh:
+                            any_fall = True
+                            h_branches.append((lh, dh, sh))
+                    has_bare_except = isinstance(s, ast.Try) and any(h.type is None for h in s.handlers)
+                    all_returns = body_returns + post_returns
+                    uncaught_raises = post_raises if has_bare_except else (body_raises + post_raises)
+                    fall_in_l = any(hl for hl, _, _ in h_branches) if any_fall else False
+                    fall_in_d = _merge_defs(*(hd for _, hd, _ in h_branches)) if any_fall else {}
+                    fall_in_s = _merge_stored([(hl, hs) for hl, _, hs in h_branches]) if any_fall else frozenset()
+                    if not s.finalbody:
+                        if abrupt_returns is not None:
+                            abrupt_returns.extend(all_returns)
+                        if abrupt_raises is not None:
+                            abrupt_raises.extend(uncaught_raises)
+                        if loop_breaks is not None:
+                            loop_breaks.extend(try_breaks)
+                        if loop_continues is not None:
+                            loop_continues.extend(try_continues)
+                        if not any_fall:
+                            return False, {}, frozenset(), False
+                        live, defs, stored = fall_in_l, fall_in_d, fall_in_s
+                    else:
+                        fin_states: list[StateTriple] = []
+                        if any_fall:
+                            fin_states.append((fall_in_l, fall_in_d, fall_in_s))
+                        fin_states.extend(all_returns)
+                        fin_states.extend(uncaught_raises)
+                        if loop_breaks is not None:
+                            fin_states.extend(try_breaks)
+                        if loop_continues is not None:
+                            fin_states.extend(try_continues)
+                        if not fin_states:
+                            fin_states.append((entry_live or lt, exc_base_defs, exc_base_st))
+                        fin_union_l = any(l for l, _, _ in fin_states)
+                        fin_union_d = _merge_defs(*(d for _, d, _ in fin_states))
+                        fin_union_s = _merge_stored([(l, st) for l, _, st in fin_states])
+                        walk_stmts(
+                            s.finalbody,
+                            fin_union_l,
+                            _copy_defs(fin_union_d),
+                            fin_union_s,
+                            guarded,
+                            loop_breaks,
+                            loop_continues,
+                            abrupt_returns,
+                            abrupt_raises,
+                        )
+
+                        def eval_finalizer(
+                            in_l: bool,
+                            in_d: DefsMap,
+                            in_s: frozenset[str],
+                            cur_g: frozenset[str] = guarded,
+                            final_stmts: list[ast.stmt] = s.finalbody,
+                        ) -> tuple[bool, DefsMap, frozenset[str], bool]:
+                            calls_snap = dict(live_calls)
+                            req_snap = set(required_attrs)
+                            dead_snap = set(dead_refs)
+                            rl, rd, rs, rf = walk_stmts(final_stmts, in_l, _copy_defs(in_d), in_s, cur_g)
+                            live_calls.clear()
+                            live_calls.update(calls_snap)
+                            required_attrs.clear()
+                            required_attrs.update(req_snap)
+                            dead_refs.clear()
+                            dead_refs.update(dead_snap)
+                            return rl, rd, rs, rf
+
+                        if all_returns and abrupt_returns is not None:
+                            rl, rd, rs, rf = eval_finalizer(
+                                any(l for l, _, _ in all_returns),
+                                _merge_defs(*(d for _, d, _ in all_returns)),
+                                _merge_stored([(l, st) for l, _, st in all_returns]),
+                            )
+                            if rf:
+                                abrupt_returns.append((rl, rd, rs))
+                        if uncaught_raises and abrupt_raises is not None:
+                            rl, rd, rs, rf = eval_finalizer(
+                                any(l for l, _, _ in uncaught_raises),
+                                _merge_defs(*(d for _, d, _ in uncaught_raises)),
+                                _merge_stored([(l, st) for l, _, st in uncaught_raises]),
+                            )
+                            if rf:
+                                abrupt_raises.append((rl, rd, rs))
+                        if try_breaks and loop_breaks is not None:
+                            rl, rd, rs, rf = eval_finalizer(
+                                any(l for l, _, _ in try_breaks),
+                                _merge_defs(*(d for _, d, _ in try_breaks)),
+                                _merge_stored([(l, st) for l, _, st in try_breaks]),
+                            )
+                            if rf:
+                                loop_breaks.append((rl, rd, rs))
+                        if try_continues and loop_continues is not None:
+                            rl, rd, rs, rf = eval_finalizer(
+                                any(l for l, _, _ in try_continues),
+                                _merge_defs(*(d for _, d, _ in try_continues)),
+                                _merge_stored([(l, st) for l, _, st in try_continues]),
+                            )
+                            if rf:
+                                loop_continues.append((rl, rd, rs))
+                        if not any_fall:
+                            return False, {}, frozenset(), False
+                        lf, df, sf, ff = eval_finalizer(fall_in_l, fall_in_d, fall_in_s)
+                        if not ff:
+                            return lf, df, sf, False
+                        live, defs, stored = lf, df, sf
+                elif isinstance(s, ast.Match):
+                    live, defs, stored = walk_expr(s.subject, live, defs, stored, guarded)
+                    c_branches: list[StateTriple] = []
+                    exit_branches: list[StateTriple] = []
+                    any_fall = False
+                    has_wild = False
+                    for case in s.cases:
+                        pat_names = {
+                            p.name for p in ast.walk(case.pattern) if isinstance(p, (ast.MatchAs, ast.MatchStar)) and p.name
+                        } | {
+                            p.rest for p in ast.walk(case.pattern) if isinstance(p, ast.MatchMapping) and p.rest
+                        }
+                        cd = _copy_defs(defs)
+                        for pn in pat_names:
+                            cd.pop(pn, None)
+                        cin = False if nm in pat_names else live
+                        cst = frozenset() if nm in pat_names else stored
+                        if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None:
+                            has_wild = True
+                        cin, cd, cst = walk_expr(case.guard, cin, cd, cst, guarded)
+                        wt_m, _ = _hasattr_guarded(case.guard, nm, cd)
+                        lc, dc, sc, fc = walk_stmts(
+                            case.body,
+                            cin,
+                            cd,
+                            cst,
+                            guarded | wt_m,
+                            loop_breaks,
+                            loop_continues,
+                            abrupt_returns,
+                            abrupt_raises,
+                        )
+                        exit_branches.append((lc, dc, sc))
+                        if fc:
+                            any_fall = True
+                            c_branches.append((lc, dc, sc))
+                    if not has_wild:
+                        any_fall = True
+                        c_branches.append((live, _copy_defs(defs), stored))
+                    if not any_fall:
+                        return (
+                            any(el for el, _, _ in exit_branches),
+                            _merge_defs(*(ed for _, ed, _ in exit_branches)),
+                            _merge_stored([(el, es) for el, _, es in exit_branches]),
+                            False,
+                        )
+                    live = any(cl for cl, _, _ in c_branches)
+                    defs = _merge_defs(*(cd_i for _, cd_i, _ in c_branches))
+                    stored = _merge_stored([(cl, cs) for cl, _, cs in c_branches])
+                else:
+                    for ch in ast.iter_child_nodes(s):
+                        if isinstance(ch, ast.expr):
+                            live, defs, stored = walk_expr(ch, live, defs, stored, guarded)
+                        elif isinstance(ch, ast.stmt):
+                            live, defs, stored, fs = walk_stmts(
+                                [ch],
+                                live,
+                                defs,
+                                stored,
+                                guarded,
+                                loop_breaks,
+                                loop_continues,
+                                abrupt_returns,
+                                abrupt_raises,
+                            )
+                            if not fs:
+                                return live, defs, stored, False
+            return live, defs, stored, True
+
+        if isinstance(body, list):
+            top_returns: list[StateTriple] = []
+            end_live, end_defs, end_st, end_fall = walk_stmts(
+                body, True, init_defs, init_stored, init_guarded, None, None, top_returns, None
             )
-            if names:
-                for sub in ast.walk(fn):
-                    if isinstance(sub, ast.Call):
-                        out[id(sub)] = out.get(id(sub), frozenset()) | names
+            exit_states = ([(end_live, end_defs, end_st)] if end_fall else []) + top_returns
+            exit_stored = _merge_stored([(l, st) for l, _, st in exit_states])
+            if any(l for l, _, _ in exit_states):
+                live_exit_defs = _merge_defs(*(d for l, d, _ in exit_states if l))
+                for fn_name, fn_nodes in list(live_exit_defs.items()):
+                    if any(id(fn_node) not in dead_refs for fn_node in fn_nodes):
+                        activate_defs(fn_name, live_exit_defs, exit_stored, init_guarded)
+            return exit_stored
+        _, _, expr_st = walk_expr(body, True, init_defs, init_stored, init_guarded)
+        return expr_st
+
+    run_scope(fn.body)
+    return live_calls, frozenset(required_attrs)
+
+
+def _injected_param_profiles(tree: ast.AST, excluded: set[int]) -> dict[int, dict[str, frozenset[str]]]:
+    """Map each call `id(call)` to `{unannotated_param: frozenset(attrs required on param in that fn)}`."""
+    out: dict[int, dict[str, frozenset[str]]] = {}
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) or id(fn) in excluded:
+            continue
+        a = fn.args
+        names = frozenset(
+            p.arg
+            for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)
+            if p.annotation is None and p.arg not in ("self", "cls")
+        )
+        if not names:
+            continue
+        for nm in names:
+            live_calls, req_attrs = _live_param_expr_nodes(fn, nm, excluded)
+            if not live_calls:
+                continue
+            for call_id, mname in live_calls.items():
+                if call_id in excluded:
+                    continue
+                merged = dict(out.get(call_id, {}))
+                merged[nm] = req_attrs if mname in _OBJECT_ATTRS else (req_attrs | {mname})
+                out[call_id] = merged
     return out
 
 
@@ -400,9 +1362,14 @@ def _call_name(call: ast.Call) -> str:
 
 
 def _model_arg(call: ast.Call) -> str | None:
-    """`query(Model)`, `select(Model)`, `session.get(Model, pk)` -> "Model" (capitalized names only)."""
-    if call.args and isinstance(call.args[0], ast.Name) and call.args[0].id[:1].isupper():
-        return call.args[0].id
+    """`query(Model)`, `select(Model)`, `session.get(Model, pk)` -> 'Model' or 'pkg.Model'."""
+    if not call.args:
+        return None
+    arg = call.args[0]
+    if isinstance(arg, ast.Name) and arg.id[:1].isupper():
+        return arg.id
+    if isinstance(arg, ast.Attribute) and arg.attr[:1].isupper():
+        return _dotted(arg)
     return None
 
 
@@ -429,7 +1396,7 @@ def _loaded_row_model(expr: ast.AST | None) -> str | None:
 
 
 def _constructed_model(expr: ast.AST | None) -> str | None:
-    """`Model(...)` or a classmethod factory `Model.create(...)` -> "Model" (capitalized names)."""
+    """`Model(...)`, `pkg.Model(...)`, or classmethod factory `Model.create(...)`."""
     if isinstance(expr, ast.Await):
         expr = expr.value
     if not isinstance(expr, ast.Call):
@@ -437,85 +1404,1095 @@ def _constructed_model(expr: ast.AST | None) -> str | None:
     func = expr.func
     if isinstance(func, ast.Name) and func.id[:1].isupper():
         return func.id
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id[:1].isupper():
-        return func.value.id
+    if isinstance(func, ast.Attribute):
+        if func.attr[:1].isupper():
+            return _dotted(func)
+        if isinstance(func.value, ast.Name) and func.value.id[:1].isupper():
+            return func.value.id
+        if isinstance(func.value, ast.Attribute) and func.value.attr[:1].isupper():
+            return _dotted(func.value)
     return None
 
 
-def _scope_nodes(root: ast.AST) -> list[ast.AST]:
-    """Nodes of one function (or module) scope, without descending into nested defs."""
-    out: list[ast.AST] = []
-    stack = list(ast.iter_child_nodes(root))
-    while stack:
-        node = stack.pop()
-        out.append(node)
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-            stack.extend(ast.iter_child_nodes(node))
+def _expr_nodes_shallow(stmt_expr: ast.AST | None, excluded: set[int]) -> list[ast.AST]:
+    """Walk an expression without descending into nested function/lambda/class definitions."""
+    if stmt_expr is None or id(stmt_expr) in excluded:
+        return []
+    out: list[ast.AST] = [stmt_expr]
+    idx = 0
+    while idx < len(out):
+        cur = out[idx]
+        idx += 1
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        for ch in ast.iter_child_nodes(cur):
+            if id(ch) not in excluded:
+                out.append(ch)
     return out
 
 
-def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
-    """Writes to rows loaded from the session, per scope.
+def _merge_binding_maps(*maps: dict[str, set[str]]) -> dict[str, set[str]]:
+    merged: dict[str, set[str]] = {}
+    for mp in maps:
+        for k, vals in mp.items():
+            if vals:
+                merged.setdefault(k, set()).update(vals)
+    return merged
 
-    Returns (session_writes, mutations): `db.delete(row)` / `db.add(row)` / `db.merge(row)` on a
-    loaded row, and attribute stores / `setattr(row, ...)` on a loaded row, as (model, lineno).
-    """
+
+def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Statement-ordered writes to rows loaded from (or added to) the session, per lexical scope."""
     session_writes: list[tuple[str, int]] = []
     mutations: list[tuple[str, int]] = []
-    scopes: list[ast.AST] = [tree, *(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))]
-    for scope in scopes:
-        nodes = [n for n in _scope_nodes(scope) if id(n) not in excluded]
-        rows: dict[str, str] = {}
-        made: dict[str, str] = {}  # `v = Model(...)` / `v = Model.factory(...)`: only a write once added
-        for n in nodes:
-            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
-                model = _loaded_row_model(n.value)
-                if model:
-                    rows[n.targets[0].id] = model
-                maker = _constructed_model(n.value)
-                if maker:
-                    made[n.targets[0].id] = maker
-            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
-                model = _loaded_row_model(n.value)
-                if model:
-                    rows[n.target.id] = model
-            elif isinstance(n, (ast.For, ast.AsyncFor)) and isinstance(n.target, ast.Name):
-                model = _model_in_row_source(n.iter)
-                if model:
-                    rows[n.target.id] = model
-        if not rows and not made:
-            continue
-        for n in nodes:
-            if isinstance(n, ast.Call):
-                name = _call_name(n)
-                if (
-                    isinstance(n.func, ast.Attribute)
-                    and name in _SESSION_WRITES
-                    and _is_session_receiver(n.func.value)
-                ):
-                    for arg in n.args:
-                        elts = arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
-                        for elt in elts:
-                            if isinstance(elt, ast.Name) and elt.id in rows:
-                                session_writes.append((rows[elt.id], n.lineno))
-                            elif isinstance(elt, ast.Name) and elt.id in made and name != "delete":
-                                session_writes.append((made[elt.id], n.lineno))
-                elif name == "setattr" and isinstance(n.func, ast.Name) and n.args:
-                    first = n.args[0]
-                    if isinstance(first, ast.Name) and first.id in rows:
-                        mutations.append((rows[first.id], n.lineno))
-            elif isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-                for tgt in targets:
-                    for t in ast.walk(tgt):
-                        if (
-                            isinstance(t, ast.Attribute)
-                            and isinstance(t.ctx, ast.Store)
-                            and isinstance(t.value, ast.Name)
-                            and t.value.id in rows
-                        ):
-                            mutations.append((rows[t.value.id], n.lineno))
+
+    def inspect_expr(expr: ast.AST | None, rows: dict[str, set[str]], made: dict[str, set[str]]) -> None:
+        if expr is None or id(expr) in excluded:
+            return
+        if isinstance(expr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return
+        if isinstance(expr, ast.Lambda):
+            for dflt in (*expr.args.defaults, *(d for d in expr.args.kw_defaults if d is not None)):
+                inspect_expr(dflt, rows, made)
+            return
+        if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            if expr.generators:
+                inspect_expr(expr.generators[0].iter, rows, made)
+            cbound = _comp_bound_names(expr)
+            crows = {k: v for k, v in rows.items() if k not in cbound}
+            cmade = {k: v for k, v in made.items() if k not in cbound}
+            if expr.generators:
+                for ifs_e in expr.generators[0].ifs:
+                    inspect_expr(ifs_e, crows, cmade)
+                for gen in expr.generators[1:]:
+                    inspect_expr(gen.iter, crows, cmade)
+                    for ifs_e in gen.ifs:
+                        inspect_expr(ifs_e, crows, cmade)
+            if isinstance(expr, ast.DictComp):
+                inspect_expr(expr.key, crows, cmade)
+                inspect_expr(expr.value, crows, cmade)
+            else:
+                inspect_expr(expr.elt, crows, cmade)
+            return
+        if isinstance(expr, ast.IfExp):
+            inspect_expr(expr.test, rows, made)
+            b_rows = {k: set(v) for k, v in rows.items()}
+            b_made = {k: set(v) for k, v in made.items()}
+            o_rows = {k: set(v) for k, v in rows.items()}
+            o_made = {k: set(v) for k, v in made.items()}
+            inspect_expr(expr.body, b_rows, b_made)
+            inspect_expr(expr.orelse, o_rows, o_made)
+            merged_r = _merge_binding_maps(b_rows, o_rows)
+            merged_m = _merge_binding_maps(b_made, o_made)
+            rows.clear()
+            rows.update(merged_r)
+            made.clear()
+            made.update(merged_m)
+            return
+        if isinstance(expr, ast.BoolOp) and expr.values:
+            inspect_expr(expr.values[0], rows, made)
+            arm_rows = [{k: set(v) for k, v in rows.items()}]
+            arm_made = [{k: set(v) for k, v in made.items()}]
+            cur_r = {k: set(v) for k, v in rows.items()}
+            cur_m = {k: set(v) for k, v in made.items()}
+            for arm in expr.values[1:]:
+                inspect_expr(arm, cur_r, cur_m)
+                arm_rows.append({k: set(v) for k, v in cur_r.items()})
+                arm_made.append({k: set(v) for k, v in cur_m.items()})
+            merged_r = _merge_binding_maps(*arm_rows)
+            merged_m = _merge_binding_maps(*arm_made)
+            rows.clear()
+            rows.update(merged_r)
+            made.clear()
+            made.update(merged_m)
+            return
+        if isinstance(expr, ast.Call):
+            name = _call_name(expr)
+            if isinstance(expr.func, ast.Attribute) and name in _SESSION_WRITES and _is_session_receiver(expr.func.value):
+                for arg in expr.args:
+                    elts = arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
+                    for elt in elts:
+                        r_prov, m_prov = _eval_expr_provenance(elt, rows, made)
+                        recorded: set[str] = set()
+                        for m in r_prov:
+                            session_writes.append((m, expr.lineno))
+                            recorded.add(m)
+                        if name != "delete":
+                            for m in m_prov:
+                                if m not in recorded:
+                                    session_writes.append((m, expr.lineno))
+            elif name in ("setattr", "delattr") and isinstance(expr.func, ast.Name) and expr.args:
+                r_first, _ = _eval_expr_provenance(expr.args[0], rows, made)
+                for m in r_first:
+                    mutations.append((m, expr.lineno))
+            inspect_expr(expr.func, rows, made)
+            for arg_e in expr.args:
+                inspect_expr(arg_e, rows, made)
+            for kw in expr.keywords:
+                inspect_expr(kw.value, rows, made)
+            return
+        if isinstance(expr, ast.NamedExpr):
+            inspect_expr(expr.value, rows, made)
+            if isinstance(expr.target, ast.Name):
+                snap_r = {k: set(v) for k, v in rows.items()}
+                snap_m = {k: set(v) for k, v in made.items()}
+                bind_expr_to_name(expr.target.id, expr.value, rows, made, snap_r, snap_m)
+            return
+        for ch in ast.iter_child_nodes(expr):
+            if isinstance(ch, ast.expr):
+                inspect_expr(ch, rows, made)
+
+    def _eval_expr_provenance(
+        rhs: ast.AST | None,
+        snap_rows: dict[str, set[str]],
+        snap_made: dict[str, set[str]],
+    ) -> tuple[set[str], set[str]]:
+        if rhs is None or id(rhs) in excluded:
+            return set(), set()
+        if isinstance(rhs, ast.Await):
+            return _eval_expr_provenance(rhs.value, snap_rows, snap_made)
+        if isinstance(rhs, ast.NamedExpr):
+            return _eval_expr_provenance(rhs.value, snap_rows, snap_made)
+        if isinstance(rhs, ast.Name):
+            return set(snap_rows.get(rhs.id, ())), set(snap_made.get(rhs.id, ()))
+        if isinstance(rhs, ast.IfExp):
+            b_r, b_m = _eval_expr_provenance(rhs.body, snap_rows, snap_made)
+            o_r, o_m = _eval_expr_provenance(rhs.orelse, snap_rows, snap_made)
+            return b_r | o_r, b_m | o_m
+        if isinstance(rhs, ast.BoolOp) and rhs.values:
+            if isinstance(rhs.op, ast.Or):
+                out_r: set[str] = set()
+                out_m: set[str] = set()
+                for val in rhs.values:
+                    v_r, v_m = _eval_expr_provenance(val, snap_rows, snap_made)
+                    out_r.update(v_r)
+                    out_m.update(v_m)
+                return out_r, out_m
+            if isinstance(rhs.op, ast.And):
+                return _eval_expr_provenance(rhs.values[-1], snap_rows, snap_made)
+        if isinstance(rhs, ast.Call) and _call_name(rhs) == "cast" and len(rhs.args) == 2:
+            return _eval_expr_provenance(rhs.args[1], snap_rows, snap_made)
+        model = _loaded_row_model(rhs)
+        if model:
+            return {model}, set()
+        maker = _constructed_model(rhs)
+        if maker:
+            return set(), {maker}
+        return set(), set()
+
+    def bind_expr_to_name(
+        var: str,
+        rhs: ast.AST | None,
+        rows: dict[str, set[str]],
+        made: dict[str, set[str]],
+        snap_rows: dict[str, set[str]],
+        snap_made: dict[str, set[str]],
+    ) -> None:
+        r_models, m_models = _eval_expr_provenance(rhs, snap_rows, snap_made)
+        if r_models:
+            rows[var] = r_models
+        else:
+            rows.pop(var, None)
+        if m_models:
+            made[var] = m_models
+        else:
+            made.pop(var, None)
+
+    def bind_target_tree(
+        tgt: ast.AST,
+        rhs: ast.AST | None,
+        rows: dict[str, set[str]],
+        made: dict[str, set[str]],
+        snap_rows: dict[str, set[str]],
+        snap_made: dict[str, set[str]],
+    ) -> None:
+        if isinstance(tgt, ast.Name):
+            bind_expr_to_name(tgt.id, rhs, rows, made, snap_rows, snap_made)
+        elif (
+            isinstance(tgt, (ast.Tuple, ast.List))
+            and isinstance(rhs, (ast.Tuple, ast.List))
+            and len(tgt.elts) == len(rhs.elts)
+            and not any(isinstance(e, ast.Starred) for e in tgt.elts)
+        ):
+            for te, re_ in zip(tgt.elts, rhs.elts, strict=False):
+                bind_target_tree(te, re_, rows, made, snap_rows, snap_made)
+
+    def record_target_mutations(tgt: ast.AST, lineno: int, rows: dict[str, set[str]]) -> None:
+        for t in ast.walk(tgt):
+            if isinstance(t, ast.Attribute) and isinstance(t.ctx, ast.Store):
+                r_val, _ = _eval_expr_provenance(t.value, rows, {})
+                for m in r_val:
+                    mutations.append((m, lineno))
+
+    def walk_block(
+        stmts: list[ast.stmt],
+        rows: dict[str, set[str]],
+        made: dict[str, set[str]],
+        exc_rows: dict[str, set[str]] | None = None,
+        exc_made: dict[str, set[str]] | None = None,
+        loop_breaks_r: list[dict[str, set[str]]] | None = None,
+        loop_breaks_m: list[dict[str, set[str]]] | None = None,
+        loop_continues_r: list[dict[str, set[str]]] | None = None,
+        loop_continues_m: list[dict[str, set[str]]] | None = None,
+    ) -> tuple[dict[str, set[str]], dict[str, set[str]], bool]:
+        def record_exc(r_cur: dict[str, set[str]], m_cur: dict[str, set[str]]) -> None:
+            if exc_rows is not None:
+                for k, vals in r_cur.items():
+                    if vals:
+                        exc_rows.setdefault(k, set()).update(vals)
+            if exc_made is not None:
+                for k, vals in m_cur.items():
+                    if vals:
+                        exc_made.setdefault(k, set()).update(vals)
+
+        record_exc(rows, made)
+        for s in stmts:
+            if id(s) in excluded:
+                continue
+            if isinstance(s, ast.Return):
+                inspect_expr(s.value, rows, made)
+                record_exc(rows, made)
+                return rows, made, False
+            if isinstance(s, ast.Raise):
+                inspect_expr(s.exc, rows, made)
+                inspect_expr(s.cause, rows, made)
+                record_exc(rows, made)
+                return rows, made, False
+            if isinstance(s, ast.Break):
+                record_exc(rows, made)
+                if loop_breaks_r is not None:
+                    loop_breaks_r.append({k: set(v) for k, v in rows.items()})
+                if loop_breaks_m is not None:
+                    loop_breaks_m.append({k: set(v) for k, v in made.items()})
+                return rows, made, False
+            if isinstance(s, ast.Continue):
+                record_exc(rows, made)
+                if loop_continues_r is not None:
+                    loop_continues_r.append({k: set(v) for k, v in rows.items()})
+                if loop_continues_m is not None:
+                    loop_continues_m.append({k: set(v) for k, v in made.items()})
+                return rows, made, False
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in s.decorator_list:
+                    inspect_expr(dec, rows, made)
+                for dflt in (*s.args.defaults, *(d for d in s.args.kw_defaults if d is not None)):
+                    inspect_expr(dflt, rows, made)
+                rows.pop(s.name, None)
+                made.pop(s.name, None)
+                record_exc(rows, made)
+                continue
+            if isinstance(s, ast.ClassDef):
+                for dec in s.decorator_list:
+                    inspect_expr(dec, rows, made)
+                rows.pop(s.name, None)
+                made.pop(s.name, None)
+                record_exc(rows, made)
+                continue
+            if isinstance(s, (ast.Import, ast.ImportFrom)):
+                for alias in s.names:
+                    if alias.name != "*":
+                        bnm = (alias.asname or alias.name).split(".", 1)[0]
+                        rows.pop(bnm, None)
+                        made.pop(bnm, None)
+                record_exc(rows, made)
+                continue
+            if isinstance(s, ast.Delete):
+                for tgt in s.targets:
+                    if isinstance(tgt, ast.Name):
+                        rows.pop(tgt.id, None)
+                        made.pop(tgt.id, None)
+                    elif isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name) and tgt.value.id in rows:
+                        for m in rows[tgt.value.id]:
+                            mutations.append((m, s.lineno))
+                    else:
+                        inspect_expr(tgt, rows, made)
+            elif isinstance(s, ast.Assign):
+                inspect_expr(s.value, rows, made)
+                for tgt in s.targets:
+                    record_target_mutations(tgt, s.lineno, rows)
+                snap_r = {k: set(v) for k, v in rows.items()}
+                snap_m = {k: set(v) for k, v in made.items()}
+                for tgt in s.targets:
+                    for sub in ast.walk(tgt):
+                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                            rows.pop(sub.id, None)
+                            made.pop(sub.id, None)
+                for tgt in s.targets:
+                    bind_target_tree(tgt, s.value, rows, made, snap_r, snap_m)
+            elif isinstance(s, ast.AnnAssign):
+                inspect_expr(s.value, rows, made)
+                record_target_mutations(s.target, s.lineno, rows)
+                if s.value is not None:
+                    snap_r = {k: set(v) for k, v in rows.items()}
+                    snap_m = {k: set(v) for k, v in made.items()}
+                    for sub in ast.walk(s.target):
+                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                            rows.pop(sub.id, None)
+                            made.pop(sub.id, None)
+                    bind_target_tree(s.target, s.value, rows, made, snap_r, snap_m)
+            elif isinstance(s, ast.AugAssign):
+                inspect_expr(s.value, rows, made)
+                record_target_mutations(s.target, s.lineno, rows)
+            elif isinstance(s, (ast.For, ast.AsyncFor)):
+                inspect_expr(s.iter, rows, made)
+                iter_model = _model_in_row_source(s.iter) if isinstance(s.target, ast.Name) else None
+                cur_in_r = {k: set(v) for k, v in rows.items()}
+                cur_in_m = {k: set(v) for k, v in made.items()}
+                sw_base, mut_base = len(session_writes), len(mutations)
+                f_breaks_r: list[dict[str, set[str]]] = []
+                f_breaks_m: list[dict[str, set[str]]] = []
+                f_conts_r: list[dict[str, set[str]]] = []
+                f_conts_m: list[dict[str, set[str]]] = []
+                iter_end_r: dict[str, set[str]] = {}
+                iter_end_m: dict[str, set[str]] = {}
+                for _ in range(8):
+                    del session_writes[sw_base:]
+                    del mutations[mut_base:]
+                    f_breaks_r.clear()
+                    f_breaks_m.clear()
+                    f_conts_r.clear()
+                    f_conts_m.clear()
+                    record_target_mutations(s.target, s.lineno, cur_in_r)
+                    r_loop_in = {k: set(v) for k, v in cur_in_r.items()}
+                    m_loop_in = {k: set(v) for k, v in cur_in_m.items()}
+                    if isinstance(s.target, ast.Name):
+                        if iter_model:
+                            r_loop_in[s.target.id] = {iter_model}
+                            m_loop_in.pop(s.target.id, None)
+                        else:
+                            r_loop_in.pop(s.target.id, None)
+                            m_loop_in.pop(s.target.id, None)
+                    else:
+                        for sub in ast.walk(s.target):
+                            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                                r_loop_in.pop(sub.id, None)
+                                m_loop_in.pop(sub.id, None)
+                    r_body, m_body, f_body = walk_block(
+                        s.body,
+                        r_loop_in,
+                        m_loop_in,
+                        exc_rows,
+                        exc_made,
+                        f_breaks_r,
+                        f_breaks_m,
+                        f_conts_r,
+                        f_conts_m,
+                    )
+                    iter_end_r = _merge_binding_maps(*(([r_body] if f_body else []) + f_conts_r))
+                    iter_end_m = _merge_binding_maps(*(([m_body] if f_body else []) + f_conts_m))
+                    next_in_r = _merge_binding_maps(cur_in_r, iter_end_r)
+                    next_in_m = _merge_binding_maps(cur_in_m, iter_end_m)
+                    if next_in_r == cur_in_r and next_in_m == cur_in_m:
+                        break
+                    cur_in_r, cur_in_m = next_in_r, next_in_m
+                r_else, m_else, f_else = walk_block(
+                    s.orelse,
+                    _merge_binding_maps(rows, iter_end_r),
+                    _merge_binding_maps(made, iter_end_m),
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
+                )
+                if not f_else and not f_breaks_r:
+                    return rows, made, False
+                rows = _merge_binding_maps(*(([rows, iter_end_r, r_else] if f_else else []) + f_breaks_r))
+                made = _merge_binding_maps(*(([made, iter_end_m, m_else] if f_else else []) + f_breaks_m))
+            elif isinstance(s, ast.While):
+                cur_w_r = {k: set(v) for k, v in rows.items()}
+                cur_w_m = {k: set(v) for k, v in made.items()}
+                sw_base_w, mut_base_w = len(session_writes), len(mutations)
+                w_breaks_r: list[dict[str, set[str]]] = []
+                w_breaks_m: list[dict[str, set[str]]] = []
+                w_conts_r: list[dict[str, set[str]]] = []
+                w_conts_m: list[dict[str, set[str]]] = []
+                w_end_r: dict[str, set[str]] = {}
+                w_end_m: dict[str, set[str]] = {}
+                for _ in range(8):
+                    del session_writes[sw_base_w:]
+                    del mutations[mut_base_w:]
+                    w_breaks_r.clear()
+                    w_breaks_m.clear()
+                    w_conts_r.clear()
+                    w_conts_m.clear()
+                    r_test_in = {k: set(v) for k, v in cur_w_r.items()}
+                    m_test_in = {k: set(v) for k, v in cur_w_m.items()}
+                    inspect_expr(s.test, r_test_in, m_test_in)
+                    r_body, m_body, f_body = walk_block(
+                        s.body,
+                        r_test_in,
+                        m_test_in,
+                        exc_rows,
+                        exc_made,
+                        w_breaks_r,
+                        w_breaks_m,
+                        w_conts_r,
+                        w_conts_m,
+                    )
+                    w_end_r = _merge_binding_maps(*(([r_body] if f_body else []) + w_conts_r))
+                    w_end_m = _merge_binding_maps(*(([m_body] if f_body else []) + w_conts_m))
+                    next_w_r = _merge_binding_maps(cur_w_r, w_end_r)
+                    next_w_m = _merge_binding_maps(cur_w_m, w_end_m)
+                    if next_w_r == cur_w_r and next_w_m == cur_w_m:
+                        break
+                    cur_w_r, cur_w_m = next_w_r, next_w_m
+                r_else, m_else, f_else = walk_block(
+                    s.orelse,
+                    _merge_binding_maps(rows, w_end_r),
+                    _merge_binding_maps(made, w_end_m),
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
+                )
+                if not f_else and not w_breaks_r:
+                    return rows, made, False
+                rows = _merge_binding_maps(*(([rows, w_end_r, r_else] if f_else else []) + w_breaks_r))
+                made = _merge_binding_maps(*(([made, w_end_m, m_else] if f_else else []) + w_breaks_m))
+            elif isinstance(s, ast.If):
+                inspect_expr(s.test, rows, made)
+                r_body, m_body, f_body = walk_block(
+                    s.body,
+                    {k: set(v) for k, v in rows.items()},
+                    {k: set(v) for k, v in made.items()},
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
+                )
+                r_else, m_else, f_else = walk_block(
+                    s.orelse,
+                    {k: set(v) for k, v in rows.items()},
+                    {k: set(v) for k, v in made.items()},
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
+                )
+                if not f_body and not f_else:
+                    return rows, made, False
+                rows = _merge_binding_maps(*(([r_body] if f_body else []) + ([r_else] if f_else else [])))
+                made = _merge_binding_maps(*(([m_body] if f_body else []) + ([m_else] if f_else else [])))
+            elif isinstance(s, (ast.With, ast.AsyncWith)):
+                for item in s.items:
+                    inspect_expr(item.context_expr, rows, made)
+                    if item.optional_vars is not None:
+                        snap_r = {k: set(v) for k, v in rows.items()}
+                        snap_m = {k: set(v) for k, v in made.items()}
+                        for sub in ast.walk(item.optional_vars):
+                            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                                rows.pop(sub.id, None)
+                                made.pop(sub.id, None)
+                        bind_target_tree(item.optional_vars, item.context_expr, rows, made, snap_r, snap_m)
+                rows, made, f_with = walk_block(
+                    s.body,
+                    rows,
+                    made,
+                    exc_rows,
+                    exc_made,
+                    loop_breaks_r,
+                    loop_breaks_m,
+                    loop_continues_r,
+                    loop_continues_m,
+                )
+                if not f_with:
+                    return rows, made, False
+            elif isinstance(s, (ast.Try, ast.TryStar)):
+                try_exc_r: dict[str, set[str]] = {}
+                try_exc_m: dict[str, set[str]] = {}
+                post_exc_r: dict[str, set[str]] = {}
+                post_exc_m: dict[str, set[str]] = {}
+                inner_breaks_r: list[dict[str, set[str]]] = []
+                inner_breaks_m: list[dict[str, set[str]]] = []
+                inner_conts_r: list[dict[str, set[str]]] = []
+                inner_conts_m: list[dict[str, set[str]]] = []
+                b_target_r = inner_breaks_r if s.finalbody else loop_breaks_r
+                b_target_m = inner_breaks_m if s.finalbody else loop_breaks_m
+                c_target_r = inner_conts_r if s.finalbody else loop_continues_r
+                c_target_m = inner_conts_m if s.finalbody else loop_continues_m
+                branches_r: list[dict[str, set[str]]] = []
+                branches_m: list[dict[str, set[str]]] = []
+                r_try, m_try, f_try = walk_block(
+                    s.body,
+                    {k: set(v) for k, v in rows.items()},
+                    {k: set(v) for k, v in made.items()},
+                    try_exc_r,
+                    try_exc_m,
+                    b_target_r,
+                    b_target_m,
+                    c_target_r,
+                    c_target_m,
+                )
+                if f_try:
+                    rb, mb, fb = walk_block(
+                        s.orelse,
+                        {k: set(v) for k, v in r_try.items()},
+                        {k: set(v) for k, v in m_try.items()},
+                        post_exc_r,
+                        post_exc_m,
+                        b_target_r,
+                        b_target_m,
+                        c_target_r,
+                        c_target_m,
+                    )
+                    if fb:
+                        branches_r.append(rb)
+                        branches_m.append(mb)
+                h_in_r = _merge_binding_maps(rows, r_try, try_exc_r)
+                h_in_m = _merge_binding_maps(made, m_try, try_exc_m)
+                for h in s.handlers:
+                    inspect_expr(h.type, h_in_r, h_in_m)
+                    hr = {k: set(v) for k, v in h_in_r.items()}
+                    hm = {k: set(v) for k, v in h_in_m.items()}
+                    if h.name:
+                        hr.pop(h.name, None)
+                        hm.pop(h.name, None)
+                    rh, mh, fh = walk_block(
+                        h.body, hr, hm, post_exc_r, post_exc_m, b_target_r, b_target_m, c_target_r, c_target_m
+                    )
+                    if fh:
+                        branches_r.append(rh)
+                        branches_m.append(mh)
+                has_bare = isinstance(s, ast.Try) and any(h.type is None for h in s.handlers)
+                uncaught_r = post_exc_r if has_bare else _merge_binding_maps(try_exc_r, post_exc_r)
+                uncaught_m = post_exc_m if has_bare else _merge_binding_maps(try_exc_m, post_exc_m)
+                record_exc(uncaught_r, uncaught_m)
+                if s.finalbody:
+                    fin_in_r = _merge_binding_maps(*branches_r, try_exc_r, post_exc_r, *inner_breaks_r, *inner_conts_r)
+                    fin_in_m = _merge_binding_maps(*branches_m, try_exc_m, post_exc_m, *inner_breaks_m, *inner_conts_m)
+                    _, _, fin_falls = walk_block(
+                        s.finalbody,
+                        fin_in_r,
+                        fin_in_m,
+                        exc_rows,
+                        exc_made,
+                        loop_breaks_r,
+                        loop_breaks_m,
+                        loop_continues_r,
+                        loop_continues_m,
+                    )
+                    if fin_falls and loop_breaks_r is not None and inner_breaks_r:
+                        sw_len, mut_len = len(session_writes), len(mutations)
+                        br_r, br_m, _ = walk_block(
+                            s.finalbody,
+                            _merge_binding_maps(*inner_breaks_r),
+                            _merge_binding_maps(*inner_breaks_m),
+                        )
+                        del session_writes[sw_len:]
+                        del mutations[mut_len:]
+                        loop_breaks_r.append(br_r)
+                        if loop_breaks_m is not None:
+                            loop_breaks_m.append(br_m)
+                    if fin_falls and loop_continues_r is not None and inner_conts_r:
+                        sw_len, mut_len = len(session_writes), len(mutations)
+                        ct_r, ct_m, _ = walk_block(
+                            s.finalbody,
+                            _merge_binding_maps(*inner_conts_r),
+                            _merge_binding_maps(*inner_conts_m),
+                        )
+                        del session_writes[sw_len:]
+                        del mutations[mut_len:]
+                        loop_continues_r.append(ct_r)
+                        if loop_continues_m is not None:
+                            loop_continues_m.append(ct_m)
+                    if not fin_falls or not branches_r:
+                        return rows, made, False
+                    sw_len, mut_len = len(session_writes), len(mutations)
+                    rows, made, _ = walk_block(
+                        s.finalbody,
+                        _merge_binding_maps(*branches_r),
+                        _merge_binding_maps(*branches_m),
+                    )
+                    del session_writes[sw_len:]
+                    del mutations[mut_len:]
+                else:
+                    if not branches_r:
+                        return rows, made, False
+                    rows = _merge_binding_maps(*branches_r)
+                    made = _merge_binding_maps(*branches_m)
+            elif isinstance(s, ast.Match):
+                inspect_expr(s.subject, rows, made)
+                case_r: list[dict[str, set[str]]] = []
+                case_m: list[dict[str, set[str]]] = []
+                has_wildcard = False
+                for case in s.cases:
+                    cr = {k: set(v) for k, v in rows.items()}
+                    cm = {k: set(v) for k, v in made.items()}
+                    for pat_node in ast.walk(case.pattern):
+                        bound_name = (
+                            pat_node.name
+                            if isinstance(pat_node, (ast.MatchAs, ast.MatchStar))
+                            else pat_node.rest
+                            if isinstance(pat_node, ast.MatchMapping)
+                            else None
+                        )
+                        if bound_name:
+                            cr.pop(bound_name, None)
+                            cm.pop(bound_name, None)
+                    if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None:
+                        has_wildcard = True
+                    inspect_expr(case.guard, cr, cm)
+                    cr, cm, fc = walk_block(
+                        case.body,
+                        cr,
+                        cm,
+                        exc_rows,
+                        exc_made,
+                        loop_breaks_r,
+                        loop_breaks_m,
+                        loop_continues_r,
+                        loop_continues_m,
+                    )
+                    if fc:
+                        case_r.append(cr)
+                        case_m.append(cm)
+                if not has_wildcard:
+                    case_r.append(rows)
+                    case_m.append(made)
+                if not case_r:
+                    return rows, made, False
+                rows = _merge_binding_maps(*case_r)
+                made = _merge_binding_maps(*case_m)
+            else:
+                for ch in ast.iter_child_nodes(s):
+                    if isinstance(ch, ast.expr):
+                        inspect_expr(ch, rows, made)
+                    elif isinstance(ch, ast.stmt):
+                        rows, made, f_ch = walk_block(
+                            [ch],
+                            rows,
+                            made,
+                            exc_rows,
+                            exc_made,
+                            loop_breaks_r,
+                            loop_breaks_m,
+                            loop_continues_r,
+                            loop_continues_m,
+                        )
+                        if not f_ch:
+                            return rows, made, False
+            record_exc(rows, made)
+        return rows, made, True
+
+    walk_block(tree.body, {}, {})
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and id(n) not in excluded:
+            walk_block(n.body, {}, {})
     return session_writes, mutations
+
+
+_CLOCK_FACTORY_KWARGS = frozenset({"default", "default_factory", "onupdate", "insert_default", "factory"})
+_CLOCK_ZERO_ARG_CALLS = frozenset({"defaultdict", "Factory", "LazyFunction"})
+_CLOCK_FACTORY_TARGETS = _CLOCK_ZERO_ARG_CALLS | {"partial"}
+
+
+def _arg_names(args: ast.arguments) -> set[str]:
+    names = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+    if args.vararg:
+        names.add(args.vararg.arg)
+    if args.kwarg:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str, int]]:
+    """Find naive clock reads/factories while keeping import bindings scoped per function/class."""
+    found: list[tuple[str, int]] = []
+
+    def check_factory_val(val: ast.AST, classes: dict[str, str], modules: set[str]) -> None:
+        ref = _clock_ref(val, classes, modules)
+        if ref and ref[1] in ("now", "utcnow", "today"):
+            found.append((f"{_dotted(val)} (passed uncalled)", getattr(val, "lineno", 1)))
+
+    def inspect_expr(
+        expr: ast.AST | None,
+        classes: dict[str, str],
+        modules: set[str],
+        factories: dict[str, str],
+        deferred_lams: list[ast.Lambda] | None = None,
+    ) -> None:
+        if isinstance(expr, ast.Lambda):
+            for dflt in (*expr.args.defaults, *(d for d in expr.args.kw_defaults if d is not None)):
+                inspect_expr(dflt, classes, modules, factories, deferred_lams)
+            if deferred_lams is not None:
+                deferred_lams.append(expr)
+            else:
+                lam_params = _arg_names(expr.args)
+                lam_classes = {k: v for k, v in classes.items() if k not in lam_params}
+                lam_factories = {k: v for k, v in factories.items() if k not in lam_params}
+                inspect_expr(expr.body, lam_classes, modules - lam_params, lam_factories, None)
+            return
+        for n in _expr_nodes_shallow(expr, excluded):
+            if isinstance(n, ast.Lambda):
+                inspect_expr(n, classes, modules, factories, deferred_lams)
+                continue
+            if not isinstance(n, ast.Call):
+                continue
+            target = n.func
+            dotted = _dotted(target) or ""
+            short = (
+                factories.get(target.id, "")
+                if isinstance(target, ast.Name)
+                else target.attr
+                if isinstance(target, ast.Attribute)
+                else ""
+            )
+            clock = _clock_ref(target, classes, modules)
+            if clock and _naive_clock_call(n, *clock):
+                found.append((f"{dotted}()", n.lineno))
+            for kw in n.keywords:
+                if kw.arg in _CLOCK_FACTORY_KWARGS:
+                    check_factory_val(kw.value, classes, modules)
+            is_tzless_partial = (
+                short == "partial"
+                and len(n.args) == 1
+                and not any(kw.arg == "tz" and not _is_none(kw.value) for kw in n.keywords)
+            )
+            if (short in _CLOCK_ZERO_ARG_CALLS and n.args) or is_tzless_partial:
+                check_factory_val(n.args[0], classes, modules)
+
+    def walk_stmts(
+        stmts: list[ast.stmt],
+        classes: dict[str, str],
+        modules: set[str],
+        factories: dict[str, str],
+        deferred_fns: list[ast.FunctionDef | ast.AsyncFunctionDef],
+        deferred_lams: list[ast.Lambda],
+    ) -> None:
+        for stmt in stmts:
+            if id(stmt) in excluded:
+                continue
+            if isinstance(stmt, ast.ImportFrom):
+                for alias in stmt.names:
+                    local_name = alias.asname or alias.name
+                    if stmt.module == "datetime" and stmt.level == 0 and alias.name in _CLOCK_CLASSES:
+                        classes[local_name] = alias.name
+                    else:
+                        classes.pop(local_name, None)
+                        modules.discard(local_name)
+                    mod_root = (stmt.module or "").split(".", 1)[0] if stmt.level == 0 else ""
+                    if alias.name in _CLOCK_FACTORY_TARGETS and mod_root in (
+                        "functools",
+                        "collections",
+                        "factory",
+                        "pydantic",
+                        "attrs",
+                        "attr",
+                        "dataclasses",
+                        "toolz",
+                        "cytoolz",
+                    ):
+                        factories[local_name] = alias.name
+                    elif alias.name != "*":
+                        factories.pop(local_name, None)
+                continue
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    if alias.name == "datetime":
+                        bound = alias.asname or "datetime"
+                        modules.add(bound)
+                        if alias.asname:
+                            classes.pop(alias.asname, None)
+                    else:
+                        bound = alias.asname or alias.name.split(".", 1)[0]
+                        classes.pop(bound, None)
+                        modules.discard(bound)
+                    factories.pop(bound, None)
+                continue
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in stmt.decorator_list:
+                    inspect_expr(dec, classes, modules, factories, deferred_lams)
+                for dflt in (*stmt.args.defaults, *(d for d in stmt.args.kw_defaults if d is not None)):
+                    inspect_expr(dflt, classes, modules, factories, deferred_lams)
+                factories.pop(stmt.name, None)
+                deferred_fns.append(stmt)
+                continue
+            if isinstance(stmt, ast.ClassDef):
+                for dec in stmt.decorator_list:
+                    inspect_expr(dec, classes, modules, factories, deferred_lams)
+                for base_expr in (*stmt.bases, *(kw.value for kw in stmt.keywords)):
+                    inspect_expr(base_expr, classes, modules, factories, deferred_lams)
+                factories.pop(stmt.name, None)
+                walk_stmts(stmt.body, dict(classes), set(modules), dict(factories), deferred_fns, deferred_lams)
+                continue
+            if isinstance(stmt, ast.Assign):
+                inspect_expr(stmt.value, classes, modules, factories, deferred_lams)
+                rhs_fac: str | None = None
+                if isinstance(stmt.value, ast.Name):
+                    rhs_fac = factories.get(stmt.value.id)
+                elif isinstance(stmt.value, ast.Attribute) and stmt.value.attr in _CLOCK_FACTORY_TARGETS:
+                    rhs_fac = stmt.value.attr
+                for tgt in stmt.targets:
+                    inspect_expr(tgt, classes, modules, factories, deferred_lams)
+                    if isinstance(tgt, ast.Name):
+                        if rhs_fac:
+                            factories[tgt.id] = rhs_fac
+                        else:
+                            factories.pop(tgt.id, None)
+                continue
+            for ch in ast.iter_child_nodes(stmt):
+                if isinstance(ch, ast.expr):
+                    inspect_expr(ch, classes, modules, factories, deferred_lams)
+                elif isinstance(ch, ast.stmt):
+                    walk_stmts([ch], classes, modules, factories, deferred_fns, deferred_lams)
+                else:
+                    for sub in ast.iter_child_nodes(ch):
+                        if isinstance(sub, ast.expr):
+                            inspect_expr(sub, classes, modules, factories, deferred_lams)
+                        elif isinstance(sub, ast.stmt):
+                            walk_stmts([sub], classes, modules, factories, deferred_fns, deferred_lams)
+
+    def run_lexical_scope(
+        stmts: list[ast.stmt],
+        classes: dict[str, str],
+        modules: set[str],
+        factories: dict[str, str],
+    ) -> None:
+        fns: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        lams: list[ast.Lambda] = []
+        walk_stmts(stmts, classes, modules, factories, fns, lams)
+        for lam in lams:
+            lam_params = _arg_names(lam.args)
+            lam_classes = {k: v for k, v in classes.items() if k not in lam_params}
+            lam_factories = {k: v for k, v in factories.items() if k not in lam_params}
+            inspect_expr(lam.body, lam_classes, modules - lam_params, lam_factories, None)
+        for fn in fns:
+            sub_classes = dict(classes)
+            sub_modules = set(modules)
+            sub_factories = dict(factories)
+            for pname in _arg_names(fn.args):
+                sub_classes.pop(pname, None)
+                sub_modules.discard(pname)
+                sub_factories.pop(pname, None)
+            run_lexical_scope(fn.body, sub_classes, sub_modules, sub_factories)
+
+    run_lexical_scope(
+        tree.body,
+        {"date": "date", "datetime": "datetime"},
+        {"datetime"},
+        {k: k for k in _CLOCK_FACTORY_TARGETS},
+    )
+    return found
+
+
+def _collect_method_self_attrs(member: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    is_static = any(
+        (isinstance(d, ast.Name) and d.id == "staticmethod") or _dotted(d) == "staticmethod"
+        for d in member.decorator_list
+    )
+    recv_names: set[str] = {"self", "cls"}
+    if not is_static:
+        first_params = [*member.args.posonlyargs, *member.args.args]
+        if first_params:
+            recv_names.add(first_params[0].arg)
+    init_shadow = {
+        p.arg
+        for p in (
+            *member.args.posonlyargs,
+            *member.args.args,
+            *member.args.kwonlyargs,
+            member.args.vararg,
+            member.args.kwarg,
+        )
+        if p is not None and p.arg == "setattr"
+    }
+    found: set[str] = set()
+
+    def static_strs(expr: ast.AST, env: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str) and expr.value.isidentifier():
+            return (expr.value,)
+        if isinstance(expr, ast.Name) and expr.id in env:
+            return env[expr.id]
+        if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+            return tuple(dict.fromkeys(s for elt in expr.elts for s in static_strs(elt, env)))
+        if isinstance(expr, ast.Dict):
+            return tuple(dict.fromkeys(s for k in expr.keys if k is not None for s in static_strs(k, env)))
+        return ()
+
+    def merge_envs(envs: list[dict[str, tuple[str, ...]]]) -> dict[str, tuple[str, ...]]:
+        merged: dict[str, tuple[str, ...]] = {}
+        for k in {k for e in envs for k in e}:
+            vals = tuple(dict.fromkeys(s for e in envs for s in e.get(k, ())))
+            if vals:
+                merged[k] = vals
+        return merged
+
+    def walk_expr(node: ast.AST, env: dict[str, tuple[str, ...]], cur_recv: set[str], shadowed: set[str]) -> None:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in cur_recv
+        ):
+            found.add(node.attr)
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "__dict__"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in cur_recv
+        ):
+            found.update(static_strs(node.slice, env))
+        elif isinstance(node, ast.Call):
+            if (
+                (
+                    (isinstance(node.func, ast.Name) and node.func.id == "setattr" and "setattr" not in shadowed)
+                    or _dotted(node.func) in ("builtins.setattr", "object.__setattr__")
+                )
+                and len(node.args) == 3
+                and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in cur_recv
+            ):
+                found.update(static_strs(node.args[1], env))
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "__setattr__"
+                and len(node.args) == 2
+                and not node.keywords
+                and (
+                    (isinstance(node.func.value, ast.Name) and node.func.value.id in cur_recv)
+                    or (
+                        isinstance(node.func.value, ast.Call)
+                        and isinstance(node.func.value.func, ast.Name)
+                        and node.func.value.func.id == "super"
+                    )
+                )
+            ):
+                found.update(static_strs(node.args[0], env))
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "update"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "__dict__"
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id in cur_recv
+            ):
+                for arg in node.args[:1]:
+                    found.update(static_strs(arg, env))
+                for kw in node.keywords:
+                    if kw.arg and kw.arg.isidentifier():
+                        found.add(kw.arg)
+        for ch in ast.iter_child_nodes(node):
+            walk_expr(ch, env, cur_recv, shadowed)
+
+    def walk_stmts(
+        stmts: list[ast.stmt],
+        env: dict[str, tuple[str, ...]],
+        cur_recv: set[str],
+        shadowed: set[str],
+    ) -> tuple[dict[str, tuple[str, ...]], set[str]]:
+        cur_env = dict(env)
+        cur_sh = set(shadowed)
+        for st in stmts:
+            if isinstance(st, ast.ClassDef):
+                if st.name == "setattr":
+                    cur_sh.add("setattr")
+                cur_env.pop(st.name, None)
+                continue
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if st.name == "setattr":
+                    cur_sh.add("setattr")
+                cur_env.pop(st.name, None)
+                inner_params = _arg_names(st.args)
+                inner_recv = cur_recv - inner_params
+                if inner_recv:
+                    inner_env = {k: v for k, v in cur_env.items() if k not in inner_params}
+                    inner_sh = cur_sh | ({"setattr"} & inner_params)
+                    walk_stmts(st.body, inner_env, inner_recv, inner_sh)
+                continue
+            if isinstance(st, ast.Assign):
+                walk_expr(st.value, cur_env, cur_recv, cur_sh)
+                vals = static_strs(st.value, cur_env)
+                for t in st.targets:
+                    walk_expr(t, cur_env, cur_recv, cur_sh)
+                    if isinstance(t, ast.Name):
+                        if t.id == "setattr":
+                            cur_sh.add("setattr")
+                        if vals:
+                            cur_env[t.id] = vals
+                        else:
+                            cur_env.pop(t.id, None)
+            elif isinstance(st, ast.AnnAssign):
+                if st.value is not None:
+                    walk_expr(st.value, cur_env, cur_recv, cur_sh)
+                    vals = static_strs(st.value, cur_env)
+                    walk_expr(st.target, cur_env, cur_recv, cur_sh)
+                    if isinstance(st.target, ast.Name):
+                        if st.target.id == "setattr":
+                            cur_sh.add("setattr")
+                        if vals:
+                            cur_env[st.target.id] = vals
+                        else:
+                            cur_env.pop(st.target.id, None)
+                else:
+                    walk_expr(st.target, cur_env, cur_recv, cur_sh)
+            elif isinstance(st, (ast.For, ast.AsyncFor)):
+                walk_expr(st.iter, cur_env, cur_recv, cur_sh)
+                iter_vals = static_strs(st.iter, cur_env)
+                if (
+                    not iter_vals
+                    and isinstance(st.iter, ast.Call)
+                    and isinstance(st.iter.func, ast.Attribute)
+                    and st.iter.func.attr in ("items", "keys")
+                    and not st.iter.args
+                ):
+                    iter_vals = static_strs(st.iter.func.value, cur_env)
+                tname: str | None = None
+                if isinstance(st.target, ast.Name):
+                    tname = st.target.id
+                elif (
+                    isinstance(st.target, (ast.Tuple, ast.List))
+                    and st.target.elts
+                    and isinstance(st.target.elts[0], ast.Name)
+                ):
+                    tname = st.target.elts[0].id
+                walk_expr(st.target, cur_env, cur_recv, cur_sh)
+                body_env = {**cur_env, tname: iter_vals} if (tname and iter_vals) else dict(cur_env)
+                if tname and not iter_vals:
+                    body_env.pop(tname, None)
+                b_out, b_sh = walk_stmts(st.body, body_env, cur_recv, cur_sh | ({tname} & {"setattr"}))
+                e_out, e_sh = walk_stmts(st.orelse, merge_envs([cur_env, b_out]), cur_recv, cur_sh | b_sh)
+                cur_env, cur_sh = e_out, e_sh
+            elif isinstance(st, ast.If):
+                walk_expr(st.test, cur_env, cur_recv, cur_sh)
+                b_env, b_sh = walk_stmts(st.body, cur_env, cur_recv, cur_sh)
+                e_env, e_sh = walk_stmts(st.orelse, cur_env, cur_recv, cur_sh)
+                cur_env = merge_envs([b_env, e_env])
+                cur_sh = b_sh | e_sh
+            elif isinstance(st, (ast.With, ast.AsyncWith)):
+                for item in st.items:
+                    walk_expr(item.context_expr, cur_env, cur_recv, cur_sh)
+                    if item.optional_vars is not None:
+                        walk_expr(item.optional_vars, cur_env, cur_recv, cur_sh)
+                cur_env, cur_sh = walk_stmts(st.body, cur_env, cur_recv, cur_sh)
+            elif isinstance(st, (ast.Try, ast.TryStar)):
+                b_env, b_sh = walk_stmts(st.body, cur_env, cur_recv, cur_sh)
+                o_env, o_sh = walk_stmts(st.orelse, b_env, cur_recv, b_sh)
+                branches = [o_env]
+                all_sh = set(o_sh)
+                for h in st.handlers:
+                    h_env, h_sh = walk_stmts(h.body, merge_envs([cur_env, b_env]), cur_recv, cur_sh | b_sh)
+                    branches.append(h_env)
+                    all_sh |= h_sh
+                m_env = merge_envs(branches)
+                cur_env, cur_sh = walk_stmts(st.finalbody, m_env, cur_recv, all_sh)
+            else:
+                walk_expr(st, cur_env, cur_recv, cur_sh)
+        return cur_env, cur_sh
+
+    walk_stmts(member.body, {}, recv_names, init_shadow)
+    return found
 
 
 def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedPythonModule | None:
@@ -539,19 +2516,14 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     imported_modules: set[str] = set()
     external_roots: set[str] = set()
     imported_names: dict[str, set[str]] = {}
-    mod_parts = module_name.split(".")
     for n in ast.walk(tree):
+        if id(n) in excluded:
+            continue
         if isinstance(n, ast.ImportFrom) and n.module:
             imported_modules.add(n.module)
             is_ext = n.level == 0 and n.module.split(".", 1)[0] != local_pkg
-            abs_module = (
-                ".".join([*mod_parts[: max(0, len(mod_parts) - n.level)], n.module])
-                if n.level
-                else n.module
-            )
             for alias in n.names:
                 imported_modules.add(f"{n.module}.{alias.name}")
-                imported_names.setdefault(alias.name, set()).add(abs_module)
                 local_name = alias.asname or alias.name
                 aliases[local_name] = alias.name
                 import_sources[local_name] = n.module
@@ -564,33 +2536,21 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                     aliases[alias.asname] = alias.name
                 if alias.name.split(".", 1)[0] != local_pkg:
                     external_roots.add(alias.asname or alias.name.split(".", 1)[0])
-    # Relative imports (`from .x import y`, `from . import x`) by their absolute module path.
-    bindings = _absolute_import_bindings(tree, module_name, rel_path)
-    for local_name, target, level in bindings:
+    # All runtime `from ... import` bindings (including `pkg/__init__.py` relative & `from . import x`).
+    bindings = _absolute_import_bindings(tree, module_name, rel_path, excluded)
+    for local_name, target, orig_name, src_mod, level in bindings:
+        imported_names.setdefault(orig_name, set()).add(src_mod)
         if level:
-            imported_modules.update((target.rpartition(".")[0], target))
-            aliases[local_name] = target.rpartition(".")[2]
+            imported_modules.update((src_mod, target))
+            aliases[local_name] = orig_name
+            import_sources.setdefault(local_name, target)
 
     def resolve(sym: str) -> str:
         return aliases.get(sym, sym)
 
-    # Names bound to the stdlib clock classes and module (`from datetime import date as d`,
-    # `import datetime as dt`). Bare `date`/`datetime` keep counting unless another module
-    # supplies that name.
-    clock_classes: dict[str, str] = {"date": "date", "datetime": "datetime"}
-    clock_modules: set[str] = {"datetime"}
-    for n in ast.walk(tree):
-        if isinstance(n, ast.ImportFrom):
-            for alias in n.names:
-                local_name = alias.asname or alias.name
-                if n.module == "datetime" and n.level == 0 and alias.name in _CLOCK_CLASSES:
-                    clock_classes[local_name] = alias.name
-                elif local_name in _CLOCK_CLASSES:
-                    clock_classes.pop(local_name, None)
-        elif isinstance(n, ast.Import):
-            for alias in n.names:
-                if alias.name == "datetime":
-                    clock_modules.add(alias.asname or "datetime")
+    def resolve_qual(sym: str) -> str:
+        h, _, t = sym.partition(".")
+        return f"{resolve(h)}.{t}" if t else resolve(sym)
 
     writes: set[str] = set()
     constructed: set[str] = set()
@@ -600,13 +2560,15 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     called: set[str] = set()
     symbol_calls: set[str] = set()
     method_calls: set[str] = set()
-    injected_params = _injected_params_by_call(tree)
+    param_method_calls: set[tuple[str, frozenset[str]]] = set()
+    param_profiles = _injected_param_profiles(tree, excluded)
     write_only: set[int] = set()
 
     def note_write(sym: str, lineno: int) -> None:
         if sym not in write_lines or lineno < write_lines[sym]:
             write_lines[sym] = lineno
-    raw_clocks: list[tuple[str, int]] = []
+
+    raw_clocks = _collect_raw_clocks(tree, excluded)
     router_prefix = ""
     router_includes: list[tuple[str, str]] = []
     nested_router_includes: list[tuple[str, str]] = []
@@ -640,18 +2602,6 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                 if dotted.rsplit(".", 1)[0] in router_vars:
                     nested_router_includes.append((child, inc_prefix))
 
-        clock = _clock_ref(target, clock_classes, clock_modules)
-        if clock and _naive_clock_call(n, *clock):
-            raw_clocks.append((f"{dotted}()", n.lineno))
-        # An uncalled clock passed as a value (`default_factory=datetime.now`,
-        # `Column(default=date.today)`) runs later with no time zone; `partial(datetime.now, tz)`
-        # binds one and is left alone.
-        if short != "partial":
-            for value in (*n.args, *(kw.value for kw in n.keywords)):
-                ref = _clock_ref(value, clock_classes, clock_modules)
-                if ref and ref[1] in ("now", "utcnow", "today"):
-                    raw_clocks.append((f"{_dotted(value)} (passed uncalled)", value.lineno))
-
         if short:
             resolved_short = resolve(short)
             called.add(resolved_short)
@@ -660,15 +2610,18 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                 if target.id not in external_roots and target.id not in aliases and target.id not in _BUILTIN_NAMES:
                     symbol_calls.add(resolved_short)
             elif isinstance(target, ast.Attribute):
-                # Only an injected, unannotated parameter hides its class from the imports. Any
-                # other receiver resolves through an import edge or is a library object
-                # (`logger.error()`, `session.query()`), so a name match there is a coincidence.
+                # Only an injected, unannotated parameter hides its class from the imports.
                 recv = target.value
-                if isinstance(recv, ast.Name) and recv.id in injected_params.get(id(n), ()) and short not in _GENERIC_ATTR_METHODS:
+                prof = param_profiles.get(id(n), {})
+                if isinstance(recv, ast.Name) and recv.id in prof and short not in _GENERIC_ATTR_METHODS:
                     method_calls.add(short)
+                    param_method_calls.add((short, prof[recv.id]))
             if dotted:
-                head, _, tail = dotted.partition(".")
-                called.add(f"{resolve(head)}.{tail}" if tail else resolve(head))
+                qual = resolve_qual(dotted)
+                called.add(qual)
+                writes.add(qual)
+                constructed.add(qual)
+                note_write(qual, n.lineno)
             writes.add(resolved_short)
             constructed.add(resolved_short)
             note_write(resolved_short, n.lineno)
@@ -685,14 +2638,15 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         if is_construct or is_sess:
             for sub in [*n.args, *(kw.value for kw in n.keywords)]:
                 for child in ast.walk(sub):
-                    sym = (
-                        resolve(child.id)
-                        if isinstance(child, ast.Name)
-                        else child.attr
-                        if isinstance(child, ast.Attribute)
-                        else None
-                    )
-                    if sym:
+                    syms: list[str] = []
+                    if isinstance(child, ast.Name):
+                        syms.append(resolve(child.id))
+                    elif isinstance(child, ast.Attribute):
+                        syms.append(child.attr)
+                        d = _dotted(child)
+                        if d:
+                            syms.append(resolve_qual(d))
+                    for sym in syms:
                         writes.add(sym)
                         persisted.add(sym)
                         note_write(sym, n.lineno)
@@ -725,14 +2679,14 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         has_session_writes = True
     row_session_writes, row_mutations = _loaded_row_writes(tree, excluded)
     for model, lineno in row_session_writes:
-        sym = resolve(model)
+        sym = resolve_qual(model)
         writes.add(sym)
         persisted.add(sym)
         note_write(sym, lineno)
     if has_session_writes:
         # A loaded row's attribute change is only an UPDATE if this module flushes/commits.
         for model, lineno in row_mutations:
-            sym = resolve(model)
+            sym = resolve_qual(model)
             writes.add(sym)
             persisted.add(sym)
             note_write(sym, lineno)
@@ -741,17 +2695,180 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     defined: set[str] = set()
     top_level_defs: set[str] = set()
     method_defs: set[str] = set()
-    for stmt in tree.body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            defined.add(stmt.name)
-            top_level_defs.add(stmt.name)
-        elif isinstance(stmt, ast.ClassDef):
-            defined.add(stmt.name)
-            top_level_defs.add(stmt.name)
-            for member in stmt.body:
-                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and not member.name.startswith("_"):
-                    defined.add(member.name)
-                    method_defs.add(member.name)
+    class_attrs: dict[str, frozenset[str]] = {}
+    class_bases: dict[str, tuple[str, ...]] = {}
+    own_pkg = module_name if rel_path.endswith("__init__.py") else module_name.rpartition(".")[0]
+    scope_base_targets: dict[str, str] = {}
+    import_targets: dict[str, str] = {}
+
+    def walk_module_scope(stmts: list[ast.stmt], *, top_level: bool) -> None:
+        for stmt in stmts:
+            if id(stmt) in excluded:
+                continue
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    bound_nm = alias.asname or alias.name.split(".", 1)[0]
+                    target_nm = alias.name if alias.asname else bound_nm
+                    if top_level:
+                        scope_base_targets[bound_nm] = target_nm
+                        import_targets[bound_nm] = target_nm
+                    else:
+                        scope_base_targets.setdefault(bound_nm, target_nm)
+                        import_targets.setdefault(bound_nm, target_nm)
+            elif isinstance(stmt, ast.ImportFrom):
+                src_mod = stmt.module or ""
+                if stmt.level:
+                    base_pkg = own_pkg
+                    for _ in range(stmt.level - 1):
+                        base_pkg = base_pkg.rpartition(".")[0]
+                    src_mod = ".".join(p for p in (base_pkg, stmt.module) if p)
+                if src_mod:
+                    for alias in stmt.names:
+                        if alias.name == "*":
+                            continue
+                        lname = alias.asname or alias.name
+                        qual_t = f"{src_mod}.{alias.name}"
+                        if top_level:
+                            scope_base_targets[lname] = qual_t
+                            import_targets[lname] = qual_t
+                        else:
+                            scope_base_targets.setdefault(lname, qual_t)
+                            import_targets.setdefault(lname, qual_t)
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if top_level:
+                    scope_base_targets.pop(stmt.name, None)
+                    import_targets.pop(stmt.name, None)
+                    defined.add(stmt.name)
+                    top_level_defs.add(stmt.name)
+            elif isinstance(stmt, ast.ClassDef):
+                if top_level:
+                    defined.add(stmt.name)
+                    top_level_defs.add(stmt.name)
+                    cattrs: set[str] = set()
+                    bases: list[str] = []
+                    for b in stmt.bases:
+                        b_inner = b.value if isinstance(b, ast.Subscript) else b
+                        bdotted = _dotted(b_inner)
+                        if not bdotted:
+                            continue
+                        head, _, tail = bdotted.partition(".")
+                        if tail:
+                            qual_head = scope_base_targets.get(head)
+                            bases.append(f"{qual_head}.{tail}" if qual_head else resolve_qual(bdotted))
+                        elif head in scope_base_targets:
+                            bases.append(scope_base_targets[head])
+                        else:
+                            bases.append(resolve(head))
+                    class_bases[stmt.name] = tuple(bases)
+                    def _extract_slots(val: ast.AST | None) -> set[str]:
+                        if isinstance(val, ast.Constant) and isinstance(val.value, str) and val.value.isidentifier():
+                            return {val.value}
+                        if isinstance(val, (ast.Tuple, ast.List, ast.Set)):
+                            return {
+                                e.value
+                                for e in val.elts
+                                if isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value.isidentifier()
+                            }
+                        if isinstance(val, ast.Dict):
+                            return {
+                                k.value
+                                for k in val.keys
+                                if isinstance(k, ast.Constant) and isinstance(k.value, str) and k.value.isidentifier()
+                            }
+                        return set()
+
+                    def _scan_class_stmts(c_stmts: list[ast.stmt], out_attrs: set[str]) -> None:
+                        for member in c_stmts:
+                            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                out_attrs.add(member.name)
+                                if not member.name.startswith("_"):
+                                    defined.add(member.name)
+                                    method_defs.add(member.name)
+                                out_attrs.update(_collect_method_self_attrs(member))
+                            elif isinstance(member, ast.Assign):
+                                for t in member.targets:
+                                    if isinstance(t, ast.Name):
+                                        out_attrs.add(t.id)
+                                        if t.id == "__slots__":
+                                            out_attrs.update(_extract_slots(member.value))
+                            elif isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
+                                out_attrs.add(member.target.id)
+                                if member.target.id == "__slots__" and member.value is not None:
+                                    out_attrs.update(_extract_slots(member.value))
+                            elif isinstance(member, ast.If):
+                                _scan_class_stmts(member.body, out_attrs)
+                                _scan_class_stmts(member.orelse, out_attrs)
+                            elif isinstance(member, (ast.Try, ast.TryStar)):
+                                _scan_class_stmts(member.body, out_attrs)
+                                for h in member.handlers:
+                                    _scan_class_stmts(h.body, out_attrs)
+                                _scan_class_stmts(member.orelse, out_attrs)
+                                _scan_class_stmts(member.finalbody, out_attrs)
+
+                    _scan_class_stmts(stmt.body, cattrs)
+                    class_attrs[stmt.name] = frozenset(cattrs)
+                    scope_base_targets[stmt.name] = f"{module_name}.{stmt.name}"
+                    import_targets.pop(stmt.name, None)
+                else:
+                    scope_base_targets.setdefault(stmt.name, f"{module_name}.{stmt.name}")
+            elif (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id == "setattr"
+                and len(stmt.value.args) == 3
+                and not stmt.value.keywords
+                and isinstance(stmt.value.args[0], ast.Name)
+                and stmt.value.args[0].id in class_attrs
+                and isinstance(stmt.value.args[1], ast.Constant)
+                and isinstance(stmt.value.args[1].value, str)
+                and stmt.value.args[1].value.isidentifier()
+            ):
+                cname = stmt.value.args[0].id
+                class_attrs[cname] = class_attrs[cname] | {stmt.value.args[1].value}
+            elif isinstance(stmt, ast.Assign):
+                for t in stmt.targets:
+                    if (
+                        isinstance(t, ast.Attribute)
+                        and isinstance(t.value, ast.Name)
+                        and t.value.id in class_attrs
+                    ):
+                        class_attrs[t.value.id] = class_attrs[t.value.id] | {t.attr}
+                if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                    tname = stmt.targets[0].id
+                    rhs_d = _dotted(stmt.value)
+                    qual_rhs: str | None = None
+                    if rhs_d:
+                        rh, _, rt = rhs_d.partition(".")
+                        if rt and rh in scope_base_targets:
+                            qual_rhs = f"{scope_base_targets[rh]}.{rt}"
+                        elif not rt and rh in scope_base_targets:
+                            qual_rhs = scope_base_targets[rh]
+                    if qual_rhs:
+                        if top_level:
+                            scope_base_targets[tname] = qual_rhs
+                            import_targets[tname] = qual_rhs
+                        else:
+                            scope_base_targets.setdefault(tname, qual_rhs)
+                            import_targets.setdefault(tname, qual_rhs)
+                    elif top_level:
+                        scope_base_targets.pop(tname, None)
+                        import_targets.pop(tname, None)
+            elif isinstance(stmt, ast.If):
+                walk_module_scope(stmt.body, top_level=False)
+                walk_module_scope(stmt.orelse, top_level=False)
+            elif isinstance(stmt, (ast.Try, ast.TryStar)):
+                walk_module_scope(stmt.body, top_level=False)
+                for h in stmt.handlers:
+                    walk_module_scope(h.body, top_level=False)
+                walk_module_scope(stmt.orelse, top_level=False)
+                walk_module_scope(stmt.finalbody, top_level=False)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)):
+                walk_module_scope(stmt.body, top_level=False)
+                if hasattr(stmt, "orelse"):
+                    walk_module_scope(stmt.orelse, top_level=False)
+
+    walk_module_scope(tree.body, top_level=True)
 
     for n in ast.walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -819,6 +2936,9 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         policy_literals=tuple(policy_literals),
         raw_clock_calls=tuple(raw_clocks),
         method_calls=frozenset(method_calls),
+        param_method_calls=tuple(sorted(param_method_calls, key=lambda x: (x[0], tuple(sorted(x[1]))))),
+        class_attrs=class_attrs,
+        class_bases=class_bases,
         top_level_defs=frozenset(top_level_defs),
         method_defs=frozenset(method_defs),
         package_exports=package_exports,
@@ -827,6 +2947,7 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         persisted=frozenset(persisted),
         has_session_writes=has_session_writes,
         imported_names={k: frozenset(v) for k, v in imported_names.items()},
+        import_targets=import_targets,
         write_lines=write_lines,
     )
 

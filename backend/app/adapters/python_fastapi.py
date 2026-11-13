@@ -93,16 +93,26 @@ def _sql_table_id(truth: TruthExtractionResult, sym: str) -> str | None:
 def _ast_table_id(
     truth: TruthExtractionResult, pm: ParsedPythonModule, sym: str, model_modules: frozenset[str]
 ) -> str | None:
-    """Table node for a Python identifier.
-
-    With class provenance from the truth adapter, only an ORM class name counts, and only when
-    the module imports it from a module that defines it (or a package above that module), or
-    defines it itself. A same-named class imported from elsewhere (a response schema, a
-    dataclass) is not the table, and a variable or attribute that happens to equal a table
-    name is not table access. Without provenance, keep the name-only lookup.
-    """
+    """Table node for a Python identifier or module-qualified model/table reference."""
     if not truth.class_modules:
-        return _sql_table_id(truth, sym)
+        return _sql_table_id(truth, sym.rpartition(".")[2] if "." in sym else sym)
+    if "." in sym:
+        mod_part, _, attr = sym.rpartition(".")
+        cand_mods: set[str] = set()
+        if mod_part in pm.imported_modules:
+            cand_mods.add(mod_part)
+        for src in pm.imported_names.get(mod_part, ()):
+            cand_mods.add(f"{src}.{mod_part}")
+        if not cand_mods:
+            return None
+        defining_attr = truth.class_modules.get(attr)
+        if defining_attr:
+            if any(d == c or d.startswith(f"{c}.") for c in cand_mods for d in defining_attr):
+                return truth.table_symbol_map.get(attr)
+            return None
+        if any(m == c or m.startswith(f"{c}.") or c.startswith(f"{m}.") for c in cand_mods for m in model_modules):
+            return _sql_table_id(truth, attr)
+        return None
     defining = truth.class_modules.get(sym)
     if not defining:
         # A table object imported by name from a models module (e.g. an association `Table`).
@@ -182,13 +192,20 @@ class _ImportResolver:
                 if users:
                     self.own_uses.setdefault(pkg, []).append((target, users))
 
-    def _export(self, pkg: str, sym: str) -> str | None:
+    def _export(self, pkg: str, sym: str, seen: frozenset[str] = frozenset()) -> str | None:
+        if pkg in seen:
+            return None
         if sym in self.exports.get(pkg, {}):
             return self.exports[pkg][sym]
+        next_seen = seen | {pkg}
         for star_mod in self.stars.get(pkg, ()):
             star_pm = self.parsed_by_mod.get(star_mod)
             if star_pm is not None and sym in star_pm.defined:
                 return f"{star_mod}.{sym}"
+            if star_mod in self.exports:
+                nested = self._export(star_mod, sym, next_seen)
+                if nested is not None:
+                    return nested
         return None
 
     def node_for(self, qualified: str, depth: int = 0) -> str | None:
@@ -201,6 +218,39 @@ class _ImportResolver:
             return self.mod_to_node[parent]
         target = self._export(parent, sym) if parent in self.exports else None
         return self.node_for(target, depth + 1) if target and target != qualified else None
+
+    def resolve_class(
+        self,
+        qualified: str,
+        raw_class_attrs: dict[tuple[str, str], set[str]],
+        depth: int = 0,
+    ) -> tuple[str, str] | None:
+        """Resolve `pkg.mod.ClassName` through module and package re-exports to `(node_id, class_name)`."""
+        if depth > 8 or "." not in qualified:
+            return None
+        parent, _, sym = qualified.rpartition(".")
+        nid = self.mod_to_node.get(parent)
+        if nid is not None and (nid, sym) in raw_class_attrs:
+            return (nid, sym)
+        pm_parent = self.parsed_by_mod.get(parent)
+        if pm_parent is not None:
+            reexp = pm_parent.import_targets.get(sym)
+            if reexp and reexp != qualified:
+                return self.resolve_class(reexp, raw_class_attrs, depth + 1)
+            star_hits = {
+                sh
+                for m in pm_parent.imported_modules
+                if m.endswith(".*")
+                for sh in (self.resolve_class(f"{m[:-2]}.{sym}", raw_class_attrs, depth + 1),)
+                if sh is not None
+            }
+            if len(star_hits) == 1:
+                return next(iter(star_hits))
+        if parent in self.exports:
+            target = self._export(parent, sym)
+            if target and target != qualified:
+                return self.resolve_class(target, raw_class_attrs, depth + 1)
+        return None
 
     def targets(self, imp: str, pm: ParsedPythonModule) -> list[tuple[str, str]]:
         """(node id, evidence) pairs that the import entry `imp` of module `pm` reaches."""
@@ -286,7 +336,11 @@ class PythonFastApiAdapter:
         nodes_by_rel: dict[str, AtlasNode] = {}
         mod_name_to_node_id: dict[str, str] = {}
         symbol_to_defining_nodes: dict[str, list[str]] = {}
-        method_to_defining_nodes: dict[str, list[str]] = {}
+        raw_class_attrs: dict[tuple[str, str], set[str]] = {}
+        raw_class_methods: dict[tuple[str, str], dict[str, str]] = {}
+        raw_class_bases: dict[tuple[str, str], tuple[str, ...]] = {}
+        star_sources_by_key: dict[tuple[str, str], tuple[str, ...]] = {}
+        classes_by_name: dict[str, list[tuple[str, str]]] = {}
 
         for rel_app, pm in parsed_modules.items():
             subkind, cluster = _classify_manipulator(rel_app)
@@ -296,9 +350,17 @@ class PythonFastApiAdapter:
             for sym in pm.top_level_defs:
                 if len(sym) > 3 and not sym.startswith("_"):
                     symbol_to_defining_nodes.setdefault(sym, []).append(node_id)
-            for sym in pm.method_defs:
-                if len(sym) > 3:
-                    method_to_defining_nodes.setdefault(sym, []).append(node_id)
+            star_mods = tuple(sorted(m[:-2] for m in pm.imported_modules if m.endswith(".*")))
+            for cname, cattrs in pm.class_attrs.items():
+                key = (node_id, cname)
+                raw_class_attrs[key] = set(cattrs)
+                raw_class_methods[key] = {
+                    m: node_id for m in cattrs if len(m) > 3 and not m.startswith("_") and m in pm.method_defs
+                }
+                raw_class_bases[key] = pm.class_bases.get(cname, ())
+                if star_mods:
+                    star_sources_by_key[key] = star_mods
+                classes_by_name.setdefault(cname, []).append(key)
 
             nodes_by_rel[rel_app] = AtlasNode(
                 id=node_id,
@@ -319,6 +381,42 @@ class PythonFastApiAdapter:
             packages,
             symbol_to_defining_nodes,
         )
+
+        for _ in range(4):
+            for key, bases in raw_class_bases.items():
+                for bname in bases:
+                    if "." in bname:
+                        hit = import_resolver.resolve_class(bname, raw_class_attrs)
+                        if hit is None and not bname.startswith("app."):
+                            hit = import_resolver.resolve_class(f"app.{bname}", raw_class_attrs)
+                        bkeys = [hit] if hit is not None else []
+                    else:
+                        star_hits = {
+                            sh
+                            for smod in star_sources_by_key.get(key, ())
+                            for sh in (
+                                import_resolver.resolve_class(f"{smod}.{bname}", raw_class_attrs)
+                                or (
+                                    import_resolver.resolve_class(f"app.{smod}.{bname}", raw_class_attrs)
+                                    if not smod.startswith("app.")
+                                    else None
+                                ),
+                            )
+                            if sh is not None
+                        }
+                        bkeys = list(star_hits) if len(star_hits) == 1 else classes_by_name.get(bname, ())
+                    if len(bkeys) == 1:
+                        raw_class_attrs[key].update(raw_class_attrs[bkeys[0]])
+                        for mname, def_nid in raw_class_methods[bkeys[0]].items():
+                            raw_class_methods[key].setdefault(mname, def_nid)
+
+        method_to_class_profiles: dict[str, list[tuple[str, str, frozenset[str]]]] = {}
+        for rel_app, pm in parsed_modules.items():
+            nid = nodes_by_rel[rel_app].id
+            for cname in pm.class_attrs:
+                full_attrs = frozenset(raw_class_attrs[(nid, cname)])
+                for mname, def_nid in raw_class_methods[(nid, cname)].items():
+                    method_to_class_profiles.setdefault(mname, []).append((def_nid, nid, full_attrs))
         edges: list[AtlasEdge] = []
         seen_edges: set[tuple[str, str, str]] = set()
         routes: list[RouteDescriptor] = []
@@ -404,13 +502,27 @@ class PythonFastApiAdapter:
                 for target_nid, note in import_resolver.targets(imp, pm):
                     add_edge(nid, target_nid, "calls_helper", pm.rel_path, note)
 
-            for called_sym, definers in (
-                *((s, symbol_to_defining_nodes) for s in pm.symbol_calls),
-                *((s, method_to_defining_nodes) for s in pm.method_calls),
-            ):
-                defs = definers.get(called_sym, [])
+            for called_sym in pm.symbol_calls:
+                defs = symbol_to_defining_nodes.get(called_sym, [])
                 if len(defs) == 1:
                     add_edge(nid, defs[0], "calls_helper", pm.rel_path, f"Calls `{called_sym}()` across manipulation tier.")
+            for called_sym, req_attrs in pm.param_method_calls:
+                matches = [
+                    (def_nid, own_nid)
+                    for def_nid, own_nid, cattrs in method_to_class_profiles.get(called_sym, ())
+                    if req_attrs <= cattrs
+                ]
+                definers = {def_nid for def_nid, _ in matches}
+                owners = {own_nid for _, own_nid in matches}
+                targets = (*(definers if len(definers) == 1 else ()), *(owners if len(owners) == 1 else ()))
+                for target_cand in dict.fromkeys(targets):
+                    add_edge(
+                        nid,
+                        target_cand,
+                        "calls_helper",
+                        pm.rel_path,
+                        f"Calls `{called_sym}()` across manipulation tier.",
+                    )
 
             # 3. Route descriptors
             if pm.route_handlers:

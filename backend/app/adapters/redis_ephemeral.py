@@ -34,14 +34,14 @@ _C_COMMENT_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
 
 _RECV_PAT = r"(?:redis(?:_[A-Za-z0-9_]+)?|rdb|rcache|cache|valkey|upstash|kv|[A-Za-z0-9_]+_redis)"
 _REDIS_CALL_RE = re.compile(
-    rf"""\b(?P<recv>{_RECV_PAT})\s*\.\s*(?P<op>get|mget|hget|hgetall|lrange|smembers|xread|set|setex|psetex|set_ex|hset|hmset|mset|lpush|rpush|xadd|publish|expire|pexpire|Get|MGet|HGet|HGetAll|Set|SetEx|SetNX|HSet|LPush|RPush|Expire)\s*\("""
+    rf"""\b(?P<recv>{_RECV_PAT})\s*\.\s*(?P<op>get|mget|hget|hgetall|lrange|smembers|xread|set|setex|psetex|set_ex|hset|hmset|mset|lpush|rpush|xadd|publish|expire|pexpire|expireat|pexpireat|Get|MGet|HGet|HGetAll|Set|SetEx|SetNX|HSet|LPush|RPush|Expire)\s*\("""
 )
 _RUST_CMD_RE = re.compile(
     r"""\bredis::cmd\(\s*"(?P<op>GET|MGET|HGET|HGETALL|SET|SETEX|PSETEX|HSET|LPUSH|RPUSH|EXPIRE)"\s*\)\s*\.\s*arg\(\s*"(?P<key>[A-Za-z0-9_.-]+:[A-Za-z0-9_:.*{}-]*)" """.strip()
 )
 _FIRST_STR_ARG_RE = re.compile(r"""^\s*(?:ctx\s*,\s*)?['"`](?P<key>[A-Za-z0-9_.-]+:[A-Za-z0-9_:.*{}$/-]*)['"`]""")
 _EXPIRE_CALL_RE = re.compile(
-    rf"""\b{_RECV_PAT}\s*\.\s*(?:expire|pexpire|Expire)\s*\(\s*(?:ctx\s*,\s*)?['"`](?P<key>[A-Za-z0-9_.-]+:)"""
+    rf"""\b(?P<recv>{_RECV_PAT})\s*\.\s*(?:expire|pexpire|expireat|pexpireat|Expire)\s*\(\s*(?:ctx\s*,\s*)?['"`](?P<key>[A-Za-z0-9_.-]+:)"""
 )
 _TTL_OPT_RE = re.compile(
     r"""(?:\b(?:ex|px|exat|pxat|timeout|ttl|EX|PX)\s*[=:]|\b(?:keepttl|KEEPTTL)\s*[=:]\s*(?:True|true)\b|['"](?:EX|PX|KEEPTTL)['"]\s*[,)])"""
@@ -185,16 +185,20 @@ class _PyRedisCalls:
         return op == "set" and len(call.args) >= 3 and not _is_falsy_const(call.args[2])
 
     def expired_after(self, call: ast.Call) -> bool:
-        """`expire(<same key expression>)` later in the same block of the same function."""
-        if not call.args:
+        """`expire(<same key expression>)` later in the same block on the same Redis client."""
+        if not call.args or not isinstance(call.func, ast.Attribute):
             return False
+        recv_dump = ast.dump(call.func.value)
         key_dump = ast.dump(call.args[0])
         block = self._block(call)
         scope = self._enclosing(call, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module))
         for exp in self._expires:
             if (
-                exp.lineno >= call.lineno
+                isinstance(exp.func, ast.Attribute)
+                and (exp.lineno, exp.col_offset) >= (call.lineno, call.col_offset)
+                and ast.dump(exp.func.value) == recv_dump
                 and ast.dump(exp.args[0]) == key_dump
+                and (len(exp.args) < 2 or not _is_falsy_const(exp.args[1]))
                 and self._enclosing(exp, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)) is scope
                 and block is not None
                 and self._block(exp) == block
@@ -464,9 +468,10 @@ def augment_redis_ephemeral_lineage(
             link(mnode.id, sid, "writes_truth", rel_repo, f"Asynq cron scheduler enqueues `{qname}`.")
 
         # 2. Keyspace reads/writes & TRUTH-004 shadow-truth TTL check
-        expired_prefixes = {
-            em.group("key").rstrip(":").lower() for em in _EXPIRE_CALL_RE.finditer(txt)
+        expired_recv_prefixes = {
+            (em.group("recv"), em.group("key").rstrip(":").lower()) for em in _EXPIRE_CALL_RE.finditer(txt)
         }
+        expired_prefixes = {pfx for _recv, pfx in expired_recv_prefixes}
 
         py_calls: _PyRedisCalls | None = None
         if src_file.suffix == ".py":
@@ -505,13 +510,18 @@ def augment_redis_ephemeral_lineage(
                 link(mnode.id, sid, "writes_truth", rel_repo, f"Writes Redis keyspace `{prefix}:*` via `{op}`.")
                 has_ttl = (
                     op in _TTL_WRITE_OPS
-                    or bool(_TTL_OPT_RE.search(call_args))
-                    or (src_file.suffix == ".go" and op == "Set" and _go_set_has_ttl(call_args))
-                    or prefix.lower() in expired_prefixes
                     or (
                         py_calls is not None
                         and py_call is not None
                         and (py_calls.has_ttl(py_call, op) or py_calls.expired_after(py_call))
+                    )
+                    or (
+                        py_calls is None
+                        and (
+                            bool(_TTL_OPT_RE.search(call_args))
+                            or (src_file.suffix == ".go" and op == "Set" and _go_set_has_ttl(call_args))
+                            or (cm.group("recv"), prefix.lower()) in expired_recv_prefixes
+                        )
                     )
                 )
                 if not has_ttl:

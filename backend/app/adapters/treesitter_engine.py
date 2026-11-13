@@ -42,7 +42,6 @@ except ImportError:  # pragma: no cover
 _HTTP_VERBS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 _FETCH_HELPERS = frozenset({"fetch", "ofetch", "$fetch", "useFetch", "useLazyFetch", "apiRequest", "request", "httpClient"})
 _CALLEE_WRAPPERS = frozenset({"await_expression", "parenthesized_expression", "non_null_expression"})
-_METHOD_RE = re.compile(r"""method\s*:\s*['"](?P<m>GET|POST|PUT|PATCH|DELETE)['"]""", re.IGNORECASE)
 _TAURI_READ_PREFIXES = ("get_", "list_", "fetch_", "load_", "find_", "query_", "read_", "detect_", "estimate_", "scope_")
 
 
@@ -202,6 +201,207 @@ def resolve_url_const_head(url_val: str, url_consts: dict[str, str] | None) -> s
     return url_val
 
 
+_PARAM_CONTAINERS = frozenset(
+    {
+        "formal_parameters",
+        "required_parameter",
+        "optional_parameter",
+        "rest_pattern",
+        "object_pattern",
+        "array_pattern",
+    }
+)
+
+
+def _collect_cst_pattern_idents(raw: bytes, node: Any, out: set[str]) -> None:
+    """Collect identifiers bound by a parameter or destructuring pattern (ignoring types/defaults)."""
+    ntype = node.type
+    if ntype in ("identifier", "shorthand_property_identifier_pattern"):
+        out.add(raw[node.start_byte : node.end_byte].decode("utf-8", errors="replace"))
+        return
+    if ntype in ("type_annotation", "opting_type_annotation"):
+        return
+    if ntype == "assignment_pattern":
+        left = node.child_by_field_name("left") or (node.named_children[0] if node.named_children else None)
+        if left is not None:
+            _collect_cst_pattern_idents(raw, left, out)
+        return
+    if ntype == "pair_pattern":
+        val = node.child_by_field_name("value") or (node.named_children[-1] if node.named_children else None)
+        if val is not None:
+            _collect_cst_pattern_idents(raw, val, out)
+        return
+    if ntype in ("required_parameter", "optional_parameter"):
+        pat = node.child_by_field_name("pattern") or (node.named_children[0] if node.named_children else None)
+        if pat is not None:
+            _collect_cst_pattern_idents(raw, pat, out)
+        return
+    if ntype in _PARAM_CONTAINERS:
+        for ch in node.named_children:
+            _collect_cst_pattern_idents(raw, ch, out)
+
+
+def _collect_cst_var_decl(raw: bytes, decl_node: Any, raw_local: dict[str, str | None]) -> None:
+    is_const = decl_node.type == "lexical_declaration" and any(
+        tok.type == "const" for tok in decl_node.children
+    )
+    for decl in decl_node.named_children:
+        if decl.type != "variable_declarator":
+            continue
+        lhs = decl.child_by_field_name("name") or (
+            decl.named_children[0] if decl.named_children else None
+        )
+        rhs = decl.child_by_field_name("value")
+        while (
+            rhs is not None
+            and rhs.type in ("as_expression", "satisfies_expression")
+            and rhs.named_children
+        ):
+            rhs = rhs.named_children[0]
+        if (
+            is_const
+            and lhs is not None
+            and lhs.type == "identifier"
+            and rhs is not None
+            and rhs.type in ("string", "template_string")
+        ):
+            ident = raw[lhs.start_byte : lhs.end_byte].decode("utf-8", errors="replace")
+            val = _unquote_node(raw, rhs)
+            if rhs.type == "string" and "${" in val:
+                raw_local[ident] = None
+            else:
+                raw_local[ident] = val if raw_local.get(ident, val) == val else None
+        elif lhs is not None:
+            bound: set[str] = set()
+            _collect_cst_pattern_idents(raw, lhs, bound)
+            for b in bound:
+                raw_local[b] = None
+
+
+def _merge_cst_local_consts(outer_consts: dict[str, str], raw_local: dict[str, str | None]) -> dict[str, str]:
+    if not raw_local:
+        return outer_consts
+    merged = {k: v for k, v in outer_consts.items() if k not in raw_local}
+    pending = {k: v for k, v in raw_local.items() if v is not None}
+    if not pending:
+        return merged
+    working = {**merged, **pending}
+    for _ in range(3):
+        for k in list(pending):
+            working[k] = resolve_url_const_head(
+                working[k], {ok: ov for ok, ov in working.items() if ok != k and ov.startswith("/")}
+            )
+    for k in pending:
+        if working[k].startswith("/"):
+            merged[k] = working[k]
+    return merged
+
+
+def _collect_hoisted_cst_vars(raw: bytes, root: Any, out: set[str]) -> None:
+    stack = list(root.named_children)
+    while stack:
+        n = stack.pop()
+        if n.type in (
+            "function_declaration",
+            "generator_function_declaration",
+            "function",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+        ):
+            continue
+        if n.type == "variable_declaration":
+            for decl in n.named_children:
+                if decl.type == "variable_declarator":
+                    lhs = decl.child_by_field_name("name") or (
+                        decl.named_children[0] if decl.named_children else None
+                    )
+                    if lhs is not None:
+                        _collect_cst_pattern_idents(raw, lhs, out)
+            continue
+        if n.type == "for_in_statement" and any(tok.type == "var" for tok in n.children):
+            left = n.child_by_field_name("left")
+            if left is not None:
+                _collect_cst_pattern_idents(raw, left, out)
+        stack.extend(n.named_children)
+
+
+def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, str]) -> dict[str, str]:
+    """Update `outer_consts` with lexical local `const X = '/...'` bindings and drop shadowed ones."""
+    raw_local: dict[str, str | None] = {}
+    for ch in container.named_children:
+        decl_node = (
+            (ch.child_by_field_name("declaration") or (ch.named_children[0] if ch.named_children else None))
+            if ch.type == "export_statement"
+            else ch
+        )
+        if decl_node is None:
+            continue
+        if decl_node.type in ("lexical_declaration", "variable_declaration"):
+            _collect_cst_var_decl(raw, decl_node, raw_local)
+        elif decl_node.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
+            fn_id = decl_node.child_by_field_name("name")
+            if fn_id is not None:
+                bound_fn: set[str] = set()
+                _collect_cst_pattern_idents(raw, fn_id, bound_fn)
+                for b in bound_fn:
+                    raw_local[b] = None
+    return _merge_cst_local_consts(outer_consts, raw_local)
+
+
+def _unwrap_cst_expr(node: Any) -> Any:
+    cur = node
+    while cur is not None and cur.named_children:
+        if cur.type in ("parenthesized_expression", "as_expression", "satisfies_expression", "non_null_expression"):
+            cur = cur.named_children[0]
+        elif cur.type == "type_assertion":
+            cur = cur.named_children[-1]
+        else:
+            break
+    return cur
+
+
+def _extract_cst_fetch_method(raw: bytes, opt_node: Any) -> str:
+    """Read HTTP method only from a top-level `method` property on the options object literal."""
+    obj = _unwrap_cst_expr(opt_node)
+    if obj is None or obj.type != "object":
+        return "GET"
+    verb = "GET"
+    for ch in obj.named_children:
+        if ch.type != "pair":
+            continue
+        k_node = ch.child_by_field_name("key") or (ch.named_children[0] if ch.named_children else None)
+        v_node = ch.child_by_field_name("value") or (ch.named_children[-1] if len(ch.named_children) >= 2 else None)
+        if k_node is None or v_node is None:
+            continue
+        key_name = ""
+        if k_node.type in ("property_identifier", "identifier"):
+            key_name = raw[k_node.start_byte : k_node.end_byte].decode("utf-8", errors="replace")
+        elif k_node.type in ("string", "template_string") and not any(
+            c.type == "template_substitution" for c in k_node.children
+        ):
+            key_name = _unquote_node(raw, k_node)
+        elif k_node.type == "computed_property_name" and k_node.named_children:
+            inner_k = _unwrap_cst_expr(k_node.named_children[0])
+            if inner_k is not None and inner_k.type in ("string", "template_string") and not any(
+                c.type == "template_substitution" for c in inner_k.children
+            ):
+                key_name = _unquote_node(raw, inner_k)
+        if key_name != "method":
+            continue
+        val = _unwrap_cst_expr(v_node)
+        if (
+            val is not None
+            and val.type in ("string", "template_string")
+            and not any(c.type == "template_substitution" for c in val.children)
+        ):
+            cand = _unquote_node(raw, val).strip().upper()
+            verb = cand if cand in _HTTP_VERBS else "GET"
+        else:
+            verb = "GET"
+    return verb
+
+
 def extract_ts_http_calls_cst(
     source: str,
     *,
@@ -211,7 +411,7 @@ def extract_ts_http_calls_cst(
     """Extract `(http_method, raw_url, lineno)` from TS/TSX CST `call_expression` nodes.
 
     `url_consts` maps same-file string constants (`const BASE = '/things'`) to their values so
-    `` get(`${BASE}/${id}`) `` and `get(BASE)` resolve to a path instead of being dropped.
+    `` get(`${BASE}/${id}`) `` and `get(BASE)` resolve to a path unless shadowed in a local scope.
     """
     if not has_treesitter():
         return None
@@ -220,9 +420,58 @@ def extract_ts_http_calls_cst(
     tree = parser.parse(raw)
     has_tauri_import = b"@tauri-apps" in raw or b"__TAURI__" in raw
     found: list[tuple[str, str, int]] = []
+    init_consts = dict(url_consts or {})
+    root_consts = _apply_cst_block_decls(raw, tree.root_node, init_consts)
+    hoisted_root_vars: set[str] = set()
+    _collect_hoisted_cst_vars(raw, tree.root_node, hoisted_root_vars)
+    if hoisted_root_vars:
+        root_consts = {k: v for k, v in root_consts.items() if k not in hoisted_root_vars}
 
-    def walk(node: Any) -> None:
-        if node.type == "call_expression" and node.children:
+    def walk(node: Any, scope_consts: dict[str, str]) -> None:
+        ntype = node.type
+        if ntype in (
+            "function_declaration",
+            "generator_function_declaration",
+            "function",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+        ):
+            bound: set[str] = set()
+            params = node.child_by_field_name("parameters")
+            if params is not None:
+                _collect_cst_pattern_idents(raw, params, bound)
+            else:
+                single = node.child_by_field_name("parameter")
+                if single is not None:
+                    _collect_cst_pattern_idents(raw, single, bound)
+            _collect_hoisted_cst_vars(raw, node, bound)
+            if bound:
+                scope_consts = {k: v for k, v in scope_consts.items() if k not in bound}
+        elif ntype == "catch_clause":
+            c_param = node.child_by_field_name("parameter")
+            if c_param is not None:
+                c_bound: set[str] = set()
+                _collect_cst_pattern_idents(raw, c_param, c_bound)
+                if c_bound:
+                    scope_consts = {k: v for k, v in scope_consts.items() if k not in c_bound}
+        elif ntype == "for_in_statement":
+            left = node.child_by_field_name("left")
+            if left is not None:
+                f_bound: set[str] = set()
+                _collect_cst_pattern_idents(raw, left, f_bound)
+                if f_bound:
+                    scope_consts = {k: v for k, v in scope_consts.items() if k not in f_bound}
+        elif ntype == "for_statement":
+            init_node = node.child_by_field_name("initializer")
+            if init_node is not None and init_node.type in ("lexical_declaration", "variable_declaration"):
+                for_local: dict[str, str | None] = {}
+                _collect_cst_var_decl(raw, init_node, for_local)
+                scope_consts = _merge_cst_local_consts(scope_consts, for_local)
+        elif ntype == "statement_block":
+            scope_consts = _apply_cst_block_decls(raw, node, scope_consts)
+
+        if ntype == "call_expression" and node.children:
             fn_node = node.children[0]
             # tree-sitter-typescript parses `await post<T>(url)` as a call whose function is
             # `await post`; unwrap await/parens/non-null so generic calls are not missed.
@@ -247,25 +496,20 @@ def extract_ts_http_calls_cst(
                 elif first_arg is not None and first_arg.type in ("string", "template_string", "identifier"):
                     if first_arg.type == "identifier":
                         ident = raw[first_arg.start_byte : first_arg.end_byte].decode("utf-8", errors="replace")
-                        url_val = (url_consts or {}).get(ident, "")
+                        url_val = scope_consts.get(ident, "")
                     else:
-                        url_val = resolve_url_const_head(_unquote_node(raw, first_arg), url_consts)
+                        url_val = resolve_url_const_head(_unquote_node(raw, first_arg), scope_consts)
                     if url_val.startswith("/"):
                         upper_c = "DELETE" if callee_name.lower() == "del" else callee_name.upper()
                         if upper_c in _HTTP_VERBS:
                             found.append((upper_c, url_val, fn_node.start_point[0] + 1))
                         elif callee_name in _FETCH_HELPERS:
-                            verb = "GET"
-                            if len(arg_items) >= 2:
-                                opt_txt = raw[arg_items[1].start_byte : arg_items[1].end_byte].decode("utf-8", errors="replace")
-                                mm = _METHOD_RE.search(opt_txt)
-                                if mm:
-                                    verb = mm.group("m").upper()
+                            verb = _extract_cst_fetch_method(raw, arg_items[1]) if len(arg_items) >= 2 else "GET"
                             found.append((verb, url_val, fn_node.start_point[0] + 1))
         for ch in node.children:
-            walk(ch)
+            walk(ch, scope_consts)
 
-    walk(tree.root_node)
+    walk(tree.root_node, root_consts)
     return found
 
 

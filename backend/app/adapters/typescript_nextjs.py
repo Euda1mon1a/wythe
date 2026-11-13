@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
-from app.adapters.a11y_inspect import scan_a11y_markup_findings
+from app.adapters.a11y_inspect import (
+    _REGEX_PREV_CHARS,
+    _can_start_js_regex,
+    _skip_js_regex,
+    scan_a11y_markup_findings,
+)
 from app.adapters.base import (
     DisplayExtractionResult,
     FrontendHttpCall,
@@ -40,7 +47,7 @@ _HTTP_CALL_START_RE = re.compile(
     r"""\b(?:api\.|axios\.|http\.|client\.|ky\.)?(?P<verb>get|post|put|patch|del|delete|fetch|apiRequest|request|httpClient|ofetch)\s*(?:<[^;()]{0,220}?>)?\s*\(\s*(?:[A-Za-z_$][A-Za-z0-9_$.]*\s*\?\s*)?(?P<quote>['"`])"""
 )
 _FETCH_LIKE_VERBS = frozenset({"FETCH", "APIREQUEST", "REQUEST", "HTTPCLIENT", "OFETCH"})
-_FETCH_METHOD_RE = re.compile(r"""method\s*:\s*['"](?P<m>GET|POST|PUT|PATCH|DELETE)['"]""", re.IGNORECASE)
+_VALID_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 _RTK_BASE_URL_RE = re.compile(r"""fetchBaseQuery\s*\(\s*\{[\s\S]{0,160}?baseUrl\s*:\s*['"](?P<base>[^'"]+)['"]""")
 _RTK_ENDPOINT_RE = re.compile(
     r"""builder\.(?P<kind>query|mutation)\s*(?:<[^;()]{0,220}?>)?\s*\(\s*\{[\s\S]{0,260}?url\s*:\s*(?P<quote>['"`])(?P<url>[^'"`\n]+)(?P=quote)"""
@@ -52,8 +59,8 @@ _TAURI_READ_CMD_PREFIXES = ("get_", "list_", "fetch_", "load_", "find_", "query_
 
 
 _URL_CONST_RE = re.compile(
-    r"""^[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
-    r"""(?P<q>['"`])(?P<val>(?:/|\$\{)[^'"`\n]*)(?P=q)\s*(?:as\s+const\s*)?;?[ \t]*$""",
+    r"""(?:^|[;{])[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
+    r"""(?P<q>['"`])(?P<val>(?:/|\$\{)[^'"`\n]*)(?P=q)[ \t]*(?:as\s+const[ \t]*)?(?:[ \t]*/\*[^*\r\n]*\*/)*[ \t]*(?://[^\r\n]*)?(?=[;\r\n}]|$)""",
     re.MULTILINE,
 )
 _TEMPLATE_HEAD_CONST_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
@@ -63,28 +70,762 @@ _URL_CALL_IDENT_RE = re.compile(
 
 
 def _collect_url_consts(txt: str) -> dict[str, str]:
-    """Same-file `const NAME = '/path'` (or `` `${OTHER}/path` ``) values usable as URL prefixes.
+    """Top-level `const NAME = '/path'` values usable as module-wide URL prefixes."""
+    return _build_scoped_url_consts(txt)[0]
 
-    A name declared twice with different values is ambiguous and dropped. Chains such as
-    `` const B = `${A}/b` `` resolve through earlier constants.
-    """
-    seen: dict[str, str | None] = {}
+
+_FN_PARAM_HEAD_RE = re.compile(
+    r"""(?:\bfunction\b[A-Za-z0-9_$\s]*(?:<[^>{}()]*>)?\s*\((?P<fparams>[^)]*)\)\s*(?::[^{=]+)?\s*\{|\bcatch\s*\((?P<cparam>[^)]*)\)\s*\{|\((?P<aparams>[^()]*)\)\s*(?::[^=;\r\n)]+)?\s*=>|(?P<sparam>[A-Za-z_$][\w$]*)\s*=>)"""
+)
+_LOCAL_BIND_RE = re.compile(r"""\b(?P<kw>const|let|var|function)\s+(?P<name>[A-Za-z_$][\w$]*)\b""")
+_FOR_HEADER_RE = re.compile(r"(?<![.\w$])for\s*(?:await\s*)?\(")
+_FOR_INNER_HEAD_RE = re.compile(r"(?:for\s*(?:await\s*)?|while\s*|with\s*)\(")
+_PARAM_MODIFIER_RE = re.compile(r"^(?:(?:public|private|protected|readonly|override)\s+)+")
+
+
+def _split_top_level_ts(s: str, sep: str) -> list[str]:
+    parts: list[str] = []
+    pdepth = bdepth = cdepth = adepth = 0
+    quote: str | None = None
+    start = 0
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            pdepth = max(0, pdepth - 1)
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            bdepth = max(0, bdepth - 1)
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            cdepth = max(0, cdepth - 1)
+        elif ch == "<":
+            adepth += 1
+        elif ch == ">" and (i == 0 or s[i - 1] != "="):
+            adepth = max(0, adepth - 1)
+        elif ch == sep and pdepth == 0 and bdepth == 0 and cdepth == 0 and adepth == 0:
+            if sep == "=" and (
+                (i > 0 and s[i - 1] in ("=", "!", "<", ">"))
+                or (i + 1 < n and s[i + 1] in ("=", ">"))
+            ):
+                i += 1
+                continue
+            parts.append(s[start:i])
+            start = i + 1
+        i += 1
+    parts.append(s[start:])
+    return parts
+
+
+def _collect_pattern_bound_names(pat: str, out: set[str], *, allow_type_colon: bool) -> None:
+    lhs = _split_top_level_ts(pat, "=")[0].strip()
+    if allow_type_colon:
+        lhs = _split_top_level_ts(lhs, ":")[0].strip()
+    lhs = _PARAM_MODIFIER_RE.sub("", lhs).strip().removeprefix("...").strip().removesuffix("?").strip()
+    if not lhs:
+        return
+    if lhs.startswith("{") and lhs.endswith("}"):
+        for prop in _split_top_level_ts(lhs[1:-1], ","):
+            no_def = _split_top_level_ts(prop, "=")[0].strip()
+            if not no_def:
+                continue
+            kv = _split_top_level_ts(no_def, ":")
+            target = kv[1] if len(kv) >= 2 else kv[0]
+            _collect_pattern_bound_names(target, out, allow_type_colon=False)
+    elif lhs.startswith("[") and lhs.endswith("]"):
+        for elem in _split_top_level_ts(lhs[1:-1], ","):
+            _collect_pattern_bound_names(elem, out, allow_type_colon=False)
+    elif re.fullmatch(r"[A-Za-z_$][\w$]*", lhs) and lhs != "this":
+        out.add(lhs)
+
+
+def _extract_param_bound_names(raw_params: str) -> set[str]:
+    out: set[str] = set()
+    for item in _split_top_level_ts(raw_params, ","):
+        _collect_pattern_bound_names(item, out, allow_type_colon=True)
+    return out
+
+
+def _find_matching_delim(txt: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+    n = len(txt)
+    depth = 1
+    i = open_idx + 1
+    quote: str | None = None
+    while i < n and depth > 0:
+        ch = txt[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+        i += 1
+    return i
+
+
+_ARROW_CONT_TRAILING_KW_RE = re.compile(
+    r"\b(?:await|typeof|void|delete|new|in|instanceof|as|satisfies|keyof|readonly|yield)$"
+)
+_ARROW_GENERIC_TAIL_RE = re.compile(r"<[^<>=\r\n]+>$")
+_ARROW_CONT_LEADING_RE = re.compile(
+    r"^(?:\.|\?|:|\|\||&&|\?\?|[|&^*%/=>]|!=|\+(?!\+)|-(?!-)|<=|<<|<(?=\s)|(?:as|satisfies|instanceof|in)\b)"
+)
+
+
+def _arrow_continues_across_newline(txt: str, body_start: int, nl_pos: int) -> bool:
+    prefix = txt[body_start:nl_pos].rstrip(" \t")
+    if not prefix:
+        return True
+    last = prefix[-1]
+    if not prefix.endswith(("++", "--")):
+        if last in "+-*/%=&|^?:.~<":
+            return True
+        if last == ">" and (prefix.endswith("=>") or not _ARROW_GENERIC_TAIL_RE.search(prefix)):
+            return True
+    if _ARROW_CONT_TRAILING_KW_RE.search(prefix):
+        return True
+    k = nl_pos
+    n = len(txt)
+    while k < n and txt[k].isspace():
+        k += 1
+    if k >= n:
+        return False
+    return bool(_ARROW_CONT_LEADING_RE.match(txt, k))
+
+
+def _find_arrow_expr_end(txt: str, start: int) -> int:
+    n = len(txt)
+    i = start
+    while i < n and txt[i].isspace():
+        i += 1
+    if i < n and txt[i] == "{":
+        return _find_matching_delim(txt, i, "{", "}")
+    body_start = i
+    pdepth = bdepth = cdepth = 0
+    quote: str | None = None
+    while i < n:
+        ch = txt[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            if pdepth == 0:
+                break
+            pdepth -= 1
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            if bdepth == 0:
+                break
+            bdepth -= 1
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            if cdepth == 0:
+                break
+            cdepth -= 1
+        elif pdepth == 0 and bdepth == 0 and cdepth == 0:
+            if ch in (";", ","):
+                break
+            if ch in ("\n", "\r") and not _arrow_continues_across_newline(txt, body_start, i):
+                break
+        i += 1
+    return i
+
+
+def _apply_url_scope_map(outer: dict[str, str], bmap: dict[str, str | None]) -> dict[str, str]:
+    merged = {k: v for k, v in outer.items() if k not in bmap}
+    pending = {k: v for k, v in bmap.items() if v is not None}
+    if not pending:
+        return merged
+    working = {**merged, **pending}
+    for _ in range(3):
+        for k in list(pending):
+            working[k] = resolve_url_const_head(
+                working[k],
+                {ok: ov for ok, ov in working.items() if ok != k and ov.startswith("/")},
+            )
+    for k in pending:
+        if working[k].startswith("/"):
+            merged[k] = working[k]
+    return merged
+
+
+def _has_closing_line_quote(src: str, start: int, quote_ch: str) -> bool:
+    k = start + 1
+    limit = len(src)
+    while k < limit:
+        ch = src[k]
+        if ch == "\\":
+            k += 2
+            continue
+        if ch == quote_ch:
+            return True
+        if ch in ("\n", "\r"):
+            return False
+        k += 1
+    return False
+
+
+def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], dict[str, str]]]:
+    """Return `(root_consts, consts_at)` preserving local URL constants while shadowing rebindings."""
+    n = len(txt)
+    root_span = (0, n)
+    block_stack: list[int] = []
+    tpl_brace_depths: list[int] = []
+    code_chars: list[str] = []
+    i = 0
+    prev_sig_pos = -1
+    quote: str | None = None
+    block_spans: list[tuple[int, int]] = []
+    while i < n:
+        ch = txt[i]
+        if quote in ("'", '"'):
+            if ch == "\\" and i + 1 < n:
+                code_chars.append(" ")
+                code_chars.append("\n" if txt[i + 1] == "\n" else " ")
+                i += 2
+                continue
+            if ch in ("\n", "\r"):
+                quote = None
+                code_chars.append(ch)
+                i += 1
+                continue
+            if ch == quote:
+                quote = None
+                prev_sig_pos = i
+                code_chars.append(ch)
+            else:
+                code_chars.append(" ")
+            i += 1
+            continue
+        if quote == "`":
+            if ch == "\\" and i + 1 < n:
+                code_chars.append(" ")
+                code_chars.append("\n" if txt[i + 1] == "\n" else " ")
+                i += 2
+                continue
+            if ch == "`":
+                quote = None
+                prev_sig_pos = i
+                code_chars.append("`")
+                i += 1
+                continue
+            if ch == "$" and i + 1 < n and txt[i + 1] == "{":
+                tpl_brace_depths.append(0)
+                quote = None
+                prev_sig_pos = i + 1
+                code_chars.append(" ")
+                code_chars.append(" ")
+                i += 2
+                continue
+            code_chars.append("\n" if ch == "\n" else " ")
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and txt[i + 1] == "/":
+            while i < n and txt[i] != "\n":
+                code_chars.append(" ")
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and txt[i + 1] == "*":
+            end = txt.find("*/", i + 2)
+            stop = n if end < 0 else end + 2
+            while i < stop:
+                code_chars.append("\n" if txt[i] == "\n" else " ")
+                i += 1
+            continue
+        if (
+            ch == "/"
+            and not (i > 0 and txt[i - 1] == "<")
+            and not (
+                i + 1 < n
+                and txt[i + 1] == ">"
+                and (prev_sig_pos < 0 or txt[prev_sig_pos] not in _REGEX_PREV_CHARS)
+            )
+            and _can_start_js_regex(txt, prev_sig_pos, 0)
+        ):
+            reg_end = _skip_js_regex(txt, i, n)
+            if reg_end is not None:
+                code_chars.extend(" " * (reg_end - i))
+                prev_sig_pos = reg_end - 1
+                i = reg_end
+                continue
+        if ch in ("'", '"') and _has_closing_line_quote(txt, i, ch):
+            quote = ch
+            prev_sig_pos = i
+            code_chars.append(ch)
+        elif ch == "`":
+            quote = "`"
+            prev_sig_pos = i
+            code_chars.append("`")
+        elif ch == "{":
+            if tpl_brace_depths:
+                tpl_brace_depths[-1] += 1
+            block_stack.append(i)
+            prev_sig_pos = i
+            code_chars.append("{")
+        elif ch == "}":
+            if tpl_brace_depths and tpl_brace_depths[-1] == 0:
+                tpl_brace_depths.pop()
+                quote = "`"
+                prev_sig_pos = i
+                code_chars.append(" ")
+                i += 1
+                continue
+            if tpl_brace_depths:
+                tpl_brace_depths[-1] -= 1
+            if block_stack:
+                bstart = block_stack.pop()
+                block_spans.append((bstart, i + 1))
+            prev_sig_pos = i
+            code_chars.append("}")
+        else:
+            if not ch.isspace():
+                prev_sig_pos = i
+            code_chars.append(ch)
+        i += 1
+    code_only = "".join(code_chars)
+
+    loop_headers: list[tuple[int, int, int]] = []
+    loop_spans: list[tuple[int, int]] = []
+    for fm in _FOR_HEADER_RE.finditer(code_only):
+        open_p = fm.end() - 1
+        close_p = _find_matching_delim(code_only, open_p, "(", ")")
+        if close_p <= open_p + 1:
+            continue
+        loop_end = _find_ts_loop_end(code_only, close_p)
+        loop_headers.append((open_p, close_p, loop_end))
+        loop_spans.append((open_p, loop_end))
+
+    lexical_spans = [*block_spans, *loop_spans]
+
+    def innermost_block(pos: int) -> tuple[int, int]:
+        return min(
+            (sp for sp in block_spans if sp[0] < pos < sp[1]),
+            key=lambda sp: sp[1] - sp[0],
+            default=root_span,
+        )
+
+    def innermost_lexical_block(pos: int) -> tuple[int, int]:
+        return min(
+            (sp for sp in lexical_spans if sp[0] < pos < sp[1]),
+            key=lambda sp: sp[1] - sp[0],
+            default=root_span,
+        )
+
+    block_decls: dict[tuple[int, int], dict[str, str | None]] = {}
+    url_name_positions: set[int] = set()
     for m in _URL_CONST_RE.finditer(txt):
         name, val = m.group("name"), m.group("val")
-        if m.group("q") != "`" and "${" in val:
+        npos = m.start("name")
+        if code_only[npos : m.end("name")] != name:
             continue
-        seen[name] = val if seen.get(name, val) == val else None
-    consts = {k: v for k, v in seen.items() if v is not None}
-    for _ in range(3):
-        for name, val in list(consts.items()):
-            consts[name] = resolve_url_const_head(val, {k: v for k, v in consts.items() if k != name})
-    return {k: v for k, v in consts.items() if v.startswith("/")}
+        url_name_positions.add(npos)
+        bmap = block_decls.setdefault(innermost_lexical_block(npos), {})
+        if m.group("q") != "`" and "${" in val:
+            bmap[name] = None
+        else:
+            bmap[name] = val if bmap.get(name, val) == val else None
+
+    for dm in _LOCAL_BIND_RE.finditer(code_only):
+        npos = dm.start("name")
+        if npos in url_name_positions:
+            continue
+        target_span = (
+            innermost_lexical_block(npos)
+            if dm.group("kw") in ("const", "let")
+            else innermost_block(npos)
+        )
+        block_decls.setdefault(target_span, {})[dm.group("name")] = None
+
+    for open_p, close_p, loop_end in loop_headers:
+        hdr_kw, hdr_bound = _extract_for_header_binds(code_only[open_p + 1 : close_p - 1])
+        if not hdr_bound:
+            continue
+        hdr_span = (open_p, loop_end) if hdr_kw in ("const", "let") else innermost_block(open_p)
+        hdr_map = block_decls.setdefault(hdr_span, {})
+        for bname in hdr_bound:
+            if hdr_kw == "var":
+                hdr_map[bname] = None
+            else:
+                hdr_map.setdefault(bname, None)
+
+    param_scopes: list[tuple[int, int, set[str]]] = []
+    for m in _FN_PARAM_HEAD_RE.finditer(code_only):
+        raw_params = (
+            m.group("fparams") or m.group("cparam") or m.group("aparams") or m.group("sparam") or ""
+        )
+        bound = _extract_param_bound_names(raw_params)
+        if not bound:
+            continue
+        if m.group("fparams") is not None or m.group("cparam") is not None:
+            span = (m.end() - 1, _find_matching_delim(code_only, m.end() - 1, "{", "}"))
+        else:
+            span = (m.end(), _find_arrow_expr_end(code_only, m.end()))
+        param_scopes.append((span[0], span[1], bound))
+
+    root_consts = _apply_url_scope_map({}, block_decls.get(root_span, {}))
+    inner_blocks = [(s, e, bmap) for (s, e), bmap in block_decls.items() if (s, e) != root_span]
+
+    def consts_at(pos: int) -> dict[str, str]:
+        if not inner_blocks and not param_scopes:
+            return root_consts
+        events: list[tuple[int, int, str, Any]] = []
+        for s, e, pnames in param_scopes:
+            if s <= pos < e:
+                events.append((e - s, 1, "params", pnames))
+        for s, e, bmap in inner_blocks:
+            if s <= pos < e:
+                events.append((e - s, 0, "block", bmap))
+        if not events:
+            return root_consts
+        events.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        env = dict(root_consts)
+        for _span_len, _prio, kind, payload in events:
+            if kind == "params":
+                for pname in payload:
+                    env.pop(pname, None)
+            else:
+                env = _apply_url_scope_map(env, payload)
+        return env
+
+    return root_consts, consts_at
+
+
+def _find_ts_loop_end(code_only: str, after_paren: int) -> int:
+    n = len(code_only)
+    idx = _skip_ts_ws_and_comments(code_only, after_paren)
+    if idx >= n:
+        return n
+    if code_only[idx] == "{":
+        return _find_matching_delim(code_only, idx, "{", "}")
+    if code_only[idx] == ";":
+        return idx + 1
+    m_inner = _FOR_INNER_HEAD_RE.match(code_only, idx)
+    if m_inner is not None:
+        inner_close = _find_matching_delim(code_only, m_inner.end() - 1, "(", ")")
+        return _find_ts_loop_end(code_only, inner_close)
+    m_if = re.match(r"if\s*\(", code_only[idx:])
+    if m_if is not None:
+        if_close = _find_matching_delim(code_only, idx + m_if.end() - 1, "(", ")")
+        then_end = _find_ts_loop_end(code_only, if_close)
+        after_then = _skip_ts_ws_and_comments(code_only, then_end)
+        if re.match(r"else(?![\w$])", code_only[after_then:]):
+            return _find_ts_loop_end(code_only, after_then + 4)
+        return then_end
+    pdepth = bdepth = cdepth = 0
+    quote: str | None = None
+    i = idx
+    while i < n:
+        ch = code_only[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            pdepth = max(0, pdepth - 1)
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            bdepth = max(0, bdepth - 1)
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            if cdepth == 0:
+                return i
+            cdepth -= 1
+        elif pdepth == 0 and bdepth == 0 and cdepth == 0:
+            if ch == ";":
+                return i + 1
+            if ch in ("\n", "\r") and not _arrow_continues_across_newline(code_only, idx, i):
+                return i
+        i += 1
+    return n
+
+
+def _extract_for_header_binds(hdr: str) -> tuple[str | None, set[str]]:
+    m_decl = re.match(r"^\s*(?P<kw>const|let|var)\b(?P<rest>[\s\S]*)$", hdr)
+    if m_decl is None:
+        return None, set()
+    kw = m_decl.group("kw")
+    rest = m_decl.group("rest")
+    bound: set[str] = set()
+    semi_parts = _split_top_level_ts(rest, ";")
+    if len(semi_parts) >= 2:
+        for decl in _split_top_level_ts(semi_parts[0], ","):
+            _collect_pattern_bound_names(decl, bound, allow_type_colon=True)
+        return kw, bound
+    pdepth = bdepth = cdepth = 0
+    quote: str | None = None
+    k = 0
+    rlen = len(rest)
+    while k < rlen:
+        ch = rest[k]
+        if quote:
+            if ch == "\\":
+                k += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            pdepth = max(0, pdepth - 1)
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            bdepth = max(0, bdepth - 1)
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            cdepth = max(0, cdepth - 1)
+        elif (
+            pdepth == 0
+            and bdepth == 0
+            and cdepth == 0
+            and k > 0
+            and (rest[k - 1].isspace() or rest[k - 1] in "}]")
+            and re.match(r"(?:of|in)(?![\w$])", rest[k:])
+        ):
+            _collect_pattern_bound_names(rest[:k], bound, allow_type_colon=False)
+            break
+        k += 1
+    return kw, bound
+
+
+def _skip_ts_ws_and_comments(s: str, idx: int) -> int:
+    n = len(s)
+    while idx < n:
+        if s[idx].isspace():
+            idx += 1
+        elif s.startswith("//", idx):
+            nl = s.find("\n", idx + 2)
+            idx = n if nl < 0 else nl + 1
+        elif s.startswith("/*", idx):
+            end_c = s.find("*/", idx + 2)
+            idx = n if end_c < 0 else end_c + 2
+        else:
+            break
+    return idx
+
+
+def _skip_ts_quoted(s: str, idx: int) -> tuple[str | None, int]:
+    """Read a static JS/TS string or template literal starting at `idx`, returning `(value_or_None, next_idx)`."""
+    n = len(s)
+    q = s[idx]
+    j = idx + 1
+    chars: list[str] = []
+    dynamic = False
+    if q == "`":
+        bdepth = 0
+        while j < n:
+            ch = s[j]
+            if bdepth == 0:
+                if ch == "\\":
+                    if j + 1 < n:
+                        chars.append(s[j + 1])
+                    j += 2
+                    continue
+                if ch == "`":
+                    return (None if dynamic else "".join(chars)), j + 1
+                if ch == "$" and j + 1 < n and s[j + 1] == "{":
+                    dynamic = True
+                    bdepth = 1
+                    j += 2
+                    continue
+                chars.append(ch)
+                j += 1
+            else:
+                if ch in ("'", '"', "`"):
+                    _, j = _skip_ts_quoted(s, j)
+                    continue
+                if s.startswith("//", j) or s.startswith("/*", j):
+                    j = _skip_ts_ws_and_comments(s, j)
+                    continue
+                if ch == "{":
+                    bdepth += 1
+                elif ch == "}":
+                    bdepth -= 1
+                j += 1
+        return None, n
+    while j < n:
+        ch = s[j]
+        if ch == "\\":
+            if j + 1 < n:
+                chars.append(s[j + 1])
+            j += 2
+            continue
+        if ch == q:
+            return "".join(chars), j + 1
+        if ch in ("\n", "\r"):
+            return None, j
+        chars.append(ch)
+        j += 1
+    return None, n
+
+
+def _unwrap_ts_prefix_wrappers(s: str, idx: int) -> int:
+    n = len(s)
+    while idx < n:
+        idx = _skip_ts_ws_and_comments(s, idx)
+        if idx < n and s[idx] == "(":
+            idx += 1
+            continue
+        if idx < n and s[idx] == "<":
+            close_gt = _find_matching_delim(s, idx, "<", ">")
+            if close_gt > idx + 1:
+                idx = close_gt
+                continue
+        break
+    return idx
+
+
+def _fetch_method_from_call_tail(txt: str, pos: int, *, at_second_arg: bool = False) -> str:
+    n = len(txt)
+    if at_second_arg:
+        arg2_pos = pos
+    else:
+        k = pos + 1 if pos < n and txt[pos] in ("'", '"', "`") else pos
+        pdepth = 1
+        bdepth = cdepth = 0
+        arg2_pos = -1
+        while k < n and pdepth > 0:
+            ch = txt[k]
+            if ch in ("'", '"', "`"):
+                _, k = _skip_ts_quoted(txt, k)
+                continue
+            if txt.startswith("//", k) or txt.startswith("/*", k):
+                k = _skip_ts_ws_and_comments(txt, k)
+                continue
+            if ch == "(":
+                pdepth += 1
+            elif ch == ")":
+                pdepth -= 1
+            elif ch == "[":
+                bdepth += 1
+            elif ch == "]":
+                bdepth = max(0, bdepth - 1)
+            elif ch == "{":
+                cdepth += 1
+            elif ch == "}":
+                cdepth = max(0, cdepth - 1)
+            elif ch == "," and pdepth == 1 and bdepth == 0 and cdepth == 0:
+                arg2_pos = k + 1
+                break
+            k += 1
+        if arg2_pos < 0:
+            return "GET"
+
+    obj_pos = _unwrap_ts_prefix_wrappers(txt, arg2_pos)
+    if obj_pos >= n or txt[obj_pos] != "{":
+        return "GET"
+
+    props: list[tuple[int, int]] = []
+    j = obj_pos + 1
+    cdepth = 1
+    pdepth = bdepth = 0
+    seg_start = j
+    while j < n and cdepth > 0:
+        ch = txt[j]
+        if ch in ("'", '"', "`"):
+            _, j = _skip_ts_quoted(txt, j)
+            continue
+        if txt.startswith("//", j) or txt.startswith("/*", j):
+            j = _skip_ts_ws_and_comments(txt, j)
+            continue
+        if ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            cdepth -= 1
+            if cdepth == 0:
+                props.append((seg_start, j))
+                break
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            pdepth = max(0, pdepth - 1)
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            bdepth = max(0, bdepth - 1)
+        elif ch == "," and cdepth == 1 and pdepth == 0 and bdepth == 0:
+            props.append((seg_start, j))
+            seg_start = j + 1
+        j += 1
+
+    verb = "GET"
+    for ps, pe in props:
+        prop = txt[ps:pe]
+        p = _skip_ts_ws_and_comments(prop, 0)
+        if p >= len(prop):
+            continue
+        key_name: str | None = None
+        if prop[p] in ("'", '"', "`"):
+            key_name, p = _skip_ts_quoted(prop, p)
+        elif prop[p] == "[":
+            inner_p = _unwrap_ts_prefix_wrappers(prop, p + 1)
+            if inner_p < len(prop) and prop[inner_p] in ("'", '"', "`"):
+                key_name, inner_p = _skip_ts_quoted(prop, inner_p)
+                close_b = prop.find("]", inner_p)
+                p = close_b + 1 if close_b >= 0 else len(prop)
+        else:
+            km = re.match(r"[A-Za-z_$][\w$]*", prop[p:])
+            if km:
+                key_name = km.group(0)
+                p += km.end()
+        if key_name != "method":
+            continue
+        p = _skip_ts_ws_and_comments(prop, p)
+        if p >= len(prop) or prop[p] != ":":
+            continue
+        val_p = _unwrap_ts_prefix_wrappers(prop, p + 1)
+        if val_p < len(prop) and prop[val_p] in ("'", '"', "`"):
+            raw_m, _ = _skip_ts_quoted(prop, val_p)
+            cand = raw_m.strip().upper() if raw_m is not None else ""
+            verb = cand if cand in _VALID_HTTP_METHODS else "GET"
+        else:
+            verb = "GET"
+    return verb
 
 
 def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
     """Extract (verb, raw_url, lineno) via Tree-sitter TSX CST (with character-scanner fallback)."""
-    url_consts = _collect_url_consts(txt)
-    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True, url_consts=url_consts)
+    root_consts, consts_at = _build_scoped_url_consts(txt)
+    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True, url_consts=root_consts)
     if cst_calls is not None:
         results = list(cst_calls)
         if "createApi" in txt and "builder." in txt:
@@ -105,6 +846,7 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
     results = []
     n = len(txt)
     for m in _HTTP_CALL_START_RE.finditer(txt):
+        local_consts = consts_at(m.start())
         verb = m.group("verb").upper()
         if verb == "DEL":
             verb = "DELETE"
@@ -113,8 +855,8 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
         buf: list[str] = []
         if quote == "`":
             hm = _TEMPLATE_HEAD_CONST_RE.match(txt, i)
-            if hm and hm.group("name") in url_consts:
-                buf.append(url_consts[hm.group("name")])
+            if hm and hm.group("name") in local_consts:
+                buf.append(local_consts[hm.group("name")])
                 i = hm.end()
         if i >= n or (not buf and txt[i] != "/"):
             continue
@@ -145,27 +887,25 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
                     buf.append(ch)
                     i += 1
         if verb in _FETCH_LIKE_VERBS:
-            pdepth = 1
-            j = i
-            limit = min(n, i + 260)
-            while j < limit and pdepth > 0:
-                if txt[j] == "(":
-                    pdepth += 1
-                elif txt[j] == ")":
-                    pdepth -= 1
-                j += 1
-            tail = txt[i:j]
-            mm = _FETCH_METHOD_RE.search(tail)
-            verb = mm.group("m").upper() if mm else "GET"
+            verb = _fetch_method_from_call_tail(txt, i)
         raw_url = "".join(buf)
         if raw_url.startswith("/"):
             lineno = txt.count("\n", 0, m.start()) + 1
             results.append((verb, raw_url, lineno))
     for im in _URL_CALL_IDENT_RE.finditer(txt):
-        if im.group("ident") in url_consts:
+        local_consts = consts_at(im.start())
+        ident = im.group("ident")
+        if ident in local_consts:
             iverb = im.group("verb").upper()
-            iverb = "DELETE" if iverb == "DEL" else ("GET" if iverb in _FETCH_LIKE_VERBS else iverb)
-            results.append((iverb, url_consts[im.group("ident")], txt.count("\n", 0, im.start()) + 1))
+            if iverb == "DEL":
+                iverb = "DELETE"
+            elif iverb in _FETCH_LIKE_VERBS:
+                iverb = (
+                    _fetch_method_from_call_tail(txt, im.end(), at_second_arg=True)
+                    if txt[im.end() - 1] == ","
+                    else "GET"
+                )
+            results.append((iverb, local_consts[ident], txt.count("\n", 0, im.start()) + 1))
     if "createApi" in txt and "builder." in txt:
         bm = _RTK_BASE_URL_RE.search(txt)
         rtk_base = ("/" + bm.group("base").strip("/")) if bm and not bm.group("base").startswith("http") else ""

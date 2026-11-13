@@ -10,10 +10,10 @@ dev-ui:
 	cd frontend && npm run dev
 
 scan:
-	cd backend && .venv/bin/wythe scan wythe
+	cd backend && .venv/bin/wythe scan ..
 
 gate:
-	cd backend && .venv/bin/wythe gate --strict wythe
+	cd backend && .venv/bin/wythe gate --strict ..
 
 test:
 	cd backend && .venv/bin/pytest -v
