@@ -1682,30 +1682,56 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                 record_target_mutations(s.target, s.lineno, rows)
             elif isinstance(s, (ast.For, ast.AsyncFor)):
                 inspect_expr(s.iter, rows, made)
-                r_loop_in = {k: set(v) for k, v in rows.items()}
-                m_loop_in = {k: set(v) for k, v in made.items()}
-                if isinstance(s.target, ast.Name):
-                    m = _model_in_row_source(s.iter)
-                    if m:
-                        r_loop_in[s.target.id] = {m}
-                        m_loop_in.pop(s.target.id, None)
-                    else:
-                        r_loop_in.pop(s.target.id, None)
-                        m_loop_in.pop(s.target.id, None)
-                else:
-                    for sub in ast.walk(s.target):
-                        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
-                            r_loop_in.pop(sub.id, None)
-                            m_loop_in.pop(sub.id, None)
+                iter_model = _model_in_row_source(s.iter) if isinstance(s.target, ast.Name) else None
+                cur_in_r = {k: set(v) for k, v in rows.items()}
+                cur_in_m = {k: set(v) for k, v in made.items()}
+                sw_base, mut_base = len(session_writes), len(mutations)
                 f_breaks_r: list[dict[str, set[str]]] = []
                 f_breaks_m: list[dict[str, set[str]]] = []
                 f_conts_r: list[dict[str, set[str]]] = []
                 f_conts_m: list[dict[str, set[str]]] = []
-                r_body, m_body, f_body = walk_block(
-                    s.body, r_loop_in, m_loop_in, exc_rows, exc_made, f_breaks_r, f_breaks_m, f_conts_r, f_conts_m
-                )
-                iter_end_r = _merge_binding_maps(*(([r_body] if f_body else []) + f_conts_r))
-                iter_end_m = _merge_binding_maps(*(([m_body] if f_body else []) + f_conts_m))
+                iter_end_r: dict[str, set[str]] = {}
+                iter_end_m: dict[str, set[str]] = {}
+                for _ in range(8):
+                    del session_writes[sw_base:]
+                    del mutations[mut_base:]
+                    f_breaks_r.clear()
+                    f_breaks_m.clear()
+                    f_conts_r.clear()
+                    f_conts_m.clear()
+                    record_target_mutations(s.target, s.lineno, cur_in_r)
+                    r_loop_in = {k: set(v) for k, v in cur_in_r.items()}
+                    m_loop_in = {k: set(v) for k, v in cur_in_m.items()}
+                    if isinstance(s.target, ast.Name):
+                        if iter_model:
+                            r_loop_in[s.target.id] = {iter_model}
+                            m_loop_in.pop(s.target.id, None)
+                        else:
+                            r_loop_in.pop(s.target.id, None)
+                            m_loop_in.pop(s.target.id, None)
+                    else:
+                        for sub in ast.walk(s.target):
+                            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                                r_loop_in.pop(sub.id, None)
+                                m_loop_in.pop(sub.id, None)
+                    r_body, m_body, f_body = walk_block(
+                        s.body,
+                        r_loop_in,
+                        m_loop_in,
+                        exc_rows,
+                        exc_made,
+                        f_breaks_r,
+                        f_breaks_m,
+                        f_conts_r,
+                        f_conts_m,
+                    )
+                    iter_end_r = _merge_binding_maps(*(([r_body] if f_body else []) + f_conts_r))
+                    iter_end_m = _merge_binding_maps(*(([m_body] if f_body else []) + f_conts_m))
+                    next_in_r = _merge_binding_maps(cur_in_r, iter_end_r)
+                    next_in_m = _merge_binding_maps(cur_in_m, iter_end_m)
+                    if next_in_r == cur_in_r and next_in_m == cur_in_m:
+                        break
+                    cur_in_r, cur_in_m = next_in_r, next_in_m
                 r_else, m_else, f_else = walk_block(
                     s.orelse,
                     _merge_binding_maps(rows, iter_end_r),
@@ -1722,24 +1748,43 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
                 rows = _merge_binding_maps(*(([rows, iter_end_r, r_else] if f_else else []) + f_breaks_r))
                 made = _merge_binding_maps(*(([made, iter_end_m, m_else] if f_else else []) + f_breaks_m))
             elif isinstance(s, ast.While):
-                inspect_expr(s.test, rows, made)
+                cur_w_r = {k: set(v) for k, v in rows.items()}
+                cur_w_m = {k: set(v) for k, v in made.items()}
+                sw_base_w, mut_base_w = len(session_writes), len(mutations)
                 w_breaks_r: list[dict[str, set[str]]] = []
                 w_breaks_m: list[dict[str, set[str]]] = []
                 w_conts_r: list[dict[str, set[str]]] = []
                 w_conts_m: list[dict[str, set[str]]] = []
-                r_body, m_body, f_body = walk_block(
-                    s.body,
-                    {k: set(v) for k, v in rows.items()},
-                    {k: set(v) for k, v in made.items()},
-                    exc_rows,
-                    exc_made,
-                    w_breaks_r,
-                    w_breaks_m,
-                    w_conts_r,
-                    w_conts_m,
-                )
-                w_end_r = _merge_binding_maps(*(([r_body] if f_body else []) + w_conts_r))
-                w_end_m = _merge_binding_maps(*(([m_body] if f_body else []) + w_conts_m))
+                w_end_r: dict[str, set[str]] = {}
+                w_end_m: dict[str, set[str]] = {}
+                for _ in range(8):
+                    del session_writes[sw_base_w:]
+                    del mutations[mut_base_w:]
+                    w_breaks_r.clear()
+                    w_breaks_m.clear()
+                    w_conts_r.clear()
+                    w_conts_m.clear()
+                    r_test_in = {k: set(v) for k, v in cur_w_r.items()}
+                    m_test_in = {k: set(v) for k, v in cur_w_m.items()}
+                    inspect_expr(s.test, r_test_in, m_test_in)
+                    r_body, m_body, f_body = walk_block(
+                        s.body,
+                        r_test_in,
+                        m_test_in,
+                        exc_rows,
+                        exc_made,
+                        w_breaks_r,
+                        w_breaks_m,
+                        w_conts_r,
+                        w_conts_m,
+                    )
+                    w_end_r = _merge_binding_maps(*(([r_body] if f_body else []) + w_conts_r))
+                    w_end_m = _merge_binding_maps(*(([m_body] if f_body else []) + w_conts_m))
+                    next_w_r = _merge_binding_maps(cur_w_r, w_end_r)
+                    next_w_m = _merge_binding_maps(cur_w_m, w_end_m)
+                    if next_w_r == cur_w_r and next_w_m == cur_w_m:
+                        break
+                    cur_w_r, cur_w_m = next_w_r, next_w_m
                 r_else, m_else, f_else = walk_block(
                     s.orelse,
                     _merge_binding_maps(rows, w_end_r),
@@ -1993,6 +2038,7 @@ def _loaded_row_writes(tree: ast.Module, excluded: set[int]) -> tuple[list[tuple
 
 _CLOCK_FACTORY_KWARGS = frozenset({"default", "default_factory", "onupdate", "insert_default", "factory"})
 _CLOCK_ZERO_ARG_CALLS = frozenset({"defaultdict", "Factory", "LazyFunction"})
+_CLOCK_FACTORY_TARGETS = _CLOCK_ZERO_ARG_CALLS | {"partial"}
 
 
 def _arg_names(args: ast.arguments) -> set[str]:
@@ -2017,27 +2063,35 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
         expr: ast.AST | None,
         classes: dict[str, str],
         modules: set[str],
+        factories: dict[str, str],
         deferred_lams: list[ast.Lambda] | None = None,
     ) -> None:
         if isinstance(expr, ast.Lambda):
             for dflt in (*expr.args.defaults, *(d for d in expr.args.kw_defaults if d is not None)):
-                inspect_expr(dflt, classes, modules, deferred_lams)
+                inspect_expr(dflt, classes, modules, factories, deferred_lams)
             if deferred_lams is not None:
                 deferred_lams.append(expr)
             else:
                 lam_params = _arg_names(expr.args)
                 lam_classes = {k: v for k, v in classes.items() if k not in lam_params}
-                inspect_expr(expr.body, lam_classes, modules - lam_params, None)
+                lam_factories = {k: v for k, v in factories.items() if k not in lam_params}
+                inspect_expr(expr.body, lam_classes, modules - lam_params, lam_factories, None)
             return
         for n in _expr_nodes_shallow(expr, excluded):
             if isinstance(n, ast.Lambda):
-                inspect_expr(n, classes, modules, deferred_lams)
+                inspect_expr(n, classes, modules, factories, deferred_lams)
                 continue
             if not isinstance(n, ast.Call):
                 continue
             target = n.func
             dotted = _dotted(target) or ""
-            short = target.id if isinstance(target, ast.Name) else target.attr if isinstance(target, ast.Attribute) else ""
+            short = (
+                factories.get(target.id, "")
+                if isinstance(target, ast.Name)
+                else target.attr
+                if isinstance(target, ast.Attribute)
+                else ""
+            )
             clock = _clock_ref(target, classes, modules)
             if clock and _naive_clock_call(n, *clock):
                 found.append((f"{dotted}()", n.lineno))
@@ -2056,6 +2110,7 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
         stmts: list[ast.stmt],
         classes: dict[str, str],
         modules: set[str],
+        factories: dict[str, str],
         deferred_fns: list[ast.FunctionDef | ast.AsyncFunctionDef],
         deferred_lams: list[ast.Lambda],
     ) -> None:
@@ -2070,6 +2125,21 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
                     else:
                         classes.pop(local_name, None)
                         modules.discard(local_name)
+                    mod_root = (stmt.module or "").split(".", 1)[0] if stmt.level == 0 else ""
+                    if alias.name in _CLOCK_FACTORY_TARGETS and mod_root in (
+                        "functools",
+                        "collections",
+                        "factory",
+                        "pydantic",
+                        "attrs",
+                        "attr",
+                        "dataclasses",
+                        "toolz",
+                        "cytoolz",
+                    ):
+                        factories[local_name] = alias.name
+                    elif alias.name != "*":
+                        factories.pop(local_name, None)
                 continue
             if isinstance(stmt, ast.Import):
                 for alias in stmt.names:
@@ -2082,50 +2152,81 @@ def _collect_raw_clocks(tree: ast.Module, excluded: set[int]) -> list[tuple[str,
                         bound = alias.asname or alias.name.split(".", 1)[0]
                         classes.pop(bound, None)
                         modules.discard(bound)
+                    factories.pop(bound, None)
                 continue
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for dec in stmt.decorator_list:
-                    inspect_expr(dec, classes, modules, deferred_lams)
+                    inspect_expr(dec, classes, modules, factories, deferred_lams)
                 for dflt in (*stmt.args.defaults, *(d for d in stmt.args.kw_defaults if d is not None)):
-                    inspect_expr(dflt, classes, modules, deferred_lams)
+                    inspect_expr(dflt, classes, modules, factories, deferred_lams)
+                factories.pop(stmt.name, None)
                 deferred_fns.append(stmt)
                 continue
             if isinstance(stmt, ast.ClassDef):
                 for dec in stmt.decorator_list:
-                    inspect_expr(dec, classes, modules, deferred_lams)
+                    inspect_expr(dec, classes, modules, factories, deferred_lams)
                 for base_expr in (*stmt.bases, *(kw.value for kw in stmt.keywords)):
-                    inspect_expr(base_expr, classes, modules, deferred_lams)
-                walk_stmts(stmt.body, dict(classes), set(modules), deferred_fns, deferred_lams)
+                    inspect_expr(base_expr, classes, modules, factories, deferred_lams)
+                factories.pop(stmt.name, None)
+                walk_stmts(stmt.body, dict(classes), set(modules), dict(factories), deferred_fns, deferred_lams)
+                continue
+            if isinstance(stmt, ast.Assign):
+                inspect_expr(stmt.value, classes, modules, factories, deferred_lams)
+                rhs_fac: str | None = None
+                if isinstance(stmt.value, ast.Name):
+                    rhs_fac = factories.get(stmt.value.id)
+                elif isinstance(stmt.value, ast.Attribute) and stmt.value.attr in _CLOCK_FACTORY_TARGETS:
+                    rhs_fac = stmt.value.attr
+                for tgt in stmt.targets:
+                    inspect_expr(tgt, classes, modules, factories, deferred_lams)
+                    if isinstance(tgt, ast.Name):
+                        if rhs_fac:
+                            factories[tgt.id] = rhs_fac
+                        else:
+                            factories.pop(tgt.id, None)
                 continue
             for ch in ast.iter_child_nodes(stmt):
                 if isinstance(ch, ast.expr):
-                    inspect_expr(ch, classes, modules, deferred_lams)
+                    inspect_expr(ch, classes, modules, factories, deferred_lams)
                 elif isinstance(ch, ast.stmt):
-                    walk_stmts([ch], classes, modules, deferred_fns, deferred_lams)
+                    walk_stmts([ch], classes, modules, factories, deferred_fns, deferred_lams)
                 else:
                     for sub in ast.iter_child_nodes(ch):
                         if isinstance(sub, ast.expr):
-                            inspect_expr(sub, classes, modules, deferred_lams)
+                            inspect_expr(sub, classes, modules, factories, deferred_lams)
                         elif isinstance(sub, ast.stmt):
-                            walk_stmts([sub], classes, modules, deferred_fns, deferred_lams)
+                            walk_stmts([sub], classes, modules, factories, deferred_fns, deferred_lams)
 
-    def run_lexical_scope(stmts: list[ast.stmt], classes: dict[str, str], modules: set[str]) -> None:
+    def run_lexical_scope(
+        stmts: list[ast.stmt],
+        classes: dict[str, str],
+        modules: set[str],
+        factories: dict[str, str],
+    ) -> None:
         fns: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         lams: list[ast.Lambda] = []
-        walk_stmts(stmts, classes, modules, fns, lams)
+        walk_stmts(stmts, classes, modules, factories, fns, lams)
         for lam in lams:
             lam_params = _arg_names(lam.args)
             lam_classes = {k: v for k, v in classes.items() if k not in lam_params}
-            inspect_expr(lam.body, lam_classes, modules - lam_params, None)
+            lam_factories = {k: v for k, v in factories.items() if k not in lam_params}
+            inspect_expr(lam.body, lam_classes, modules - lam_params, lam_factories, None)
         for fn in fns:
             sub_classes = dict(classes)
             sub_modules = set(modules)
+            sub_factories = dict(factories)
             for pname in _arg_names(fn.args):
                 sub_classes.pop(pname, None)
                 sub_modules.discard(pname)
-            run_lexical_scope(fn.body, sub_classes, sub_modules)
+                sub_factories.pop(pname, None)
+            run_lexical_scope(fn.body, sub_classes, sub_modules, sub_factories)
 
-    run_lexical_scope(tree.body, {"date": "date", "datetime": "datetime"}, {"datetime"})
+    run_lexical_scope(
+        tree.body,
+        {"date": "date", "datetime": "datetime"},
+        {"datetime"},
+        {k: k for k in _CLOCK_FACTORY_TARGETS},
+    )
     return found
 
 

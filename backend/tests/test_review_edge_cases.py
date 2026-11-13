@@ -1333,6 +1333,68 @@ def test_shared_migration_collection_mutations_and_setattr_class_profiles(tmp_pa
     assert ("m:route:api.routes.decoy_only", "m:service:services.setattr_worker") not in pairs2
 
 
+def test_unresolved_migration_loop_elements_loop_carried_rows_and_aliased_clock_factories(
+    tmp_path: Path,
+) -> None:
+    import ast
+
+    from app.adapters.postgres_sqlalchemy import _collect_migration_effects
+
+    mig_src = (
+        "from alembic import op\n"
+        "import sqlalchemy as sa\n\n"
+        "def upgrade():\n"
+        "    columns = []\n"
+        "    columns.append(sa.Column('name', sa.String()))\n"
+        "    for column in columns:\n"
+        "        op.add_column('users', column)\n"
+        "        op.create_table('widgets', sa.Column('id', sa.Integer()))\n"
+    )
+    effects = _collect_migration_effects(ast.parse(mig_src))
+    assert effects.touches_ddl is True
+
+    _write(tmp_path, "backend/alembic/versions/013_unresolved_loop.py", mig_src)
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    assert "t:widgets" in {n.id for n in truth.nodes}
+
+    carried_pm = parse_python_module(
+        "def batch_process(db, ids):\n"
+        "    row = None\n"
+        "    for ident in ids:\n"
+        "        if row is not None:\n"
+        "            row.name = 'processed'\n"
+        "        row = db.get(User, ident)\n"
+        "    prev = None\n"
+        "    while ids:\n"
+        "        if prev is not None:\n"
+        "            prev.title = 'updated'\n"
+        "        prev = db.get(Team, ids.pop())\n"
+        "    db.commit()\n",
+        "backend/app/services/carried.py",
+        "app.services.carried",
+    )
+    assert carried_pm is not None
+    assert {"User", "Team"} <= carried_pm.persisted
+
+    clock_pm = parse_python_module(
+        "from collections import defaultdict as dd\n"
+        "from datetime import UTC, datetime\n"
+        "from functools import partial as bind\n\n"
+        "def build_clocks():\n"
+        "    now_factory = bind(datetime.utcnow)\n"
+        "    buckets = dd(datetime.now)\n"
+        "    safe_factory = bind(datetime.now, UTC)\n"
+        "    return now_factory(), buckets, safe_factory()\n\n"
+        "def shadowed_bind(bind):\n"
+        "    return bind(datetime.now)\n",
+        "backend/app/services/aliased_clocks.py",
+        "app.services.aliased_clocks",
+    )
+    assert clock_pm is not None
+    assert sorted(line for _expr, line in clock_pm.raw_clock_calls) == [6, 7]
+
+
+
 
 
 
