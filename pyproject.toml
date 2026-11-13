@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wythe"
-version = "0.1.7"
+version = "0.1.8"
 description = "Why -> Therefore: 3-tier architecture verifier, cross-boundary lineage solver, and 3D WebGL atlas."
 readme = "README.md"
 license = "MIT"
@@ -70,15 +70,17 @@ wythe = "app.cli:main"
 truth-atlas = "app.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["backend/app"]
+packages = ["backend/app", "backend/wythe_examples"]
 artifacts = ["backend/app/ui_dist/**"]
 
 [tool.hatch.build.targets.wheel.sources]
 "backend/app" = "app"
+"backend/wythe_examples" = "wythe_examples"
 
 [tool.hatch.build.targets.sdist]
 include = [
   "backend/app/**",
+  "backend/wythe_examples/**",
   "backend/schema.sql",
   "backend/tests/**",
   "README.md",

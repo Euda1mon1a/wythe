@@ -17,7 +17,7 @@ Wythe supports **19 stack profiles** via `--profile auto` (**1 production-dogfoo
 
 > [!IMPORTANT]
 > **Status, Maturity & Zero-Maintenance Notice (`"AS IS"`)**
-> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.7` or `wythe==0.1.7`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
+> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.8` or `wythe==0.1.8`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
 > - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **17 experimental profiles** (`nextjs-prisma`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, `django-react`, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
 
 ---
@@ -48,7 +48,7 @@ Pin an explicit release tag (do not track unpinned branches if you want zero-sur
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0
-- uses: Euda1mon1a/wythe@v0.1.7
+- uses: Euda1mon1a/wythe@v0.1.8
   with:
     mode: diff
     base-ref: origin/main
@@ -118,6 +118,26 @@ wythe gate --sync-config /path/to/repo
 # Single-port API + 3D WebGL UI (auto-registers target directory on startup)
 wythe serve /path/to/repo --host 127.0.0.1 --port 8780
 ```
+
+### Record ownership (experimental)
+
+Inspect one ownership hypothesis without importing or executing the target:
+
+```bash
+wythe security ownership /path/to/repo \
+  --handler backend/app/api/records.py:update_record \
+  --record record --principal user.id --json ownership-evidence.json
+
+# Separately execute the shipped synthetic vulnerable/repaired examples only:
+wythe security ownership-demo --json ownership-demo.json
+```
+
+The source report shows route/dependency declarations, recognized record lookups
+and writes, owner comparisons, line evidence and unknowns. It always leaves
+runtime enforcement **unknown**. The demonstration checks two identities, HTTP
+responses and database contents in fresh in-memory applications: the same
+regression fails before the example repair and passes afterward. Neither command
+tests a live target. See the [scope, limitations and exit codes](docs/architecture/record-ownership.md).
 
 ---
 

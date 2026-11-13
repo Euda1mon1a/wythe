@@ -18,6 +18,7 @@ from app.db.session import get_session_factory
 from app.main import create_app, initialize_database
 from app.models import TargetProject
 from app.schemas.atlas import TargetProjectCreate
+from app.security_cli import add_security_parser, run_security_command
 from app.services.diff_and_sarif_service import (
     build_sarif_log,
     run_target_diff,
@@ -204,6 +205,7 @@ def _write_json_file(dest: str, payload_str: str) -> Path:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wythe", description="Wythe — 3-Tier Architecture & Lineage Verifier")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    add_security_parser(sub)
 
     p_scan = sub.add_parser("scan", help="Scan a target slug or repository path")
     p_scan.add_argument("target", help="Registered target slug or filesystem path")
@@ -300,6 +302,9 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--port", type=int, default=None)
 
     args = parser.parse_args(argv)
+
+    if args.cmd == "security":
+        return run_security_command(args)
 
     if args.cmd == "export-openapi":
         application = create_app()

@@ -19,7 +19,7 @@ test:
 	cd backend && .venv/bin/pytest -v
 
 lint:
-	cd backend && .venv/bin/ruff check app tests
+	cd backend && .venv/bin/ruff check app wythe_examples tests
 
 types:
 	cd backend && .venv/bin/wythe export-openapi --out ../frontend/openapi.json
