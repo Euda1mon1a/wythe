@@ -1394,6 +1394,106 @@ def test_unresolved_migration_loop_elements_loop_carried_rows_and_aliased_clock_
     assert sorted(line for _expr, line in clock_pm.raw_clock_calls) == [6, 7]
 
 
+def test_global_migration_rebind_callable_factories_redis_expireat_and_ts_for_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ast
+
+    from app.adapters.postgres_sqlalchemy import _collect_migration_effects
+
+    global_mig = (
+        "from alembic import op\n\n"
+        "sql = 'CREATE TABLE old_widgets (id INT PRIMARY KEY);'\n\n"
+        "def prepare():\n"
+        "    global sql\n"
+        "    sql = 'CREATE TABLE fresh_widgets (id INT PRIMARY KEY);'\n\n"
+        "def upgrade():\n"
+        "    prepare()\n"
+        "    op.execute(sql)\n"
+    )
+    factory_mig = (
+        "from alembic import op\n"
+        "import sqlalchemy as sa\n\n"
+        "def factory():\n"
+        "    def create():\n"
+        "        op.create_table('factory_widgets', sa.Column('id', sa.Integer()))\n"
+        "    return create\n\n"
+        "def named_factory(tbl):\n"
+        "    def _create():\n"
+        "        op.create_table(tbl, sa.Column('id', sa.Integer()))\n"
+        "    return _create\n\n"
+        "mod_create = named_factory('mod_widgets')\n"
+        "unused_create = named_factory('unused_widgets')\n\n"
+        "def chained_factory():\n"
+        "    return lambda: op.create_table('chained_widgets', sa.Column('id', sa.Integer()))\n\n"
+        "def upgrade():\n"
+        "    create = factory()\n"
+        "    create()\n"
+        "    mod_create()\n"
+        "    chained_factory()()\n"
+    )
+    factory_effects = _collect_migration_effects(ast.parse(factory_mig))
+    assert factory_effects.touches_ddl is True
+
+    _write(tmp_path, "backend/alembic/versions/014_global_rebind.py", global_mig)
+    _write(tmp_path, "backend/alembic/versions/015_factory_callables.py", factory_mig)
+    truth = PostgresSqlAlchemyAdapter().extract(tmp_path, "backend")
+    by_id = {n.id for n in truth.nodes}
+    assert "t:fresh_widgets" in by_id
+    assert "t:old_widgets" not in by_id
+    assert "t:factory_widgets" in by_id
+    assert "t:mod_widgets" in by_id
+    assert "t:chained_widgets" in by_id
+    assert "t:unused_widgets" not in by_id
+
+    _write(
+        tmp_path,
+        "backend/app/services/redis_state.py",
+        "def cleanup(redis):\n"
+        "    redis.expireat('state:old', 2000000000)\n\n"
+        "def save_unbounded(redis, payload):\n"
+        "    redis.set('state:new', payload)\n\n"
+        "def save_bounded(redis, payload):\n"
+        "    redis.set('bounded:ok', payload)\n"
+        "    redis.expireat('bounded:ok', 2000000000)\n",
+    )
+    r_truth = TruthExtractionResult(nodes=[], table_symbol_map={}, function_symbol_map={})
+    r_manip = PythonFastApiAdapter().extract(tmp_path, "backend", r_truth)
+    augment_redis_ephemeral_lineage(tmp_path, "backend", r_truth, r_manip)
+    truth_004_titles = [f.title for f in r_manip.findings if f.rule_code == "TRUTH-004"]
+    assert any("state:*" in t for t in truth_004_titles)
+    assert not any("bounded:*" in t for t in truth_004_titles)
+
+    _write(
+        tmp_path,
+        "frontend/src/app/items/page.tsx",
+        "const URL = '/api/v1/items';\n"
+        "const EXTRA_URL = '/api/v1/extra';\n"
+        "export function loadItems(urls: string[], entries: Array<{ url: string }>) {\n"
+        "  for (const URL of urls) {\n"
+        "    console.log(URL);\n"
+        "    void fetch(URL);\n"
+        "  }\n"
+        "  for (const { url: EXTRA_URL } of entries) console.log(EXTRA_URL);\n"
+        "  void fetch(EXTRA_URL);\n"
+        "  return fetch(URL);\n"
+        "}\n",
+    )
+    disp_cst = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    assert {(c.http_method, c.normalized_path) for c in disp_cst.http_calls} == {
+        ("GET", "/api/v1/items"),
+        ("GET", "/api/v1/extra"),
+    }
+
+    monkeypatch.setattr(typescript_nextjs, "extract_ts_http_calls_cst", lambda *a, **kw: None)
+    disp_fb = TypeScriptNextJsAdapter().extract(tmp_path, "frontend")
+    assert {(c.http_method, c.normalized_path) for c in disp_fb.http_calls} == {
+        ("GET", "/api/v1/items"),
+        ("GET", "/api/v1/extra"),
+    }
+
+
+
 
 
 

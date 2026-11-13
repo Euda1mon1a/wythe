@@ -34,7 +34,7 @@ _C_COMMENT_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
 
 _RECV_PAT = r"(?:redis(?:_[A-Za-z0-9_]+)?|rdb|rcache|cache|valkey|upstash|kv|[A-Za-z0-9_]+_redis)"
 _REDIS_CALL_RE = re.compile(
-    rf"""\b(?P<recv>{_RECV_PAT})\s*\.\s*(?P<op>get|mget|hget|hgetall|lrange|smembers|xread|set|setex|psetex|set_ex|hset|hmset|mset|lpush|rpush|xadd|publish|expire|pexpire|Get|MGet|HGet|HGetAll|Set|SetEx|SetNX|HSet|LPush|RPush|Expire)\s*\("""
+    rf"""\b(?P<recv>{_RECV_PAT})\s*\.\s*(?P<op>get|mget|hget|hgetall|lrange|smembers|xread|set|setex|psetex|set_ex|hset|hmset|mset|lpush|rpush|xadd|publish|expire|pexpire|expireat|pexpireat|Get|MGet|HGet|HGetAll|Set|SetEx|SetNX|HSet|LPush|RPush|Expire)\s*\("""
 )
 _RUST_CMD_RE = re.compile(
     r"""\bredis::cmd\(\s*"(?P<op>GET|MGET|HGET|HGETALL|SET|SETEX|PSETEX|HSET|LPUSH|RPUSH|EXPIRE)"\s*\)\s*\.\s*arg\(\s*"(?P<key>[A-Za-z0-9_.-]+:[A-Za-z0-9_:.*{}-]*)" """.strip()
@@ -510,13 +510,18 @@ def augment_redis_ephemeral_lineage(
                 link(mnode.id, sid, "writes_truth", rel_repo, f"Writes Redis keyspace `{prefix}:*` via `{op}`.")
                 has_ttl = (
                     op in _TTL_WRITE_OPS
-                    or bool(_TTL_OPT_RE.search(call_args))
-                    or (src_file.suffix == ".go" and op == "Set" and _go_set_has_ttl(call_args))
-                    or (cm.group("recv"), prefix.lower()) in expired_recv_prefixes
                     or (
                         py_calls is not None
                         and py_call is not None
                         and (py_calls.has_ttl(py_call, op) or py_calls.expired_after(py_call))
+                    )
+                    or (
+                        py_calls is None
+                        and (
+                            bool(_TTL_OPT_RE.search(call_args))
+                            or (src_file.suffix == ".go" and op == "Set" and _go_set_has_ttl(call_args))
+                            or (cm.group("recv"), prefix.lower()) in expired_recv_prefixes
+                        )
                     )
                 )
                 if not has_ttl:

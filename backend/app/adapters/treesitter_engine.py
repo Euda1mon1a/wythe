@@ -241,59 +241,44 @@ def _collect_cst_pattern_idents(raw: bytes, node: Any, out: set[str]) -> None:
             _collect_cst_pattern_idents(raw, ch, out)
 
 
-def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, str]) -> dict[str, str]:
-    """Update `outer_consts` with lexical local `const X = '/...'` bindings and drop shadowed ones."""
-    raw_local: dict[str, str | None] = {}
-    for ch in container.named_children:
-        decl_node = (
-            (ch.child_by_field_name("declaration") or (ch.named_children[0] if ch.named_children else None))
-            if ch.type == "export_statement"
-            else ch
-        )
-        if decl_node is None:
+def _collect_cst_var_decl(raw: bytes, decl_node: Any, raw_local: dict[str, str | None]) -> None:
+    is_const = decl_node.type == "lexical_declaration" and any(
+        tok.type == "const" for tok in decl_node.children
+    )
+    for decl in decl_node.named_children:
+        if decl.type != "variable_declarator":
             continue
-        if decl_node.type in ("lexical_declaration", "variable_declaration"):
-            is_const = decl_node.type == "lexical_declaration" and any(
-                tok.type == "const" for tok in decl_node.children
-            )
-            for decl in decl_node.named_children:
-                if decl.type != "variable_declarator":
-                    continue
-                lhs = decl.child_by_field_name("name") or (
-                    decl.named_children[0] if decl.named_children else None
-                )
-                rhs = decl.child_by_field_name("value")
-                while (
-                    rhs is not None
-                    and rhs.type in ("as_expression", "satisfies_expression")
-                    and rhs.named_children
-                ):
-                    rhs = rhs.named_children[0]
-                if (
-                    is_const
-                    and lhs is not None
-                    and lhs.type == "identifier"
-                    and rhs is not None
-                    and rhs.type in ("string", "template_string")
-                ):
-                    ident = raw[lhs.start_byte : lhs.end_byte].decode("utf-8", errors="replace")
-                    val = _unquote_node(raw, rhs)
-                    if rhs.type == "string" and "${" in val:
-                        raw_local[ident] = None
-                    else:
-                        raw_local[ident] = val if raw_local.get(ident, val) == val else None
-                elif lhs is not None:
-                    bound: set[str] = set()
-                    _collect_cst_pattern_idents(raw, lhs, bound)
-                    for b in bound:
-                        raw_local[b] = None
-        elif decl_node.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
-            fn_id = decl_node.child_by_field_name("name")
-            if fn_id is not None:
-                bound_fn: set[str] = set()
-                _collect_cst_pattern_idents(raw, fn_id, bound_fn)
-                for b in bound_fn:
-                    raw_local[b] = None
+        lhs = decl.child_by_field_name("name") or (
+            decl.named_children[0] if decl.named_children else None
+        )
+        rhs = decl.child_by_field_name("value")
+        while (
+            rhs is not None
+            and rhs.type in ("as_expression", "satisfies_expression")
+            and rhs.named_children
+        ):
+            rhs = rhs.named_children[0]
+        if (
+            is_const
+            and lhs is not None
+            and lhs.type == "identifier"
+            and rhs is not None
+            and rhs.type in ("string", "template_string")
+        ):
+            ident = raw[lhs.start_byte : lhs.end_byte].decode("utf-8", errors="replace")
+            val = _unquote_node(raw, rhs)
+            if rhs.type == "string" and "${" in val:
+                raw_local[ident] = None
+            else:
+                raw_local[ident] = val if raw_local.get(ident, val) == val else None
+        elif lhs is not None:
+            bound: set[str] = set()
+            _collect_cst_pattern_idents(raw, lhs, bound)
+            for b in bound:
+                raw_local[b] = None
+
+
+def _merge_cst_local_consts(outer_consts: dict[str, str], raw_local: dict[str, str | None]) -> dict[str, str]:
     if not raw_local:
         return outer_consts
     merged = {k: v for k, v in outer_consts.items() if k not in raw_local}
@@ -310,6 +295,58 @@ def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, s
         if working[k].startswith("/"):
             merged[k] = working[k]
     return merged
+
+
+def _collect_hoisted_cst_vars(raw: bytes, root: Any, out: set[str]) -> None:
+    stack = list(root.named_children)
+    while stack:
+        n = stack.pop()
+        if n.type in (
+            "function_declaration",
+            "generator_function_declaration",
+            "function",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+        ):
+            continue
+        if n.type == "variable_declaration":
+            for decl in n.named_children:
+                if decl.type == "variable_declarator":
+                    lhs = decl.child_by_field_name("name") or (
+                        decl.named_children[0] if decl.named_children else None
+                    )
+                    if lhs is not None:
+                        _collect_cst_pattern_idents(raw, lhs, out)
+            continue
+        if n.type == "for_in_statement" and any(tok.type == "var" for tok in n.children):
+            left = n.child_by_field_name("left")
+            if left is not None:
+                _collect_cst_pattern_idents(raw, left, out)
+        stack.extend(n.named_children)
+
+
+def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, str]) -> dict[str, str]:
+    """Update `outer_consts` with lexical local `const X = '/...'` bindings and drop shadowed ones."""
+    raw_local: dict[str, str | None] = {}
+    for ch in container.named_children:
+        decl_node = (
+            (ch.child_by_field_name("declaration") or (ch.named_children[0] if ch.named_children else None))
+            if ch.type == "export_statement"
+            else ch
+        )
+        if decl_node is None:
+            continue
+        if decl_node.type in ("lexical_declaration", "variable_declaration"):
+            _collect_cst_var_decl(raw, decl_node, raw_local)
+        elif decl_node.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
+            fn_id = decl_node.child_by_field_name("name")
+            if fn_id is not None:
+                bound_fn: set[str] = set()
+                _collect_cst_pattern_idents(raw, fn_id, bound_fn)
+                for b in bound_fn:
+                    raw_local[b] = None
+    return _merge_cst_local_consts(outer_consts, raw_local)
 
 
 def _unwrap_cst_expr(node: Any) -> Any:
@@ -385,6 +422,10 @@ def extract_ts_http_calls_cst(
     found: list[tuple[str, str, int]] = []
     init_consts = dict(url_consts or {})
     root_consts = _apply_cst_block_decls(raw, tree.root_node, init_consts)
+    hoisted_root_vars: set[str] = set()
+    _collect_hoisted_cst_vars(raw, tree.root_node, hoisted_root_vars)
+    if hoisted_root_vars:
+        root_consts = {k: v for k, v in root_consts.items() if k not in hoisted_root_vars}
 
     def walk(node: Any, scope_consts: dict[str, str]) -> None:
         ntype = node.type
@@ -404,8 +445,29 @@ def extract_ts_http_calls_cst(
                 single = node.child_by_field_name("parameter")
                 if single is not None:
                     _collect_cst_pattern_idents(raw, single, bound)
+            _collect_hoisted_cst_vars(raw, node, bound)
             if bound:
                 scope_consts = {k: v for k, v in scope_consts.items() if k not in bound}
+        elif ntype == "catch_clause":
+            c_param = node.child_by_field_name("parameter")
+            if c_param is not None:
+                c_bound: set[str] = set()
+                _collect_cst_pattern_idents(raw, c_param, c_bound)
+                if c_bound:
+                    scope_consts = {k: v for k, v in scope_consts.items() if k not in c_bound}
+        elif ntype == "for_in_statement":
+            left = node.child_by_field_name("left")
+            if left is not None:
+                f_bound: set[str] = set()
+                _collect_cst_pattern_idents(raw, left, f_bound)
+                if f_bound:
+                    scope_consts = {k: v for k, v in scope_consts.items() if k not in f_bound}
+        elif ntype == "for_statement":
+            init_node = node.child_by_field_name("initializer")
+            if init_node is not None and init_node.type in ("lexical_declaration", "variable_declaration"):
+                for_local: dict[str, str | None] = {}
+                _collect_cst_var_decl(raw, init_node, for_local)
+                scope_consts = _merge_cst_local_consts(scope_consts, for_local)
         elif ntype == "statement_block":
             scope_consts = _apply_cst_block_decls(raw, node, scope_consts)
 

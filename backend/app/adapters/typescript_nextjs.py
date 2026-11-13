@@ -75,9 +75,11 @@ def _collect_url_consts(txt: str) -> dict[str, str]:
 
 
 _FN_PARAM_HEAD_RE = re.compile(
-    r"""(?:\bfunction\b[A-Za-z0-9_$\s]*(?:<[^>{}()]*>)?\s*\((?P<fparams>[^)]*)\)\s*(?::[^{=]+)?\s*\{|\((?P<aparams>[^()]*)\)\s*(?::[^=;\r\n)]+)?\s*=>|(?P<sparam>[A-Za-z_$][\w$]*)\s*=>)"""
+    r"""(?:\bfunction\b[A-Za-z0-9_$\s]*(?:<[^>{}()]*>)?\s*\((?P<fparams>[^)]*)\)\s*(?::[^{=]+)?\s*\{|\bcatch\s*\((?P<cparam>[^)]*)\)\s*\{|\((?P<aparams>[^()]*)\)\s*(?::[^=;\r\n)]+)?\s*=>|(?P<sparam>[A-Za-z_$][\w$]*)\s*=>)"""
 )
-_LOCAL_BIND_RE = re.compile(r"""\b(?:const|let|var|function)\s+(?P<name>[A-Za-z_$][\w$]*)\b""")
+_LOCAL_BIND_RE = re.compile(r"""\b(?P<kw>const|let|var|function)\s+(?P<name>[A-Za-z_$][\w$]*)\b""")
+_FOR_HEADER_RE = re.compile(r"(?<![.\w$])for\s*(?:await\s*)?\(")
+_FOR_INNER_HEAD_RE = re.compile(r"(?:for\s*(?:await\s*)?|while\s*|with\s*)\(")
 _PARAM_MODIFIER_RE = re.compile(r"^(?:(?:public|private|protected|readonly|override)\s+)+")
 
 
@@ -410,9 +412,29 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
         i += 1
     code_only = "".join(code_chars)
 
+    loop_headers: list[tuple[int, int, int]] = []
+    loop_spans: list[tuple[int, int]] = []
+    for fm in _FOR_HEADER_RE.finditer(code_only):
+        open_p = fm.end() - 1
+        close_p = _find_matching_delim(code_only, open_p, "(", ")")
+        if close_p <= open_p + 1:
+            continue
+        loop_end = _find_ts_loop_end(code_only, close_p)
+        loop_headers.append((open_p, close_p, loop_end))
+        loop_spans.append((open_p, loop_end))
+
+    lexical_spans = [*block_spans, *loop_spans]
+
     def innermost_block(pos: int) -> tuple[int, int]:
         return min(
             (sp for sp in block_spans if sp[0] < pos < sp[1]),
+            key=lambda sp: sp[1] - sp[0],
+            default=root_span,
+        )
+
+    def innermost_lexical_block(pos: int) -> tuple[int, int]:
+        return min(
+            (sp for sp in lexical_spans if sp[0] < pos < sp[1]),
             key=lambda sp: sp[1] - sp[0],
             default=root_span,
         )
@@ -425,7 +447,7 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
         if code_only[npos : m.end("name")] != name:
             continue
         url_name_positions.add(npos)
-        bmap = block_decls.setdefault(innermost_block(npos), {})
+        bmap = block_decls.setdefault(innermost_lexical_block(npos), {})
         if m.group("q") != "`" and "${" in val:
             bmap[name] = None
         else:
@@ -435,15 +457,34 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
         npos = dm.start("name")
         if npos in url_name_positions:
             continue
-        block_decls.setdefault(innermost_block(npos), {})[dm.group("name")] = None
+        target_span = (
+            innermost_lexical_block(npos)
+            if dm.group("kw") in ("const", "let")
+            else innermost_block(npos)
+        )
+        block_decls.setdefault(target_span, {})[dm.group("name")] = None
+
+    for open_p, close_p, loop_end in loop_headers:
+        hdr_kw, hdr_bound = _extract_for_header_binds(code_only[open_p + 1 : close_p - 1])
+        if not hdr_bound:
+            continue
+        hdr_span = (open_p, loop_end) if hdr_kw in ("const", "let") else innermost_block(open_p)
+        hdr_map = block_decls.setdefault(hdr_span, {})
+        for bname in hdr_bound:
+            if hdr_kw == "var":
+                hdr_map[bname] = None
+            else:
+                hdr_map.setdefault(bname, None)
 
     param_scopes: list[tuple[int, int, set[str]]] = []
     for m in _FN_PARAM_HEAD_RE.finditer(code_only):
-        raw_params = m.group("fparams") or m.group("aparams") or m.group("sparam") or ""
+        raw_params = (
+            m.group("fparams") or m.group("cparam") or m.group("aparams") or m.group("sparam") or ""
+        )
         bound = _extract_param_bound_names(raw_params)
         if not bound:
             continue
-        if m.group("fparams") is not None:
+        if m.group("fparams") is not None or m.group("cparam") is not None:
             span = (m.end() - 1, _find_matching_delim(code_only, m.end() - 1, "{", "}"))
         else:
             span = (m.end(), _find_arrow_expr_end(code_only, m.end()))
@@ -475,6 +516,115 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
         return env
 
     return root_consts, consts_at
+
+
+def _find_ts_loop_end(code_only: str, after_paren: int) -> int:
+    n = len(code_only)
+    idx = _skip_ts_ws_and_comments(code_only, after_paren)
+    if idx >= n:
+        return n
+    if code_only[idx] == "{":
+        return _find_matching_delim(code_only, idx, "{", "}")
+    if code_only[idx] == ";":
+        return idx + 1
+    m_inner = _FOR_INNER_HEAD_RE.match(code_only, idx)
+    if m_inner is not None:
+        inner_close = _find_matching_delim(code_only, m_inner.end() - 1, "(", ")")
+        return _find_ts_loop_end(code_only, inner_close)
+    m_if = re.match(r"if\s*\(", code_only[idx:])
+    if m_if is not None:
+        if_close = _find_matching_delim(code_only, idx + m_if.end() - 1, "(", ")")
+        then_end = _find_ts_loop_end(code_only, if_close)
+        after_then = _skip_ts_ws_and_comments(code_only, then_end)
+        if re.match(r"else(?![\w$])", code_only[after_then:]):
+            return _find_ts_loop_end(code_only, after_then + 4)
+        return then_end
+    pdepth = bdepth = cdepth = 0
+    quote: str | None = None
+    i = idx
+    while i < n:
+        ch = code_only[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            pdepth = max(0, pdepth - 1)
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            bdepth = max(0, bdepth - 1)
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            if cdepth == 0:
+                return i
+            cdepth -= 1
+        elif pdepth == 0 and bdepth == 0 and cdepth == 0:
+            if ch == ";":
+                return i + 1
+            if ch in ("\n", "\r") and not _arrow_continues_across_newline(code_only, idx, i):
+                return i
+        i += 1
+    return n
+
+
+def _extract_for_header_binds(hdr: str) -> tuple[str | None, set[str]]:
+    m_decl = re.match(r"^\s*(?P<kw>const|let|var)\b(?P<rest>[\s\S]*)$", hdr)
+    if m_decl is None:
+        return None, set()
+    kw = m_decl.group("kw")
+    rest = m_decl.group("rest")
+    bound: set[str] = set()
+    semi_parts = _split_top_level_ts(rest, ";")
+    if len(semi_parts) >= 2:
+        for decl in _split_top_level_ts(semi_parts[0], ","):
+            _collect_pattern_bound_names(decl, bound, allow_type_colon=True)
+        return kw, bound
+    pdepth = bdepth = cdepth = 0
+    quote: str | None = None
+    k = 0
+    rlen = len(rest)
+    while k < rlen:
+        ch = rest[k]
+        if quote:
+            if ch == "\\":
+                k += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            pdepth = max(0, pdepth - 1)
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            bdepth = max(0, bdepth - 1)
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}":
+            cdepth = max(0, cdepth - 1)
+        elif (
+            pdepth == 0
+            and bdepth == 0
+            and cdepth == 0
+            and k > 0
+            and (rest[k - 1].isspace() or rest[k - 1] in "}]")
+            and re.match(r"(?:of|in)(?![\w$])", rest[k:])
+        ):
+            _collect_pattern_bound_names(rest[:k], bound, allow_type_colon=False)
+            break
+        k += 1
+    return kw, bound
 
 
 def _skip_ts_ws_and_comments(s: str, idx: int) -> int:
