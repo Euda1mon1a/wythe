@@ -357,7 +357,7 @@ export function registerWytheWebMcpBridge(handlers: WythePageBridgeHandlers): ()
   if (typeof window === 'undefined') return () => {};
   const win = window as unknown as Record<string, unknown>;
   win.wythe = {
-    version: '0.1.2',
+    version: '0.1.3',
     mcpHttpEndpoint: `${window.location.origin}/api/v1/mcp`,
     openapiEndpoint: `${window.location.origin}/openapi.json`,
     whatIsThis: () => handlers.getWhatIsThis(),
