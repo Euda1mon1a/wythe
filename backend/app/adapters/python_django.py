@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path, PurePosixPath
 
 from app.adapters.base import (
@@ -12,11 +11,21 @@ from app.adapters.base import (
     RouteDescriptor,
     TruthExtractionResult,
 )
+from app.adapters.django_urls import (
+    UrlModuleAst,
+    ViewModuleMeta,
+    django_route_regex,
+    expand_url_modules,
+    extract_pkg_reexports,
+    extract_view_module_meta,
+    norm_django_path,
+    parse_url_module,
+    resolve_dotted_symbol,
+    resolve_view_target_and_methods,
+)
 from app.adapters.python_ast_inspect import parse_python_module
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
-_DJANGO_PARAM_RE = re.compile(r"<(?:[a-zA-Z_]\w*:)?(?P<p>[a-zA-Z_]\w*)>")
-_DJANGO_REGEX_NAMED_RE = re.compile(r"\(\?P<(?P<p>[a-zA-Z_]\w*)>[^)]+\)")
 _DJANGO_READ_ATTRS = frozenset(
     {"filter", "get", "all", "exclude", "values", "values_list", "count", "exists", "first", "last", "select_related", "prefetch_related"}
 )
@@ -24,24 +33,10 @@ _DJANGO_WRITE_ATTRS = frozenset(
     {"create", "bulk_create", "update", "bulk_update", "update_or_create", "get_or_create", "delete"}
 )
 _CLOCK_ALLOW_MODULES = ("clock.py", "program_time.py", "sql_clock.py", "timezone.py")
-
-
-def _norm_django_path(*parts: str) -> str:
-    cleaned_parts: list[str] = []
-    for p in parts:
-        s = re.sub(r"^\^|\$$", "", p.strip()).strip("/")
-        if s:
-            cleaned_parts.append(s)
-    joined = "/" + "/".join(cleaned_parts) if cleaned_parts else "/"
-    converted = _DJANGO_REGEX_NAMED_RE.sub(r"{\g<p>}", joined)
-    converted = _DJANGO_PARAM_RE.sub(r"{\g<p>}", converted)
-    return converted or "/"
-
-
-def _route_regex(full_path: str) -> str:
-    norm = full_path.rstrip("/") or "/"
-    escaped = re.sub(r"\{[^/{}]+\}", r"[^/?#]+", norm)
-    return rf"^(?:/api/v\d+)?{escaped}/?$"
+_SKIP_DIRS = frozenset(
+    {".venv", "venv", "__pycache__", "migrations", "tests", "node_modules", "frontend", "static", "dist"}
+)
+_SKIP_FILES = frozenset({"models.py", "settings.py", "asgi.py", "wsgi.py", "apps.py", "admin.py"})
 
 
 def _extract_django_orm_ops(source: str) -> tuple[set[str], set[str]]:
@@ -80,45 +75,6 @@ def _extract_django_orm_ops(source: str) -> tuple[set[str], set[str]]:
     return reads, writes
 
 
-def _extract_urls_file(
-    py_file: Path,
-) -> tuple[list[tuple[str, str]], list[tuple[str, str, int]], list[tuple[str, str, int]]]:
-    """Return (includes[(prefix, target_mod)], paths[(subpath, view_ref, line)], drf_regs[(prefix, viewset, line)])."""
-    includes: list[tuple[str, str]] = []
-    url_paths: list[tuple[str, str, int]] = []
-    drf_regs: list[tuple[str, str, int]] = []
-    try:
-        tree = ast.parse(py_file.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, SyntaxError):
-        return includes, url_paths, drf_regs
-
-    for sub in ast.walk(tree):
-        if not isinstance(sub, ast.Call):
-            continue
-        fn = sub.func
-        fn_name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
-        if fn_name in ("path", "re_path") and len(sub.args) >= 2 and isinstance(sub.args[0], ast.Constant) and isinstance(sub.args[0].value, str):
-            raw_route = sub.args[0].value
-            target = sub.args[1]
-            if isinstance(target, ast.Call):
-                tfn = target.func
-                tfn_name = tfn.id if isinstance(tfn, ast.Name) else tfn.attr if isinstance(tfn, ast.Attribute) else ""
-                if tfn_name == "include" and target.args and isinstance(target.args[0], ast.Constant) and isinstance(target.args[0].value, str):
-                    includes.append((raw_route, target.args[0].value))
-                    continue
-                if isinstance(tfn, ast.Attribute) and tfn.attr == "as_view":
-                    vref = tfn.value.id if isinstance(tfn.value, ast.Name) else tfn.value.attr if isinstance(tfn.value, ast.Attribute) else ""
-                    url_paths.append((raw_route, vref, sub.lineno))
-                    continue
-            vref = target.id if isinstance(target, ast.Name) else target.attr if isinstance(target, ast.Attribute) else ""
-            url_paths.append((raw_route, vref, sub.lineno))
-        elif fn_name == "register" and len(sub.args) >= 2 and isinstance(sub.args[0], ast.Constant) and isinstance(sub.args[0].value, str):
-            vs_arg = sub.args[1]
-            vs_name = vs_arg.id if isinstance(vs_arg, ast.Name) else vs_arg.attr if isinstance(vs_arg, ast.Attribute) else ""
-            drf_regs.append((sub.args[0].value, vs_name, sub.lineno))
-    return includes, url_paths, drf_regs
-
-
 class PythonDjangoAdapter:
     """Extracts Django urls.py/DRF/Ninja routes, Django ORM read/write links, and MANIP findings."""
 
@@ -143,37 +99,72 @@ class PythonDjangoAdapter:
                 coverage_complete=False,
             )
 
-        py_files: list[Path] = []
-        for pf in sorted(base_dir.rglob("*.py")):
-            if any(
-                p in pf.parts
-                for p in (".venv", "venv", "__pycache__", "migrations", "tests", "node_modules", "frontend", "static", "dist")
-            ):
-                continue
-            if pf.name in ("__init__.py", "models.py", "settings.py", "asgi.py", "wsgi.py", "apps.py", "admin.py"):
-                continue
-            py_files.append(pf)
-
+        mod_files: dict[str, tuple[Path, str]] = {}
         nodes_by_mod: dict[str, AtlasNode] = {}
         parsed_by_mod: dict[str, tuple[Path, str, object]] = {}
-        url_data: dict[str, tuple[list[tuple[str, str]], list[tuple[str, str, int]], list[tuple[str, str, int]]]] = {}
+        view_metas: dict[str, ViewModuleMeta] = {}
+        url_modules: dict[str, UrlModuleAst] = {}
+        pkg_reexports: dict[tuple[str, str], tuple[str, str | None]] = {}
 
-        for pf in py_files:
-            rel_base = pf.relative_to(base_dir).as_posix()
+        for pf in sorted(base_dir.rglob("*.py")):
+            if pf.is_symlink():
+                continue
+            rel_base_path = pf.relative_to(base_dir)
+            rel_parts = rel_base_path.parts
+            if _SKIP_DIRS.intersection(rel_parts):
+                continue
+            if pf.name in _SKIP_FILES:
+                continue
+
             rel_repo = pf.relative_to(repo_root).as_posix()
-            mod_name = ".".join(Path(rel_base).with_suffix("").parts)
+            raw_mod = ".".join(rel_base_path.with_suffix("").parts)
+            is_init = pf.name == "__init__.py"
+            mod_name = raw_mod.removesuffix(".__init__") if is_init else raw_mod
+            if not mod_name or mod_name == "__init__":
+                continue
+
+            mod_files[mod_name] = (pf, rel_repo)
             try:
                 src = pf.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 continue
-            if pf.name == "urls.py":
-                url_data[mod_name] = _extract_urls_file(pf)
+
+            in_url_pkg = "urls" in rel_base_path.parts[:-1]
+            is_url_file = pf.name == "urls.py" or in_url_pkg
+            if is_url_file:
+                parsed_url = parse_url_module(pf, rel_repo, mod_name)
+                if parsed_url is not None:
+                    url_modules[mod_name] = parsed_url
+                try:
+                    tree = ast.parse(src)
+                except (SyntaxError, ValueError):
+                    tree = None
+                if tree is not None:
+                    view_metas[mod_name] = extract_view_module_meta(tree, mod_name, is_init=is_init)
+                    if is_init:
+                        pkg_reexports.update(extract_pkg_reexports(tree, mod_name))
                 continue
+
+            if is_init:
+                try:
+                    tree = ast.parse(src)
+                except (SyntaxError, ValueError):
+                    continue
+                pkg_reexports.update(extract_pkg_reexports(tree, mod_name))
+                continue
+
             pm = parse_python_module(src, rel_repo, mod_name)
             if pm is None:
                 continue
-            is_view = pf.name in ("views.py", "viewsets.py", "api.py", "routers.py") or "views" in pf.parts
-            is_cli = "management" in pf.parts or pf.name == "manage.py"
+            try:
+                tree = ast.parse(src)
+            except (SyntaxError, ValueError):
+                tree = None
+            if tree is not None:
+                view_metas[mod_name] = extract_view_module_meta(tree, mod_name, is_init=False)
+
+            is_view = pf.name in ("views.py", "viewsets.py", "api.py", "routers.py") or "views" in rel_parts
+            is_cli = "management" in rel_parts or pf.name == "manage.py"
             subkind = "route" if is_view else "cli" if is_cli else "service"
             nid = f"m:{subkind}:{mod_name}"
             nodes_by_mod[mod_name] = AtlasNode(
@@ -190,71 +181,133 @@ class PythonDjangoAdapter:
             )
             parsed_by_mod[mod_name] = (pf, src, pm)
 
-        # Resolve urls.py prefixes across included app urlconfs
-        mod_prefixes: dict[str, str] = {}
-        for umod, (incs, _, _) in url_data.items():
-            base_pref = mod_prefixes.get(umod, "")
-            for sub_pref, target_umod in incs:
-                mod_prefixes[target_umod] = _norm_django_path(base_pref, sub_pref)
+        expansion = expand_url_modules(url_modules, mod_files, pkg_reexports)
+        for promoted_mod in expansion.promoted_modules:
+            nodes_by_mod.pop(promoted_mod, None)
+            parsed_by_mod.pop(promoted_mod, None)
 
         symbol_to_mod: dict[str, str] = {}
+        for mod_name, (_, _, pm) in parsed_by_mod.items():
+            for sym in pm.top_level_defs:  # type: ignore[attr-defined]
+                symbol_to_mod.setdefault(sym, mod_name)
         for mod_name, (_, _, pm) in parsed_by_mod.items():
             for sym in pm.defined:  # type: ignore[attr-defined]
                 symbol_to_mod.setdefault(sym, mod_name)
 
+        url_imports = {m: u.imports for m, u in url_modules.items()}
+        all_imports = {**{m: meta.imports for m, meta in view_metas.items()}, **url_imports}
+        known_mods = set(view_metas) | set(url_imports) | {m for m, _ in pkg_reexports}
         routes: list[RouteDescriptor] = []
-        for umod, (_, upaths, drf_regs) in url_data.items():
-            pref = mod_prefixes.get(umod, "")
-            app_pkg = umod.rsplit(".", 1)[0] if "." in umod else ""
-            fallback_view_mod = f"{app_pkg}.views" if f"{app_pkg}.views" in nodes_by_mod else next(iter(nodes_by_mod), "")
-            for subpath, vref, lineno in upaths:
-                target_mod = symbol_to_mod.get(vref, fallback_view_mod)
-                if target_mod not in nodes_by_mod:
-                    continue
-                vnode = nodes_by_mod[target_mod]
-                vnode.subkind = "route"
-                full_p = _norm_django_path(pref, subpath)
-                for verb in ("GET", "POST"):
-                    if verb not in vnode.http_methods:
-                        vnode.http_methods.append(verb)
-                    if full_p not in vnode.http_paths:
-                        vnode.http_paths.append(full_p)
-                    routes.append(
-                        RouteDescriptor(
-                            node_id=vnode.id,
-                            http_method=verb,
-                            full_path=full_p,
-                            path_regex=_route_regex(full_p),
-                            source_file=vnode.source_file,
-                            line=lineno,
-                            called_symbols=frozenset({vref}),
-                            imported_modules=frozenset(),
-                        )
+
+        def _ensure_route_node(mod_name: str) -> AtlasNode | None:
+            if mod_name in nodes_by_mod:
+                return nodes_by_mod[mod_name]
+            if mod_name not in url_modules or mod_name not in mod_files:
+                return None
+            pf_u, rel_u = mod_files[mod_name]
+            try:
+                src_u = pf_u.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return None
+            pm_u = parse_python_module(src_u, rel_u, mod_name)
+            if pm_u is None:
+                return None
+            node_u = AtlasNode(
+                id=f"m:route:{mod_name}",
+                tier="manipulate",
+                subkind="route",
+                label=mod_name,
+                source_file=rel_u,
+                line=1,
+                status="clean",
+                role="mechanism",
+                cluster=mod_name.split(".", 1)[0],
+                summary=pm_u.summary,
+            )
+            nodes_by_mod[mod_name] = node_u
+            parsed_by_mod[mod_name] = (pf_u, src_u, pm_u)
+            return node_u
+
+        for r in expansion.routes:
+            target_mod, vref, verbs = resolve_view_target_and_methods(
+                r.target_expr, r.origin_mod, url_imports, view_metas, pkg_reexports, symbol_to_mod
+            )
+            if not target_mod:
+                continue
+            vnode = _ensure_route_node(target_mod)
+            if vnode is None:
+                continue
+            vnode.subkind = "route"
+            for verb in verbs:
+                if verb not in vnode.http_methods:
+                    vnode.http_methods.append(verb)
+                if r.full_path not in vnode.http_paths:
+                    vnode.http_paths.append(r.full_path)
+                routes.append(
+                    RouteDescriptor(
+                        node_id=vnode.id,
+                        http_method=verb,
+                        full_path=r.full_path,
+                        path_regex=django_route_regex(r.full_path),
+                        source_file=vnode.source_file,
+                        line=r.lineno,
+                        called_symbols=frozenset({vref}) if vref else frozenset(),
+                        imported_modules=frozenset(),
                     )
-            for reg_pref, vs_name, lineno in drf_regs:
-                target_mod = symbol_to_mod.get(vs_name, fallback_view_mod)
-                if target_mod not in nodes_by_mod:
-                    continue
-                vnode = nodes_by_mod[target_mod]
-                coll_p = _norm_django_path(pref, reg_pref)
-                item_p = _norm_django_path(coll_p, "{id}")
-                for verb, fp in (("GET", coll_p), ("POST", coll_p), ("GET", item_p), ("PATCH", item_p), ("DELETE", item_p)):
-                    if verb not in vnode.http_methods:
-                        vnode.http_methods.append(verb)
-                    if fp not in vnode.http_paths:
-                        vnode.http_paths.append(fp)
-                    routes.append(
-                        RouteDescriptor(
-                            node_id=vnode.id,
-                            http_method=verb,
-                            full_path=fp,
-                            path_regex=_route_regex(fp),
-                            source_file=vnode.source_file,
-                            line=lineno,
-                            called_symbols=frozenset({vs_name}),
-                            imported_modules=frozenset(),
-                        )
+                )
+
+        for drf in expansion.drf_regs:
+            vs_expr = drf.viewset_expr
+            vs_dotted = ""
+            if isinstance(vs_expr, ast.Name):
+                vs_dotted = vs_expr.id
+            elif isinstance(vs_expr, ast.Attribute):
+                parts: list[str] = []
+                cur: ast.AST = vs_expr
+                while isinstance(cur, ast.Attribute):
+                    parts.append(cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name):
+                    parts.append(cur.id)
+                    vs_dotted = ".".join(reversed(parts))
+            vs_short = vs_dotted.rsplit(".", 1)[-1]
+            target_mod, vs_sym, is_ext = (
+                resolve_dotted_symbol(drf.origin_mod, vs_dotted, all_imports, known_mods, pkg_reexports)
+                if vs_dotted
+                else (None, None, False)
+            )
+            if is_ext:
+                continue
+            if not target_mod or target_mod not in nodes_by_mod:
+                target_mod = symbol_to_mod.get(vs_short)
+            if not target_mod or target_mod not in nodes_by_mod:
+                continue
+            vnode = nodes_by_mod[target_mod]
+            vnode.subkind = "route"
+            vs_label = (vs_sym or vs_short).rsplit(".", 1)[-1]
+            for verb, fp in (
+                ("GET", drf.collection_path),
+                ("POST", drf.collection_path),
+                ("GET", drf.item_path),
+                ("PATCH", drf.item_path),
+                ("DELETE", drf.item_path),
+            ):
+                if verb not in vnode.http_methods:
+                    vnode.http_methods.append(verb)
+                if fp not in vnode.http_paths:
+                    vnode.http_paths.append(fp)
+                routes.append(
+                    RouteDescriptor(
+                        node_id=vnode.id,
+                        http_method=verb,
+                        full_path=fp,
+                        path_regex=django_route_regex(fp),
+                        source_file=vnode.source_file,
+                        line=drf.lineno,
+                        called_symbols=frozenset({vs_label}) if vs_label else frozenset(),
+                        imported_modules=frozenset(),
                     )
+                )
 
         edges: list[AtlasEdge] = []
         seen_edges: set[tuple[str, str, str]] = set()
@@ -281,13 +334,13 @@ class PythonDjangoAdapter:
             node = nodes_by_mod[mod_name]
             # Django Ninja decorator routes
             for rh in pm.route_handlers:  # type: ignore[attr-defined]
-                full_p = _norm_django_path(pm.router_prefix, rh.subpath)  # type: ignore[attr-defined]
+                full_p = norm_django_path(pm.router_prefix, rh.subpath)  # type: ignore[attr-defined]
                 routes.append(
                     RouteDescriptor(
                         node_id=node.id,
                         http_method=rh.http_method,
                         full_path=full_p,
-                        path_regex=_route_regex(full_p),
+                        path_regex=django_route_regex(full_p),
                         source_file=node.source_file,
                         line=rh.lineno,
                         called_symbols=rh.called_symbols,
@@ -400,4 +453,6 @@ class PythonDjangoAdapter:
             edges=edges,
             routes=routes,
             findings=findings,
+            notes=expansion.notes,
+            coverage_complete=expansion.coverage_complete,
         )
