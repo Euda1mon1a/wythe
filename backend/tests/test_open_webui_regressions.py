@@ -420,3 +420,105 @@ def test_barrel_explicit_export_masks_star_reexport_and_svelte_slot_opaque(
     disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
     assert [(f.source_file, f.line) for f in disp_005] == [("src/routes/+page.svelte", 7)], disp_005
 
+
+def test_icon_component_aria_label_and_forwarded_undefined_prop_defaults(tmp_path: Path) -> None:
+    """Icon components honor ARIA name props and forwarded omitted props keep `undefined`."""
+    from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+
+    put(
+        tmp_path,
+        "components/Labels.tsx",
+        "export function Label({ text = 'Save' }: { text?: string | null }) {\n"
+        "  return <span>{text}</span>;\n"
+        "}\n"
+        "export function Wrapper({ text }: { text?: string | null }) {\n"
+        "  return <Label text={text} />;\n"
+        "}\n"
+        "export function WrapperProps(props: { text?: string | null }) {\n"
+        "  return <Label text={props.text} />;\n"
+        "}\n",
+    )
+    put(
+        tmp_path,
+        "app/page.tsx",
+        "import { Search } from 'lucide-react';\n"
+        "import { Wrapper, WrapperProps } from '../components/Labels';\n"
+        "export function Page() {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <button><Search aria-hidden={false} aria-label='Search' /></button>\n"
+        "      <button><Search aria-hidden={true} aria-label='Hidden' /></button>\n"
+        "      <button><Search /></button>\n"
+        "      <button><Wrapper /></button>\n"
+        "      <button><Wrapper text={undefined} /></button>\n"
+        "      <button><Wrapper text='' /></button>\n"
+        "      <button><Wrapper text={null} /></button>\n"
+        "      <button><WrapperProps /></button>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    res = TypeScriptNextJsAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    lines = sorted(f.line for f in disp_005)
+    assert lines == [7, 8, 11, 12], disp_005
+
+
+def test_vue_bound_prop_expressions_and_concat_url_origin_resolution(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Vue `:prop` evaluates expressions; concatenated URL constants check full expanded origin."""
+    from app.adapters.typescript_nextjs import _extract_ts_http_calls
+    from app.adapters.vue_sfc import VueSfcDisplayAdapter
+
+    put(
+        tmp_path,
+        "src/components/Label.vue",
+        "<script setup lang='ts'>defineProps<{ text?: string | null }>();</script>\n"
+        "<template><span>{{ text }}</span></template>\n",
+    )
+    put(
+        tmp_path,
+        "src/App.vue",
+        "<script setup lang='ts'>\n"
+        "import { Search } from 'lucide-vue-next';\n"
+        "import Label from './components/Label.vue';\n"
+        "</script>\n"
+        "<template>\n"
+        "  <button><Label :text=\"''\" /></button>\n"
+        "  <button><Label :text='null' /></button>\n"
+        "  <button><Label v-bind:text=\"''\" /></button>\n"
+        "  <button><Label :text=\"'Save'\" /></button>\n"
+        "  <button><Search :aria-label=\"'Find'\" /></button>\n"
+        "  <button><Search :aria-label=\"''\" /></button>\n"
+        "</template>\n",
+    )
+    res = VueSfcDisplayAdapter().extract(tmp_path, ".")
+    disp_lines = sorted(f.line for f in res.findings if f.rule_code == "DISP-005")
+    assert disp_lines == [6, 7, 8, 11], res.findings
+
+    src = (
+        "const HOST = '/evil.example';\n"
+        "const PROTO = '//evil.example';\n"
+        "const BASE = '/api';\n"
+        "const SUB = '/v1';\n"
+        "fetch('/' + HOST + '/users');\n"
+        "fetch(`/${HOST}/users`);\n"
+        "fetch('/' + PROTO + '/users');\n"
+        "fetch('' + PROTO + '/users');\n"
+        "fetch(BASE + SUB + '/items');\n"
+    )
+    cst_calls = {url for _v, url, _l in _extract_ts_http_calls(src)}
+    assert "//evil.example/users" not in cst_calls
+    assert "/${HOST}/users" not in cst_calls
+    assert "/evil.example/users" not in cst_calls
+    assert "/api/v1/items" in cst_calls
+
+    import app.adapters.typescript_nextjs as tsnext
+
+    monkeypatch.setattr(tsnext, "extract_ts_http_calls_cst", lambda *a, **k: None)
+    rx_calls = {url for _v, url, _l in _extract_ts_http_calls(src)}
+    assert "//evil.example/users" not in rx_calls
+    assert "/${HOST}/users" not in rx_calls
+
+

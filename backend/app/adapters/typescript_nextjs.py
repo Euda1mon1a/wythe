@@ -1000,6 +1000,8 @@ def _extract_ts_http_calls(
         if verb in _FETCH_LIKE_VERBS:
             verb = _fetch_method_from_call_tail(txt, i)
         raw_url = "".join(buf)
+        if quote == "`":
+            raw_url = resolve_url_const_head(raw_url, local_consts)
         if is_same_origin_url_path(raw_url):
             lineno = txt.count("\n", 0, m.start()) + 1
             results.append((verb, raw_url, lineno))

@@ -235,7 +235,8 @@ def build_a11y_component_resolver(
 ) -> Callable[[Path, str], Callable[[str, str, str], str]]:
     """Build a per-scan factory returning depth-bounded component text-semantics resolvers."""
     shared_cache: dict[
-        tuple[Path, str], tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path]
+        tuple[Path, str],
+        tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path, str],
     ] = {}
 
     def _resolve_imp(spec: str, current_file: Path) -> Path | None:

@@ -18,7 +18,7 @@ _LABEL_FOR_ATTR_RE = re.compile(r"""\b(?:htmlFor|for)\s*=\s*(?:['"](?P<id>[^'"]+
 _ID_ATTR_RE = re.compile(r"""(?<![\w-])id\s*=\s*(?:['"](?P<id>[^'"]+)['"]|\{(?P<expr>[^}]+)\})""")
 _HIDDEN_INPUT_RE = re.compile(r"""\btype\s*=\s*['"](?:hidden|submit|reset|button)['"]""", re.IGNORECASE)
 _ICON_PKG_SPEC_RE = re.compile(
-    r"^(?:lucide-react|lucide-svelte|@lucide/|@heroicons/|react-icons/|@tabler/icons|@radix-ui/react-icons|phosphor-react|@phosphor-icons/|svelte-hero-icons|svelte-lucide)"
+    r"^(?:lucide-react|lucide-svelte|lucide-vue-next|@lucide/|@heroicons/|react-icons/|@tabler/icons|@radix-ui/react-icons|phosphor-react|@phosphor-icons/|svelte-hero-icons|svelte-lucide)"
 )
 _COMPONENT_IMPORT_RE = re.compile(
     r"""(?:^|[;\r\n])[ \t]*import\s+(?!type\b)(?P<clause>[A-Za-z_$][\w$]*(?:\s*,\s*\{[^;{}]*\})?|\{[^;{}]*\})\s+from\s+['"](?P<spec>[^'"]+)['"]"""
@@ -469,6 +469,9 @@ def parse_component_imports(raw_source: str) -> dict[str, tuple[str, str]]:
     return mapping
 
 
+_PROP_IDENT_REF_RE = re.compile(r"^(?:props\.)?(?P<ident>[A-Za-z_$][\w$]*)$")
+
+
 def _eval_attr_value(expr: str, *, preserve_undefined: bool = False) -> str:
     s = expr.strip()
     if preserve_undefined and s == "undefined":
@@ -476,6 +479,8 @@ def _eval_attr_value(expr: str, *, preserve_undefined: bool = False) -> str:
     if s in ("", "''", '""', "``", "null", "undefined", "false", "true"):
         return "empty"
     if len(s) >= 2 and s[0] in ("'", '"') and s[-1] == s[0]:
+        return "named" if s[1:-1].strip() else "empty"
+    if len(s) >= 2 and s[0] == "`" and s[-1] == "`" and "${" not in s:
         return "named" if s[1:-1].strip() else "empty"
     return "dynamic"
 
@@ -536,9 +541,42 @@ def _split_first_top_level_js(src: str, sep: str) -> tuple[str, str | None]:
     return src, None
 
 
-def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str]]:
-    """Parse JSX/Svelte component attrs into `(props, has_opaque_spread, explicit_after_spread)`."""
+def _parse_spread_object_literal(
+    body: str,
+    props: dict[str, str],
+    raw_exprs: dict[str, str],
+    mark_opaque_spread: Callable[[], None],
+    record_explicit: Callable[[str], None],
+) -> None:
+    """Populate `props` and `raw_exprs` from an inline `{...{ key: val }}` / `v-bind="{...}"` body."""
+    for entry in _split_top_level_js(body, ","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry.startswith("..."):
+            mark_opaque_spread()
+            continue
+        raw_k, raw_v = _split_first_top_level_js(entry, ":")
+        if raw_v is not None:
+            skey = raw_k.strip().strip("'\"")
+            if re.fullmatch(r"[A-Za-z_$][\w$.-]*", skey):
+                props[skey] = _eval_attr_value(raw_v, preserve_undefined=True)
+                rm = _PROP_IDENT_REF_RE.match(raw_v.strip())
+                if rm:
+                    raw_exprs[skey] = f"props.{rm.group('ident')}" if raw_v.strip().startswith("props.") else rm.group("ident")
+                else:
+                    raw_exprs.pop(skey, None)
+                record_explicit(skey)
+        elif re.fullmatch(r"[A-Za-z_$][\w$]*", entry):
+            props[entry] = "dynamic"
+            raw_exprs[entry] = entry
+            record_explicit(entry)
+
+
+def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str], dict[str, str]]:
+    """Parse JSX/Svelte/Vue component attrs into `(props, has_opaque_spread, explicit_after_spread, raw_exprs)`."""
     props: dict[str, str] = {}
+    raw_exprs: dict[str, str] = {}
     has_opaque_spread = False
     explicit_after_spread: set[str] = set()
 
@@ -547,8 +585,21 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str]]:
         has_opaque_spread = True
         explicit_after_spread.clear()
         for existing_k, existing_v in list(props.items()):
-            if existing_v == "empty":
+            if existing_v in ("empty", "undefined"):
                 props[existing_k] = "opaque"
+
+    def record_explicit(prop_name: str) -> None:
+        if has_opaque_spread:
+            explicit_after_spread.add(prop_name)
+
+    def record_ident_ref(prop_name: str, expr: str) -> None:
+        rm = _PROP_IDENT_REF_RE.match(expr.strip())
+        if rm:
+            raw_exprs[prop_name] = (
+                f"props.{rm.group('ident')}" if expr.strip().startswith("props.") else rm.group("ident")
+            )
+        else:
+            raw_exprs.pop(prop_name, None)
 
     i = 0
     n = len(attrs)
@@ -564,34 +615,45 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str]]:
                 if inner.startswith("..."):
                     spread_expr = inner[3:].strip()
                     if spread_expr.startswith("{") and spread_expr.endswith("}"):
-                        for entry in _split_top_level_js(spread_expr[1:-1], ","):
-                            entry = entry.strip()
-                            if not entry:
-                                continue
-                            if entry.startswith("..."):
-                                mark_opaque_spread()
-                                continue
-                            raw_k, raw_v = _split_first_top_level_js(entry, ":")
-                            if raw_v is not None:
-                                skey = raw_k.strip().strip("'\"")
-                                if re.fullmatch(r"[A-Za-z_$][\w$.-]*", skey):
-                                    props[skey] = _eval_attr_value(raw_v, preserve_undefined=True)
-                                    if has_opaque_spread:
-                                        explicit_after_spread.add(skey)
-                            elif re.fullmatch(r"[A-Za-z_$][\w$]*", entry):
-                                props[entry] = "dynamic"
-                                if has_opaque_spread:
-                                    explicit_after_spread.add(entry)
+                        _parse_spread_object_literal(
+                            spread_expr[1:-1], props, raw_exprs, mark_opaque_spread, record_explicit
+                        )
                     else:
                         mark_opaque_spread()
                 elif re.fullmatch(r"[A-Za-z_$][\w$]*", inner):
                     props[inner] = "dynamic"
-                    if has_opaque_spread:
-                        explicit_after_spread.add(inner)
+                    raw_exprs[inner] = inner
+                    record_explicit(inner)
                 i = bend
                 continue
             i += 1
             continue
+        if attrs.startswith("@", i) or attrs.startswith("v-on:", i):
+            dm = re.match(r"(?:@|v-on:)[\w.:$-]+", attrs[i:])
+            i += dm.end() if dm else 1
+            while i < n and attrs[i].isspace():
+                i += 1
+            if i < n and attrs[i] == "=":
+                i += 1
+                while i < n and attrs[i].isspace():
+                    i += 1
+                if i < n and attrs[i] in ("'", '"'):
+                    q = attrs[i]
+                    j = i + 1
+                    while j < n and attrs[j] != q:
+                        j += 2 if attrs[j] == "\\" else 1
+                    i = min(j + 1, n)
+                elif i < n and attrs[i] == "{":
+                    bend = _scan_brace_end(attrs, i)
+                    i = bend if bend is not None else i + 1
+            continue
+        is_vue_bound = False
+        if attrs.startswith("v-bind:", i):
+            is_vue_bound = True
+            i += len("v-bind:")
+        elif attrs[i] == ":":
+            is_vue_bound = True
+            i += 1
         km = re.match(r"([A-Za-z_$][\w$.-]*)", attrs[i:])
         if not km:
             i += 1
@@ -601,6 +663,11 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str]]:
         while i < n and attrs[i].isspace():
             i += 1
         if i >= n or attrs[i] != "=":
+            if is_vue_bound:
+                base_key = key.split(".", 1)[0]
+                props[base_key] = "dynamic"
+                raw_exprs[base_key] = base_key
+                record_explicit(base_key)
             continue
         i += 1
         while i < n and attrs[i].isspace():
@@ -613,21 +680,34 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str]]:
             while j < n and attrs[j] != q:
                 j += 2 if attrs[j] == "\\" else 1
             val = attrs[i + 1 : j]
-            props[key] = "named" if val.strip() else "empty"
-            if has_opaque_spread:
-                explicit_after_spread.add(key)
+            if not is_vue_bound and key == "v-bind":
+                trimmed = val.strip()
+                if trimmed.startswith("{") and trimmed.endswith("}"):
+                    _parse_spread_object_literal(
+                        trimmed[1:-1], props, raw_exprs, mark_opaque_spread, record_explicit
+                    )
+                else:
+                    mark_opaque_spread()
+            elif is_vue_bound:
+                base_key = key.split(".", 1)[0]
+                props[base_key] = _eval_attr_value(val, preserve_undefined=True)
+                record_ident_ref(base_key, val)
+                record_explicit(base_key)
+            else:
+                props[key] = "named" if val.strip() else "empty"
+                raw_exprs.pop(key, None)
+                record_explicit(key)
             i = min(j + 1, n)
         elif attrs[i] == "{":
             bend = _scan_brace_end(attrs, i)
             if bend is None:
                 break
-            props[key] = _eval_attr_value(
-                attrs[i + 1 : bend - 1], preserve_undefined=True
-            )
-            if has_opaque_spread:
-                explicit_after_spread.add(key)
+            inner_expr = attrs[i + 1 : bend - 1]
+            props[key] = _eval_attr_value(inner_expr, preserve_undefined=True)
+            record_ident_ref(key, inner_expr)
+            record_explicit(key)
             i = bend
-    return props, has_opaque_spread, explicit_after_spread
+    return props, has_opaque_spread, explicit_after_spread, raw_exprs
 
 
 _SCRIPT_BLOCK_RE = re.compile(r"<script\b[^>]*>(?P<body>[\s\S]*?)</script>", re.IGNORECASE)
@@ -652,7 +732,9 @@ def _parse_default_params(raw_params: str) -> tuple[dict[str, str], dict[str, st
         local_name = alias_part.strip() if alias_part is not None else src_name
         if not (re.fullmatch(r"[A-Za-z_$][\w$]*", src_name) and re.fullmatch(r"[A-Za-z_$][\w$]*", local_name)):
             continue
-        defaults[local_name] = _eval_attr_value(rhs_raw) if rhs_raw is not None else "unknown"
+        defaults[local_name] = (
+            _eval_attr_value(rhs_raw, preserve_undefined=True) if rhs_raw is not None else "unknown"
+        )
         aliases[local_name] = src_name
     return defaults, aliases
 
@@ -1153,7 +1235,9 @@ def _extract_component_props_and_markup(
             ):
                 dval = pm.group("def")
                 pname = pm.group("name")
-                prop_defaults[pname] = _eval_attr_value(dval) if dval is not None else "unknown"
+                prop_defaults[pname] = (
+                    _eval_attr_value(dval, preserve_undefined=True) if dval is not None else "unknown"
+                )
                 prop_aliases.setdefault(pname, pname)
             for pm in re.finditer(r"\blet\s*\{", script_body):
                 bend = _scan_brace_end(script_body, pm.end() - 1)
@@ -1171,14 +1255,38 @@ def _extract_component_props_and_markup(
     if suffix == ".vue":
         for sm in _SCRIPT_BLOCK_RE.finditer(raw_source):
             sb = sm.group("body")
-            for pm in re.finditer(r"withDefaults\s*\([\s\S]{0,400}?,\s*\{(?P<inner>[^}]+)\}", sb):
-                for item in pm.group("inner").split(","):
-                    if ":" in item:
-                        k, v = item.split(":", 1)
-                        k = k.strip().strip("'\"")
+            for pm in re.finditer(r"withDefaults\s*\([\s\S]{0,400}?,\s*\{", sb):
+                bend = _scan_brace_end(sb, pm.end() - 1)
+                if bend is None:
+                    continue
+                for item in _split_top_level_js(sb[pm.end() : bend - 1], ","):
+                    k_raw, v_raw = _split_first_top_level_js(item, ":")
+                    if v_raw is not None:
+                        k = k_raw.strip().strip("'\"")
                         if re.fullmatch(r"[A-Za-z_$][\w$]*", k):
-                            prop_defaults[k] = _eval_attr_value(v)
+                            prop_defaults[k] = _eval_attr_value(v_raw, preserve_undefined=True)
                             prop_aliases.setdefault(k, k)
+            for pm in re.finditer(r"defineProps\s*\(\s*\{", sb):
+                bend = _scan_brace_end(sb, pm.end() - 1)
+                if bend is None:
+                    continue
+                for item in _split_top_level_js(sb[pm.end() : bend - 1], ","):
+                    k_raw, v_raw = _split_first_top_level_js(item, ":")
+                    if v_raw is None:
+                        continue
+                    k = k_raw.strip().strip("'\"")
+                    if not re.fullmatch(r"[A-Za-z_$][\w$]*", k):
+                        continue
+                    v_str = v_raw.strip()
+                    dstate = "unknown"
+                    if v_str.startswith("{") and v_str.endswith("}"):
+                        for sub in _split_top_level_js(v_str[1:-1], ","):
+                            sk, sv = _split_first_top_level_js(sub, ":")
+                            if sv is not None and sk.strip().strip("'\"") == "default":
+                                dstate = _eval_attr_value(sv, preserve_undefined=True)
+                                break
+                    prop_defaults.setdefault(k, dstate)
+                    prop_aliases.setdefault(k, k)
             for pm in re.finditer(r"defineProps\s*<\s*\{(?P<inner>[^}]+)\}\s*>", sb):
                 for k in re.findall(r"([A-Za-z_$][\w$]*)\s*\??:", pm.group("inner")):
                     prop_defaults.setdefault(k, "unknown")
@@ -1424,6 +1532,7 @@ def _classify_markup_segment(
                     child_inner,
                     imported_components=imported_components,
                     component_resolver=component_resolver,
+                    prop_values=prop_values,
                 )
                 merge_status(resolved, tag)
                 i = next_i
@@ -1454,23 +1563,47 @@ def _eval_inline_graphic_name(
     allow_alt: bool,
     prop_values: dict[str, str] | None,
 ) -> str:
-    """Classify accessible name of inline `<img>` / `<svg>` / `<i>` as `named`, `opaque`, or `icon_only`."""
-    if re.search(r"""\baria-hidden\s*=\s*['"]true['"]""", attrs) or re.search(
-        r"""\brole\s*=\s*['"](?:presentation|none)['"]""", attrs
+    """Classify accessible name of inline `<img>`/`<svg>`/`<i>` or icon component."""
+    if (
+        re.search(r"""(?<![\w$-])aria-hidden\s*=\s*(?:['"]true['"]|\{\s*true\s*\})""", attrs)
+        or re.search(
+            r"""(?<![\w$-])(?::|v-bind:)aria-hidden\s*=\s*(?:"\s*(?:true|'true')\s*"|'\s*(?:true|"true")\s*')""",
+            attrs,
+        )
+        or re.search(r"""(?<![\w$-])aria-hidden(?!\s*=)(?=\s|$|/)""", attrs)
+        or re.search(
+            r"""(?<![\w$-])role\s*=\s*(?:['"](?:presentation|none)['"]|\{\s*['"](?:presentation|none)['"]\s*\})""",
+            attrs,
+        )
     ):
         return "icon_only"
-    if "{..." in attrs:
-        return "named" if prop_values is None else "opaque"
     attr_names = ("aria-label", "aria-labelledby", "title") + (("alt",) if allow_alt else ())
     saw_opaque = False
     for attr_name in attr_names:
+        mb = re.search(
+            rf"""(?<![\w$-])(?::|v-bind:){re.escape(attr_name)}\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')""",
+            attrs,
+        )
+        if mb:
+            bexpr = mb.group("dq") if mb.group("dq") is not None else (mb.group("sq") or "")
+            sem = _classify_expr_semantics(
+                bexpr,
+                prop_values=prop_values,
+                inner_status="empty",
+            )
+            if sem in ("named", "dynamic"):
+                return "named"
+            if sem == "opaque":
+                saw_opaque = True
+            continue
         m = re.search(
-            rf"""\b{re.escape(attr_name)}\s*=\s*(?:['"](?P<lit>[^'"]*)['"]|\{{(?P<expr>[^}}]+)\}})""",
+            rf"""(?<![\w$:-]){re.escape(attr_name)}\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|\{{(?P<expr>[^}}]+)\}})""",
             attrs,
         )
         if m:
-            if m.group("lit") is not None:
-                if m.group("lit").strip():
+            lit = m.group("dq") if m.group("dq") is not None else m.group("sq")
+            if lit is not None:
+                if lit.strip():
                     return "named"
                 continue
             sem = _classify_expr_semantics(
@@ -1487,6 +1620,8 @@ def _eval_inline_graphic_name(
             return "named"
         if prop_values.get("alt") == "opaque":
             saw_opaque = True
+    if "{..." in attrs:
+        return "named" if prop_values is None else "opaque"
     return "opaque" if saw_opaque else "icon_only"
 
 
@@ -1497,11 +1632,12 @@ def _resolve_component_tag(
     *,
     imported_components: dict[str, tuple[str, str]],
     component_resolver: Callable[[str, str, str], str] | None,
+    prop_values: dict[str, str] | None = None,
 ) -> str:
     root_name = tag.split(".", 1)[0]
     imp = imported_components.get(root_name)
     if imp and _ICON_PKG_SPEC_RE.match(imp[0]):
-        return "icon_only"
+        return _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values)
     if component_resolver is not None:
         return component_resolver(tag, attrs, inner_status)
     return "opaque"
@@ -1514,11 +1650,13 @@ def make_local_component_resolver(
     *,
     _caller_imports: dict[str, tuple[str, str]] | None = None,
     _cache: dict[
-        tuple[Path, str], tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path]
+        tuple[Path, str],
+        tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path, str],
     ] | None = None,
-    _visiting: frozenset[Path] = frozenset(),
+    _visiting: frozenset[tuple[Path, str]] = frozenset(),
     _depth: int = 0,
     _parent_props: dict[str, str] | None = None,
+    _parent_has_spread: bool = False,
 ) -> Callable[[str, str, str], str]:
     """Build a depth-bounded, cycle-guarded local component accessibility semantics resolver."""
     imports = _caller_imports if _caller_imports is not None else parse_component_imports(caller_source)
@@ -1528,7 +1666,7 @@ def make_local_component_resolver(
         root_name = tag_name.split(".", 1)[0]
         imp = imports.get(root_name)
         if imp is not None and _ICON_PKG_SPEC_RE.match(imp[0]):
-            return "icon_only"
+            return _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=_parent_props)
         same_file = (
             imp is None
             and caller_file.suffix in (".tsx", ".jsx")
@@ -1550,9 +1688,11 @@ def make_local_component_resolver(
             if "." in tag_name:
                 exported = tag_name.split(".", 1)[1]
             target = resolve_import_fn(spec, caller_file)
-            if target is None or target in _visiting:
+            if target is None:
                 return "opaque"
         ckey = (target, exported)
+        if ckey in _visiting:
+            return "opaque"
         if ckey not in cache:
             try:
                 raw_target = caller_source if same_file else target.read_text(encoding="utf-8", errors="replace")
@@ -1562,12 +1702,28 @@ def make_local_component_resolver(
                 raw_target, target.suffix, exported_name=exported
             )
             target_imports = imports if same_file else parse_component_imports(raw_target)
-            cache[ckey] = (defaults, aliases, markup, target_imports, target)
-        defaults, aliases, markup, target_imports, resolved_path = cache[ckey]
+            cache[ckey] = (defaults, aliases, markup, target_imports, target, raw_target)
+        defaults, aliases, markup, target_imports, resolved_path, resolved_source = cache[ckey]
         if not markup.strip():
             return "opaque"
 
-        passed, has_opaque_spread, explicit_after_spread = _extract_prop_attrs(attrs)
+        passed, has_opaque_spread, explicit_after_spread, raw_prop_exprs = _extract_prop_attrs(attrs)
+        if _parent_props is not None:
+            for pname, raw_ref in raw_prop_exprs.items():
+                if raw_ref.startswith("props."):
+                    ident = raw_ref[len("props.") :]
+                    resolved_val = _parent_props.get(
+                        ident, "opaque" if _parent_has_spread else "undefined"
+                    )
+                elif raw_ref in _parent_props:
+                    resolved_val = _parent_props[raw_ref]
+                else:
+                    continue
+                if has_opaque_spread and pname not in explicit_after_spread and resolved_val == "empty":
+                    passed[pname] = "opaque"
+                else:
+                    passed[pname] = resolved_val
+
         merged_props: dict[str, str] = {}
         for local_name, dstate in defaults.items():
             src_name = aliases.get(local_name, local_name)
@@ -1578,20 +1734,19 @@ def make_local_component_resolver(
                 merged_props[local_name] = "opaque"
             elif dstate in ("named", "dynamic"):
                 merged_props[local_name] = "named"
+            elif dstate in ("empty", "undefined"):
+                merged_props[local_name] = dstate
             else:
-                merged_props[local_name] = "empty"
+                # Preserve omitted/`undefined` state when no default is declared so multi-hop
+                # prop forwarding lets nested components apply their own default values.
+                merged_props[local_name] = "undefined"
         for src_name, pstate in passed.items():
-            norm_state = "empty" if pstate == "undefined" else pstate
+            norm_state = (
+                "opaque"
+                if (has_opaque_spread and src_name not in explicit_after_spread and pstate in ("empty", "undefined"))
+                else pstate
+            )
             merged_props.setdefault(src_name, norm_state)
-
-        if _parent_props is not None:
-            raw_prop_exprs = _extract_prop_raw_exprs(attrs)
-            for local_name, src_name in aliases.items():
-                if src_name in raw_prop_exprs and raw_prop_exprs[src_name] in _parent_props:
-                    merged_props[local_name] = _parent_props[raw_prop_exprs[src_name]]
-            for pname, raw_e in raw_prop_exprs.items():
-                if pname not in aliases.values() and raw_e in _parent_props:
-                    merged_props[pname] = _parent_props[raw_e]
 
         children_local = next(
             (ln for ln, sn in aliases.items() if sn == "children"),
@@ -1609,13 +1764,14 @@ def make_local_component_resolver(
 
         nested_resolver = make_local_component_resolver(
             resolved_path,
-            "" if not same_file else caller_source,
+            resolved_source,
             resolve_import_fn,
             _caller_imports=target_imports,
             _cache=cache,
-            _visiting=_visiting | {resolved_path},
+            _visiting=_visiting | {(resolved_path, exported)},
             _depth=_depth + 1,
             _parent_props=merged_props,
+            _parent_has_spread=has_opaque_spread,
         )
 
         def classify_branch(branch: str) -> str:
@@ -1642,18 +1798,6 @@ def make_local_component_resolver(
         return next(iter(branch_statuses)) if len(branch_statuses) == 1 else "opaque"
 
     return resolve_tag
-
-
-def _extract_prop_raw_exprs(attrs: str) -> dict[str, str]:
-    """Map prop names on `<Tag prop={ident} {shorthand} />` to bare identifier expressions."""
-    exprs: dict[str, str] = {}
-    for m in re.finditer(r"\{\s*([A-Za-z_$][\w$]*)\s*\}", attrs):
-        before = attrs[: m.start()].rstrip()
-        if not before.endswith("="):
-            exprs[m.group(1)] = m.group(1)
-    for m in re.finditer(r"\b([A-Za-z_$][\w$]*)\s*=\s*\{\s*([A-Za-z_$][\w$]*)\s*\}", attrs):
-        exprs[m.group(1)] = m.group(2)
-    return exprs
 
 
 def scan_a11y_markup_findings(

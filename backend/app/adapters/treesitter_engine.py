@@ -188,7 +188,7 @@ def extract_ts_backend_routes_cst(source: str, mount_prefix: str = "") -> list[t
     return found
 
 
-_TEMPLATE_HEAD_CONST_RE = re.compile(r"^\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
 
 
 def is_same_origin_url_path(val: str) -> bool:
@@ -197,27 +197,29 @@ def is_same_origin_url_path(val: str) -> bool:
 
 
 def is_resolvable_url_const_value(val: str) -> bool:
-    """True when `val` is an empty origin prefix `""` or a same-origin root-relative path."""
-    return val == "" or is_same_origin_url_path(val)
+    """True when `val` is a static URL/path piece (`""`, `/...`, `//...`, or scheme URL)."""
+    return val == "" or val.startswith(("/", "http://", "https://", "ws://", "wss://"))
 
 
 def resolve_url_const_head(url_val: str, url_consts: dict[str, str] | None) -> str:
-    """Expand leading `${NAME}` chains when NAME is a statically known constant piece."""
-    if not url_consts:
+    """Expand statically known `${NAME}` URL pieces across template/concatenation expressions."""
+    if not url_consts or "${" not in url_val:
         return url_val
     cur = url_val
-    seen: set[str] = set()
     for _ in range(4):
-        if not cur.startswith("${"):
+        changed = False
+
+        def _repl(m: re.Match[str]) -> str:
+            nonlocal changed
+            name = m.group("name")
+            if name in url_consts:
+                changed = True
+                return url_consts[name]
+            return m.group(0)
+
+        cur = _TEMPLATE_PLACEHOLDER_RE.sub(_repl, cur)
+        if not changed or "${" not in cur:
             break
-        m = _TEMPLATE_HEAD_CONST_RE.match(cur)
-        if not m:
-            break
-        name = m.group("name")
-        if name in seen or name not in url_consts:
-            break
-        seen.add(name)
-        cur = url_consts[name] + cur[m.end() :]
     return cur
 
 
