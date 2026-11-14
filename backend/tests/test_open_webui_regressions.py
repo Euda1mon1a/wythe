@@ -522,3 +522,45 @@ def test_vue_bound_prop_expressions_and_concat_url_origin_resolution(
     assert "/${HOST}/users" not in rx_calls
 
 
+def test_aria_named_elements_and_nullish_vs_or_coalescing_a11y(tmp_path: Path) -> None:
+    """ARIA-named wrapper elements satisfy `<button>`; `??` keeps `""`/`"   "` distinct from nullish."""
+    from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+
+    put(
+        tmp_path,
+        "components/Coalesce.tsx",
+        "export function NullishLabel({ text }: { text?: string | null }) {\n"
+        "  return <span>{text ?? 'Save'}</span>;\n"
+        "}\n"
+        "export function OrLabel({ text }: { text?: string | null }) {\n"
+        "  return <span>{text || 'Save'}</span>;\n"
+        "}\n",
+    )
+    put(
+        tmp_path,
+        "app/page.tsx",
+        "import { NullishLabel, OrLabel } from '../components/Coalesce';\n"
+        "export function Page() {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <button><span role='img' aria-label='Save'><svg /></span></button>\n"
+        "      <button><span role='img' aria-label=''><svg /></span></button>\n"
+        "      <button><span role='presentation' aria-label='Save'><svg /></span></button>\n"
+        "      <button><span aria-hidden={true}>Hidden</span><svg /></button>\n"
+        "      <button><NullishLabel text='' /></button>\n"
+        "      <button><NullishLabel text={null} /></button>\n"
+        "      <button><NullishLabel text={undefined} /></button>\n"
+        "      <button><NullishLabel /></button>\n"
+        "      <button><NullishLabel text='   ' /></button>\n"
+        "      <button><OrLabel text='' /></button>\n"
+        "      <button><OrLabel text='   ' /></button>\n"
+        "      <button><OrLabel text={null} /></button>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    res = TypeScriptNextJsAdapter().extract(tmp_path, ".")
+    disp_lines = sorted(f.line for f in res.findings if f.rule_code == "DISP-005")
+    assert disp_lines == [6, 7, 8, 9, 13, 15], res.findings
+
+

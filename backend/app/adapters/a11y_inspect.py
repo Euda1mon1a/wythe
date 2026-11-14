@@ -470,18 +470,34 @@ def parse_component_imports(raw_source: str) -> dict[str, tuple[str, str]]:
 
 
 _PROP_IDENT_REF_RE = re.compile(r"^(?:props\.)?(?P<ident>[A-Za-z_$][\w$]*)$")
+_EMPTY_PROP_STATES = frozenset({"empty", "blank", "null", "undefined"})
 
 
 def _eval_attr_value(expr: str, *, preserve_undefined: bool = False) -> str:
     s = expr.strip()
-    if preserve_undefined and s == "undefined":
-        return "undefined"
-    if s in ("", "''", '""', "``", "null", "undefined", "false", "true"):
+    if s == "undefined":
+        return "undefined" if preserve_undefined else "empty"
+    if s == "null":
+        return "null" if preserve_undefined else "empty"
+    if s in ("", "''", '""', "``", "false"):
         return "empty"
+    if s == "true":
+        return "blank" if preserve_undefined else "empty"
     if len(s) >= 2 and s[0] in ("'", '"') and s[-1] == s[0]:
-        return "named" if s[1:-1].strip() else "empty"
+        inner = s[1:-1]
+        if inner.strip():
+            return "named"
+        return "blank" if (preserve_undefined and inner != "") else "empty"
     if len(s) >= 2 and s[0] == "`" and s[-1] == "`" and "${" not in s:
-        return "named" if s[1:-1].strip() else "empty"
+        inner = s[1:-1]
+        if inner.strip():
+            return "named"
+        return "blank" if (preserve_undefined and inner != "") else "empty"
+    if "||" in s or "??" in s:
+        ev = _eval_coalesce_expr(s, prop_values={}, inner_status="empty", unknown_fallback="dynamic")
+        if not preserve_undefined and ev in ("null", "undefined", "blank"):
+            return "empty"
+        return ev
     return "dynamic"
 
 
@@ -585,7 +601,7 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str], dic
         has_opaque_spread = True
         explicit_after_spread.clear()
         for existing_k, existing_v in list(props.items()):
-            if existing_v in ("empty", "undefined"):
+            if existing_v in _EMPTY_PROP_STATES:
                 props[existing_k] = "opaque"
 
     def record_explicit(prop_name: str) -> None:
@@ -694,7 +710,7 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str], dic
                 record_ident_ref(base_key, val)
                 record_explicit(base_key)
             else:
-                props[key] = "named" if val.strip() else "empty"
+                props[key] = "named" if val.strip() else ("blank" if val else "empty")
                 raw_exprs.pop(key, None)
                 record_explicit(key)
             i = min(j + 1, n)
@@ -1313,9 +1329,9 @@ def _extract_component_props_and_markup(
     return prop_defaults, prop_aliases, _extract_tsx_return_markup(target_src)
 
 
-def _split_top_level_or_nullish(expr: str) -> list[str]:
-    """Split a JS expression on top-level `||` or `??` outside strings and brackets."""
-    parts: list[str] = []
+def _split_top_level_coalesce_ops(expr: str) -> list[tuple[str, str | None]]:
+    """Split a JS expression on top-level `||` / `??`, yielding `(term, following_op)` pairs."""
+    parts: list[tuple[str, str | None]] = []
     depth = 0
     quote: str | None = None
     start = 0
@@ -1336,13 +1352,105 @@ def _split_top_level_or_nullish(expr: str) -> list[str]:
         elif ch in (")", "]", "}"):
             depth = max(0, depth - 1)
         elif depth == 0 and (expr.startswith("||", i) or expr.startswith("??", i)):
-            parts.append(expr[start:i])
+            op = expr[i : i + 2]
+            parts.append((expr[start:i], op))
             i += 2
             start = i
             continue
         i += 1
-    parts.append(expr[start:])
+    parts.append((expr[start:], None))
     return parts
+
+
+def _eval_coalesce_expr(
+    expr: str,
+    *,
+    prop_values: dict[str, str] | None,
+    inner_status: str,
+    unknown_fallback: str | None = None,
+    depth: int = 0,
+) -> str:
+    """Evaluate a JS `||` / `??` expression preserving nullish vs falsy semantics."""
+    s = expr.strip()
+    if depth > 6:
+        return "dynamic" if prop_values is None else "opaque"
+    parts = _split_top_level_coalesce_ops(s)
+    if len(parts) == 1:
+        t = s
+        if len(t) >= 2 and t[0] == "(" and t[-1] == ")" and _scan_brace_end("{" + t[1:-1] + "}", 0) == len(t):
+            return _eval_coalesce_expr(
+                t[1:-1],
+                prop_values=prop_values,
+                inner_status=inner_status,
+                unknown_fallback=unknown_fallback,
+                depth=depth + 1,
+            )
+        if t == "undefined":
+            return "undefined"
+        if t == "null":
+            return "null"
+        if t in ("", "''", '""', "``", "false"):
+            return "empty"
+        if t == "true":
+            return "blank"
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", t):
+            return "named"
+        if (
+            len(t) >= 2
+            and t[0] in ("'", '"')
+            and t[-1] == t[0]
+            and t[0] not in t[1:-1].replace(f"\\{t[0]}", "")
+        ):
+            inner = t[1:-1]
+            return "named" if inner.strip() else ("blank" if inner else "empty")
+        if len(t) >= 2 and t[0] == "`" and t[-1] == "`" and "${" not in t and "`" not in t[1:-1].replace("\\`", ""):
+            inner = t[1:-1]
+            return "named" if inner.strip() else ("blank" if inner else "empty")
+        if t in ("children", "props.children"):
+            return inner_status
+        mp = re.fullmatch(r"(?:props\.)?(?P<p>[A-Za-z_$][\w$]*)", t)
+        if prop_values is not None and mp and mp.group("p") in prop_values:
+            return prop_values[mp.group("p")]
+        if unknown_fallback is not None:
+            return unknown_fallback
+        return "dynamic" if prop_values is None else "opaque"
+
+    states = [
+        (
+            _eval_coalesce_expr(
+                term,
+                prop_values=prop_values,
+                inner_status=inner_status,
+                unknown_fallback=unknown_fallback,
+                depth=depth + 1,
+            ),
+            op,
+        )
+        for term, op in parts
+    ]
+    acc, prev_op = states[0]
+    for nxt_state, nxt_op in states[1:]:
+        if prev_op == "??":
+            if acc in ("undefined", "null"):
+                acc = nxt_state
+            elif acc in ("empty", "blank", "named"):
+                pass
+            elif acc == "dynamic":
+                acc = "named" if nxt_state == "named" else "dynamic"
+            else:
+                acc = "opaque"
+        else:
+            # Logical `||` treats empty string / false / 0 / null / undefined as falsy.
+            if acc in ("undefined", "null", "empty"):
+                acc = nxt_state
+            elif acc in ("blank", "named"):
+                pass
+            elif acc == "dynamic":
+                acc = "named" if nxt_state == "named" else "dynamic"
+            else:
+                acc = "opaque"
+        prev_op = nxt_op
+    return acc
 
 
 def _classify_expr_semantics(
@@ -1363,43 +1471,16 @@ def _classify_expr_semantics(
         expr = expr[5:].strip()
     elif expr.startswith("@"):
         return "ignore"
-    if expr in ("''", '""', "``", "null", "undefined", "false", "true"):
+    res = _eval_coalesce_expr(
+        expr,
+        prop_values=prop_values,
+        inner_status=inner_status,
+        depth=0,
+    )
+    if res in _EMPTY_PROP_STATES:
         return "empty"
-    if prop_values is None:
+    if res in ("named", "dynamic"):
         return "named"
-    if expr in ("children", "props.children"):
-        return inner_status
-    if re.fullmatch(r"-?\d+(?:\.\d+)?", expr):
-        return "named"
-    term_states: list[str] = []
-    all_simple = True
-    for raw_term in _split_top_level_or_nullish(expr):
-        t = raw_term.strip()
-        while len(t) >= 2 and t[0] == "(" and t[-1] == ")" and _scan_brace_end("{" + t[1:-1] + "}", 0) == len(t):
-            t = t[1:-1].strip()
-        if t in ("''", '""', "``", "null", "undefined", "false", "true"):
-            term_states.append("empty")
-        elif re.fullmatch(r"-?\d+(?:\.\d+)?", t):
-            term_states.append("named")
-        elif len(t) >= 2 and t[0] in ("'", '"') and t[-1] == t[0] and t[0] not in t[1:-1].replace(f"\\{t[0]}", ""):
-            term_states.append("named" if t[1:-1].strip() else "empty")
-        elif t in ("children", "props.children"):
-            term_states.append(inner_status)
-        else:
-            mp = re.fullmatch(r"(?:props\.)?(?P<p>[A-Za-z_$][\w$]*)", t)
-            if mp and mp.group("p") in prop_values:
-                term_states.append(prop_values[mp.group("p")])
-            else:
-                all_simple = False
-                break
-    if all_simple and term_states:
-        if any(st in ("named", "dynamic") for st in term_states):
-            return "named"
-        if any(st == "opaque" for st in term_states):
-            return "opaque"
-        return "empty"
-    # Computed expressions (e.g. `{text.length}`, `{t(key)}`, `{localVar}`) are uncertain
-    # rather than proven empty even if an input prop happens to be empty.
     return "opaque"
 
 
@@ -1492,6 +1573,14 @@ def _classify_markup_segment(
                 )
                 i = next_i
                 continue
+            root_imp = imported_components.get(tag.split(".", 1)[0])
+            if root_imp and _ICON_PKG_SPEC_RE.match(root_imp[0]):
+                merge_status(
+                    _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values),
+                    tag,
+                )
+                i = next_i
+                continue
             if tag_low == "slot":
                 if not re.search(r"""\bname\s*=""", attrs):
                     if inner_status == "empty" and inner_body.strip():
@@ -1507,7 +1596,7 @@ def _classify_markup_segment(
                         merge_status(inner_status, "slot")
                 i = next_i
                 continue
-            if tag_low in ("script", "style") or re.search(r"""\baria-hidden\s*=\s*['"]true['"]""", attrs):
+            if tag_low in ("script", "style") or _is_aria_hidden_true(attrs):
                 i = next_i
                 continue
             if tag[0].isupper() or "." in tag:
@@ -1537,6 +1626,13 @@ def _classify_markup_segment(
                 merge_status(resolved, tag)
                 i = next_i
                 continue
+            own_name = _eval_element_own_name(attrs, allow_alt=False, prop_values=prop_values)
+            if own_name == "named":
+                has_named = True
+                i = next_i
+                continue
+            if own_name == "opaque":
+                merge_status("opaque", tag)
             i = open_end
             continue
         j = i
@@ -1557,26 +1653,37 @@ def _classify_markup_segment(
     return "empty", [], False
 
 
-def _eval_inline_graphic_name(
-    attrs: str,
-    *,
-    allow_alt: bool,
-    prop_values: dict[str, str] | None,
-) -> str:
-    """Classify accessible name of inline `<img>`/`<svg>`/`<i>` or icon component."""
-    if (
+def _is_aria_hidden_true(attrs: str) -> bool:
+    """True when element attributes statically set `aria-hidden="true"` / `{true}` / bare boolean."""
+    return bool(
         re.search(r"""(?<![\w$-])aria-hidden\s*=\s*(?:['"]true['"]|\{\s*true\s*\})""", attrs)
         or re.search(
             r"""(?<![\w$-])(?::|v-bind:)aria-hidden\s*=\s*(?:"\s*(?:true|'true')\s*"|'\s*(?:true|"true")\s*')""",
             attrs,
         )
         or re.search(r"""(?<![\w$-])aria-hidden(?!\s*=)(?=\s|$|/)""", attrs)
-        or re.search(
+    )
+
+
+def _has_presentational_role(attrs: str) -> bool:
+    """True when `role` is statically `presentation` or `none`, stripping implicit/ARIA naming."""
+    return bool(
+        re.search(
             r"""(?<![\w$-])role\s*=\s*(?:['"](?:presentation|none)['"]|\{\s*['"](?:presentation|none)['"]\s*\})""",
             attrs,
         )
-    ):
-        return "icon_only"
+    )
+
+
+def _eval_element_own_name(
+    attrs: str,
+    *,
+    allow_alt: bool,
+    prop_values: dict[str, str] | None,
+) -> str | None:
+    """Evaluate ARIA/`title`/`alt` accessible name attributes on an element as `named`, `opaque`, or `None`."""
+    if _is_aria_hidden_true(attrs) or _has_presentational_role(attrs):
+        return None
     attr_names = ("aria-label", "aria-labelledby", "title") + (("alt",) if allow_alt else ())
     saw_opaque = False
     for attr_name in attr_names:
@@ -1620,9 +1727,19 @@ def _eval_inline_graphic_name(
             return "named"
         if prop_values.get("alt") == "opaque":
             saw_opaque = True
-    if "{..." in attrs:
+    if "{..." in attrs or re.search(r"(?<![\w$:-])v-bind\s*=", attrs):
         return "named" if prop_values is None else "opaque"
-    return "opaque" if saw_opaque else "icon_only"
+    return "opaque" if saw_opaque else None
+
+
+def _eval_inline_graphic_name(
+    attrs: str,
+    *,
+    allow_alt: bool,
+    prop_values: dict[str, str] | None,
+) -> str:
+    """Classify accessible name of inline `<img>`/`<svg>`/`<i>` or icon component."""
+    return _eval_element_own_name(attrs, allow_alt=allow_alt, prop_values=prop_values) or "icon_only"
 
 
 def _resolve_component_tag(
@@ -1719,7 +1836,7 @@ def make_local_component_resolver(
                     resolved_val = _parent_props[raw_ref]
                 else:
                     continue
-                if has_opaque_spread and pname not in explicit_after_spread and resolved_val == "empty":
+                if has_opaque_spread and pname not in explicit_after_spread and resolved_val in ("empty", "blank", "null"):
                     passed[pname] = "opaque"
                 else:
                     passed[pname] = resolved_val
@@ -1734,7 +1851,7 @@ def make_local_component_resolver(
                 merged_props[local_name] = "opaque"
             elif dstate in ("named", "dynamic"):
                 merged_props[local_name] = "named"
-            elif dstate in ("empty", "undefined"):
+            elif dstate in _EMPTY_PROP_STATES:
                 merged_props[local_name] = dstate
             else:
                 # Preserve omitted/`undefined` state when no default is declared so multi-hop
@@ -1743,7 +1860,7 @@ def make_local_component_resolver(
         for src_name, pstate in passed.items():
             norm_state = (
                 "opaque"
-                if (has_opaque_spread and src_name not in explicit_after_spread and pstate in ("empty", "undefined"))
+                if (has_opaque_spread and src_name not in explicit_after_spread and pstate in _EMPTY_PROP_STATES)
                 else pstate
             )
             merged_props.setdefault(src_name, norm_state)
