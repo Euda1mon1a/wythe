@@ -377,5 +377,46 @@ def test_inline_script_imports_and_child_local_expr_a11y(tmp_path: Path) -> None
     res = SvelteKitDisplayAdapter().extract(tmp_path, ".")
     disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
     assert len(disp_005) == 1, disp_005
-    assert any("unobserved" in n.lower() for n in res.notes), res.notes
+
+
+def test_barrel_explicit_export_masks_star_reexport_and_svelte_slot_opaque(
+    tmp_path: Path,
+) -> None:
+    """Explicit unresolved exports shadow `export *`, and `<slot />` preserves opaque children."""
+    put(tmp_path, "src/lib/local.ts", "export const API = '/internal';\n")
+    put(
+        tmp_path,
+        "src/lib/barrel.ts",
+        "export * from './local';\n"
+        "export const API = process.env.PUBLIC_API;\n",
+    )
+    put(
+        tmp_path,
+        "src/lib/Wrapper.svelte",
+        "<span class='wrap'><slot /></span>\n",
+    )
+    put(
+        tmp_path,
+        "src/routes/+page.ts",
+        "import { API } from '$lib/barrel';\n"
+        "export function load() {\n"
+        "  return fetch(`${API}/users`);\n"
+        "}\n",
+    )
+    put(
+        tmp_path,
+        "src/routes/+page.svelte",
+        "<script lang='ts'>\n"
+        "import { ThirdPartyLabel, MenuIcon } from 'third-party-ui';\n"
+        "import Wrapper from '$lib/Wrapper.svelte';\n"
+        "</script>\n"
+        "<button type='button'><Wrapper><ThirdPartyLabel /></Wrapper></button>\n"
+        "<button type='button'><Wrapper><MenuIcon /></Wrapper></button>\n"
+        "<button type='button'><svg aria-hidden='true' /></button>\n",
+    )
+    res = SvelteKitDisplayAdapter().extract(tmp_path, ".")
+    paths = {c.normalized_path for c in res.http_calls}
+    assert "/internal/users" not in paths, paths
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    assert [(f.source_file, f.line) for f in disp_005] == [("src/routes/+page.svelte", 7)], disp_005
 

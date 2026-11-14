@@ -309,4 +309,64 @@ def test_tsx_spread_props_and_destructured_aliases_a11y(tmp_path: Path) -> None:
         ("src/App.tsx", 11),
         ("src/App.tsx", 12),
     ], disp_005
+
+
+def test_tsx_conditional_returns_undefined_defaults_and_default_children_a11y(
+    tmp_path: Path,
+) -> None:
+    """Handle multi-return uncertainty, explicit `undefined` prop defaults, and default children."""
+    from app.adapters.typescript_react import TypeScriptReactSpaAdapter
+
+    (tmp_path / "src" / "components").mkdir(parents=True)
+    (tmp_path / "package.json").write_text('{"dependencies":{"react":"^18.0.0"}}', encoding="utf-8")
+
+    (tmp_path / "src" / "components" / "ConditionalLabel.tsx").write_text(
+        "export function ConditionalLabel({ loading }: { loading?: boolean }) {\n"
+        "  if (loading) {\n"
+        "    return <svg aria-hidden='true' />;\n"
+        "  }\n"
+        "  return <span>Save</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "DefaultText.tsx").write_text(
+        "export function DefaultText({ text = 'Save' }: { text?: string | null }) {\n"
+        "  return <span>{text}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "DefaultChildren.tsx").write_text(
+        "export function DefaultChildren({ children = 'Save' }: { children?: unknown }) {\n"
+        "  return <span>{children}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "App.tsx").write_text(
+        "import { ConditionalLabel } from './components/ConditionalLabel';\n"
+        "import { DefaultText } from './components/DefaultText';\n"
+        "import { DefaultChildren } from './components/DefaultChildren';\n"
+        "export function App() {\n"
+        "  return (\n"
+        "    <main>\n"
+        "      <button type='button'><ConditionalLabel loading={false} /></button>\n"
+        "      <button type='button'><DefaultText text={undefined} /></button>\n"
+        "      <button type='button'><DefaultText text={null} /></button>\n"
+        "      <button type='button'><DefaultChildren /></button>\n"
+        "      <button type='button'><DefaultChildren children={undefined} /></button>\n"
+        "      <button type='button'><DefaultChildren children={null} /></button>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = TypeScriptReactSpaAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    # ConditionalLabel -> uncertain across branches (not flagged)
+    # DefaultText text={undefined} -> applies 'Save' default (clean); text={null} -> flagged (line 9)
+    # DefaultChildren -> applies 'Save' default for omitted and {undefined}; children={null} -> flagged (line 12)
+    assert [(f.source_file, f.line) for f in disp_005] == [
+        ("src/App.tsx", 9),
+        ("src/App.tsx", 12),
+    ], disp_005
     assert any("unobserved" in n.lower() for n in res.notes), res.notes

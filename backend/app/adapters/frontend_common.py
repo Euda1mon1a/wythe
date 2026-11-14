@@ -56,7 +56,7 @@ _NAMED_IMPORT_STMT_RE = re.compile(
     r"""(?:^|[;\r\n])[ \t]*import\s+(?!type\b)(?:[A-Za-z_$][\w$]*\s*,\s*)?\{(?P<clause>[^}]+)\}\s*from\s*['"](?P<spec>[^'"]+)['"]""",
 )
 _EXPORT_CONST_NAME_RE = re.compile(
-    r"""(?:^|[;\r\n])[ \t]*export\s+const\s+(?P<name>[A-Za-z_$][\w$]*)\b""",
+    r"""(?:^|[;\r\n])[ \t]*export\s+(?:default\s+)?(?:const|let|var|async\s+function|function|class)\s+(?P<name>[A-Za-z_$][\w$]*)\b""",
 )
 _EXPORT_LOCAL_CLAUSE_RE = re.compile(
     r"""(?:^|[;\r\n])[ \t]*export\s+(?!type\b)\{(?P<clause>[^}]+)\}\s*(?:[;\r\n]|$)""",
@@ -177,24 +177,34 @@ def build_frontend_url_const_resolver(
             if not is_js_module_stmt_in_code(cleaned, mask, rm):
                 continue
             target = resolve_frontend_import(rm.group("spec"), fpath, src_root, extensions)
+            pairs = _parse_specifier_pairs(rm.group("clause"))
             if target is not None:
                 target_exports, cyc = _exports_of(target, next_visiting, depth + 1)
                 hit_cycle = hit_cycle or cyc
-                for orig_name, export_name in _parse_specifier_pairs(rm.group("clause")):
+                for orig_name, export_name in pairs:
                     if orig_name in target_exports:
                         exported[export_name] = target_exports[orig_name]
+                    else:
+                        exported.pop(export_name, None)
+            else:
+                for _orig_name, export_name in pairs:
+                    exported.pop(export_name, None)
         for em in _EXPORT_CONST_NAME_RE.finditer(cleaned):
             if not is_js_module_stmt_in_code(cleaned, mask, em):
                 continue
             cname = em.group("name")
             if cname in local_consts:
                 exported[cname] = local_consts[cname]
+            else:
+                exported.pop(cname, None)
         for lm in _EXPORT_LOCAL_CLAUSE_RE.finditer(cleaned):
             if not is_js_module_stmt_in_code(cleaned, mask, lm):
                 continue
             for local_name, export_name in _parse_specifier_pairs(lm.group("clause")):
                 if local_name in local_consts:
                     exported[export_name] = local_consts[local_name]
+                else:
+                    exported.pop(export_name, None)
         if not hit_cycle:
             export_cache[fpath] = exported
         return exported, hit_cycle

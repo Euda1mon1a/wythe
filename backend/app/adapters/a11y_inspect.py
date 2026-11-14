@@ -469,8 +469,10 @@ def parse_component_imports(raw_source: str) -> dict[str, tuple[str, str]]:
     return mapping
 
 
-def _eval_attr_value(expr: str) -> str:
+def _eval_attr_value(expr: str, *, preserve_undefined: bool = False) -> str:
     s = expr.strip()
+    if preserve_undefined and s == "undefined":
+        return "undefined"
     if s in ("", "''", '""', "``", "null", "undefined", "false", "true"):
         return "empty"
     if len(s) >= 2 and s[0] in ("'", '"') and s[-1] == s[0]:
@@ -573,7 +575,7 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str]]:
                             if raw_v is not None:
                                 skey = raw_k.strip().strip("'\"")
                                 if re.fullmatch(r"[A-Za-z_$][\w$.-]*", skey):
-                                    props[skey] = _eval_attr_value(raw_v)
+                                    props[skey] = _eval_attr_value(raw_v, preserve_undefined=True)
                                     if has_opaque_spread:
                                         explicit_after_spread.add(skey)
                             elif re.fullmatch(r"[A-Za-z_$][\w$]*", entry):
@@ -619,7 +621,9 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str]]:
             bend = _scan_brace_end(attrs, i)
             if bend is None:
                 break
-            props[key] = _eval_attr_value(attrs[i + 1 : bend - 1])
+            props[key] = _eval_attr_value(
+                attrs[i + 1 : bend - 1], preserve_undefined=True
+            )
             if has_opaque_spread:
                 explicit_after_spread.add(key)
             i = bend
@@ -879,6 +883,259 @@ def _locate_tsx_export_source(raw_source: str, exported_name: str) -> str:
     return raw_source
 
 
+def _extract_jsx_at(src: str, jsx_start: int) -> tuple[str, int] | None:
+    """Extract a complete JSX element or fragment starting at `jsx_start`."""
+    if jsx_start >= len(src) or src[jsx_start] != "<":
+        return None
+    if src.startswith("<>", jsx_start):
+        depth = 1
+        pos = jsx_start + 2
+        n = len(src)
+        while pos < n:
+            nxt_open = src.find("<>", pos)
+            nxt_close = src.find("</>", pos)
+            if nxt_close < 0:
+                return None
+            if nxt_open >= 0 and nxt_open < nxt_close:
+                depth += 1
+                pos = nxt_open + 2
+            else:
+                depth -= 1
+                pos = nxt_close + 3
+                if depth == 0:
+                    return src[jsx_start:pos], pos
+        return None
+    tm = re.match(r"<([A-Za-z][\w.]*)", src[jsx_start:])
+    if not tm:
+        return None
+    tname = tm.group(1)
+    open_end = scan_open_tag_end(src, jsx_start + tm.end())
+    if open_end is None:
+        return None
+    if src[jsx_start + tm.end() : open_end - 1].rstrip().endswith("/"):
+        return src[jsx_start:open_end], open_end
+    close_span = _find_matching_close_tag(src, open_end, tname)
+    if close_span is None:
+        return None
+    return src[jsx_start : close_span[1]], close_span[1]
+
+
+def _extract_jsx_or_conditional_branches(expr_src: str) -> list[str]:
+    """Collect JSX roots and short-circuit fallback semantics from a returned JS expression."""
+    mask = js_code_mask(expr_src)
+    branches: list[str] = []
+    n = len(expr_src)
+    i = 0
+    saw_short_circuit = False
+    saw_ternary = False
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        ch = expr_src[i]
+        if ch == "<":
+            found = _extract_jsx_at(expr_src, i)
+            if found is not None:
+                jsx_slice, end_pos = found
+                branches.append(jsx_slice)
+                i = end_pos
+                continue
+        elif expr_src.startswith("&&", i) or expr_src.startswith("||", i):
+            saw_short_circuit = True
+            i += 2
+            continue
+        elif ch == "?":
+            saw_ternary = True
+        elif expr_src.startswith("=>", i):
+            i = _slice_arrow_body_end(expr_src, i + 2, mask)
+            continue
+        i += 1
+    if branches and saw_short_circuit and not saw_ternary:
+        branches.append("<!--WYTHE_EXPR-->null")
+    return branches
+
+
+def _find_tsx_body_start(target_src: str, mask: str) -> tuple[bool, int] | None:
+    """Locate `(is_block_body, body_start_idx)` after a TSX component's signature."""
+    n = len(target_src)
+    i = 0
+    paren_depth = 0
+    angle_depth = 0
+    saw_fn_kw = bool(re.match(r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\b", target_src))
+    saw_params_end = False
+    in_return_type = False
+    last_sig = ""
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        ch = target_src[i]
+        if paren_depth == 0 and angle_depth == 0 and target_src.startswith("function", i):
+            prev_ok = i == 0 or not (target_src[i - 1].isalnum() or target_src[i - 1] in "_$")
+            nxt = i + 8
+            next_ok = nxt >= n or not (target_src[nxt].isalnum() or target_src[nxt] in "_$")
+            if prev_ok and next_ok:
+                saw_fn_kw = True
+        if ch == "(" and angle_depth == 0:
+            paren_depth += 1
+            last_sig = "("
+        elif ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+            if paren_depth == 0:
+                saw_params_end = True
+            last_sig = ")"
+        elif paren_depth == 0:
+            if angle_depth == 0 and target_src.startswith("=>", i):
+                pos = i + 2
+                while pos < n and target_src[pos].isspace():
+                    pos += 1
+                if pos < n and target_src[pos] == "{":
+                    return True, pos
+                return False, pos
+            if ch == "<" and (saw_params_end or saw_fn_kw):
+                angle_depth += 1
+                last_sig = "<"
+            elif ch == ">" and angle_depth > 0 and (i == 0 or target_src[i - 1] != "="):
+                angle_depth -= 1
+                last_sig = ">"
+            elif ch == ":" and saw_params_end and angle_depth == 0:
+                in_return_type = True
+                last_sig = ":"
+            elif ch == "{" and angle_depth == 0:
+                if in_return_type and last_sig in (":", "|", "&"):
+                    type_end = _scan_brace_end(target_src, i)
+                    if type_end is not None:
+                        last_sig = "}"
+                        i = type_end
+                        continue
+                if saw_fn_kw and saw_params_end:
+                    return True, i
+                skip_end = _scan_brace_end(target_src, i)
+                if skip_end is not None:
+                    last_sig = "}"
+                    i = skip_end
+                    continue
+            elif not ch.isspace():
+                last_sig = ch
+        i += 1
+    return None
+
+
+def _extract_tsx_return_markup(target_src: str) -> str:
+    """Extract single JSX output or `<!--WYTHE_BRANCH-->`-joined conditional returns."""
+    mask = js_code_mask(target_src)
+    body_info = _find_tsx_body_start(target_src, mask)
+    if body_info is None:
+        return ""
+    is_block, body_start = body_info
+    n = len(target_src)
+
+    if not is_block:
+        expr_tail = target_src[body_start:].strip()
+        if expr_tail.endswith(";"):
+            expr_tail = expr_tail[:-1].strip()
+        if expr_tail.startswith("(") and expr_tail.endswith(")"):
+            expr_tail = expr_tail[1:-1].strip()
+        if expr_tail.startswith("<"):
+            found = _extract_jsx_at(expr_tail, 0)
+            return found[0] if found is not None else ""
+        branches = _extract_jsx_or_conditional_branches(expr_tail)
+        return "\n<!--WYTHE_BRANCH-->\n".join(branches) if any("<" in b for b in branches) else ""
+
+    body_end = _scan_brace_end(target_src, body_start) or n
+    branches: list[str] = []
+    i = body_start + 1
+    limit = min(body_end - 1, n)
+    while i < limit:
+        if not mask[i]:
+            i += 1
+            continue
+        if target_src.startswith("=>", i):
+            i = _slice_arrow_body_end(target_src, i + 2, mask)
+            continue
+        if target_src.startswith("function", i):
+            prev_ok = i == 0 or not (target_src[i - 1].isalnum() or target_src[i - 1] in "_$")
+            nxt = i + 8
+            next_ok = nxt >= limit or not (target_src[nxt].isalnum() or target_src[nxt] in "_$")
+            if prev_ok and next_ok:
+                bpos = nxt
+                pdepth = 0
+                while bpos < limit:
+                    if not mask[bpos]:
+                        bpos += 1
+                        continue
+                    if target_src[bpos] == "(":
+                        pdepth += 1
+                    elif target_src[bpos] == ")" and pdepth > 0:
+                        pdepth -= 1
+                    elif target_src[bpos] == "{" and pdepth == 0:
+                        bend = _scan_brace_end(target_src, bpos)
+                        bpos = bend if bend is not None else limit
+                        break
+                    bpos += 1
+                i = bpos
+                continue
+        if target_src.startswith("return", i):
+            prev_ok = i == 0 or not (target_src[i - 1].isalnum() or target_src[i - 1] in "_$.")
+            nxt = i + 6
+            next_ok = nxt >= limit or not (target_src[nxt].isalnum() or target_src[nxt] in "_$")
+            if prev_ok and next_ok:
+                pos = nxt
+                while pos < limit and target_src[pos].isspace():
+                    pos += 1
+                if pos < limit and target_src[pos] == "(":
+                    inner_pos = pos + 1
+                    while inner_pos < limit and target_src[inner_pos].isspace():
+                        inner_pos += 1
+                    if inner_pos < limit and target_src[inner_pos] == "<":
+                        found = _extract_jsx_at(target_src, inner_pos)
+                        if found is not None:
+                            branches.append(found[0])
+                            i = found[1]
+                            continue
+                if pos < limit and target_src[pos] == "<":
+                    found = _extract_jsx_at(target_src, pos)
+                    if found is not None:
+                        branches.append(found[0])
+                        i = found[1]
+                        continue
+                depth = 0
+                end_pos = pos
+                while end_pos < limit:
+                    if not mask[end_pos]:
+                        end_pos += 1
+                        continue
+                    ch = target_src[end_pos]
+                    if ch in ("(", "[", "{"):
+                        depth += 1
+                    elif ch in (")", "]", "}"):
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif ch == ";" and depth == 0:
+                        break
+                    elif ch == "\n" and depth == 0 and target_src[pos:end_pos].strip():
+                        tail_tok = target_src[pos:end_pos].rstrip()
+                        if not tail_tok.endswith(("?", ":", "&&", "||", "+", ",")):
+                            break
+                    end_pos += 1
+                raw_expr = target_src[pos:end_pos].strip()
+                if "<" in raw_expr:
+                    sub_branches = _extract_jsx_or_conditional_branches(raw_expr)
+                    if sub_branches:
+                        branches.extend(sub_branches)
+                    else:
+                        branches.append(f"<!--WYTHE_EXPR-->{raw_expr or 'null'}")
+                else:
+                    branches.append(f"<!--WYTHE_EXPR-->{raw_expr or 'null'}")
+                i = end_pos + 1
+                continue
+        i += 1
+    if not any("<" in b and not b.startswith("<!--WYTHE_EXPR-->") for b in branches):
+        return ""
+    return "\n<!--WYTHE_BRANCH-->\n".join(branches)
+
+
 def _extract_component_props_and_markup(
     raw_source: str,
     suffix: str,
@@ -942,26 +1199,7 @@ def _extract_component_props_and_markup(
             defs, als = _parse_default_params(target_src[m_open.end() : bend - 1])
             prop_defaults.update(defs)
             prop_aliases.update(als)
-    m_ret = re.search(r"(?:\breturn\s*\(?|=>\s*\(?)\s*(?=<(?:[A-Za-z]|>))", target_src)
-    if not m_ret:
-        return prop_defaults, prop_aliases, ""
-    jsx_start = m_ret.end()
-    if target_src.startswith("<>", jsx_start):
-        close = target_src.find("</>", jsx_start + 2)
-        return prop_defaults, prop_aliases, target_src[jsx_start : close + 3] if close >= 0 else ""
-    tm = re.match(r"<([A-Za-z][\w.]*)", target_src[jsx_start:])
-    if not tm:
-        return prop_defaults, prop_aliases, ""
-    tname = tm.group(1)
-    open_end = scan_open_tag_end(target_src, jsx_start + tm.end())
-    if open_end is None:
-        return prop_defaults, prop_aliases, ""
-    if target_src[jsx_start + tm.end() : open_end - 1].rstrip().endswith("/"):
-        return prop_defaults, prop_aliases, target_src[jsx_start:open_end]
-    close_span = _find_matching_close_tag(target_src, open_end, tname)
-    if close_span is None:
-        return prop_defaults, prop_aliases, ""
-    return prop_defaults, prop_aliases, target_src[jsx_start : close_span[1]]
+    return prop_defaults, prop_aliases, _extract_tsx_return_markup(target_src)
 
 
 def _classify_expr_semantics(
@@ -1032,8 +1270,10 @@ def _classify_markup_segment(
             has_icon = True
         elif st == "empty":
             has_empty_comp = True
-        elif st == "opaque" and tag_label and tag_label not in opaque_tags:
-            opaque_tags.append(tag_label)
+        elif st == "opaque":
+            lbl = tag_label or "slot"
+            if lbl not in opaque_tags:
+                opaque_tags.append(lbl)
 
     while i < n:
         ch = src[i]
@@ -1094,7 +1334,17 @@ def _classify_markup_segment(
                 continue
             if tag_low == "slot":
                 if not re.search(r"""\bname\s*=""", attrs):
-                    merge_status(inner_status)
+                    if inner_status == "empty" and inner_body.strip():
+                        slot_fallback, _, _ = _classify_markup_segment(
+                            inner_body,
+                            imported_components=imported_components,
+                            component_resolver=component_resolver,
+                            prop_values=prop_values,
+                            inner_status="empty",
+                        )
+                        merge_status(slot_fallback, "slot")
+                    else:
+                        merge_status(inner_status, "slot")
                 i = next_i
                 continue
             if tag_low in ("script", "style") or re.search(r"""\baria-hidden\s*=\s*['"]true['"]""", attrs):
@@ -1238,8 +1488,9 @@ def make_local_component_resolver(
         merged_props: dict[str, str] = {}
         for local_name, dstate in defaults.items():
             src_name = aliases.get(local_name, local_name)
-            if src_name in passed:
-                merged_props[local_name] = passed[src_name]
+            pval = passed.get(src_name)
+            if pval is not None and pval != "undefined":
+                merged_props[local_name] = pval
             elif has_opaque_spread and src_name not in explicit_after_spread:
                 merged_props[local_name] = "opaque"
             elif dstate in ("named", "dynamic"):
@@ -1247,16 +1498,8 @@ def make_local_component_resolver(
             else:
                 merged_props[local_name] = "empty"
         for src_name, pstate in passed.items():
-            merged_props.setdefault(src_name, pstate)
-
-        effective_inner = inner_status
-        if effective_inner == "empty":
-            if passed.get("children") in ("named", "dynamic"):
-                effective_inner = "named"
-            elif passed.get("children") == "opaque" or (
-                has_opaque_spread and "children" not in explicit_after_spread
-            ):
-                effective_inner = "opaque"
+            norm_state = "empty" if pstate == "undefined" else pstate
+            merged_props.setdefault(src_name, norm_state)
 
         if _parent_props is not None:
             raw_prop_exprs = _extract_prop_raw_exprs(attrs)
@@ -1266,6 +1509,20 @@ def make_local_component_resolver(
             for pname, raw_e in raw_prop_exprs.items():
                 if pname not in aliases.values() and raw_e in _parent_props:
                     merged_props[pname] = _parent_props[raw_e]
+
+        children_local = next(
+            (ln for ln, sn in aliases.items() if sn == "children"),
+            "children",
+        )
+        effective_children = merged_props.get(children_local, passed.get("children"))
+        effective_inner = inner_status
+        if effective_inner == "empty":
+            if effective_children in ("named", "dynamic"):
+                effective_inner = "named"
+            elif effective_children == "opaque" or (
+                has_opaque_spread and "children" not in explicit_after_spread
+            ):
+                effective_inner = "opaque"
 
         nested_resolver = make_local_component_resolver(
             resolved_path,
@@ -1277,14 +1534,29 @@ def make_local_component_resolver(
             _depth=_depth + 1,
             _parent_props=merged_props,
         )
-        status, _, _ = _classify_markup_segment(
-            markup,
-            imported_components=target_imports,
-            component_resolver=nested_resolver,
-            prop_values=merged_props,
-            inner_status=effective_inner,
-        )
-        return status
+
+        def classify_branch(branch: str) -> str:
+            if branch.startswith("<!--WYTHE_EXPR-->"):
+                sem = _classify_expr_semantics(
+                    branch[len("<!--WYTHE_EXPR-->") :],
+                    prop_values=merged_props,
+                    inner_status=effective_inner,
+                )
+                return "empty" if sem == "ignore" else sem
+            st, _, _ = _classify_markup_segment(
+                branch,
+                imported_components=target_imports,
+                component_resolver=nested_resolver,
+                prop_values=merged_props,
+                inner_status=effective_inner,
+            )
+            return st
+
+        branches = markup.split("\n<!--WYTHE_BRANCH-->\n")
+        if len(branches) == 1:
+            return classify_branch(branches[0])
+        branch_statuses = {classify_branch(b) for b in branches}
+        return next(iter(branch_statuses)) if len(branch_statuses) == 1 else "opaque"
 
     return resolve_tag
 
