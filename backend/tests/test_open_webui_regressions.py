@@ -1084,4 +1084,104 @@ def test_bare_jsx_props_svelte_if_branches_and_native_hidden_a11y(
     assert svelte_lines == [6, 9, 12], svelte_res.findings
 
 
+def test_vue_conditional_rendering_and_svelte_raw_html_a11y(
+    tmp_path: Path,
+) -> None:
+    """Verify Vue `v-if`/`v-else`/`v-show` visibility and Svelte `{@html ...}` markup parsing."""
+    from app.adapters.sveltekit_display import SvelteKitDisplayAdapter
+    from app.adapters.vue_sfc import VueSfcDisplayAdapter
+
+    vue_root = tmp_path / "vue_conditionals"
+    put(
+        vue_root,
+        "src/components/VIfFalse.vue",
+        "<template><span v-if=\"false\">Save</span><svg /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/VShowFalse.vue",
+        "<template><span v-show=\"false\">Save</span><svg /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/VIfDynamic.vue",
+        "<script setup>defineProps(['dynamicFlag']);</script>\n"
+        "<template><span v-if=\"dynamicFlag\">Save</span><svg /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/VShowDynamic.vue",
+        "<script setup>defineProps(['dynamicFlag']);</script>\n"
+        "<template><span v-show=\"dynamicFlag\">Save</span><svg /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/VIfElseBoth.vue",
+        "<script setup>defineProps(['dynamicFlag']);</script>\n"
+        "<template><span v-if=\"dynamicFlag\">Save</span><span v-else>Done</span><svg /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/VIfPropShow.vue",
+        "<script setup>defineProps({ show: { default: false } });</script>\n"
+        "<template><span v-if=\"show\">Save</span><svg v-else /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/App.vue",
+        "<script setup>\n"
+        "import VIfFalse from './components/VIfFalse.vue';\n"
+        "import VShowFalse from './components/VShowFalse.vue';\n"
+        "import VIfDynamic from './components/VIfDynamic.vue';\n"
+        "import VShowDynamic from './components/VShowDynamic.vue';\n"
+        "import VIfElseBoth from './components/VIfElseBoth.vue';\n"
+        "import VIfPropShow from './components/VIfPropShow.vue';\n"
+        "</script>\n"
+        "<template>\n"
+        "  <button><VIfFalse /></button>\n"
+        "  <button><VShowFalse /></button>\n"
+        "  <button><VIfDynamic :dynamic-flag=\"cond\" /></button>\n"
+        "  <button><VShowDynamic :dynamic-flag=\"cond\" /></button>\n"
+        "  <button><VIfElseBoth :dynamic-flag=\"cond\" /></button>\n"
+        "  <button><VIfPropShow /></button>\n"
+        "  <button><VIfPropShow show /></button>\n"
+        "  <button><span v-if=\"false\">Save</span><svg /></button>\n"
+        "</template>\n",
+    )
+    vue_res = VueSfcDisplayAdapter().extract(vue_root, ".")
+    vue_lines = sorted(f.line for f in vue_res.findings if f.rule_code == "DISP-005")
+    assert vue_lines == [10, 11, 15, 17], vue_res.findings
+
+    sv_root = tmp_path / "svelte_raw_html"
+    put(sv_root, "src/lib/RawIcon.svelte", "{@html '<svg></svg>'}\n")
+    put(sv_root, "src/lib/RawText.svelte", "{@html '<span>Save</span>'}<svg />\n")
+    put(
+        sv_root,
+        "src/lib/RawDyn.svelte",
+        "<script>export let rawHtml = '<span>Save</span>';</script>\n"
+        "{@html rawHtml}<svg />\n",
+    )
+    put(sv_root, "src/lib/RawEmpty.svelte", "{@html ''}<svg />\n")
+    put(
+        sv_root,
+        "src/routes/+page.svelte",
+        "<script>\n"
+        "  import RawIcon from '$lib/RawIcon.svelte';\n"
+        "  import RawText from '$lib/RawText.svelte';\n"
+        "  import RawDyn from '$lib/RawDyn.svelte';\n"
+        "  import RawEmpty from '$lib/RawEmpty.svelte';\n"
+        "  export let dynamicHtml;\n"
+        "</script>\n"
+        "<button><RawIcon /></button>\n"
+        "<button><RawText /></button>\n"
+        "<button><RawDyn /></button>\n"
+        "<button><RawEmpty /></button>\n"
+        "<button>{@html '<svg></svg>'}</button>\n"
+        "<button>{@html dynamicHtml}<svg /></button>\n",
+    )
+    sv_res = SvelteKitDisplayAdapter().extract(sv_root, ".")
+    sv_lines = sorted(f.line for f in sv_res.findings if f.rule_code == "DISP-005")
+    assert sv_lines == [8, 11, 12], sv_res.findings
+
+
 

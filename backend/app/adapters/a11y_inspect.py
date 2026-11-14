@@ -2268,8 +2268,23 @@ def _classify_expr_semantics(
             return inner_status
         return "named"
     if expr.startswith("@html"):
-        expr = expr[5:].strip()
-    elif expr.startswith("@"):
+        raw_html_expr = expr[5:].strip()
+        if not raw_html_expr:
+            return "empty"
+        lit = _unwrap_static_js_string(raw_html_expr)
+        if lit is not None:
+            return _classify_static_html_fragment(lit)
+        res = _eval_coalesce_expr(
+            raw_html_expr,
+            prop_values=prop_values,
+            inner_status=inner_status,
+            depth=0,
+            portal_names=portal_names,
+        )
+        if res == "omitted" or res in _EMPTY_PROP_STATES or res == "bool_false":
+            return "empty"
+        return "opaque"
+    if expr.startswith("@"):
         return "ignore"
     res = _eval_coalesce_expr(
         expr,
@@ -2621,6 +2636,141 @@ def _eval_svelte_condition_truthiness(
     return truth
 
 
+def _parse_vue_conditional_attrs(
+    attrs: str,
+) -> tuple[str | None, str | None, tuple[int, int] | None, str | None, tuple[int, int] | None]:
+    """Return `(if_kind, if_cond, if_span, v_show_cond, v_show_span)` for Vue directives outside quotes."""
+    if_kind: str | None = None
+    if_cond: str | None = None
+    if_span: tuple[int, int] | None = None
+    v_show_cond: str | None = None
+    v_show_span: tuple[int, int] | None = None
+    i = 0
+    n = len(attrs)
+    while i < n:
+        while i < n and (attrs[i].isspace() or attrs[i] == "/"):
+            i += 1
+        if i >= n:
+            break
+        if attrs[i] == "{":
+            bend = _scan_brace_end(attrs, i)
+            i = bend if bend is not None else i + 1
+            continue
+        km = re.match(r"[:\w$.@-]+", attrs[i:])
+        if not km:
+            i += 1
+            continue
+        key_start = i
+        key = km.group(0).split(".", 1)[0]
+        i += km.end()
+        while i < n and attrs[i].isspace():
+            i += 1
+        if i >= n or attrs[i] != "=":
+            if key == "v-else" and if_kind is None:
+                if_kind = "v-else"
+                if_cond = None
+                if_span = (key_start, key_start + km.end())
+            continue
+        i += 1
+        while i < n and attrs[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        val = ""
+        val_end = i
+        if attrs[i] in ("'", '"'):
+            q = attrs[i]
+            j = i + 1
+            while j < n and attrs[j] != q:
+                j += 2 if attrs[j] == "\\" else 1
+            val = attrs[i + 1 : j].strip()
+            val_end = min(j + 1, n)
+        elif attrs[i] == "{":
+            bend = _scan_brace_end(attrs, i)
+            if bend is None:
+                break
+            val = attrs[i + 1 : bend - 1].strip()
+            val_end = bend
+        else:
+            vm = re.match(r"\S+", attrs[i:])
+            val = vm.group(0) if vm else ""
+            val_end = i + (vm.end() if vm else 1)
+        if key in ("v-if", "v-else-if") and if_kind is None:
+            if_kind = key
+            if_cond = val
+            if_span = (key_start, val_end)
+        elif key == "v-else" and if_kind is None:
+            if_kind = "v-else"
+            if_cond = None
+            if_span = (key_start, val_end)
+        elif key == "v-show" and v_show_cond is None:
+            v_show_cond = val
+            v_show_span = (key_start, val_end)
+        i = val_end
+    return if_kind, if_cond, if_span, v_show_cond, v_show_span
+
+
+def _mask_elem_attr_span(
+    src: str, elem_start: int, elem_end: int, attr_base: int, span: tuple[int, int]
+) -> str:
+    """Return `src[elem_start:elem_end]` with one directive span replaced by spaces, keeping offsets."""
+    s = attr_base + span[0] - elem_start
+    e = attr_base + span[1] - elem_start
+    frag = src[elem_start:elem_end]
+    return frag[:s] + (" " * (e - s)) + frag[e:]
+
+
+def _collect_vue_if_chain(
+    src: str,
+    first_start: int,
+    first_end: int,
+    first_cond: str | None,
+    first_attr_base: int,
+    first_span: tuple[int, int],
+) -> tuple[list[tuple[str | None, int, str]], int]:
+    """Collect adjacent Vue `v-if` / `v-else-if` / `v-else` sibling branches."""
+    branches: list[tuple[str | None, int, str]] = [
+        (first_cond, first_start, _mask_elem_attr_span(src, first_start, first_end, first_attr_base, first_span))
+    ]
+    n = len(src)
+    pos = first_end
+    while pos < n:
+        cur = pos
+        while cur < n:
+            if src[cur].isspace():
+                cur += 1
+            elif src.startswith("<!--", cur):
+                cend = src.find("-->", cur + 4)
+                cur = cend + 3 if cend >= 0 else n
+            else:
+                break
+        if cur >= n or src[cur] != "<" or src.startswith(("</", "<>"), cur):
+            break
+        tm = re.match(r"<([A-Za-z][\w.:-]*)", src[cur:])
+        if not tm:
+            break
+        tag = tm.group(1)
+        open_end = scan_open_tag_end(src, cur + tm.end())
+        if open_end is None:
+            break
+        attrs = src[cur + tm.end() : open_end - 1]
+        if_kind, if_cond, if_span, _vs_cond, _vs_span = _parse_vue_conditional_attrs(attrs)
+        if if_kind not in ("v-else-if", "v-else") or if_span is None:
+            break
+        elem_end = open_end
+        if not attrs.rstrip().endswith("/") and tag.lower() != "img":
+            cspan = _find_matching_close_tag(src, open_end, tag)
+            if cspan is not None:
+                elem_end = cspan[1]
+        branches.append(
+            (if_cond, cur, _mask_elem_attr_span(src, cur, elem_end, cur + tm.end(), if_span))
+        )
+        pos = elem_end
+        if if_kind == "v-else":
+            break
+    return branches, pos
+
+
 def _classify_markup_segment(
     src: str,
     *,
@@ -2732,8 +2882,10 @@ def _classify_markup_segment(
                 has_named = True
             elif sem == "icon_only":
                 has_icon = True
-            elif sem == "opaque" and prop_values is not None:
-                opaque_tags.append("{expr}")
+            elif sem == "opaque" and (
+                prop_values is not None or block_hdr.startswith("@html")
+            ):
+                opaque_tags.append("@html" if block_hdr.startswith("@html") else "{expr}")
             i = bend
             continue
         if ch == "<":
@@ -2759,6 +2911,92 @@ def _classify_markup_segment(
                 if cspan is not None:
                     inner_body = src[open_end : cspan[0]]
                     next_i = cspan[1]
+            if allow_vue_kebab:
+                v_kind, v_cond, v_span, v_show_cond, v_show_span = _parse_vue_conditional_attrs(
+                    attrs
+                )
+                if v_kind == "v-if" and v_span is not None:
+                    vbranches, chain_end = _collect_vue_if_chain(
+                        src, i, next_i, v_cond, i + tm.end(), v_span
+                    )
+                    possible_statuses: set[str] = set()
+                    definitive_hit = False
+                    for b_cond, b_off, b_src in vbranches:
+                        if b_cond is None:
+                            bst, _, _ = _classify_markup_segment(
+                                b_src,
+                                imported_components=imported_components,
+                                component_resolver=component_resolver,
+                                prop_values=prop_values,
+                                inner_status=inner_status,
+                                render_booleans_as_text=render_booleans_as_text,
+                                allow_vue_kebab=allow_vue_kebab,
+                                source_offset=source_offset + b_off,
+                            )
+                            possible_statuses.add(bst)
+                            definitive_hit = True
+                            break
+                        truth = _eval_svelte_condition_truthiness(
+                            b_cond,
+                            prop_values=prop_values,
+                            inner_status=inner_status,
+                            portal_names=portal_names,
+                        )
+                        if truth == "false":
+                            continue
+                        bst, _, _ = _classify_markup_segment(
+                            b_src,
+                            imported_components=imported_components,
+                            component_resolver=component_resolver,
+                            prop_values=prop_values,
+                            inner_status=inner_status,
+                            render_booleans_as_text=render_booleans_as_text,
+                            allow_vue_kebab=allow_vue_kebab,
+                            source_offset=source_offset + b_off,
+                        )
+                        possible_statuses.add(bst)
+                        if truth == "true":
+                            definitive_hit = True
+                            break
+                    if not definitive_hit:
+                        possible_statuses.add("empty")
+                    if len(possible_statuses) == 1:
+                        merge_status(next(iter(possible_statuses)), "v-if")
+                    else:
+                        merge_status("opaque", "v-if")
+                    i = chain_end
+                    continue
+                if v_kind in ("v-else-if", "v-else"):
+                    merge_status("opaque", v_kind)
+                    i = next_i
+                    continue
+                if v_show_cond is not None and v_show_span is not None:
+                    show_truth = _eval_svelte_condition_truthiness(
+                        v_show_cond,
+                        prop_values=prop_values,
+                        inner_status=inner_status,
+                        portal_names=portal_names,
+                    )
+                    if show_truth == "false":
+                        i = next_i
+                        continue
+                    if show_truth == "unknown":
+                        masked_elem = _mask_elem_attr_span(
+                            src, i, next_i, i + tm.end(), v_show_span
+                        )
+                        bst, _, _ = _classify_markup_segment(
+                            masked_elem,
+                            imported_components=imported_components,
+                            component_resolver=component_resolver,
+                            prop_values=prop_values,
+                            inner_status=inner_status,
+                            render_booleans_as_text=render_booleans_as_text,
+                            allow_vue_kebab=allow_vue_kebab,
+                            source_offset=source_offset + i,
+                        )
+                        merge_status("empty" if bst == "empty" else "opaque", "v-show")
+                        i = next_i
+                        continue
             tag_low = tag.lower()
             matched_imp = _normalize_component_lookup(
                 tag, imported_components, allow_vue_case_insensitive=allow_vue_kebab
