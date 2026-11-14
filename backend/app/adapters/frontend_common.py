@@ -236,8 +236,9 @@ def build_a11y_component_resolver(
     """Build a per-scan factory returning depth-bounded component text-semantics resolvers."""
     shared_cache: dict[
         tuple[Path, str],
-        tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path, str],
+        tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path, str, int],
     ] = {}
+    shared_lexical_cache: dict[Path, dict[str, list[tuple[int, tuple[int, int]]]]] = {}
 
     def _resolve_imp(spec: str, current_file: Path) -> Path | None:
         return resolve_frontend_import(spec, current_file, src_root, extensions)
@@ -248,6 +249,7 @@ def build_a11y_component_resolver(
             caller_raw_source,
             _resolve_imp,
             _cache=shared_cache,
+            _lexical_cache=shared_lexical_cache,
         )
 
     return resolver_for

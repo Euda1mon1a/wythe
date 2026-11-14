@@ -1192,6 +1192,69 @@ def _find_lexical_tsx_decl_pos(
     return "found", innermost[0]
 
 
+_ALL_TSX_LOCAL_DECL_RE = re.compile(
+    r"\b(?:async\s+)?function\s+(?P<fn>[A-Za-z_$][\w$]*)\b"
+    r"|\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*(?::[^=;\n]+)?="
+)
+
+
+def _build_tsx_local_decl_index(
+    raw_source: str,
+    *,
+    mask: list[bool] | str | None = None,
+    brace_spans: list[tuple[int, int]] | None = None,
+) -> dict[str, list[tuple[int, tuple[int, int]]]]:
+    """Index all same-file TSX/JSX value declarations with their innermost brace scope once."""
+    src_mask = mask if mask is not None else js_code_mask(raw_source)
+    spans = brace_spans if brace_spans is not None else _js_brace_spans(raw_source, src_mask)
+    sorted_spans = sorted(spans, key=lambda s: (s[0], -s[1]))
+    decls_flat: list[tuple[int, str]] = []
+    for m in _ALL_TSX_LOCAL_DECL_RE.finditer(raw_source):
+        if not src_mask[m.start()]:
+            continue
+        sym = m.group("fn") or m.group("var")
+        if sym:
+            decls_flat.append((m.start(), sym))
+    index: dict[str, list[tuple[int, tuple[int, int]]]] = {}
+    full_span = (0, len(raw_source))
+    scope_stack: list[tuple[int, int]] = [full_span]
+    si = 0
+    ns = len(sorted_spans)
+    for pos, sym in decls_flat:
+        while si < ns and sorted_spans[si][0] < pos:
+            s_start, s_end = sorted_spans[si]
+            si += 1
+            if pos < s_end:
+                while len(scope_stack) > 1 and scope_stack[-1][1] <= s_start:
+                    scope_stack.pop()
+                scope_stack.append((s_start, s_end))
+        while len(scope_stack) > 1 and scope_stack[-1][1] <= pos:
+            scope_stack.pop()
+        index.setdefault(sym, []).append((pos, scope_stack[-1]))
+    return index
+
+
+def _lookup_tsx_decl_index(
+    index: dict[str, list[tuple[int, tuple[int, int]]]],
+    symbol: str,
+    usage_pos: int | None,
+) -> tuple[str, int | None]:
+    """Resolve `symbol` at `usage_pos` against a prebuilt `_build_tsx_local_decl_index` map."""
+    decls = index.get(symbol)
+    if not decls:
+        return "missing", None
+    if usage_pos is None:
+        return ("found", decls[0][0]) if len(decls) == 1 else ("ambiguous", None)
+    visible = [(pos, sc) for pos, sc in decls if sc[0] <= usage_pos < sc[1]]
+    if not visible:
+        return "missing", None
+    min_width = min(sc[1] - sc[0] for _pos, sc in visible)
+    innermost = [pos for pos, sc in visible if (sc[1] - sc[0]) == min_width]
+    if len(innermost) != 1:
+        return "ambiguous", None
+    return "found", innermost[0]
+
+
 def _resolve_tsx_decl_slice_with_pos(
     raw_source: str,
     decl_pos: int,
@@ -1505,6 +1568,251 @@ def _find_tsx_body_start(target_src: str, mask: str) -> tuple[bool, int] | None:
     return None
 
 
+_NON_METHOD_KEYWORDS = frozenset(
+    {
+        "abstract",
+        "as",
+        "async",
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "declare",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "finally",
+        "for",
+        "function",
+        "get",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "interface",
+        "let",
+        "new",
+        "of",
+        "override",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "return",
+        "satisfies",
+        "set",
+        "static",
+        "super",
+        "switch",
+        "throw",
+        "try",
+        "type",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    }
+)
+_METHOD_MODIFIER_WORDS = frozenset(
+    {
+        "abstract",
+        "async",
+        "declare",
+        "get",
+        "override",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "set",
+        "static",
+    }
+)
+_DECL_NAME_KEYWORDS = frozenset({"async", "delete", "get", "set", "static", "type"})
+
+
+def _skip_ws_and_unmasked(src: str, pos: int, mask: list[bool], limit: int) -> int:
+    """Advance `pos` past comments, strings, regexes, and whitespace."""
+    while pos < limit and (not mask[pos] or src[pos].isspace()):
+        pos += 1
+    return pos
+
+
+def _prev_sig_char(
+    src: str, pos: int, mask: list[bool], *, skip_modifiers: bool = False
+) -> tuple[int, str]:
+    """Return `(index, char)` of the previous significant code token before `pos`."""
+    j = pos - 1
+    while j >= 0:
+        if not mask[j] or src[j].isspace():
+            j -= 1
+            continue
+        if skip_modifiers:
+            if src[j] == "*":
+                j -= 1
+                continue
+            if src[j].isalnum() or src[j] in "_$":
+                ws = j
+                while ws > 0 and (src[ws - 1].isalnum() or src[ws - 1] in "_$"):
+                    ws -= 1
+                if src[ws : j + 1] in _METHOD_MODIFIER_WORDS:
+                    j = ws - 1
+                    continue
+        return j, src[j]
+    return -1, ""
+
+
+def _skip_balanced_type_args(src: str, pos: int, mask: list[bool], limit: int) -> int | None:
+    """Advance past `<...>` generic type parameters starting at `pos`."""
+    if pos >= limit or src[pos] != "<":
+        return None
+    depth = 0
+    p = pos
+    while p < limit:
+        if not mask[p]:
+            p += 1
+            continue
+        ch = src[p]
+        if ch in (";", "{", "}"):
+            return None
+        if ch == "<" and not src.startswith("=>", p):
+            depth += 1
+        elif ch == ">" and (p == 0 or src[p - 1] != "="):
+            depth -= 1
+            if depth == 0:
+                return p + 1
+        p += 1
+    return None
+
+
+def _scan_nested_callable_end(
+    src: str,
+    after_name_pos: int,
+    mask: list[bool],
+    limit: int,
+    *,
+    allow_optional_ident: bool = False,
+    allow_return_type: bool = True,
+) -> int | None:
+    """Return end index past `{...}` for a nested `function` or object/class method, else `None`."""
+    p = _skip_ws_and_unmasked(src, after_name_pos, mask, limit)
+    if allow_optional_ident:
+        if p < limit and src[p] == "*":
+            p = _skip_ws_and_unmasked(src, p + 1, mask, limit)
+        if p < limit and (src[p].isalpha() or src[p] in "_$"):
+            while p < limit and (src[p].isalnum() or src[p] in "_$"):
+                p += 1
+            p = _skip_ws_and_unmasked(src, p, mask, limit)
+    if p < limit and src[p] == "<":
+        p_next = _skip_balanced_type_args(src, p, mask, limit)
+        if p_next is None:
+            return None
+        p = _skip_ws_and_unmasked(src, p_next, mask, limit)
+    if p >= limit or src[p] != "(":
+        return None
+    p_end = _scan_paren_end(src, p, mask, skip_jsx=True)
+    if p_end is None or p_end > limit:
+        return None
+    p = _skip_ws_and_unmasked(src, p_end, mask, limit)
+    if p < limit and src[p] == "{":
+        bend = _scan_brace_end(src, p)
+        return bend if bend is not None else limit
+    if p >= limit or src[p] != ":" or not allow_return_type:
+        return None
+    p = _skip_ws_and_unmasked(src, p + 1, mask, limit)
+    adepth = 0
+    tpdepth = 0
+    tbdepth = 0
+    last_sig = ":"
+    while p < limit:
+        if not mask[p]:
+            p += 1
+            continue
+        ch = src[p]
+        if ch == "{":
+            if adepth == 0 and tpdepth == 0 and tbdepth == 0 and last_sig not in (":", "|", "&"):
+                bend = _scan_brace_end(src, p)
+                return bend if bend is not None else limit
+            tend = _scan_brace_end(src, p)
+            if tend is None or tend > limit:
+                return None
+            last_sig = "}"
+            p = tend
+            continue
+        if adepth == 0 and tpdepth == 0 and tbdepth == 0:
+            if ch in (";", ",", ")", "]"):
+                return None
+            if ch == "=" and not src.startswith("=>", p):
+                return None
+            if src.startswith("=>", p):
+                last_sig = ">"
+                p += 2
+                continue
+            if ch == "<" and last_sig == ":" and _extract_jsx_at(src, p) is not None:
+                return None
+        if ch == "(":
+            tpdepth += 1
+        elif ch == ")" and tpdepth > 0:
+            tpdepth -= 1
+        elif ch == "[":
+            tbdepth += 1
+        elif ch == "]" and tbdepth > 0:
+            tbdepth -= 1
+        elif ch == "<" and not src.startswith("=>", p):
+            adepth += 1
+        elif ch == ">" and adepth > 0 and (p == 0 or src[p - 1] != "="):
+            adepth -= 1
+        if not ch.isspace():
+            last_sig = ch
+        p += 1
+    return None
+
+
+def _scan_nested_class_end(
+    src: str, after_class_pos: int, mask: list[bool], limit: int
+) -> int | None:
+    """Return end index past `{...}` of a nested `class` declaration/expression, else `None`."""
+    p = after_class_pos
+    pdepth = 0
+    bdepth = 0
+    adepth = 0
+    while p < limit:
+        if not mask[p]:
+            p += 1
+            continue
+        ch = src[p]
+        if pdepth == 0 and bdepth == 0 and adepth == 0:
+            if ch == ";" or src.startswith("=>", p):
+                return None
+            if ch == "{":
+                bend = _scan_brace_end(src, p)
+                return bend if bend is not None else limit
+        if ch == "(":
+            pdepth += 1
+        elif ch == ")" and pdepth > 0:
+            pdepth -= 1
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]" and bdepth > 0:
+            bdepth -= 1
+        elif ch == "<" and not src.startswith("=>", p):
+            adepth += 1
+        elif ch == ">" and adepth > 0 and (p == 0 or src[p - 1] != "="):
+            adepth -= 1
+        p += 1
+    return None
+
+
 def _extract_tsx_return_markup(
     target_src: str,
     *,
@@ -1541,28 +1849,79 @@ def _extract_tsx_return_markup(
         if target_src.startswith("=>", i):
             i = _slice_arrow_body_end(target_src, i + 2, mask)
             continue
-        if target_src.startswith("function", i):
-            prev_ok = i == 0 or not (target_src[i - 1].isalnum() or target_src[i - 1] in "_$")
-            nxt = i + 8
-            next_ok = nxt >= limit or not (target_src[nxt].isalnum() or target_src[nxt] in "_$")
-            if prev_ok and next_ok:
-                bpos = nxt
-                pdepth = 0
-                while bpos < limit:
-                    if not mask[bpos]:
-                        bpos += 1
+        ch_cur = target_src[i]
+        if ch_cur == "[":
+            _, prev_sep = _prev_sig_char(target_src, i, mask, skip_modifiers=True)
+            if prev_sep in ("", "{", ",", ";", "}"):
+                bdepth = 0
+                bp = i
+                close_br: int | None = None
+                while bp < limit:
+                    if not mask[bp]:
+                        bp += 1
                         continue
-                    if target_src[bpos] == "(":
-                        pdepth += 1
-                    elif target_src[bpos] == ")" and pdepth > 0:
-                        pdepth -= 1
-                    elif target_src[bpos] == "{" and pdepth == 0:
-                        bend = _scan_brace_end(target_src, bpos)
-                        bpos = bend if bend is not None else limit
-                        break
-                    bpos += 1
-                i = bpos
-                continue
+                    if target_src[bp] == "[":
+                        bdepth += 1
+                    elif target_src[bp] == "]":
+                        bdepth -= 1
+                        if bdepth == 0:
+                            close_br = bp + 1
+                            break
+                    bp += 1
+                if close_br is not None:
+                    method_end = _scan_nested_callable_end(
+                        target_src, close_br, mask, limit, allow_return_type=True
+                    )
+                    if method_end is not None:
+                        i = method_end
+                        continue
+        if ch_cur.isalpha() or ch_cur in "_$":
+            prev_ok = i == 0 or not (target_src[i - 1].isalnum() or target_src[i - 1] in "_$")
+            if prev_ok:
+                word_end = i + 1
+                while word_end < limit and (
+                    target_src[word_end].isalnum() or target_src[word_end] in "_$"
+                ):
+                    word_end += 1
+                word = target_src[i:word_end]
+                _, prev_sig = _prev_sig_char(target_src, i, mask, skip_modifiers=False)
+                if word == "function" and prev_sig != ".":
+                    fn_end = _scan_nested_callable_end(
+                        target_src,
+                        word_end,
+                        mask,
+                        limit,
+                        allow_optional_ident=True,
+                        allow_return_type=True,
+                    )
+                    i = fn_end if fn_end is not None else word_end
+                    continue
+                if word == "class" and prev_sig != ".":
+                    cls_end = _scan_nested_class_end(target_src, word_end, mask, limit)
+                    if cls_end is not None:
+                        i = cls_end
+                        continue
+                    i = word_end
+                    continue
+                if word != "return" and prev_sig != ".":
+                    _, member_sep = _prev_sig_char(target_src, i, mask, skip_modifiers=True)
+                    is_candidate = word not in _NON_METHOD_KEYWORDS or (
+                        word in _DECL_NAME_KEYWORDS
+                        and member_sep in ("", "{", ",", ";", "}", "*")
+                    )
+                    if is_candidate:
+                        method_end = _scan_nested_callable_end(
+                            target_src,
+                            word_end,
+                            mask,
+                            limit,
+                            allow_return_type=member_sep in ("", "{", ",", ";", "}"),
+                        )
+                        if method_end is not None:
+                            i = method_end
+                            continue
+                    i = word_end
+                    continue
         if target_src.startswith("return", i):
             prev_ok = i == 0 or not (target_src[i - 1].isalnum() or target_src[i - 1] in "_$.")
             nxt = i + 6
@@ -2120,7 +2479,10 @@ def _resolve_dynamic_component_selector(
     if own_name in ("named", "opaque"):
         return own_name
     inj = _eval_injected_html_name(
-        cleaned_attrs, prop_values=prop_values, inner_status=inner_status
+        cleaned_attrs,
+        prop_values=prop_values,
+        inner_status=inner_status,
+        render_booleans_as_text=render_booleans_as_text,
     )
     if inj in ("named", "icon_only", "opaque"):
         return inj
@@ -2255,7 +2617,10 @@ def _classify_markup_segment(
                 i = next_i
                 continue
             if tag_low == "slot":
-                if not re.search(r"""\bname\s*=""", attrs):
+                is_named_slot = bool(
+                    re.search(r"""(?<![\w$-])(?::|v-bind:)?name\s*=""", attrs)
+                )
+                if not is_named_slot:
                     if inner_status in ("omitted", "undefined") and inner_body.strip():
                         slot_fallback, _, _ = _classify_markup_segment(
                             inner_body,
@@ -2278,6 +2643,22 @@ def _classify_markup_segment(
                         else:
                             slot_st = inner_status
                         merge_status(slot_st, "slot")
+                elif inner_status in ("omitted", "undefined", "blank"):
+                    if inner_body.strip():
+                        slot_fallback, _, _ = _classify_markup_segment(
+                            inner_body,
+                            imported_components=imported_components,
+                            component_resolver=component_resolver,
+                            prop_values=prop_values,
+                            inner_status="omitted",
+                            render_booleans_as_text=render_booleans_as_text,
+                            allow_vue_kebab=allow_vue_kebab,
+                            source_offset=source_offset + open_end,
+                        )
+                        merge_status(slot_fallback, "slot")
+                else:
+                    # Caller supplied child content that may target or override this named slot.
+                    merge_status("opaque", "slot")
                 i = next_i
                 continue
             if tag_low in ("script", "style"):
@@ -2368,7 +2749,10 @@ def _classify_markup_segment(
             if own_name == "opaque":
                 merge_status("opaque", tag)
             inj = _eval_injected_html_name(
-                attrs, prop_values=prop_values, inner_status=inner_status
+                attrs,
+                prop_values=prop_values,
+                inner_status=inner_status,
+                render_booleans_as_text=render_booleans_as_text,
             )
             if inj == "named":
                 has_named = True
@@ -2520,13 +2904,22 @@ def _classify_static_html_fragment(html: str) -> str:
     return "empty"
 
 
+_HTML_INJECTION_ATTR_RE = re.compile(
+    r"""(?<![\w$-])(?P<kind>v-html|(?:v-bind)?:innerHTML|(?:v-bind)?:inner-html|innerHTML)\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')"""
+)
+_TEXT_INJECTION_ATTR_RE = re.compile(
+    r"""(?<![\w$-])(?P<kind>v-text|(?:v-bind)?:textContent|(?:v-bind)?:text-content|(?:v-bind)?:innerText|(?:v-bind)?:inner-text)\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')"""
+)
+
+
 def _eval_injected_html_name(
     attrs: str,
     *,
     prop_values: dict[str, str] | None,
     inner_status: str,
+    render_booleans_as_text: bool = False,
 ) -> str | None:
-    """Classify `dangerouslySetInnerHTML`, `v-html`, or `innerHTML` accessible text if present."""
+    """Classify `dangerouslySetInnerHTML`, `v-html`/`innerHTML`, or `v-text`/text bindings."""
     if _is_aria_hidden_true(attrs) or _has_presentational_role(attrs):
         return None
     md = re.search(r"(?<![\w$-])dangerouslySetInnerHTML\s*=\s*\{", attrs)
@@ -2560,21 +2953,36 @@ def _eval_injected_html_name(
         )
         return sem if sem in ("named", "empty", "icon_only") else "opaque"
 
-    mv = re.search(
-        r"""(?<![\w$-])(?P<kind>v-html|:innerHTML|:inner-html|innerHTML)\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')""",
-        attrs,
-    )
+    mv = _HTML_INJECTION_ATTR_RE.search(attrs)
     if mv:
+        kind = mv.group("kind")
         raw_val = mv.group("dq") if mv.group("dq") is not None else (mv.group("sq") or "")
-        if mv.group("kind") == "innerHTML":
+        if kind == "innerHTML":
             return _classify_static_html_fragment(raw_val)
         lit = _unwrap_static_js_string(raw_val)
         if lit is not None:
             return _classify_static_html_fragment(lit)
         sem = _classify_expr_semantics(
-            raw_val, prop_values=prop_values, inner_status=inner_status
+            raw_val,
+            prop_values=prop_values,
+            inner_status=inner_status,
+            render_booleans_as_text=render_booleans_as_text or kind.startswith(("v-", ":")),
         )
         return sem if sem in ("named", "empty", "icon_only") else "opaque"
+
+    mt = _TEXT_INJECTION_ATTR_RE.search(attrs)
+    if mt:
+        raw_val = mt.group("dq") if mt.group("dq") is not None else (mt.group("sq") or "")
+        lit = _unwrap_static_js_string(raw_val)
+        if lit is not None:
+            return "named" if lit.strip() else "empty"
+        sem = _classify_expr_semantics(
+            raw_val,
+            prop_values=prop_values,
+            inner_status=inner_status,
+            render_booleans_as_text=True,
+        )
+        return sem if sem in ("named", "empty") else "opaque"
     return None
 
 
@@ -2684,6 +3092,7 @@ def make_local_component_resolver(
         tuple[Path, str],
         tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path, str, int],
     ] | None = None,
+    _lexical_cache: dict[Path, dict[str, list[tuple[int, tuple[int, int]]]]] | None = None,
     _visiting: frozenset[tuple[Path, str]] = frozenset(),
     _depth: int = 0,
     _parent_props: dict[str, str] | None = None,
@@ -2693,6 +3102,7 @@ def make_local_component_resolver(
     """Build a depth-bounded, cycle-guarded local component accessibility semantics resolver."""
     imports = _caller_imports if _caller_imports is not None else parse_component_imports(caller_source)
     cache = _cache if _cache is not None else {}
+    lexical_cache = _lexical_cache if _lexical_cache is not None else {}
     vue_kebab_caller = caller_file.suffix == ".vue"
 
     def resolve_tag(
@@ -2711,8 +3121,12 @@ def make_local_component_resolver(
         scope_status = "missing"
         local_decl_pos: int | None = None
         if caller_file.suffix in (".tsx", ".jsx"):
-            scope_status, local_decl_pos = _find_lexical_tsx_decl_pos(
-                caller_source, raw_root, effective_usage_pos
+            caller_index = lexical_cache.get(caller_file)
+            if caller_index is None:
+                caller_index = _build_tsx_local_decl_index(caller_source)
+                lexical_cache[caller_file] = caller_index
+            scope_status, local_decl_pos = _lookup_tsx_decl_index(
+                caller_index, raw_root, effective_usage_pos
             )
             if scope_status == "ambiguous":
                 return "opaque"
@@ -2890,6 +3304,7 @@ def make_local_component_resolver(
             resolve_import_fn,
             _caller_imports=target_imports,
             _cache=cache,
+            _lexical_cache=lexical_cache,
             _visiting=_visiting | {initial_ckey, final_ckey},
             _depth=_depth + 1,
             _parent_props=merged_props,
@@ -3008,7 +3423,12 @@ def scan_a11y_markup_findings(
         if re.search(r"\b(?:aria-label|aria-labelledby|title)\s*=", attrs) or "{..." in attrs:
             continue
         lineno = raw_source.count("\n", 0, m.start()) + 1
-        btn_inj = _eval_injected_html_name(attrs, prop_values=None, inner_status="omitted")
+        btn_inj = _eval_injected_html_name(
+            attrs,
+            prop_values=None,
+            inner_status="omitted",
+            render_booleans_as_text=rel_repo.endswith((".svelte", ".vue")),
+        )
         if btn_inj == "named":
             continue
         if btn_inj == "opaque":

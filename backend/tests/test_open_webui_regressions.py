@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -872,5 +873,141 @@ def test_shadowing_presentational_italic_dynamic_components_and_portals_a11y(
     sv_res = SvelteKitDisplayAdapter().extract(sv_root, ".")
     sv_lines = sorted(f.line for f in sv_res.findings if f.rule_code == "DISP-005")
     assert sv_lines == [3], sv_res.findings
+
+
+def test_named_slot_fallback_v_text_nested_method_returns_and_linear_resolver_scaling(
+    tmp_path: Path,
+):
+    from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+    from app.adapters.vue_sfc import VueSfcDisplayAdapter
+
+    # 1. Named slots: inspect fallback when caller omits content; stay opaque when caller passes content.
+    # 2. Vue v-text / :textContent / :text-content / :innerText / :inner-text literal text & booleans.
+    vue_root = tmp_path / "vue_slots_and_text"
+    put(
+        vue_root,
+        "src/components/NamedLabel.vue",
+        "<template><slot name=\"label\">Save</slot><svg /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/NamedIconOnly.vue",
+        "<template><slot name=\"icon\"><svg /></slot></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/NamedEmpty.vue",
+        "<template><slot name=\"label\" /><svg /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/VTextLabel.vue",
+        "<script setup>defineProps(['label']);</script>\n"
+        "<template><span v-text=\"label\" /><svg /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/App.vue",
+        "<script setup>\n"
+        "import NamedLabel from './components/NamedLabel.vue';\n"
+        "import NamedIconOnly from './components/NamedIconOnly.vue';\n"
+        "import NamedEmpty from './components/NamedEmpty.vue';\n"
+        "import VTextLabel from './components/VTextLabel.vue';\n"
+        "const label = 'Run';\n"
+        "</script>\n"
+        "<template>\n"
+        "  <button><NamedLabel /></button>\n"
+        "  <button><NamedIconOnly /></button>\n"
+        "  <button><NamedEmpty><template #label>Filled</template></NamedEmpty></button>\n"
+        "  <button v-text=\"label\"><svg /></button>\n"
+        "  <button :textContent=\"'<svg />'\"></button>\n"
+        "  <button><span :text-content=\"'Save'\" /><svg /></button>\n"
+        "  <button><span :innerText=\"label\" /><svg /></button>\n"
+        "  <button v-text=\"''\"><svg /></button>\n"
+        "  <button><VTextLabel :label=\"false\" /></button>\n"
+        "</template>\n",
+    )
+    vue_res = VueSfcDisplayAdapter().extract(vue_root, ".")
+    vue_lines = sorted(f.line for f in vue_res.findings if f.rule_code == "DISP-005")
+    assert vue_lines == [10, 16], vue_res.findings
+
+    # Same named-slot behavior in Svelte.
+    sv_root = tmp_path / "svelte_slots"
+    put(sv_root, "src/lib/NamedLabel.svelte", "<slot name=\"label\">Save</slot><svg />\n")
+    put(sv_root, "src/lib/NamedIconOnly.svelte", "<slot name=\"icon\"><svg /></slot>\n")
+    put(
+        sv_root,
+        "src/routes/+page.svelte",
+        "<script>import NamedLabel from '$lib/NamedLabel.svelte'; import NamedIconOnly from '$lib/NamedIconOnly.svelte';</script>\n"
+        "<button><NamedLabel /></button>\n"
+        "<button><NamedIconOnly /></button>\n",
+    )
+    sv_res = SvelteKitDisplayAdapter().extract(sv_root, ".")
+    sv_lines = sorted(f.line for f in sv_res.findings if f.rule_code == "DISP-005")
+    assert sv_lines == [3], sv_res.findings
+
+    # 3. Nested object/class method returns in TSX must not masquerade as component output.
+    tsx_root = tmp_path / "tsx_nested_methods"
+    put(
+        tsx_root,
+        "app/page.tsx",
+        "function HelperIcon() {\n"
+        "  const sym = Symbol('label');\n"
+        "  const obj = {\n"
+        "    label() { return <span>Save</span>; },\n"
+        "    async asyncLabel(): Promise<{ text: string }> { return { text: 'Save' }; },\n"
+        "    get text(): string { return 'Save'; },\n"
+        "    *gen() { yield 1; return <span>Save</span>; },\n"
+        "    [sym]() { return <span>Sym</span>; },\n"
+        "  };\n"
+        "  class HelperClass {\n"
+        "    render(): string { return 'Save'; }\n"
+        "  }\n"
+        "  void obj; void HelperClass;\n"
+        "  return <svg />;\n"
+        "}\n"
+        "function ConditionalNamed({ ready }: { ready: boolean }) {\n"
+        "  if (ready) { return <span>Save</span>; }\n"
+        "  return <span>Done</span>;\n"
+        "}\n"
+        "export function Page({ ready }: { ready: boolean }) {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <button><HelperIcon /></button>\n"
+        "      <button><ConditionalNamed ready={ready} /><svg /></button>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    tsx_res = TypeScriptNextJsAdapter().extract(tsx_root, ".")
+    tsx_lines = sorted(f.line for f in tsx_res.findings if f.rule_code == "DISP-005")
+    assert tsx_lines == [23], tsx_res.findings
+
+    # 4. Performance regression: caching lexical index avoids O(N^2) scaling across 400 usages.
+    perf_root = tmp_path / "tsx_perf"
+    usages = "\n".join(
+        "      <button><LocalIcon /><span>ok</span></button>" for _ in range(399)
+    ) + "\n      <button><LocalIcon /></button>"
+    put(
+        perf_root,
+        "app/page.tsx",
+        "function LocalIcon() { return <svg />; }\n"
+        "const unrelatedA = 1;\n"
+        "const unrelatedB = 2;\n"
+        "export function Page() {\n"
+        "  return (\n"
+        "    <div>\n"
+        f"{usages}\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    t0 = time.perf_counter()
+    perf_res = TypeScriptNextJsAdapter().extract(perf_root, ".")
+    elapsed = time.perf_counter() - t0
+    perf_lines = [f for f in perf_res.findings if f.rule_code == "DISP-005"]
+    assert [f.line for f in perf_lines] == [406], perf_lines
+    assert elapsed < 1.0, f"Resolver took {elapsed:.3f}s for 400 local usages"
+
 
 
