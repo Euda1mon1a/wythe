@@ -56,10 +56,10 @@ export function LineageExplorer({
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
         <div>
           <h2 className="text-sm font-semibold text-slate-100">
-            Verified End-to-End 3-Tier Lineage ({filtered.length} of {chains.length})
+            Statically Matched End-to-End 3-Tier Lineage ({filtered.length} of {chains.length})
           </h2>
           <p className="text-xs text-slate-300">
-            Syntax-tree verified paths from Display UI through hooks/clients, HTTP endpoints, and backend services down to SQL tables. Expand any row for every intermediate hop or click{' '}
+            Static AST/route-matched paths from Display UI through hooks/clients, HTTP endpoints, and backend services down to SQL tables (static matching only; does not prove runtime execution). Expand any row for every intermediate hop or click{' '}
             <strong className="font-mono text-amber-300">Trace 3D</strong> to animate the packet in 3D.
           </p>
         </div>
@@ -205,11 +205,15 @@ export function LineageExplorer({
                           Trace 3D
                         </button>
                       )}
-                      {chain.verified && (
+                      {chain.verified ? (
                         <CheckCircle2
                           className="h-3.5 w-3.5 shrink-0 text-teal-400"
-                          aria-label="Verified"
+                          aria-label="Static match verified"
                         />
+                      ) : (
+                        <span className="border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-200">
+                          partial
+                        </span>
                       )}
                     </div>
                   </div>

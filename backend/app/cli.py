@@ -267,6 +267,11 @@ def main(argv: list[str] | None = None) -> int:
     p_ctx.add_argument("query", help="Table name, file path, HTTP route, queue lane, or node ID")
     p_ctx.add_argument("--profile", default="auto")
     p_ctx.add_argument("--max-nodes", type=int, default=DEFAULT_CONE_NODES)
+    p_ctx.add_argument(
+        "--full",
+        action="store_true",
+        help="Disable cone node/edge/finding caps and emit the complete reachable slice",
+    )
     p_ctx.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON instead of Markdown")
 
     sub.add_parser("mcp", help="Run read-only Model Context Protocol (MCP) server over stdio")
@@ -409,7 +414,12 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.cmd == "context":
                 rep = run_target_scan(session, target, strict_gate=True, persist_snapshot=False)
-                cone = build_lineage_cone_slice(rep, args.query, max_nodes=args.max_nodes)
+                cone = build_lineage_cone_slice(
+        rep,
+        args.query,
+        max_nodes=args.max_nodes,
+        full=bool(getattr(args, "full", False)),
+    )
                 if args.as_json:
                     print(cone.model_dump_json(indent=2))
                 else:

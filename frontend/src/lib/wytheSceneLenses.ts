@@ -3,7 +3,17 @@ import type { WythePaletteColors } from '@/lib/wytheTheme';
 
 export type SceneLens = 'status' | 'contention' | 'gravity' | 'subkind' | 'cluster';
 export type SceneLayoutMode = 'cluster' | 'grid';
-export type EdgeFilterMode = 'all' | 'writes' | 'reads' | 'guards' | 'helpers' | 'unverified';
+export type EdgeLinePattern = 'solid' | 'dashed' | 'dotted' | 'broken_gap';
+export type EdgeFilterMode =
+  | 'all'
+  | 'writes'
+  | 'reads'
+  | 'guards'
+  | 'helpers'
+  | 'verified'
+  | 'declared'
+  | 'unverified'
+  | 'broken';
 
 export const SCENE_LENS_LABELS: Record<SceneLens, string> = {
   status: 'Boundary Status',
@@ -351,28 +361,130 @@ export function evaluateNodeVisual(opts: {
   return { barHex, inquiryHex, scale, hollow, flagged, forceDim };
 }
 
+export interface EdgeVisual {
+  visible: boolean;
+  hex: number;
+  pattern: EdgeLinePattern;
+  verification: AtlasEdge['verification'];
+  verificationLabel: string;
+}
+
+export interface EdgeVerificationLegendItem {
+  verification: AtlasEdge['verification'];
+  color: string;
+  pattern: EdgeLinePattern;
+  label: string;
+  count: number;
+}
+
 export function evaluateEdgeVisual(
   edge: AtlasEdge,
   filterMode: EdgeFilterMode,
-): { visible: boolean; hex: number } {
+): EdgeVisual {
   const isWrite = edge.kind === 'writes_truth' || edge.kind === 'mutates_endpoint';
   const isRead = edge.kind === 'reads_truth' || edge.kind === 'queries_endpoint';
   const isGuard = edge.kind === 'guards_truth';
   const isHelper =
     edge.kind === 'calls_helper' || edge.kind === 'uses_hook' || edge.kind === 'uses_client';
-  const isUnverified = edge.verification !== 'verified';
+  const ver = edge.verification;
 
-  if (filterMode === 'writes' && !isWrite) return { visible: false, hex: 0 };
-  if (filterMode === 'reads' && !isRead) return { visible: false, hex: 0 };
-  if (filterMode === 'guards' && !isGuard) return { visible: false, hex: 0 };
-  if (filterMode === 'helpers' && !isHelper) return { visible: false, hex: 0 };
-  if (filterMode === 'unverified' && !isUnverified) return { visible: false, hex: 0 };
+  const hidden: EdgeVisual = {
+    visible: false,
+    hex: 0,
+    pattern: 'solid',
+    verification: ver,
+    verificationLabel: '',
+  };
 
-  if (isUnverified) return { visible: true, hex: 0xf43f5e };
-  if (isGuard) return { visible: true, hex: 0xa3e635 };
-  if (isWrite) return { visible: true, hex: 0xf59e0b };
-  if (isRead) return { visible: true, hex: 0x38bdf8 };
-  return { visible: true, hex: 0x64748b };
+  if (filterMode === 'writes' && !isWrite) return hidden;
+  if (filterMode === 'reads' && !isRead) return hidden;
+  if (filterMode === 'guards' && !isGuard) return hidden;
+  if (filterMode === 'helpers' && !isHelper) return hidden;
+  if (filterMode === 'verified' && ver !== 'verified') return hidden;
+  if (filterMode === 'declared' && ver !== 'declared') return hidden;
+  if (filterMode === 'unverified' && ver !== 'unverified') return hidden;
+  if (filterMode === 'broken' && ver !== 'broken') return hidden;
+
+  if (ver === 'broken') {
+    return {
+      visible: true,
+      hex: 0xf43f5e,
+      pattern: 'broken_gap',
+      verification: 'broken',
+      verificationLabel: 'Broken Contract',
+    };
+  }
+  if (ver === 'declared') {
+    return {
+      visible: true,
+      hex: 0xa78bfa,
+      pattern: 'dashed',
+      verification: 'declared',
+      verificationLabel: 'Declared Only',
+    };
+  }
+  if (ver === 'unverified') {
+    return {
+      visible: true,
+      hex: 0xfacc15,
+      pattern: 'dotted',
+      verification: 'unverified',
+      verificationLabel: 'Unverified / Heuristic',
+    };
+  }
+
+  const hex = isGuard ? 0xa3e635 : isWrite ? 0xf59e0b : isRead ? 0x38bdf8 : 0x64748b;
+  return {
+    visible: true,
+    hex,
+    pattern: 'solid',
+    verification: 'verified',
+    verificationLabel: 'Statically Verified',
+  };
+}
+
+export function getEdgeVerificationLegendItems(
+  edges: AtlasEdge[] = [],
+): EdgeVerificationLegendItem[] {
+  const counts: Record<AtlasEdge['verification'], number> = {
+    verified: 0,
+    declared: 0,
+    unverified: 0,
+    broken: 0,
+  };
+  for (const e of edges) {
+    counts[e.verification] = (counts[e.verification] ?? 0) + 1;
+  }
+  return [
+    {
+      verification: 'verified',
+      color: '#38bdf8',
+      pattern: 'solid',
+      label: 'verified (solid)',
+      count: counts.verified,
+    },
+    {
+      verification: 'declared',
+      color: '#a78bfa',
+      pattern: 'dashed',
+      label: 'declared (dashed)',
+      count: counts.declared,
+    },
+    {
+      verification: 'unverified',
+      color: '#facc15',
+      pattern: 'dotted',
+      label: 'unverified (dotted)',
+      count: counts.unverified,
+    },
+    {
+      verification: 'broken',
+      color: '#f43f5e',
+      pattern: 'broken_gap',
+      label: 'broken (gap)',
+      count: counts.broken,
+    },
+  ];
 }
 
 export function getLensLegendItems(

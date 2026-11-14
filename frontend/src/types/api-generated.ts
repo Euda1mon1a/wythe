@@ -779,6 +779,18 @@ export interface components {
             severity: string;
             /** Blocks Gate */
             blocks_gate: boolean;
+            /**
+             * Confidence
+             * @default confirmed
+             * @enum {string}
+             */
+            confidence: "confirmed" | "candidate";
+            /**
+             * Evidence Strength
+             * @default ast_exact
+             * @enum {string}
+             */
+            evidence_strength: "ast_exact" | "structural_match" | "heuristic";
             /** Node Id */
             node_id?: string | null;
             /** Target Node Id */
@@ -796,6 +808,80 @@ export interface components {
             detail: string;
             /** Remediation */
             remediation: string;
+        };
+        /** ConeCompleteness */
+        ConeCompleteness: {
+            /**
+             * Is Complete
+             * @default true
+             */
+            is_complete: boolean;
+            /**
+             * Full Export
+             * @default false
+             */
+            full_export: boolean;
+            /**
+             * Node Budget
+             * @default 0
+             */
+            node_budget: number;
+            nodes?: components["schemas"]["ConeSectionCount"];
+            upstream_nodes?: components["schemas"]["ConeSectionCount"];
+            downstream_nodes?: components["schemas"]["ConeSectionCount"];
+            edges?: components["schemas"]["ConeSectionCount"];
+            markdown_edges?: components["schemas"]["ConeSectionCount"];
+            findings?: components["schemas"]["ConeSectionCount"];
+            seed_findings?: components["schemas"]["ConeSectionCount"];
+            chains?: components["schemas"]["ConeSectionCount"];
+            /** Truncation Reasons */
+            truncation_reasons?: string[];
+            /**
+             * Full Export Hint
+             * @default
+             */
+            full_export_hint: string;
+        };
+        /** ConeEdgeSummary */
+        ConeEdgeSummary: {
+            /** Id */
+            id: string;
+            /** Source Id */
+            source_id: string;
+            /** Target Id */
+            target_id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "reads_truth" | "writes_truth" | "guards_truth" | "calls_helper" | "queries_endpoint" | "mutates_endpoint" | "uses_hook" | "uses_client";
+            /**
+             * Verification
+             * @enum {string}
+             */
+            verification: "verified" | "declared" | "unverified" | "broken";
+            /** Evidence Path */
+            evidence_path?: string | null;
+            /** Evidence Note */
+            evidence_note: string;
+        };
+        /** ConeSectionCount */
+        ConeSectionCount: {
+            /**
+             * Included
+             * @default 0
+             */
+            included: number;
+            /**
+             * Eligible
+             * @default 0
+             */
+            eligible: number;
+            /**
+             * Omitted
+             * @default 0
+             */
+            omitted: number;
         };
         /** DiffBlastRadiusReport */
         DiffBlastRadiusReport: {
@@ -1033,6 +1119,15 @@ export interface components {
             query: string;
             /** Source Commit */
             source_commit: string;
+            /** Worktree Dirty */
+            worktree_dirty?: boolean | null;
+            /** Dirty Path Count */
+            dirty_path_count?: number | null;
+            /**
+             * Content Digest
+             * @default
+             */
+            content_digest: string;
             /** Matched Seed Ids */
             matched_seed_ids?: string[];
             /** Suggestions */
@@ -1045,10 +1140,13 @@ export interface components {
             downstream_truth_nodes?: components["schemas"]["LlmNodePointer"][];
             /** Cone Edges */
             cone_edges?: string[];
+            /** Cone Edge Items */
+            cone_edge_items?: components["schemas"]["ConeEdgeSummary"][];
             /** Matching Chains */
             matching_chains?: components["schemas"]["EndToEndChain"][];
             /** Cone Findings */
             cone_findings?: components["schemas"]["BoundaryFinding"][];
+            completeness?: components["schemas"]["ConeCompleteness"] | null;
             /**
              * Approx Tokens
              * @default 0
@@ -1191,6 +1289,8 @@ export interface components {
             ratchet_baselines?: components["schemas"]["PortableRatchetItem"][];
             /** Audit Rulings */
             audit_rulings?: components["schemas"]["PortableRulingItem"][];
+            /** Reference Exemplars */
+            reference_exemplars?: components["schemas"]["PortableReferenceExemplar"][];
         };
         /** PortableRatchetItem */
         PortableRatchetItem: {
@@ -1207,6 +1307,23 @@ export interface components {
              * @default
              */
             note: string;
+        };
+        /** PortableReferenceExemplar */
+        PortableReferenceExemplar: {
+            /** Title */
+            title: string;
+            /** Node Id */
+            node_id?: string | null;
+            /** Pointer */
+            pointer: string;
+            /** Applies To Tiers */
+            applies_to_tiers?: ("truth" | "manipulate" | "display")[];
+            /** Applies To Subkinds */
+            applies_to_subkinds?: ("table" | "sql_function" | "cache_store" | "route" | "service" | "solver" | "cli" | "page" | "hook" | "api_client" | "component")[];
+            /** Rationale */
+            rationale: string;
+            /** Approved By */
+            approved_by?: string | null;
         };
         /** PortableRuleOverride */
         PortableRuleOverride: {
@@ -2343,6 +2460,7 @@ export interface operations {
             query: {
                 q: string;
                 max_nodes?: number;
+                full?: boolean;
             };
             header?: never;
             path: {

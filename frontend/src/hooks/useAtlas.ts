@@ -231,7 +231,13 @@ export function useFetchLlmsBrief(slug: string) {
 
 export function useFetchContextCone(slug: string) {
   return useMutation({
-    mutationFn: (query: string) => atlasApi.getScanContextCone(slug, query),
+    mutationFn: (input: string | { query: string; maxNodes?: number; full?: boolean }) =>
+      typeof input === 'string'
+        ? atlasApi.getScanContextCone(slug, input)
+        : atlasApi.getScanContextCone(slug, input.query, {
+            maxNodes: input.maxNodes,
+            full: input.full,
+          }),
   });
 }
 

@@ -12,6 +12,7 @@ import {
   deriveDomainCluster,
   evaluateEdgeVisual,
   evaluateNodeVisual,
+  getEdgeVerificationLegendItems,
   getLensLegendItems,
   SCENE_LENS_LABELS,
   type DiffOverlaySet,
@@ -668,7 +669,13 @@ export function StratifiedScene3D({
             : isCrossTier
               ? 0.36
               : 0.18;
-      renderEdges.push({ start: p1, end: p2, color: edgeVis.hex, opacity });
+      renderEdges.push({
+        start: p1,
+        end: p2,
+        color: edgeVis.hex,
+        opacity,
+        pattern: edgeVis.pattern,
+      });
     }
     contentGroup.add(createBatchedEdges(renderEdges));
 
@@ -714,6 +721,10 @@ export function StratifiedScene3D({
   const legendItems = useMemo(
     () => getLensLegendItems(lens, Boolean(diffOverlay)),
     [lens, diffOverlay],
+  );
+  const edgeLegendItems = useMemo(
+    () => getEdgeVerificationLegendItems(visibleEdges),
+    [visibleEdges],
   );
 
   const visualFiducial = useMemo(
@@ -1032,6 +1043,30 @@ export function StratifiedScene3D({
               {item.label}
             </span>
           ))}
+          <span
+            className="flex flex-wrap items-center gap-2.5 border-l border-slate-700/80 pl-2.5"
+            title="Static AST/route edge verification states (never implies runtime execution)"
+          >
+            {edgeLegendItems.map((edgeItem) => {
+              const borderStyle =
+                edgeItem.pattern === 'dashed'
+                  ? 'border-dashed'
+                  : edgeItem.pattern === 'dotted'
+                    ? 'border-dotted'
+                    : edgeItem.pattern === 'broken_gap'
+                      ? 'border-double'
+                      : 'border-solid';
+              return (
+                <span key={edgeItem.verification} className="flex items-center gap-1">
+                  <span
+                    className={`inline-block w-3.5 border-t-2 ${borderStyle}`}
+                    style={{ borderColor: edgeItem.color }}
+                  />
+                  {edgeItem.label}: {edgeItem.count}
+                </span>
+              );
+            })}
+          </span>
           <span className="flex items-center gap-1.5">
             <span className="h-2 w-2 border border-slate-300" />{' '}
             {polygonMode === 'atomic' ? 'hollow = unwired' : 'wireframe = unwired'}

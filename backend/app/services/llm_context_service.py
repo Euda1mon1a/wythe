@@ -5,7 +5,12 @@ from __future__ import annotations
 from collections import Counter, deque
 
 from app.schemas.atlas import (
+    AtlasEdge,
     AtlasNode,
+    BoundaryFinding,
+    ConeCompleteness,
+    ConeEdgeSummary,
+    ConeSectionCount,
     LlmBriefRead,
     LlmContextConeReport,
     LlmNodePointer,
@@ -14,6 +19,89 @@ from app.schemas.atlas import (
 
 DEFAULT_BRIEF_TOKENS = 2200
 DEFAULT_CONE_NODES = 40
+_verification_rank: dict[str, int] = {
+    "verified": 0,
+    "declared": 1,
+    "unverified": 2,
+    "broken": 3,
+}
+
+
+def _scan_identity_line(report: TruthAtlasReport) -> str:
+    commit = report.source_commit[:12]
+    dirty = (
+        f"dirty({report.dirty_path_count or 0} paths)"
+        if report.worktree_dirty is True
+        else ("clean" if report.worktree_dirty is False else "non-git")
+    )
+    digest = report.content_digest[:12] if report.content_digest else "none"
+    return f"commit=`{commit}`, worktree={dirty}, content_digest=`{digest}`"
+
+
+def _format_cone_edge(edge: AtlasEdge) -> str:
+    ev_path = f" @ {edge.evidence_path}" if edge.evidence_path else ""
+    ev_note = f" — {edge.evidence_note}" if edge.evidence_note else ""
+    return f"{edge.source_id} --[{edge.kind} | {edge.verification}]--> {edge.target_id}{ev_path}{ev_note}"
+
+
+def _edge_sort_key(edge: AtlasEdge, neighbor_id: str) -> tuple[int, str, str, str]:
+    return (_verification_rank.get(edge.verification, 9), edge.kind, neighbor_id, edge.id)
+
+
+def _count_section(included: int, eligible: int) -> ConeSectionCount:
+    return ConeSectionCount(
+        included=included,
+        eligible=eligible,
+        omitted=max(0, eligible - included),
+    )
+
+
+def _bfs_ordered_list(seeds: list[str], adj: dict[str, list[str]], valid_ids: set[str]) -> list[str]:
+    visited: set[str] = set(seeds)
+    ordered: list[str] = []
+    q: deque[str] = deque(seeds)
+    while q:
+        cur = q.popleft()
+        for nxt in adj.get(cur, ()):
+            if nxt in valid_ids and nxt not in visited:
+                visited.add(nxt)
+                ordered.append(nxt)
+                q.append(nxt)
+    return ordered
+
+
+def _interleave_cone_nodes(
+    seed_ids: list[str],
+    down_order: list[str],
+    up_order: list[str],
+    *,
+    budget: int | None,
+) -> set[str]:
+    """Interleave downstream and upstream BFS queues 1-for-1 when `budget` applies."""
+    cone_ids: set[str] = set(seed_ids)
+    if budget is None:
+        cone_ids.update(down_order)
+        cone_ids.update(up_order)
+        return cone_ids
+
+    i_down = 0
+    i_up = 0
+    while len(cone_ids) < budget and (i_down < len(down_order) or i_up < len(up_order)):
+        while i_down < len(down_order):
+            cand = down_order[i_down]
+            i_down += 1
+            if cand not in cone_ids:
+                cone_ids.add(cand)
+                break
+        if len(cone_ids) >= budget:
+            break
+        while i_up < len(up_order):
+            cand = up_order[i_up]
+            i_up += 1
+            if cand not in cone_ids:
+                cone_ids.add(cand)
+                break
+    return cone_ids
 
 
 def _ptr(node: AtlasNode) -> str:
@@ -135,7 +223,10 @@ def build_llms_txt_brief(
 
     if report.chains:
         nodes_map = {n.id: n for n in report.nodes}
-        lines.extend(["", "## Verified End-to-End 3-Tier Chains (Sample)"])
+        lines.extend(["", "## Static End-to-End 3-Tier Chains (Sample)"])
+        lines.append(
+            "> Static verification reflects AST/route matching; it does not prove runtime execution."
+        )
         seen_routes: set[str] = set()
         picked = 0
         for ch in report.chains:
@@ -147,8 +238,9 @@ def build_llms_txt_brief(
             r_node = nodes_map.get(ch.route_node_id)
             d_ptr = _ptr(d_node) if d_node else ch.display_node_id
             r_ptr = _ptr(r_node) if r_node else ch.route_node_id
+            state = "static_verified" if ch.verified else "partial"
             lines.append(
-                f"- `{ch.display_label}` (`{d_ptr}`) -> `{ch.http_method} {ch.http_path}` (`{r_ptr}`) -> [{tbls}]"
+                f"- [{state}] `{ch.display_label}` (`{d_ptr}`) -> `{ch.http_method} {ch.http_path}` (`{r_ptr}`) -> [{tbls}]"
             )
             picked += 1
             if picked >= lim_ch:
@@ -233,8 +325,10 @@ def build_lineage_cone_slice(
     query: str,
     *,
     max_nodes: int = DEFAULT_CONE_NODES,
+    full: bool = False,
 ) -> LlmContextConeReport:
     """Slice the directional upstream/downstream 3-tier Lineage Cone around `query`."""
+    full_hint = f'wythe context {report.target_slug} "{query}" --full'
     seeds, suggestions = _resolve_seed_nodes(report, query)
     if not seeds:
         hint = (
@@ -245,58 +339,82 @@ def build_lineage_cone_slice(
             target_slug=report.target_slug,
             query=query,
             source_commit=report.source_commit,
+            worktree_dirty=report.worktree_dirty,
+            dirty_path_count=report.dirty_path_count,
+            content_digest=report.content_digest,
             suggestions=suggestions,
+            completeness=ConeCompleteness(
+                is_complete=True,
+                full_export=full,
+                node_budget=0 if full else max_nodes,
+                full_export_hint=full_hint,
+            ),
             approx_tokens=max(1, len(hint) // 4),
             markdown=f"# Lineage Cone :: `{query}` ({report.target_slug})\n\n{hint}",
         )
 
     nodes_by_id = {n.id: n for n in report.nodes}
-    fwd: dict[str, list[tuple[str, str]]] = {}
-    rev: dict[str, list[tuple[str, str]]] = {}
+    valid_ids = set(nodes_by_id)
+    fwd_raw: dict[str, list[tuple[tuple[int, str, str, str], str]]] = {}
+    rev_raw: dict[str, list[tuple[tuple[int, str, str, str], str]]] = {}
     for e in report.edges:
-        fwd.setdefault(e.source_id, []).append((e.target_id, e.kind))
-        rev.setdefault(e.target_id, []).append((e.source_id, e.kind))
+        fwd_raw.setdefault(e.source_id, []).append((_edge_sort_key(e, e.target_id), e.target_id))
+        rev_raw.setdefault(e.target_id, []).append((_edge_sort_key(e, e.source_id), e.source_id))
+    fwd_adj = {
+        k: list(dict.fromkeys(nid for _, nid in sorted(v, key=lambda item: item[0])))
+        for k, v in fwd_raw.items()
+    }
+    rev_adj = {
+        k: list(dict.fromkeys(nid for _, nid in sorted(v, key=lambda item: item[0])))
+        for k, v in rev_raw.items()
+    }
 
     seed_ids = [n.id for n in seeds]
-    cone_ids: set[str] = set(seed_ids)
-
-    # Walk downstream (toward Tier 1 SQL tables & Redis queues)
-    dq_down: deque[str] = deque(seed_ids)
-    while dq_down and len(cone_ids) < max_nodes:
-        cur = dq_down.popleft()
-        for nxt, _ in fwd.get(cur, ()):
-            if nxt not in cone_ids and nxt in nodes_by_id:
-                cone_ids.add(nxt)
-                dq_down.append(nxt)
-                if len(cone_ids) >= max_nodes:
-                    break
-
-    # Walk upstream (toward Tier 2 routes & Tier 3 display pages/hooks)
-    dq_up: deque[str] = deque(seed_ids)
-    while dq_up and len(cone_ids) < max_nodes:
-        cur = dq_up.popleft()
-        for prv, _ in rev.get(cur, ()):
-            if prv not in cone_ids and prv in nodes_by_id:
-                cone_ids.add(prv)
-                dq_up.append(prv)
-                if len(cone_ids) >= max_nodes:
-                    break
+    seed_set = set(seed_ids)
+    down_order = _bfs_ordered_list(seed_ids, fwd_adj, valid_ids)
+    up_order = _bfs_ordered_list(seed_ids, rev_adj, valid_ids)
+    full_cone_ids = seed_set | set(down_order) | set(up_order)
+    budget = None if full else max(max_nodes, len(seed_ids))
+    cone_ids = _interleave_cone_nodes(seed_ids, down_order, up_order, budget=budget)
 
     cone_nodes = [nodes_by_id[nid] for nid in sorted(cone_ids)]
     disp_ptrs = [_to_llm_pointer(n) for n in cone_nodes if n.tier == "display"]
     manip_ptrs = [_to_llm_pointer(n) for n in cone_nodes if n.tier == "manipulate"]
     truth_ptrs = [_to_llm_pointer(n) for n in cone_nodes if n.tier == "truth"]
 
-    cone_edges = [
-        f"{e.source_id} --[{e.kind}]--> {e.target_id}"
-        for e in report.edges
-        if e.source_id in cone_ids and e.target_id in cone_ids
-    ][:80]
+    eligible_edges = [
+        e for e in report.edges if e.source_id in full_cone_ids and e.target_id in full_cone_ids
+    ]
+    in_cone_edges = sorted(
+        (e for e in eligible_edges if e.source_id in cone_ids and e.target_id in cone_ids),
+        key=lambda e: (
+            0 if (e.source_id in seed_set or e.target_id in seed_set) else 1,
+            _verification_rank.get(e.verification, 9),
+            e.source_id,
+            e.target_id,
+            e.kind,
+            e.id,
+        ),
+    )
+    selected_edges = in_cone_edges if full else in_cone_edges[:80]
+    md_edges = selected_edges if full else selected_edges[:35]
+    cone_edges = [_format_cone_edge(e) for e in selected_edges]
+    cone_edge_items = [
+        ConeEdgeSummary(
+            id=e.id,
+            source_id=e.source_id,
+            target_id=e.target_id,
+            kind=e.kind,
+            verification=e.verification,
+            evidence_path=e.evidence_path,
+            evidence_note=e.evidence_note,
+        )
+        for e in selected_edges
+    ]
 
-    seed_set = set(seed_ids)
     seed_labels = {n.label for n in seeds}
     seed_paths = {p for n in seeds for p in n.http_paths}
-    matching_chains = [
+    eligible_chains = [
         ch
         for ch in report.chains
         if ch.display_node_id in seed_set
@@ -306,23 +424,95 @@ def build_lineage_cone_slice(
         or bool(seed_set.intersection(ch.manipulator_node_ids))
         or bool(seed_set.intersection(ch.truth_table_ids))
         or bool(seed_set.intersection(ch.via_node_ids))
-    ][:15]
+    ]
+    selected_chains = eligible_chains if full else eligible_chains[:15]
 
-    cone_findings = [
+    eligible_findings = [
+        f for f in report.findings if f.node_id in full_cone_ids or f.target_node_id in full_cone_ids
+    ]
+    eligible_seed_findings = [
+        f for f in eligible_findings if f.node_id in seed_set or f.target_node_id in seed_set
+    ]
+    seed_finding_ids = {f.id for f in eligible_seed_findings}
+    in_cone_non_seed_findings = [
         f
-        for f in report.findings
-        if f.node_id in cone_ids or f.target_node_id in cone_ids
-    ][:25]
+        for f in eligible_findings
+        if f.id not in seed_finding_ids and (f.node_id in cone_ids or f.target_node_id in cone_ids)
+    ]
+    ordered_findings: list[BoundaryFinding] = eligible_seed_findings + in_cone_non_seed_findings
+    selected_findings = ordered_findings if full else ordered_findings[:25]
+    selected_seed_finding_count = sum(1 for f in selected_findings if f.id in seed_finding_ids)
+
+    nodes_cnt = _count_section(len(cone_ids), len(full_cone_ids))
+    up_cnt = _count_section(len(cone_ids & set(up_order)), len(up_order))
+    down_cnt = _count_section(len(cone_ids & set(down_order)), len(down_order))
+    edges_cnt = _count_section(len(selected_edges), len(eligible_edges))
+    md_edges_cnt = _count_section(len(md_edges), len(eligible_edges))
+    findings_cnt = _count_section(len(selected_findings), len(eligible_findings))
+    seed_findings_cnt = _count_section(selected_seed_finding_count, len(eligible_seed_findings))
+    chains_cnt = _count_section(len(selected_chains), len(eligible_chains))
+
+    truncation_reasons: list[str] = []
+    if nodes_cnt.omitted > 0:
+        truncation_reasons.append(f"node_budget:{nodes_cnt.included}/{nodes_cnt.eligible}")
+    if edges_cnt.omitted > 0:
+        truncation_reasons.append(f"json_edges_capped:{edges_cnt.included}/{edges_cnt.eligible}")
+    if md_edges_cnt.omitted > 0:
+        truncation_reasons.append(
+            f"markdown_edges_capped:{md_edges_cnt.included}/{md_edges_cnt.eligible}"
+        )
+    if seed_findings_cnt.omitted > 0:
+        truncation_reasons.append(
+            f"seed_findings_capped:{seed_findings_cnt.included}/{seed_findings_cnt.eligible}"
+        )
+    if findings_cnt.omitted > 0:
+        truncation_reasons.append(
+            f"findings_capped:{findings_cnt.included}/{findings_cnt.eligible}"
+        )
+    if chains_cnt.omitted > 0:
+        truncation_reasons.append(f"chains_capped:{chains_cnt.included}/{chains_cnt.eligible}")
+
+    completeness = ConeCompleteness(
+        is_complete=not truncation_reasons,
+        full_export=full,
+        node_budget=len(full_cone_ids) if full else (budget or len(full_cone_ids)),
+        nodes=nodes_cnt,
+        upstream_nodes=up_cnt,
+        downstream_nodes=down_cnt,
+        edges=edges_cnt,
+        markdown_edges=md_edges_cnt,
+        findings=findings_cnt,
+        seed_findings=seed_findings_cnt,
+        chains=chains_cnt,
+        truncation_reasons=truncation_reasons,
+        full_export_hint=full_hint,
+    )
 
     md: list[str] = [
-        f"# 3-Tier Lineage Cone :: `{query}` ({report.target_slug} @ `{report.source_commit[:10]}`)",
+        f"# 3-Tier Lineage Cone :: `{query}` ({report.target_slug} | {_scan_identity_line(report)})",
         f"> Matched seeds ({len(seeds)}): {', '.join(f'`{s.id}` (`{_ptr(s)}`)' for s in seeds)}",
         (
             "> Guardrail: Distinguish declared store purpose from verified lifetime/invalidation, "
             "discovery location from causal write `file:line`, and suggested changes from verified fixes."
         ),
-        "",
     ]
+    if completeness.is_complete:
+        md.append(
+            f"> Completeness: complete slice (nodes={nodes_cnt.included}/{nodes_cnt.eligible}, "
+            f"edges={md_edges_cnt.included}/{md_edges_cnt.eligible}, "
+            f"findings={findings_cnt.included}/{findings_cnt.eligible})."
+        )
+    else:
+        md.append(
+            f"> Completeness: TRUNCATED (nodes={nodes_cnt.included}/{nodes_cnt.eligible} "
+            f"[upstream={up_cnt.included}/{up_cnt.eligible}, downstream={down_cnt.included}/{down_cnt.eligible}], "
+            f"markdown_edges={md_edges_cnt.included}/{md_edges_cnt.eligible}, "
+            f"seed_findings={seed_findings_cnt.included}/{seed_findings_cnt.eligible}, "
+            f"findings={findings_cnt.included}/{findings_cnt.eligible}, "
+            f"chains={chains_cnt.included}/{chains_cnt.eligible}). "
+            f"Retrieve omitted context via `{full_hint}`."
+        )
+    md.append("")
     if disp_ptrs:
         md.append(f"## Tier 3 — Upstream Display ({len(disp_ptrs)})")
         for p in disp_ptrs:
@@ -349,33 +539,57 @@ def build_lineage_cone_slice(
                 pnote = f" | verification={tn.verification_note}"
             md.append(f"- [{p.subkind}] `{p.label}` (discovery=`{p.pointer}`) status={p.status}{cols}{pnote}")
         md.append("")
-    if matching_chains:
-        md.append(f"## Verified End-to-End Chains ({len(matching_chains)})")
-        for ch in matching_chains:
+    if selected_chains:
+        ch_suffix = (
+            f"showing {len(selected_chains)} of {chains_cnt.eligible}; {chains_cnt.omitted} omitted"
+            if chains_cnt.omitted > 0
+            else str(len(selected_chains))
+        )
+        md.append(f"## End-to-End 3-Tier Chains ({ch_suffix})")
+        for ch in selected_chains:
             d_node = nodes_by_id.get(ch.display_node_id)
             r_node = nodes_by_id.get(ch.route_node_id)
             d_ptr = _ptr(d_node) if d_node else ch.display_node_id
             r_ptr = _ptr(r_node) if r_node else ch.route_node_id
+            state = "static_verified" if ch.verified else "partial"
             md.append(
-                f"- `{ch.display_label}` (`{d_ptr}`) -> `{ch.http_method} {ch.http_path}` (`{r_ptr}`) -> [{', '.join(ch.truth_table_labels)}]"
+                f"- [{state}] `{ch.display_label}` (`{d_ptr}`) -> `{ch.http_method} {ch.http_path}` (`{r_ptr}`) -> [{', '.join(ch.truth_table_labels)}]"
             )
         md.append("")
-    if cone_edges:
-        md.append(f"## Verified Cone Edges ({len(cone_edges)})")
-        for ce in cone_edges[:35]:
-            md.append(f"- `{ce}`")
+    if md_edges:
+        edge_counts = Counter(e.verification for e in eligible_edges)
+        md_heading_count = (
+            f"showing {len(md_edges)} of {len(eligible_edges)}; {md_edges_cnt.omitted} omitted"
+            if md_edges_cnt.omitted > 0
+            else str(len(md_edges))
+        )
+        md.append(f"## Cone Connections ({md_heading_count})")
+        md.append(
+            "> Static verification scope: edges show static AST/route/import links "
+            f"(verified={edge_counts['verified']}, declared={edge_counts['declared']}, "
+            f"unverified={edge_counts['unverified']}, broken={edge_counts['broken']}); "
+            "static matching does not prove runtime execution or business-logic acceptance."
+        )
+        for edge in md_edges:
+            md.append(f"- `{_format_cone_edge(edge)}`")
         md.append("")
-    if cone_findings:
-        md.append(f"## Active Findings in Cone ({len(cone_findings)})")
-        for cf in cone_findings:
+    if selected_findings:
+        f_heading = (
+            f"showing {len(selected_findings)} of {findings_cnt.eligible}; {findings_cnt.omitted} omitted"
+            if findings_cnt.omitted > 0
+            else str(len(selected_findings))
+        )
+        md.append(f"## Findings in Cone (requires evidence review; {f_heading})")
+        for cf in selected_findings:
             writer_tag = (
                 f" [writer=`{cf.node_id}` -> target=`{cf.target_node_id}`]"
                 if cf.target_node_id and cf.target_node_id != cf.node_id
                 else ""
             )
             md.append(
-                f"- **{cf.rule_code}** [{cf.severity}] `{cf.source_file}:{cf.line}`{writer_tag} — "
-                f"{cf.title} | Suggested remediation: {cf.remediation}"
+                f"- **{cf.rule_code}** [{cf.severity} | {cf.confidence} | {cf.evidence_strength}] "
+                f"`{cf.source_file}:{cf.line}`{writer_tag} — "
+                f"{cf.title} | Suggested remediation (unverified): {cf.remediation}"
             )
 
     md_text = "\n".join(md).strip()
@@ -383,13 +597,18 @@ def build_lineage_cone_slice(
         target_slug=report.target_slug,
         query=query,
         source_commit=report.source_commit,
+        worktree_dirty=report.worktree_dirty,
+        dirty_path_count=report.dirty_path_count,
+        content_digest=report.content_digest,
         matched_seed_ids=seed_ids,
         upstream_display_nodes=disp_ptrs,
         manipulator_nodes=manip_ptrs,
         downstream_truth_nodes=truth_ptrs,
         cone_edges=cone_edges,
-        matching_chains=matching_chains,
-        cone_findings=cone_findings,
+        cone_edge_items=cone_edge_items,
+        matching_chains=selected_chains,
+        cone_findings=selected_findings,
+        completeness=completeness,
         approx_tokens=max(1, len(md_text) // 4),
         markdown=md_text,
     )

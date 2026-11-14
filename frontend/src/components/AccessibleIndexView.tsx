@@ -85,7 +85,7 @@ export function AccessibleIndexView({
             Day-1 Architecture Guide :: Where Does New Code Belong?
           </h2>
           <p className="mt-0.5 text-slate-300">
-            Every feature flows strictly across three strata. Click a live clean exemplar from this repository to inspect its pattern:
+            Every feature flows across three strata. Click a sample node below with zero attached scan findings in this snapshot (verify project governance references before treating any file as an architectural pattern):
           </p>
         </div>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
@@ -102,7 +102,7 @@ export function AccessibleIndexView({
                 onClick={() => onSelectNode(exemplars.truth!.id)}
                 className="mt-2 truncate font-mono text-[11px] text-teal-300 hover:underline"
               >
-                Exemplar: {exemplars.truth.label} →
+                Sample clean node (unvalidated): {exemplars.truth.label} →
               </button>
             )}
           </div>
@@ -119,7 +119,7 @@ export function AccessibleIndexView({
                 onClick={() => onSelectNode(exemplars.manipulate!.id)}
                 className="mt-2 truncate font-mono text-[11px] text-sky-300 hover:underline"
               >
-                Exemplar: {exemplars.manipulate.label} →
+                Sample clean node (unvalidated): {exemplars.manipulate.label} →
               </button>
             )}
           </div>
@@ -136,7 +136,7 @@ export function AccessibleIndexView({
                 onClick={() => onSelectNode(exemplars.display!.id)}
                 className="mt-2 truncate font-mono text-[11px] text-blue-300 hover:underline"
               >
-                Exemplar: {exemplars.display.label} →
+                Sample clean node (unvalidated): {exemplars.display.label} →
               </button>
             )}
           </div>

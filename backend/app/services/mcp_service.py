@@ -67,7 +67,12 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "target": {"type": "string", "description": "Registered target slug or repository path."},
                 "query": {"type": "string", "description": "Table name, file path, HTTP route, queue, or node ID."},
-                "max_nodes": {"type": "integer", "default": DEFAULT_CONE_NODES, "minimum": 5, "maximum": 150},
+                "max_nodes": {"type": "integer", "default": DEFAULT_CONE_NODES, "minimum": 5, "maximum": 5000},
+                "full": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Disable node/edge/finding caps and export the full cone.",
+                },
                 "profile": {"type": "string", "default": "auto"},
             },
             "required": ["target", "query"],
@@ -255,7 +260,8 @@ def _execute_tool(session: Session, tool_name: str, args: dict[str, Any]) -> str
         if not query:
             raise ValueError("Missing required parameter `query`.")
         max_nodes = int(args.get("max_nodes") or DEFAULT_CONE_NODES)
-        return build_lineage_cone_slice(report, query, max_nodes=max_nodes).markdown
+        full = bool(args.get("full", False))
+        return build_lineage_cone_slice(report, query, max_nodes=max_nodes, full=full).markdown
 
     if canonical == "wythe_blast_radius":
         base_ref = str(args.get("base_ref") or "WORKING")
