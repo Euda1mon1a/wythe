@@ -471,6 +471,26 @@ def parse_component_imports(raw_source: str) -> dict[str, tuple[str, str]]:
 
 _PROP_IDENT_REF_RE = re.compile(r"^(?:props\.)?(?P<ident>[A-Za-z_$][\w$]*)$")
 _EMPTY_PROP_STATES = frozenset({"empty", "blank", "null", "undefined"})
+_BOOL_PROP_STATES = frozenset({"bool_false", "bool_true"})
+
+
+def _normalize_component_lookup(
+    tag: str,
+    imported_components: dict[str, tuple[str, str]],
+) -> tuple[str, tuple[str, str]] | None:
+    """Resolve JSX/Svelte/Vue component tags (including kebab-case Vue tags) to imports."""
+    root_name = tag.split(".", 1)[0]
+    if root_name in imported_components:
+        return root_name, imported_components[root_name]
+    if "-" in root_name:
+        pascal = "".join(part[:1].upper() + part[1:] for part in root_name.split("-") if part)
+        if pascal in imported_components:
+            return pascal, imported_components[pascal]
+    collapsed = root_name.replace("-", "").lower()
+    for imp_name, val in imported_components.items():
+        if imp_name.lower() == collapsed:
+            return imp_name, val
+    return None
 
 
 def _eval_attr_value(expr: str, *, preserve_undefined: bool = False) -> str:
@@ -479,10 +499,12 @@ def _eval_attr_value(expr: str, *, preserve_undefined: bool = False) -> str:
         return "undefined" if preserve_undefined else "empty"
     if s == "null":
         return "null" if preserve_undefined else "empty"
-    if s in ("", "''", '""', "``", "false"):
+    if s in ("", "''", '""', "``"):
         return "empty"
+    if s == "false":
+        return "bool_false" if preserve_undefined else "empty"
     if s == "true":
-        return "blank" if preserve_undefined else "empty"
+        return "bool_true" if preserve_undefined else "empty"
     if len(s) >= 2 and s[0] in ("'", '"') and s[-1] == s[0]:
         inner = s[1:-1]
         if inner.strip():
@@ -495,7 +517,7 @@ def _eval_attr_value(expr: str, *, preserve_undefined: bool = False) -> str:
         return "blank" if (preserve_undefined and inner != "") else "empty"
     if "||" in s or "??" in s:
         ev = _eval_coalesce_expr(s, prop_values={}, inner_status="empty", unknown_fallback="dynamic")
-        if not preserve_undefined and ev in ("null", "undefined", "blank"):
+        if not preserve_undefined and ev in ("null", "undefined", "blank", "bool_false", "bool_true"):
             return "empty"
         return ev
     return "dynamic"
@@ -706,13 +728,25 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str], dic
                     mark_opaque_spread()
             elif is_vue_bound:
                 base_key = key.split(".", 1)[0]
-                props[base_key] = _eval_attr_value(val, preserve_undefined=True)
+                eval_v = _eval_attr_value(val, preserve_undefined=True)
+                props[base_key] = eval_v
                 record_ident_ref(base_key, val)
                 record_explicit(base_key)
+                if "-" in base_key:
+                    camel = re.sub(r"-([a-zA-Z0-9])", lambda m: m.group(1).upper(), base_key)
+                    props[camel] = eval_v
+                    record_ident_ref(camel, val)
+                    record_explicit(camel)
             else:
-                props[key] = "named" if val.strip() else ("blank" if val else "empty")
+                eval_v = "named" if val.strip() else ("blank" if val else "empty")
+                props[key] = eval_v
                 raw_exprs.pop(key, None)
                 record_explicit(key)
+                if "-" in key:
+                    camel = re.sub(r"-([a-zA-Z0-9])", lambda m: m.group(1).upper(), key)
+                    props[camel] = eval_v
+                    raw_exprs.pop(camel, None)
+                    record_explicit(camel)
             i = min(j + 1, n)
         elif attrs[i] == "{":
             bend = _scan_brace_end(attrs, i)
@@ -1389,10 +1423,12 @@ def _eval_coalesce_expr(
             return "undefined"
         if t == "null":
             return "null"
-        if t in ("", "''", '""', "``", "false"):
+        if t in ("", "''", '""', "``"):
             return "empty"
+        if t == "false":
+            return "bool_false"
         if t == "true":
-            return "blank"
+            return "bool_true"
         if re.fullmatch(r"-?\d+(?:\.\d+)?", t):
             return "named"
         if (
@@ -1433,7 +1469,7 @@ def _eval_coalesce_expr(
         if prev_op == "??":
             if acc in ("undefined", "null"):
                 acc = nxt_state
-            elif acc in ("empty", "blank", "named"):
+            elif acc in ("empty", "blank", "named", "bool_false", "bool_true"):
                 pass
             elif acc == "dynamic":
                 acc = "named" if nxt_state == "named" else "dynamic"
@@ -1441,9 +1477,9 @@ def _eval_coalesce_expr(
                 acc = "opaque"
         else:
             # Logical `||` treats empty string / false / 0 / null / undefined as falsy.
-            if acc in ("undefined", "null", "empty"):
+            if acc in ("undefined", "null", "empty", "bool_false"):
                 acc = nxt_state
-            elif acc in ("blank", "named"):
+            elif acc in ("blank", "named", "bool_true"):
                 pass
             elif acc == "dynamic":
                 acc = "named" if nxt_state == "named" else "dynamic"
@@ -1458,6 +1494,7 @@ def _classify_expr_semantics(
     *,
     prop_values: dict[str, str] | None,
     inner_status: str,
+    render_booleans_as_text: bool = False,
 ) -> str:
     """Classify a `{...}` expression as `ignore`, `named`, `empty`, or `opaque`."""
     expr = re.sub(r"/\*[\s\S]*?\*/", "", raw_expr).strip()
@@ -1477,6 +1514,8 @@ def _classify_expr_semantics(
         inner_status=inner_status,
         depth=0,
     )
+    if res in _BOOL_PROP_STATES:
+        return "named" if render_booleans_as_text else "empty"
     if res in _EMPTY_PROP_STATES:
         return "empty"
     if res in ("named", "dynamic"):
@@ -1491,6 +1530,7 @@ def _classify_markup_segment(
     component_resolver: Callable[[str, str, str], str] | None,
     prop_values: dict[str, str] | None = None,
     inner_status: str = "empty",
+    render_booleans_as_text: bool = False,
 ) -> tuple[str, list[str], bool]:
     """Classify markup children as `(status, opaque_tags, has_visual_empty_or_icon)`."""
     has_named = False
@@ -1528,6 +1568,7 @@ def _classify_markup_segment(
                 src[i + 1 : bend - 1],
                 prop_values=prop_values,
                 inner_status=inner_status,
+                render_booleans_as_text=render_booleans_as_text,
             )
             if sem == "named":
                 has_named = True
@@ -1568,6 +1609,7 @@ def _classify_markup_segment(
                     component_resolver=component_resolver,
                     prop_values=prop_values,
                     inner_status=inner_status,
+                    render_booleans_as_text=render_booleans_as_text,
                 )
                 if gst == "opaque" and gopaque:
                     for lbl in gopaque:
@@ -1583,7 +1625,8 @@ def _classify_markup_segment(
                 )
                 i = next_i
                 continue
-            root_imp = imported_components.get(tag.split(".", 1)[0])
+            matched_imp = _normalize_component_lookup(tag, imported_components)
+            root_imp = matched_imp[1] if matched_imp is not None else None
             if root_imp and _ICON_PKG_SPEC_RE.match(root_imp[0]):
                 merge_status(
                     _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values),
@@ -1600,6 +1643,7 @@ def _classify_markup_segment(
                             component_resolver=component_resolver,
                             prop_values=prop_values,
                             inner_status="empty",
+                            render_booleans_as_text=render_booleans_as_text,
                         )
                         merge_status(slot_fallback, "slot")
                     else:
@@ -1609,7 +1653,7 @@ def _classify_markup_segment(
             if tag_low in ("script", "style") or _is_aria_hidden_true(attrs):
                 i = next_i
                 continue
-            if tag[0].isupper() or "." in tag:
+            if tag[0].isupper() or "." in tag or "-" in tag or matched_imp is not None:
                 child_inner = "empty"
                 if inner_body:
                     cst, copaque, _ = _classify_markup_segment(
@@ -1618,6 +1662,7 @@ def _classify_markup_segment(
                         component_resolver=component_resolver,
                         prop_values=prop_values,
                         inner_status=inner_status,
+                        render_booleans_as_text=render_booleans_as_text,
                     )
                     if cst == "named":
                         child_inner = "named"
@@ -1756,6 +1801,7 @@ def _classify_graphic_element(
     component_resolver: Callable[[str, str, str], str] | None,
     prop_values: dict[str, str] | None,
     inner_status: str,
+    render_booleans_as_text: bool = False,
 ) -> tuple[str, list[str]]:
     """Classify inline `<i>`/`<svg>` checking ARIA/title attrs first, then naming children."""
     own_name = _eval_element_own_name(attrs, allow_alt=False, prop_values=prop_values)
@@ -1769,6 +1815,7 @@ def _classify_graphic_element(
                 component_resolver=component_resolver,
                 prop_values=prop_values,
                 inner_status=inner_status,
+                render_booleans_as_text=render_booleans_as_text,
             )
             if cst == "named":
                 return "named", []
@@ -1786,6 +1833,7 @@ def _classify_graphic_element(
                     component_resolver=component_resolver,
                     prop_values=prop_values,
                     inner_status=inner_status,
+                    render_booleans_as_text=render_booleans_as_text,
                 )
                 if cst == "named":
                     return "named", []
@@ -1814,8 +1862,8 @@ def _resolve_component_tag(
     component_resolver: Callable[[str, str, str], str] | None,
     prop_values: dict[str, str] | None = None,
 ) -> str:
-    root_name = tag.split(".", 1)[0]
-    imp = imported_components.get(root_name)
+    matched = _normalize_component_lookup(tag, imported_components)
+    imp = matched[1] if matched is not None else None
     if imp and _ICON_PKG_SPEC_RE.match(imp[0]):
         return _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values)
     if component_resolver is not None:
@@ -1843,8 +1891,9 @@ def make_local_component_resolver(
     cache = _cache if _cache is not None else {}
 
     def resolve_tag(tag_name: str, attrs: str, inner_status: str) -> str:
-        root_name = tag_name.split(".", 1)[0]
-        imp = imports.get(root_name)
+        matched = _normalize_component_lookup(tag_name, imports)
+        root_name = matched[0] if matched is not None else tag_name.split(".", 1)[0]
+        imp = matched[1] if matched is not None else None
         if imp is not None and _ICON_PKG_SPEC_RE.match(imp[0]):
             return _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=_parent_props)
         same_file = (
@@ -1899,7 +1948,13 @@ def make_local_component_resolver(
                     resolved_val = _parent_props[raw_ref]
                 else:
                     continue
-                if has_opaque_spread and pname not in explicit_after_spread and resolved_val in ("empty", "blank", "null"):
+                if has_opaque_spread and pname not in explicit_after_spread and resolved_val in (
+                    "empty",
+                    "blank",
+                    "null",
+                    "bool_false",
+                    "bool_true",
+                ):
                     passed[pname] = "opaque"
                 else:
                     passed[pname] = resolved_val
@@ -1914,7 +1969,7 @@ def make_local_component_resolver(
                 merged_props[local_name] = "opaque"
             elif dstate in ("named", "dynamic"):
                 merged_props[local_name] = "named"
-            elif dstate in _EMPTY_PROP_STATES:
+            elif dstate in _EMPTY_PROP_STATES or dstate in _BOOL_PROP_STATES:
                 merged_props[local_name] = dstate
             else:
                 # Preserve omitted/`undefined` state when no default is declared so multi-hop
@@ -1923,7 +1978,11 @@ def make_local_component_resolver(
         for src_name, pstate in passed.items():
             norm_state = (
                 "opaque"
-                if (has_opaque_spread and src_name not in explicit_after_spread and pstate in _EMPTY_PROP_STATES)
+                if (
+                    has_opaque_spread
+                    and src_name not in explicit_after_spread
+                    and (pstate in _EMPTY_PROP_STATES or pstate in _BOOL_PROP_STATES)
+                )
                 else pstate
             )
             merged_props.setdefault(src_name, norm_state)
@@ -1957,6 +2016,7 @@ def make_local_component_resolver(
             _parent_props=merged_props,
             _parent_has_spread=has_opaque_spread,
         )
+        child_bool_as_text = resolved_path.suffix in (".svelte", ".vue")
 
         def classify_branch(branch: str) -> str:
             if branch.startswith("<!--WYTHE_EXPR-->"):
@@ -1964,6 +2024,7 @@ def make_local_component_resolver(
                     branch[len("<!--WYTHE_EXPR-->") :],
                     prop_values=merged_props,
                     inner_status=effective_inner,
+                    render_booleans_as_text=child_bool_as_text,
                 )
                 return "empty" if sem == "ignore" else sem
             st, _, _ = _classify_markup_segment(
@@ -1972,6 +2033,7 @@ def make_local_component_resolver(
                 component_resolver=nested_resolver,
                 prop_values=merged_props,
                 inner_status=effective_inner,
+                render_booleans_as_text=child_bool_as_text,
             )
             return st
 
@@ -2066,6 +2128,7 @@ def scan_a11y_markup_findings(
             body,
             imported_components=imported_components,
             component_resolver=component_resolver,
+            render_booleans_as_text=rel_repo.endswith((".svelte", ".vue")),
         )
         lineno = raw_source.count("\n", 0, m.start()) + 1
         if status == "named":

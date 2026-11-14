@@ -588,6 +588,8 @@ def test_aria_named_elements_and_nullish_vs_or_coalescing_a11y(tmp_path: Path) -
         "      <button><OrLabel text='' /></button>\n"
         "      <button><OrLabel text='   ' /></button>\n"
         "      <button><OrLabel text={null} /></button>\n"
+        "      <button><NullishLabel text={false} /></button>\n"
+        "      <button><OrLabel text={false} /></button>\n"
         "      <button><ChildWrapper>Save</ChildWrapper></button>\n"
         "      <button><span><i>Save</i></span></button>\n"
         "      <button><span><i className='icon' /></span></button>\n"
@@ -600,6 +602,67 @@ def test_aria_named_elements_and_nullish_vs_or_coalescing_a11y(tmp_path: Path) -
     )
     res = TypeScriptNextJsAdapter().extract(tmp_path, ".")
     disp_lines = sorted(f.line for f in res.findings if f.rule_code == "DISP-005")
-    assert disp_lines == [6, 7, 8, 9, 13, 15, 19, 21, 22], res.findings
+    assert disp_lines == [6, 7, 8, 9, 13, 15, 17, 21, 23, 24], res.findings
+
+
+def test_vue_kebab_case_and_framework_boolean_semantics_a11y(tmp_path: Path) -> None:
+    """Vue kebab-case components stay resolved/opaque and Svelte/Vue booleans render text."""
+    from app.adapters.sveltekit_display import SvelteKitDisplayAdapter
+    from app.adapters.vue_sfc import VueSfcDisplayAdapter
+
+    vue_root = tmp_path / "vue_app"
+    put(
+        vue_root,
+        "src/components/LabelText.vue",
+        "<template><span>Save</span></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/BoolText.vue",
+        "<script setup>\nconst props = defineProps({ text: String });\n</script>\n"
+        "<template><span>{{ text }}</span></template>\n",
+    )
+    put(
+        vue_root,
+        "src/components/EmptyBadge.vue",
+        "<script setup>\nconst props = defineProps({ empty: Boolean });\n</script>\n"
+        "<template><span /></template>\n",
+    )
+    put(
+        vue_root,
+        "src/App.vue",
+        "<script setup>\n"
+        "import LabelText from './components/LabelText.vue';\n"
+        "import BoolText from './components/BoolText.vue';\n"
+        "import EmptyBadge from './components/EmptyBadge.vue';\n"
+        "</script>\n"
+        "<template>\n"
+        "  <button><svg /><label-text /></button>\n"
+        "  <button><svg /><unknown-widget /></button>\n"
+        "  <button><bool-text :text=\"false\" /></button>\n"
+        "  <button><svg /><empty-badge /></button>\n"
+        "</template>\n",
+    )
+    vue_res = VueSfcDisplayAdapter().extract(vue_root, ".")
+    vue_disp = [f.line for f in vue_res.findings if f.rule_code == "DISP-005"]
+    assert vue_disp == [10], vue_res.findings
+
+    sv_root = tmp_path / "svelte_app"
+    put(
+        sv_root,
+        "src/lib/BoolLabel.svelte",
+        "<script>export let text;</script>\n<span>{text}</span>\n",
+    )
+    put(
+        sv_root,
+        "src/routes/+page.svelte",
+        "<script>import BoolLabel from '$lib/BoolLabel.svelte';</script>\n"
+        "<button><BoolLabel text={false} /></button>\n"
+        "<button><BoolLabel text={true} /></button>\n"
+        "<button><BoolLabel text='' /></button>\n",
+    )
+    sv_res = SvelteKitDisplayAdapter().extract(sv_root, ".")
+    sv_disp = [f.line for f in sv_res.findings if f.rule_code == "DISP-005"]
+    assert sv_disp == [4], sv_res.findings
 
 
