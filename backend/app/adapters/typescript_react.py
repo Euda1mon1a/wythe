@@ -23,7 +23,11 @@ from app.adapters.ts_reachability import (
     ReachabilityIndex,
     build_react_spa_reachability,
 )
-from app.adapters.typescript_nextjs import _REEXPORT_NAMED_RE, _REEXPORT_STAR_RE
+from app.adapters.typescript_nextjs import (
+    _REEXPORT_NAMED_RE,
+    _REEXPORT_STAR_RE,
+    has_frontend_generator_config,
+)
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _EXTS = (".ts", ".tsx", ".js", ".jsx")
@@ -54,6 +58,9 @@ class TypeScriptReactSpaAdapter:
             if (
                 fpath.name.endswith((".d.ts", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx", ".config.ts", ".config.js"))
                 or rel_src.endswith("api-generated.ts")
+                or fpath.name == "types.gen.ts"
+                or ("/core/" in f"/{rel_src}" and fpath.name.endswith(".gen.ts"))
+                or rel_src.startswith("client/client/")
                 or rel_src in ("main.tsx", "index.tsx", "vite-env.d.ts", "lib/api.ts")
             ):
                 continue
@@ -64,7 +71,10 @@ class TypeScriptReactSpaAdapter:
 
             resolved = fpath.resolve()
             clean_txt = extract_script_preserving_lines(raw, fpath.suffix)
-            if fpath.name in ("index.ts", "index.tsx", "index.js"):
+            parts = Path(rel_src).parts
+            eff_parts = parts[1:] if len(parts) > 1 and parts[0] in ("lib", "app") else parts
+            head = eff_parts[0] if eff_parts else ""
+            if fpath.name in ("index.ts", "index.tsx", "index.js") and head not in ("pages", "routes", "views"):
                 targets: list[Path] = []
                 for rex in (_REEXPORT_STAR_RE, _REEXPORT_NAMED_RE):
                     for m in rex.finditer(clean_txt):
@@ -74,9 +84,6 @@ class TypeScriptReactSpaAdapter:
                 barrel_targets[resolved] = targets
                 continue
 
-            parts = Path(rel_src).parts
-            eff_parts = parts[1:] if len(parts) > 1 and parts[0] in ("lib", "app") else parts
-            head = eff_parts[0] if eff_parts else ""
             stem_low = fpath.stem.lower()
             if head in ("pages", "routes", "views") or fpath.stem == "App":
                 lbl = "/" if fpath.stem in ("App", "Home", "index") else f"/{stem_low}"
@@ -84,9 +91,10 @@ class TypeScriptReactSpaAdapter:
             elif head in ("hooks", "stores", "store") or fpath.stem.startswith("use") or stem_low in ("store", "state"):
                 lbl, subkind, cluster = fpath.stem, "hook", "hooks"
             elif (
-                head in ("api", "services", "clients", "queries")
+                head in ("api", "client", "services", "clients", "queries")
                 or stem_low in ("api", "client", "http", "queries")
                 or fpath.stem.endswith(("Client", "Api", "Service"))
+                or fpath.name.endswith(".gen.ts")
             ):
                 lbl, subkind, cluster = fpath.stem, "api_client", "api_clients"
             elif head in ("components", "features") or fpath.suffix in (".tsx", ".jsx"):
@@ -130,6 +138,8 @@ class TypeScriptReactSpaAdapter:
 
         url_const_resolver = build_frontend_url_const_resolver(src_root, _EXTS, cleaned_cache=cleaned)
         comp_resolver_for = build_a11y_component_resolver(src_root, _EXTS)
+        has_gen_cfg = has_frontend_generator_config(fe_dir)
+        page_paths = {p for p, n in nodes_by_path.items() if n.subkind == "page"}
         unobserved_a11y: list[str] = []
 
         for fpath, node in nodes_by_path.items():
@@ -141,6 +151,7 @@ class TypeScriptReactSpaAdapter:
                 imported_url_consts=url_const_resolver(fpath, cleaned[fpath]),
                 component_resolver=comp_resolver_for(fpath, raw_sources[fpath]),
                 unobserved_a11y_out=unobserved_a11y,
+                has_generator_config=has_gen_cfg,
             )
             if reach is not None:
                 annotated_calls: list[FrontendHttpCall] = []
@@ -149,15 +160,23 @@ class TypeScriptReactSpaAdapter:
                     caller_sym = None if sym == MODULE_SYMBOL else sym
                     live: bool | None = None
                     trail: tuple[str, ...] = ()
+                    entry_ids: tuple[str, ...] = ()
                     if reach.has_roots:
                         live = reach.is_live(fpath, sym)
                         trail = reach.trail(fpath, sym) if live else ()
+                        if live:
+                            entry_ids = tuple(
+                                nodes_by_path[rp].id
+                                for rp in reach.reaching_roots(fpath, sym, stop_paths=page_paths)
+                                if rp in nodes_by_path
+                            )
                     annotated_calls.append(
                         replace(
                             c,
                             caller_symbol=caller_sym,
                             reachable=live,
                             reach_trail=trail,
+                            entry_node_ids=entry_ids,
                         )
                     )
                 http_calls.extend(annotated_calls)

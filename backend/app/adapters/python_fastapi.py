@@ -16,7 +16,7 @@ from app.adapters.python_layout import discover_python_app
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _CLOCK_ALLOW_MODULES = ("clock.py", "program_time.py", "sql_clock.py")
-_INFRA_SKIP_PARTS = ("__pycache__", "tests", "test")
+_INFRA_SKIP_PARTS = ("__pycache__", "tests", "test", "alembic")
 # Declaration-only files are callers, not mechanisms; mixed repository modules are retained.
 _CALLER_ONLY_PARTS = ("models", "schemas")
 _CALLER_ONLY_FILES = ("core/config.py", "db/base.py", "db/session.py")
@@ -297,7 +297,12 @@ class PythonFastApiAdapter:
 
         for py_file in sorted(app_dir.rglob("*.py")):
             rel_app = py_file.relative_to(app_dir).as_posix()
-            if py_file.is_symlink() or any(part in _INFRA_SKIP_PARTS for part in Path(rel_app).parts):
+            rel_parts = Path(rel_app).parts
+            if (
+                py_file.is_symlink()
+                or any(part in _INFRA_SKIP_PARTS for part in rel_parts)
+                or ("migrations" in rel_parts[:-1] and ("versions" in rel_parts or rel_parts[-1] == "env.py"))
+            ):
                 continue
             rel_repo = py_file.relative_to(repo_root).as_posix()
             mod_parts = list(Path(rel_app).with_suffix("").parts)

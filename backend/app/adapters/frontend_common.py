@@ -25,6 +25,7 @@ from app.adapters.typescript_nextjs import (
     _is_raw_clock_read,
     _normalize_ts_url,
     _strip_ts_comments,
+    has_generated_contract_provenance,
 )
 from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 from app.schemas.atlas import AtlasNode
@@ -34,7 +35,6 @@ _VUE_SFC_FETCH_RE = re.compile(
     r"""\b(?:\$fetch|useFetch|useLazyFetch)\s*(?:<[^;()]{0,180}?>)?\s*\(\s*(?P<quote>['"`])(?P<url>/[^'"`\n]+)(?P=quote)(?P<tail>[\s\S]{0,160})"""
 )
 _METHOD_OPT_RE = re.compile(r"""method\s*:\s*['"](?P<m>GET|POST|PUT|PATCH|DELETE)['"]""", re.IGNORECASE)
-_SCHEMA_BIND_MARKERS = ("api-generated", "openapi", ".schema", "generated/", "/types", "./types")
 
 
 def extract_script_preserving_lines(raw_source: str, suffix: str) -> str:
@@ -338,11 +338,15 @@ def scan_display_module_semantics(
     imported_url_consts: dict[str, str] | None = None,
     component_resolver: Callable[[str, str, str], str] | None = None,
     unobserved_a11y_out: list[str] | None = None,
+    has_generator_config: bool = False,
 ) -> tuple[list[str], list[FrontendHttpCall], list[RawCandidateFinding]]:
     """Extract imports, HTTP calls, and DISP-001..005 findings for a single display node."""
     imported_specs = [m.group("spec") for m in _IMPORT_RE.finditer(cleaned_txt)]
-    uses_schema_types = any(
-        any(marker in spec for marker in _SCHEMA_BIND_MARKERS) for spec in imported_specs
+    uses_schema_types = has_generated_contract_provenance(
+        imported_specs,
+        raw_source=raw_source,
+        source_file=rel_repo,
+        has_generator_config=has_generator_config,
     )
 
     raw_calls = list(_extract_ts_http_calls(cleaned_txt, imported_consts=imported_url_consts))

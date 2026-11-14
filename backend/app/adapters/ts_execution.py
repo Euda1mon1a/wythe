@@ -91,10 +91,36 @@ def module_execution(source: str) -> ModuleExecution | None:
                 else:
                     statements.append(_text(raw, decl))
         elif node.type in ("class_declaration", "abstract_class_declaration"):
-            # Static fields, static blocks and decorators can execute now.
-            name = node.child_by_field_name("name")
-            if name is not None:
-                eager.add(_text(raw, name))
+            # Class bodies hold lazy methods, while decorators, static initializers, static blocks,
+            # and heritage expressions run at module evaluation time.
+            decorators = [c for c in (*statement.children, *node.children) if c.type == "decorator"]
+            for dec in decorators:
+                statements.append(_text(raw, dec))
+            heritage = next((c for c in node.children if c.type == "class_heritage"), None)
+            if heritage is not None:
+                statements.append(_text(raw, heritage))
+            cls_name = _text(raw, name) if name is not None else ""
+            cls_body = node.child_by_field_name("body")
+            if cls_body is not None:
+                for member in cls_body.named_children:
+                    for dec in member.children:
+                        if dec.type == "decorator":
+                            statements.append(_text(raw, dec))
+                    if member.type == "class_static_block":
+                        statements.append(_text(raw, member))
+                    elif member.type in ("public_field_definition", "field_definition"):
+                        is_static = any(tok.type == "static" for tok in member.children)
+                        init_val = member.child_by_field_name("value")
+                        if is_static and init_val is not None:
+                            statements.append(_text(raw, init_val))
+                    elif member.type == "method_definition" and cls_name:
+                        m_name_node = member.child_by_field_name("name")
+                        if m_name_node is not None and m_name_node.type == "property_identifier":
+                            qual = f"{cls_name}.{_text(raw, m_name_node)}"
+                            ranges.append((qual, member.start_point[0] + 1, member.end_point[0] + 1))
+                            bodies[qual] = _text(raw, member)
+                            if exported and not default:
+                                exports[qual] = qual
         elif node.type not in (
             "import_statement", "comment", "function_declaration",
             "generator_function_declaration", "interface_declaration",
