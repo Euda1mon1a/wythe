@@ -43,7 +43,7 @@ EdgeKind = Literal[
 VerificationState = Literal["verified", "declared", "unverified", "broken"]
 FindingConfidence = Literal["confirmed", "candidate"]
 EvidenceStrength = Literal["ast_exact", "structural_match", "heuristic"]
-GateVerdict = Literal["PASS", "RATCHET_PASS", "FAIL"]
+GateVerdict = Literal["PASS", "RATCHET_PASS", "INCOMPLETE", "FAIL"]
 StoreIntendedUse = Literal[
     "derived_cache",
     "read_replica",
@@ -177,6 +177,7 @@ class GateEvaluation(StrictSchema):
     verdict: GateVerdict
     mode: Literal["strict", "ratchet"]
     blocking_violations: int
+    coverage_complete: bool = True
     ratchet_exceeded_rules: list[str] = Field(default_factory=list)
     rule_counts: list[RuleGateRow] = Field(default_factory=list)
     evaluated_at: datetime
@@ -232,6 +233,7 @@ class TruthAtlasReport(StrictSchema):
     repo_path: str
     stack_profile: str
     stack_profile_status: Literal["implemented", "experimental", "planned"] = "implemented"
+    coverage_complete: bool = True
     source_commit: str
     # The scan reads files from disk, so a dirty tree means `source_commit` alone does not
     # describe the scanned code. None outside git.
@@ -282,6 +284,7 @@ class StackDetectionResult(StrictSchema):
     backend_subdir: str
     frontend_subdir: str
     confidence: Literal["high", "medium", "fallback"]
+    coverage_complete: bool = True
     detected_signals: list[str] = Field(default_factory=list)
 
 

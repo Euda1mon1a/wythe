@@ -41,7 +41,7 @@ def test_http_api_surface_end_to_end(isolated_db_url: str) -> None:
         exp_count = sum(
             1 for p in profiles.json() if p["implementation_status"] == "experimental"
         )
-        assert exp_count == 17
+        assert exp_count == 30
         assert profiles_by_slug["python-services"]["implementation_status"] == "experimental"
 
         targets = client.get("/api/v1/targets")
@@ -116,7 +116,7 @@ def test_http_api_surface_end_to_end(isolated_db_url: str) -> None:
 
         rules = client.get("/api/v1/rules")
         assert rules.status_code == 200
-        assert len(rules.json()) == 17
+        assert len(rules.json()) == 18
 
         patch_rule = client.patch(
             "/api/v1/rules/TRUTH-001",

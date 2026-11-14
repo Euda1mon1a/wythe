@@ -181,6 +181,7 @@ def _resolve_git_commit(repo_root: Path) -> str:
 class _CachedStaticExtraction:
     commit_sha: str
     obs_source: str
+    coverage_complete: bool
     nodes: list[AtlasNode]
     edges: list[AtlasEdge]
     chains: list[EndToEndChain]
@@ -392,7 +393,29 @@ def _solve_cross_tier_lineage(
             if r.http_method == call.http_method and pat.match(call.normalized_path)
         ]
         if not matched_routes:
-            extra_findings.extend(_classify_unbacked_call(call, manip.routes, local_route_res))
+            if not manip.coverage_complete:
+                if not any(rx.match(call.normalized_path) for rx in local_route_res):
+                    method_path = f"{call.http_method} {call.normalized_path}"
+                    extra_findings.append(
+                        RawCandidateFinding(
+                            rule_code="DISP-008",
+                            node_id=call.caller_node_id,
+                            source_file=call.source_file,
+                            line=call.line,
+                            title=f"Frontend `{method_path}` could not be verified (incomplete backend route coverage)",
+                            detail=(
+                                f"{call.source_file}:{call.line} calls `{call.raw_path}`. Backend route extraction "
+                                "was absent or incomplete, so Wythe cannot determine whether a backend route exists."
+                            ),
+                            remediation="Configure a supported backend adapter or inspect the backend service directly to verify route backing.",
+                            http_method=call.http_method,
+                            http_path=call.normalized_path,
+                            confidence="candidate",
+                            evidence_strength="heuristic",
+                        )
+                    )
+            else:
+                extra_findings.extend(_classify_unbacked_call(call, manip.routes, local_route_res))
             continue
 
         kind = "queries_endpoint" if call.http_method == "GET" else "mutates_endpoint"
@@ -511,6 +534,7 @@ def run_target_scan(
         _EXTRACTION_CACHE.move_to_end(cache_key)
         commit_sha = cached.commit_sha
         obs_source = cached.obs_source
+        coverage_complete = cached.coverage_complete
         all_nodes = [n.model_copy(deep=True) for n in cached.nodes]
         all_edges = list(cached.edges)
         chains = list(cached.chains)
@@ -528,6 +552,11 @@ def run_target_scan(
             truth_res,
             manip_res,
             redis_dsn=redis_dsn,
+        )
+        coverage_complete = (
+            truth_res.coverage_complete
+            and manip_res.coverage_complete
+            and disp_res.coverage_complete
         )
 
         cross_edges, chains, cross_findings = _solve_cross_tier_lineage(
@@ -553,6 +582,7 @@ def run_target_scan(
             _EXTRACTION_CACHE[cache_key] = _CachedStaticExtraction(
                 commit_sha=commit_sha,
                 obs_source=obs_source,
+                coverage_complete=coverage_complete,
                 nodes=[n.model_copy(deep=True) for n in all_nodes],
                 edges=list(all_edges),
                 chains=list(chains),
@@ -581,7 +611,11 @@ def run_target_scan(
     )
 
     findings, gate = evaluate_findings_and_gate(
-        session, raw_findings, target_id=target.id or None, strict=strict_gate
+        session,
+        raw_findings,
+        target_id=target.id or None,
+        strict=strict_gate,
+        coverage_complete=coverage_complete,
     )
 
     observed = utc_now()
@@ -623,6 +657,7 @@ def run_target_scan(
         repo_path=str(repo_root),
         stack_profile=target.stack_profile_slug,
         stack_profile_status=profile_maturity,  # type: ignore[arg-type]
+        coverage_complete=coverage_complete,
         source_commit=commit_sha,
         worktree_dirty=None if dirty_count is None else dirty_count > 0,
         dirty_path_count=dirty_count,

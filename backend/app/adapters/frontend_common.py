@@ -124,6 +124,7 @@ def build_frontend_url_const_resolver(
     export_cache: dict[Path, dict[str, str]] = {}
     text_cache: dict[Path, str] = dict(cleaned_cache) if cleaned_cache is not None else {}
     parsed_cache: dict[Path, tuple[str, list[tuple[Path, list[tuple[str, str]]]], list[Path], list[tuple[Path | None, list[tuple[str, str]]]], list[str], list[tuple[str, str]]]] = {}
+    scoped_const_cache: dict[tuple[Path, tuple[tuple[str, str], ...]], dict[str, str]] = {}
 
     def _read_cleaned(fpath: Path) -> str:
         if fpath not in text_cache:
@@ -188,49 +189,61 @@ def build_frontend_url_const_resolver(
         fpath: Path,
         visiting: frozenset[Path],
         depth: int,
-        run_memo: dict[Path, tuple[int, frozenset[Path], dict[str, str], bool]],
+        run_memo: dict[Path, tuple[int, frozenset[Path], dict[str, str], frozenset[Path], bool]],
         budget: list[int],
-    ) -> tuple[dict[str, str], bool]:
+    ) -> tuple[dict[str, str], frozenset[Path], bool]:
         if fpath in export_cache:
-            return export_cache[fpath], False
-        if fpath in visiting or depth > 8 or budget[0] <= 0:
-            return {}, True
+            return export_cache[fpath], frozenset(), False
+        if fpath in visiting:
+            return {}, frozenset({fpath}), False
+        if depth > 8 or budget[0] <= 0:
+            return {}, frozenset(), True
         prev = run_memo.get(fpath)
         if prev is not None:
-            prev_depth, prev_visiting, prev_exp, prev_cyc = prev
-            if prev_depth <= depth and prev_visiting.issubset(visiting):
-                return prev_exp, prev_cyc
+            prev_depth, prev_visiting, prev_exp, prev_cyc, prev_trunc = prev
+            if (not prev_trunc and prev_cyc.issubset(visiting)) or (
+                prev_depth <= depth and prev_visiting.issubset(visiting)
+            ):
+                return prev_exp, prev_cyc, prev_trunc
         budget[0] -= 1
         cleaned, named_imports, reexport_all, reexport_from, exported_names, exported_local_pairs = _parse_module(fpath)
         if not cleaned or (not reexport_all and not reexport_from and not exported_names and not exported_local_pairs):
             export_cache[fpath] = {}
-            return {}, False
+            return {}, frozenset(), False
 
         next_visiting = visiting | {fpath}
-        hit_cycle = False
+        cycle_deps: set[Path] = set()
+        truncated = False
         imported: dict[str, str] = {}
         if exported_names or exported_local_pairs:
             for target, pairs in named_imports:
-                target_exports, cyc = _exports_of(target, next_visiting, depth + 1, run_memo, budget)
-                hit_cycle = hit_cycle or cyc
+                target_exports, cyc_set, trunc = _exports_of(target, next_visiting, depth + 1, run_memo, budget)
+                cycle_deps.update(cyc_set)
+                truncated = truncated or trunc
                 for orig_name, local_name in pairs:
                     if orig_name in target_exports:
                         imported[local_name] = target_exports[orig_name]
 
-        local_consts, _ = (
-            _build_scoped_url_consts(cleaned, imported_consts=imported)
-            if (exported_names or exported_local_pairs)
-            else ({}, set())
-        )
+        if exported_names or exported_local_pairs:
+            sc_key = (fpath, tuple(sorted(imported.items())))
+            local_consts = scoped_const_cache.get(sc_key)
+            if local_consts is None:
+                local_consts, _ = _build_scoped_url_consts(cleaned, imported_consts=imported)
+                scoped_const_cache[sc_key] = local_consts
+        else:
+            local_consts = {}
+
         exported: dict[str, str] = {}
         for target in reexport_all:
-            target_exports, cyc = _exports_of(target, next_visiting, depth + 1, run_memo, budget)
-            hit_cycle = hit_cycle or cyc
+            target_exports, cyc_set, trunc = _exports_of(target, next_visiting, depth + 1, run_memo, budget)
+            cycle_deps.update(cyc_set)
+            truncated = truncated or trunc
             exported.update(target_exports)
         for target, pairs in reexport_from:
             if target is not None:
-                target_exports, cyc = _exports_of(target, next_visiting, depth + 1, run_memo, budget)
-                hit_cycle = hit_cycle or cyc
+                target_exports, cyc_set, trunc = _exports_of(target, next_visiting, depth + 1, run_memo, budget)
+                cycle_deps.update(cyc_set)
+                truncated = truncated or trunc
                 for orig_name, export_name in pairs:
                     if orig_name in target_exports:
                         exported[export_name] = target_exports[orig_name]
@@ -249,13 +262,15 @@ def build_frontend_url_const_resolver(
                 exported[export_name] = local_consts[local_name]
             else:
                 exported.pop(export_name, None)
-        if not hit_cycle:
+
+        remaining_cycles = frozenset(cycle_deps - {fpath})
+        if not remaining_cycles and not truncated:
             export_cache[fpath] = exported
         else:
             prev = run_memo.get(fpath)
-            if prev is None or depth < prev[0]:
-                run_memo[fpath] = (depth, visiting, exported, hit_cycle)
-        return exported, hit_cycle
+            if prev is None or depth < prev[0] or (not truncated and prev[4]):
+                run_memo[fpath] = (depth, visiting, exported, remaining_cycles, truncated)
+        return exported, remaining_cycles, truncated
 
     def imported_consts_for(fpath: Path, cleaned_txt: str) -> dict[str, str]:
         resolved_path = fpath.resolve()
@@ -264,12 +279,12 @@ def build_frontend_url_const_resolver(
         if not named_imports:
             return {}
         imported: dict[str, str] = {}
-        run_memo: dict[Path, tuple[int, frozenset[Path], dict[str, str], bool]] = {}
+        run_memo: dict[Path, tuple[int, frozenset[Path], dict[str, str], frozenset[Path], bool]] = {}
         budget = [256]
         for target, pairs in named_imports:
             if target == resolved_path:
                 continue
-            target_exports, _ = _exports_of(target, frozenset({resolved_path}), 0, run_memo, budget)
+            target_exports, _, _ = _exports_of(target, frozenset({resolved_path}), 0, run_memo, budget)
             for orig_name, local_name in pairs:
                 if orig_name in target_exports:
                     imported[local_name] = target_exports[orig_name]

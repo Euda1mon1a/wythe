@@ -51,9 +51,24 @@ def compute_diff_and_blast_radius(
     changed_ranges = changes.after
     changed_files = sorted(changes.before.keys() | changes.after.keys())
     notes = list(analysis_notes or [])
-    incomplete = bool(changes.before) and base_report is None
-    if incomplete:
+    base_missing = bool(changes.before) and base_report is None
+    head_incomplete = not report.coverage_complete
+    base_incomplete = base_report is not None and not base_report.coverage_complete
+    incomplete = base_missing or head_incomplete or base_incomplete
+    if base_missing:
         notes.append("Base graph unavailable: removed dependencies may be missing from the blast radius.")
+    if head_incomplete:
+        for scan_note in report.scan_notes:
+            if scan_note not in notes:
+                notes.append(scan_note)
+        if not report.scan_notes:
+            notes.append(
+                "Head scan coverage is incomplete because one or more stack tiers lacked coverage."
+            )
+    if base_incomplete:
+        notes.append(
+            "Base scan coverage is incomplete because one or more stack tiers lacked coverage."
+        )
     notes.append(
         "Static dependency evidence is not proof of safe deletion; "
         "check external entry points and runtime effects."
@@ -128,7 +143,7 @@ def compute_diff_and_blast_radius(
         target_slug=report.target_slug,
         base_ref=base_ref,
         base_commit=changes.base_commit,
-        base_graph_status="unavailable" if incomplete else "available" if base_report else "not_needed",
+        base_graph_status="unavailable" if base_missing else "available" if base_report else "not_needed",
         base_impacted_node_ids=sorted(base_impacted),
         removed_nodes=[n for n in (base_report.nodes if base_report else [])
                        if n.id in touched_ids and n.id not in head_ids],
@@ -143,7 +158,15 @@ def compute_diff_and_blast_radius(
         impacted_chains=list(chains_by_id.values()),
         new_findings=new_findings,
         blocking_new_findings=blocking_new,
-        diff_verdict="INCOMPLETE" if incomplete else "FAIL" if blocking_new > 0 else "PASS",
+        diff_verdict=(
+            "INCOMPLETE"
+            if base_missing
+            else "FAIL"
+            if blocking_new > 0
+            else "INCOMPLETE"
+            if incomplete
+            else "PASS"
+        ),
     )
 
 
@@ -298,6 +321,8 @@ def build_sarif_log(
                     "worktreeDirty": report.worktree_dirty,
                     "dirtyPathCount": report.dirty_path_count,
                     "observationSource": report.observation_source,
+                    "gateVerdict": report.gate.verdict,
+                    "coverageComplete": report.gate.coverage_complete,
                     "scanNotes": list(report.scan_notes),
                 },
             }
@@ -309,11 +334,31 @@ def build_sarif_log(
             baseCommit=diff.base_commit, baseGraphStatus=diff.base_graph_status,
             diffVerdict=diff.diff_verdict, analysisNotes=diff.analysis_notes,
         )
+        incomplete_diff = (
+            diff.diff_verdict == "INCOMPLETE"
+            or not report.coverage_complete
+            or any("coverage is incomplete" in note for note in diff.analysis_notes)
+        )
         run["invocations"] = [{
-            "executionSuccessful": diff.diff_verdict != "INCOMPLETE",
+            "executionSuccessful": not incomplete_diff,
             "toolExecutionNotifications": [
-                {"level": "error", "message": {"text": note}}
-                for note in diff.analysis_notes if diff.diff_verdict == "INCOMPLETE"
+                {
+                    "level": "error" if diff.diff_verdict == "INCOMPLETE" else "warning",
+                    "message": {"text": note},
+                }
+                for note in diff.analysis_notes if incomplete_diff
+            ],
+        }]
+    elif report.gate.verdict == "INCOMPLETE":
+        run = payload["runs"][0]
+        notes = list(report.scan_notes) or [
+            "Architecture verification is incomplete because one or more stack tiers lacked coverage."
+        ]
+        run["invocations"] = [{
+            "executionSuccessful": False,
+            "toolExecutionNotifications": [
+                {"level": "warning", "message": {"text": note}}
+                for note in notes
             ],
         }]
     return payload

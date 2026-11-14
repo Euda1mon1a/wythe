@@ -995,7 +995,7 @@ export interface components {
              * Verdict
              * @enum {string}
              */
-            verdict: "PASS" | "RATCHET_PASS" | "FAIL";
+            verdict: "PASS" | "RATCHET_PASS" | "INCOMPLETE" | "FAIL";
             /**
              * Mode
              * @enum {string}
@@ -1003,6 +1003,11 @@ export interface components {
             mode: "strict" | "ratchet";
             /** Blocking Violations */
             blocking_violations: number;
+            /**
+             * Coverage Complete
+             * @default true
+             */
+            coverage_complete: boolean;
             /** Ratchet Exceeded Rules */
             ratchet_exceeded_rules?: string[];
             /** Rule Counts */
@@ -1598,6 +1603,11 @@ export interface components {
              * @enum {string}
              */
             confidence: "high" | "medium" | "fallback";
+            /**
+             * Coverage Complete
+             * @default true
+             */
+            coverage_complete: boolean;
             /** Detected Signals */
             detected_signals?: string[];
         };
@@ -1720,6 +1730,11 @@ export interface components {
              * @enum {string}
              */
             stack_profile_status: "implemented" | "experimental" | "planned";
+            /**
+             * Coverage Complete
+             * @default true
+             */
+            coverage_complete: boolean;
             /** Source Commit */
             source_commit: string;
             /** Worktree Dirty */

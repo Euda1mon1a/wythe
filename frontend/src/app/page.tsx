@@ -1381,12 +1381,14 @@ export default function WytheWorkspacePage() {
                   className={`flex items-center gap-1.5 border px-2.5 py-0.5 font-semibold ${
                     report.gate.verdict === 'FAIL'
                       ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
-                      : report.gate.verdict === 'RATCHET_PASS'
+                      : report.gate.verdict === 'RATCHET_PASS' ||
+                          report.gate.verdict === 'INCOMPLETE'
                         ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
                         : 'border-teal-500/40 bg-teal-500/10 text-teal-300'
                   }`}
                 >
-                  {report.gate.verdict === 'FAIL' ? (
+                  {report.gate.verdict === 'FAIL' ||
+                  report.gate.verdict === 'INCOMPLETE' ? (
                     <ShieldAlert className="h-3.5 w-3.5" />
                   ) : (
                     <ShieldCheck className="h-3.5 w-3.5" />

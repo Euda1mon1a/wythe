@@ -57,6 +57,7 @@ class TruthExtractionResult:
     # Database-side readers of a table: node id -> {reader node id: (evidence path, edge kind, note)}.
     # Filled from SQL function bodies (`fn:*` reads) and foreign keys (`t:*` references).
     db_readers: dict[str, dict[str, tuple[str, str, str]]] = field(default_factory=dict)
+    coverage_complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class ManipulatorExtractionResult:
     routes: list[RouteDescriptor]
     findings: list[RawCandidateFinding] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    coverage_complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,7 @@ class DisplayExtractionResult:
     # calls matching one are not backend calls.
     local_route_patterns: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    coverage_complete: bool = True
 
 
 class TruthTierAdapter(Protocol):
@@ -388,6 +391,22 @@ class AdapterRegistry:
                     "Leptos/Dioxus/Yew route & component graph extraction",
                     "gloo-net / reqwest HTTP & Tauri invoke() lineage + WASM DISP-001..004 checks",
                 ],
+            ),
+            AdapterSlotSchema(
+                name="no-truth",
+                tier="truth",
+                language="None",
+                frameworks=["Absent or Unsupported Persistence"],
+                implementation_status="implemented",
+                capabilities=["Explicit partial-coverage marker when SQL/ORM truth extraction is unsupported or absent"],
+            ),
+            AdapterSlotSchema(
+                name="no-manipulator",
+                tier="manipulate",
+                language="None",
+                frameworks=["Frontend-Only / Unsupported Backend"],
+                implementation_status="implemented",
+                capabilities=["Explicit partial-coverage marker distinguishing unverified endpoint calls from missing routes"],
             ),
             AdapterSlotSchema(
                 name="swift-vapor",

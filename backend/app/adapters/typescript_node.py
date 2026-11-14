@@ -139,7 +139,16 @@ class TypeScriptNodeAdapter:
         fullstack_root = backend_subdir in ("", ".")
         base_dir = repo_root if fullstack_root else (repo_root / backend_subdir)
         if not base_dir.is_dir():
-            return ManipulatorExtractionResult(nodes=[], edges=[], routes=[], findings=[])
+            return ManipulatorExtractionResult(
+                nodes=[],
+                edges=[],
+                routes=[],
+                findings=[],
+                notes=[
+                    f"Backend directory '{backend_subdir}' was not found; Node backend coverage is absent."
+                ],
+                coverage_complete=False,
+            )
 
         files: list[Path] = [
             f
