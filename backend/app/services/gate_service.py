@@ -77,6 +77,7 @@ def evaluate_findings_and_gate(
     raw_findings: list[RawCandidateFinding],
     target_id: int | None = None,
     strict: bool = False,
+    coverage_complete: bool = True,
 ) -> tuple[list[BoundaryFinding], GateEvaluation]:
     """Bind candidate findings to persisted RulePolicy rows and compute gate verdict."""
     rules_by_code = load_effective_rules(session)
@@ -152,6 +153,8 @@ def evaluate_findings_and_gate(
 
     if exceeded:
         verdict = "FAIL"
+    elif not coverage_complete:
+        verdict = "INCOMPLETE"
     elif blocking_total > 0 and use_ratchet:
         verdict = "RATCHET_PASS"
     else:
@@ -161,6 +164,7 @@ def evaluate_findings_and_gate(
         verdict=verdict,  # type: ignore[arg-type]
         mode=mode,  # type: ignore[arg-type]
         blocking_violations=blocking_total,
+        coverage_complete=coverage_complete,
         ratchet_exceeded_rules=exceeded,
         rule_counts=rule_rows,
         evaluated_at=utc_now(),

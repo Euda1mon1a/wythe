@@ -54,6 +54,8 @@ export function GateAndRulesView({
         <div className="flex items-center gap-3">
           {report.gate.verdict === 'FAIL' ? (
             <ShieldAlert className="h-5 w-5 text-rose-400" />
+          ) : report.gate.verdict === 'INCOMPLETE' ? (
+            <ShieldAlert className="h-5 w-5 text-amber-400" />
           ) : (
             <ShieldCheck className="h-5 w-5 text-teal-400" />
           )}

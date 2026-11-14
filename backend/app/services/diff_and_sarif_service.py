@@ -298,6 +298,8 @@ def build_sarif_log(
                     "worktreeDirty": report.worktree_dirty,
                     "dirtyPathCount": report.dirty_path_count,
                     "observationSource": report.observation_source,
+                    "gateVerdict": report.gate.verdict,
+                    "coverageComplete": report.gate.coverage_complete,
                     "scanNotes": list(report.scan_notes),
                 },
             }
@@ -314,6 +316,18 @@ def build_sarif_log(
             "toolExecutionNotifications": [
                 {"level": "error", "message": {"text": note}}
                 for note in diff.analysis_notes if diff.diff_verdict == "INCOMPLETE"
+            ],
+        }]
+    elif report.gate.verdict == "INCOMPLETE":
+        run = payload["runs"][0]
+        notes = list(report.scan_notes) or [
+            "Architecture verification is incomplete because one or more stack tiers lacked coverage."
+        ]
+        run["invocations"] = [{
+            "executionSuccessful": False,
+            "toolExecutionNotifications": [
+                {"level": "warning", "message": {"text": note}}
+                for note in notes
             ],
         }]
     return payload

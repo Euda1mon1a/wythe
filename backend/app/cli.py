@@ -217,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--sarif", dest="sarif_out", default=None, help="Write SARIF 2.1.0 report to file")
     _add_probe_args(p_scan)
 
-    p_gate = sub.add_parser("gate", help="Fail-closed 3-tier boundary check (exit 0 pass, 1 violation, 2 error)")
+    p_gate = sub.add_parser("gate", help="Fail-closed 3-tier boundary check (exit 0 pass, 1 violation, 2 incomplete or error)")
     p_gate.add_argument("target", help="Registered target slug or filesystem path")
     p_gate.add_argument("--profile", default="auto", help="Stack profile slug or 'auto' (default)")
     p_gate.add_argument("--dsn", default=None, help="Optional read-only SQL DB DSN")
@@ -488,7 +488,9 @@ def main(argv: list[str] | None = None) -> int:
                 out_s = _write_json_file(args.sarif_out, json.dumps(sarif, indent=2))
                 print(f"  SARIF written            : {out_s}")
             if args.cmd == "gate":
-                return 0 if report.gate.verdict in ("PASS", "RATCHET_PASS") else 1
+                return {"PASS": 0, "RATCHET_PASS": 0, "FAIL": 1, "INCOMPLETE": 2}[
+                    report.gate.verdict
+                ]
             return 0
     except Exception as exc:  # noqa: BLE001 - fail-closed CLI operational exit code 2
         print(f"wythe error: {exc}", file=sys.stderr)

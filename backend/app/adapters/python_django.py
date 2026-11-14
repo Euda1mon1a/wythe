@@ -132,7 +132,16 @@ class PythonDjangoAdapter:
     ) -> ManipulatorExtractionResult:
         base_dir = (repo_root / backend_subdir).resolve() if backend_subdir not in ("", ".") else repo_root
         if not base_dir.is_dir():
-            return ManipulatorExtractionResult(nodes=[], edges=[], routes=[], findings=[])
+            return ManipulatorExtractionResult(
+                nodes=[],
+                edges=[],
+                routes=[],
+                findings=[],
+                notes=[
+                    f"Backend directory '{backend_subdir}' was not found; Django backend coverage is absent."
+                ],
+                coverage_complete=False,
+            )
 
         py_files: list[Path] = []
         for pf in sorted(base_dir.rglob("*.py")):

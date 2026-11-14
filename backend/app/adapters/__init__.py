@@ -6,6 +6,7 @@ from app.adapters.base import AdapterRegistry
 from app.adapters.django_truth import DjangoOrmAdapter
 from app.adapters.drizzle_truth import DrizzleOrmAdapter
 from app.adapters.go_http import GoHttpAdapter
+from app.adapters.no_coverage import NoManipulatorAdapter, NoTruthAdapter
 from app.adapters.postgres_sqlalchemy import PostgresSqlAlchemyAdapter
 from app.adapters.prisma_truth import PrismaSchemaAdapter
 from app.adapters.python_django import PythonDjangoAdapter
@@ -33,6 +34,7 @@ def build_default_registry() -> AdapterRegistry:
     registry.register_truth(DjangoOrmAdapter())
     registry.register_truth(SqlDdlTruthAdapter())
     registry.register_truth(RustSqlTruthAdapter())
+    registry.register_truth(NoTruthAdapter())
 
     # Tier 2: Backend Manipulation
     registry.register_manipulator(PythonFastApiAdapter())
@@ -41,6 +43,7 @@ def build_default_registry() -> AdapterRegistry:
     registry.register_manipulator(PythonDjangoAdapter())
     registry.register_manipulator(GoHttpAdapter())
     registry.register_manipulator(RustHttpAdapter())
+    registry.register_manipulator(NoManipulatorAdapter())
 
     # Tier 3: Frontend Display
     registry.register_display(TypeScriptNextJsAdapter())

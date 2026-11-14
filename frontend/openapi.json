@@ -2837,6 +2837,7 @@
             "enum": [
               "PASS",
               "RATCHET_PASS",
+              "INCOMPLETE",
               "FAIL"
             ],
             "title": "Verdict"
@@ -2852,6 +2853,11 @@
           "blocking_violations": {
             "type": "integer",
             "title": "Blocking Violations"
+          },
+          "coverage_complete": {
+            "type": "boolean",
+            "title": "Coverage Complete",
+            "default": true
           },
           "ratchet_exceeded_rules": {
             "items": {
@@ -4337,6 +4343,11 @@
             ],
             "title": "Confidence"
           },
+          "coverage_complete": {
+            "type": "boolean",
+            "title": "Coverage Complete",
+            "default": true
+          },
           "detected_signals": {
             "items": {
               "type": "string"
@@ -4668,6 +4679,11 @@
             ],
             "title": "Stack Profile Status",
             "default": "implemented"
+          },
+          "coverage_complete": {
+            "type": "boolean",
+            "title": "Coverage Complete",
+            "default": true
           },
           "source_commit": {
             "type": "string",

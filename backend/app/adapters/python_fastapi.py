@@ -280,7 +280,14 @@ class PythonFastApiAdapter:
     ) -> ManipulatorExtractionResult:
         app_dir, notes = discover_python_app(repo_root / backend_subdir)
         if app_dir is None:
-            return ManipulatorExtractionResult(nodes=[], edges=[], routes=[], findings=[], notes=notes)
+            return ManipulatorExtractionResult(
+                nodes=[],
+                edges=[],
+                routes=[],
+                findings=[],
+                notes=notes,
+                coverage_complete=False,
+            )
         package_name = app_dir.name
 
         packages: dict[str, ParsedPythonModule] = {}

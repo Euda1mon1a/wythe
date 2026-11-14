@@ -403,7 +403,15 @@ def test_report_and_sarif_carry_worktree_state(db_session: Session, tmp_path: Pa
     report = run_target_scan(db_session, target, strict_gate=True, persist_snapshot=False)
     assert report.worktree_dirty is None and report.dirty_path_count is None  # not a git repo
     props = build_sarif_log(report)["runs"][0]["properties"]
-    assert set(props) == {"sourceCommit", "worktreeDirty", "dirtyPathCount", "observationSource", "scanNotes"}
+    assert set(props) == {
+        "sourceCommit",
+        "worktreeDirty",
+        "dirtyPathCount",
+        "observationSource",
+        "gateVerdict",
+        "coverageComplete",
+        "scanNotes",
+    }
 
 
 # --- #12: live route probe ----------------------------------------------------------------
