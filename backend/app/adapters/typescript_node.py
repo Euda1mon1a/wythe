@@ -14,13 +14,20 @@ from app.adapters.base import (
 from app.adapters.treesitter_engine import (
     blank_comments_cst,
     extract_ts_backend_routes_cst,
-    extract_ts_imports_cst,
+)
+from app.adapters.ts_kysely import extract_kysely_table_ops
+from app.adapters.ts_workspace import (
+    WorkspaceResolver,
+    executable_ts_text,
+    extract_ts_import_bindings,
+    resolve_reexport_targets,
+    resolve_string_expr,
+    verified_import_bindings,
 )
 from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _COMMENT_STRIP_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
-_IMPORT_SPEC_RE = re.compile(r"""(?:import|export)\s+[\s\S]*?from\s+['"](?P<spec>[^'"]+)['"]""")
 _NEXT_HANDLER_EXPORT_RE = re.compile(
     r"""export\s+(?:async\s+)?(?:function|const)\s+(?P<verb>GET|POST|PUT|PATCH|DELETE)\b"""
 )
@@ -30,7 +37,7 @@ _EXPRESS_MOUNT_RE = re.compile(
 _EXPRESS_ROUTE_RE = re.compile(
     r"""\b(?P<recv>[A-Za-z_]\w*)\.(?P<verb>get|post|put|patch|delete)\(\s*['"](?P<path>/[^'"]*)['"]"""
 )
-_NEST_CTRL_RE = re.compile(r"""@Controller\(\s*(?:['"](?P<prefix>[^'"]*)['"])?\s*\)""")
+_NEST_CTRL_RE = re.compile(r"""@Controller\(\s*(?P<arg>[^)]*?)\s*\)""")
 _NEST_VERB_RE = re.compile(
     r"""@(?P<verb>Get|Post|Put|Patch|Delete)\(\s*(?:['"](?P<subpath>[^'"]*)['"])?\s*\)"""
 )
@@ -117,6 +124,12 @@ def _is_backend_ts_candidate(rel_base: str, fullstack_root: bool) -> bool:
             "routes",
             "actions",
             "queries",
+            "repos",
+            "processors",
+            "queues",
+            "workers",
+            "tasks",
+            "jobs",
             "db",
             "models",
             "prisma",
@@ -194,55 +207,101 @@ class TypeScriptNodeAdapter:
                 summary=f"TypeScript backend {subkind} `{rel_repo}`.",
             )
 
+        resolver = WorkspaceResolver.build(repo_root, extra_roots=(base_dir,))
         edges: list[AtlasEdge] = []
-        seen_edges: set[tuple[str, str, str]] = set()
+        edge_map: dict[tuple[str, str, str], AtlasEdge] = {}
         routes: list[RouteDescriptor] = []
         findings: list[RawCandidateFinding] = []
+        manip_notes: list[str] = []
+        seen_notes: set[str] = set()
         table_readers: dict[str, set[str]] = {}
         table_writers: dict[str, set[str]] = {}
 
-        def add_edge(src: str, dst: str, kind: str, ev_path: str, note: str) -> None:
-            if (src, dst, kind) not in seen_edges:
-                seen_edges.add((src, dst, kind))
-                edges.append(
-                    AtlasEdge(
-                        id=f"e:{src}->{dst}:{kind}",
-                        source_id=src,
-                        target_id=dst,
-                        kind=kind,  # type: ignore[arg-type]
-                        verification="verified",
-                        evidence_path=ev_path,
-                        evidence_note=note,
-                    )
+        def add_note(msg: str) -> None:
+            if msg not in seen_notes:
+                seen_notes.add(msg)
+                manip_notes.append(msg)
+
+        def add_edge(
+            src: str,
+            dst: str,
+            kind: str,
+            ev_path: str,
+            note: str,
+            verification: str = "verified",
+        ) -> None:
+            key = (src, dst, kind)
+            existing = edge_map.get(key)
+            if existing is None:
+                edge = AtlasEdge(
+                    id=f"e:{src}->{dst}:{kind}",
+                    source_id=src,
+                    target_id=dst,
+                    kind=kind,  # type: ignore[arg-type]
+                    verification=verification,  # type: ignore[arg-type]
+                    evidence_path=ev_path,
+                    evidence_note=note,
                 )
+                edge_map[key] = edge
+                edges.append(edge)
+            elif verification == "verified" and existing.verification != "verified":
+                existing.verification = "verified"
+                existing.evidence_note = note
 
         for f, txt in cleaned_texts.items():
             node = nodes_by_path[f]
             rel_repo = node.source_file
             rel_b = f.relative_to(base_dir).as_posix()
 
-            # 1. Cross-module runtime imports -> calls_helper (type-only imports excluded under CST)
-            cst_imps = extract_ts_imports_cst(txt, is_tsx=False)
-            runtime_specs = (
-                cst_imps[0]
-                if cst_imps is not None
-                else [imp.group("spec") for imp in _IMPORT_SPEC_RE.finditer(txt)]
-            )
-            for spec in runtime_specs:
-                cand: Path | None = None
-                if spec.startswith("."):
-                    cand = (f.parent / spec).resolve()
-                elif spec.startswith("@/"):
-                    src_dir = base_dir / "src" if (base_dir / "src").is_dir() else base_dir
-                    cand = (src_dir / spec[2:]).resolve()
-                elif spec.startswith("$lib/"):
-                    src_dir = base_dir / "src" if (base_dir / "src").is_dir() else base_dir
-                    lib_dir = src_dir / "lib" if (src_dir / "lib").is_dir() else src_dir
-                    cand = (lib_dir / spec[len("$lib/") :]).resolve()
-                if cand is not None:
-                    for probe in (cand, Path(f"{cand}.ts"), cand / "index.ts"):
-                        if probe in nodes_by_path and probe != f:
-                            add_edge(node.id, nodes_by_path[probe].id, "calls_helper", rel_repo, f"Imports `{nodes_by_path[probe].label}`.")
+            # 1. Cross-module runtime imports -> verified vs declared calls_helper (type-only imports excluded)
+            imp_bindings = extract_ts_import_bindings(txt, is_tsx=False)
+            exec_txt, di_map = executable_ts_text(txt, is_tsx=False)
+            for imp in imp_bindings:
+                target = resolver.resolve_import(imp.spec, f)
+                if target is None or target == f:
+                    continue
+                imp_verified, used_syms = verified_import_bindings(exec_txt, di_map, imp)
+                verif = "verified" if imp_verified else "declared"
+                if target in nodes_by_path:
+                    verb_txt = "Calls/uses" if imp_verified else "Imports (uninvoked)"
+                    add_edge(
+                        node.id,
+                        nodes_by_path[target].id,
+                        "calls_helper",
+                        rel_repo,
+                        f"{verb_txt} `{nodes_by_path[target].label}`.",
+                        verification=verif,
+                    )
+                # Follow re-export barrels to concrete target modules so calls through barrels link cleanly
+                sym_list: list[str | None] = sorted(used_syms) if used_syms else [None]
+                for sym in sym_list:
+                    for re_tgt in resolve_reexport_targets(target, sym, resolver):
+                        if re_tgt not in nodes_by_path or re_tgt == f:
+                            continue
+                        if target in nodes_by_path:
+                            re_src = nodes_by_path[target].id
+                            re_ev = nodes_by_path[target].source_file
+                            re_note = (
+                                f"Re-exports invoked symbol `{sym}` from `{nodes_by_path[re_tgt].label}`."
+                                if sym and imp_verified
+                                else f"Re-exports `{nodes_by_path[re_tgt].label}`."
+                            )
+                        else:
+                            re_src = node.id
+                            re_ev = rel_repo
+                            re_note = f"Imports `{nodes_by_path[re_tgt].label}` via `{target.name}`."
+                        add_edge(re_src, nodes_by_path[re_tgt].id, "calls_helper", re_ev, re_note, verification=verif)
+
+            for bare_re in resolve_reexport_targets(f, None, resolver):
+                if bare_re in nodes_by_path and bare_re != f:
+                    add_edge(
+                        node.id,
+                        nodes_by_path[bare_re].id,
+                        "calls_helper",
+                        rel_repo,
+                        f"Re-exports `{nodes_by_path[bare_re].label}`.",
+                        verification="declared",
+                    )
 
             # 2. Synthesize HTTP routes
             file_methods: list[str] = []
@@ -349,28 +408,42 @@ class TypeScriptNodeAdapter:
 
             ctrl_m = _NEST_CTRL_RE.search(txt)
             if ctrl_m:
-                ctrl_pref = ctrl_m.group("prefix") or ""
-                node.subkind = "route"
-                for nm in _NEST_VERB_RE.finditer(txt):
-                    verb = nm.group("verb").upper()
-                    sub_p = nm.group("subpath") or ""
-                    full_p = _norm_colon_params(f"/{ctrl_pref}/{sub_p}")
-                    lineno = txt.count("\n", 0, nm.start()) + 1
-                    file_methods.append(verb)
-                    if full_p not in file_paths:
-                        file_paths.append(full_p)
-                    routes.append(
-                        RouteDescriptor(
-                            node_id=node.id,
-                            http_method=verb,
-                            full_path=full_p,
-                            path_regex=_route_regex(full_p),
-                            source_file=rel_repo,
-                            line=lineno,
-                            called_symbols=frozenset(),
-                            imported_modules=frozenset(),
+                raw_ctrl_arg = (ctrl_m.group("arg") or "").strip()
+                if not raw_ctrl_arg:
+                    ctrl_pref = ""
+                else:
+                    if raw_ctrl_arg.startswith("{"):
+                        pm = re.search(r"\bpath\s*:\s*([^,\n}]+)", raw_ctrl_arg)
+                        raw_ctrl_arg = pm.group(1).strip() if pm else ""
+                    resolved_pref = resolve_string_expr(raw_ctrl_arg, f, resolver) if raw_ctrl_arg else ""
+                    if resolved_pref is None:
+                        ctrl_lineno = txt.count("\n", 0, ctrl_m.start()) + 1
+                        add_note(f"Unresolved @Controller prefix expression `{raw_ctrl_arg}` in {rel_repo}:{ctrl_lineno}.")
+                        ctrl_pref = None
+                    else:
+                        ctrl_pref = resolved_pref
+                if ctrl_pref is not None:
+                    node.subkind = "route"
+                    for nm in _NEST_VERB_RE.finditer(txt):
+                        verb = nm.group("verb").upper()
+                        sub_p = nm.group("subpath") or ""
+                        full_p = _norm_colon_params(f"/{ctrl_pref}/{sub_p}")
+                        lineno = txt.count("\n", 0, nm.start()) + 1
+                        file_methods.append(verb)
+                        if full_p not in file_paths:
+                            file_paths.append(full_p)
+                        routes.append(
+                            RouteDescriptor(
+                                node_id=node.id,
+                                http_method=verb,
+                                full_path=full_p,
+                                path_regex=_route_regex(full_p),
+                                source_file=rel_repo,
+                                line=lineno,
+                                called_symbols=frozenset(),
+                                imported_modules=frozenset(),
+                            )
                         )
-                    )
             node.http_methods = sorted(set(file_methods))
             node.http_paths = file_paths[:20]
 
@@ -400,6 +473,12 @@ class TypeScriptNodeAdapter:
                 tk = sr.group(1).lower()
                 if tk in truth.table_symbol_map and truth.table_symbol_map[tk] not in writes_tids:
                     reads_tids.add(truth.table_symbol_map[tk])
+
+            k_reads, k_writes, k_notes = extract_kysely_table_ops(txt, rel_repo, truth, f, resolver)
+            reads_tids.update(k_reads)
+            writes_tids.update(k_writes)
+            for kn in k_notes:
+                add_note(kn)
 
             for tid in sorted(reads_tids):
                 table_readers.setdefault(tid, set()).add(node.id)
@@ -477,7 +556,7 @@ class TypeScriptNodeAdapter:
 
         inbound: dict[str, int] = {}
         for e in edges:
-            if e.kind == "calls_helper":
+            if e.kind == "calls_helper" and e.verification == "verified":
                 inbound[e.target_id] = inbound.get(e.target_id, 0) + 1
         for node in nodes_by_path.values():
             if node.subkind == "service" and inbound.get(node.id, 0) == 0:
@@ -500,4 +579,5 @@ class TypeScriptNodeAdapter:
             edges=edges,
             routes=routes,
             findings=findings,
+            notes=manip_notes,
         )

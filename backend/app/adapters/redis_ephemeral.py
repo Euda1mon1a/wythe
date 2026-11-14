@@ -10,6 +10,7 @@ Why Redis is inspected as Tier-1 `cache_store` (`role='ephemeral'`) rather than 
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import socket
 import ssl
@@ -21,6 +22,7 @@ from app.adapters.base import (
     RawCandidateFinding,
     TruthExtractionResult,
 )
+from app.adapters.ts_workspace import WorkspaceResolver, resolve_string_expr
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _SKIP_PARTS = ("adapters", "tests", "__pycache__", "node_modules", "target", ".git", "migrations", "alembic")
@@ -76,6 +78,25 @@ _DECLARED_QUEUES_RE = re.compile(
 _ASYNQ_SCHED_RE = re.compile(
     r"""\.Register\s*\(\s*"[^"\n]+"\s*,\s*asynq\.NewTask\s*\(\s*"(?P<asynq_q>[A-Za-z0-9_:-]+)" """.strip()
 )
+_NEST_PROCESSOR_RE = re.compile(r"""@Processor\(\s*(?P<arg>[^)]*?)\s*\)""")
+_NEST_INJECT_QUEUE_RE = re.compile(
+    r"""@InjectQueue\(\s*(?P<arg>[^)]+?)\s*\)\s*(?:(?:private|protected|public|readonly)\s+)*(?P<prop>[A-Za-z_$][\w$]*)"""
+)
+_BULL_REGISTER_QUEUE_RE = re.compile(
+    r"""\bBullModule\.registerQueue(?:Async)?\s*\((?P<body>[\s\S]{1,800}?)\)"""
+)
+_BULL_REG_NAME_RE = re.compile(r"""\bname\s*:\s*(?P<expr>[^,\n}]+)""")
+_BULL_NEW_WORKER_EXPR_RE = re.compile(r"""\bnew\s+Worker\s*\(\s*(?P<arg>[^,\n)]+)""")
+_BULL_NEW_QUEUE_EXPR_RE = re.compile(r"""\bnew\s+Queue\s*\(\s*(?P<arg>[^,\n)]+)""")
+
+
+def _queue_store_prefix(qname: str) -> str:
+    raw = qname.strip()
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", raw):
+        return f"queue_{raw}"
+    clean = re.sub(r"[^a-z0-9_.-]", "_", raw.lower()).strip("_") or "queue"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
+    return f"queue_{clean}_{digest}"
 
 _READ_OPS = frozenset({"get", "mget", "hget", "hgetall", "lrange", "smembers", "xread", "Get", "MGet", "HGet", "HGetAll", "GET", "MGET", "HGET", "HGETALL"})
 _TTL_WRITE_OPS = frozenset({"setex", "psetex", "set_ex", "SetEx", "SETEX", "PSETEX", "lpush", "rpush", "xadd", "publish", "LPush", "RPush", "LPUSH", "RPUSH"})
@@ -504,6 +525,13 @@ def augment_redis_ephemeral_lineage(
     file_entries: list[tuple[Path, str, AtlasNode, str]] = []
     route_prefix_queues: list[tuple[str, str]] = []
     task_queues_by_name: dict[str, str] = {}
+    ts_resolver = WorkspaceResolver.build(repo_root, extra_roots=(base_dir,))
+    seen_notes: set[str] = set(manip.notes)
+
+    def add_redis_note(msg: str) -> None:
+        if msg not in seen_notes:
+            seen_notes.add(msg)
+            manip.notes.append(msg)
 
     for src_file in sorted(base_dir.rglob("*")):
         if not src_file.is_file() or src_file.suffix not in _CODE_SUFFIXES:
@@ -511,14 +539,31 @@ def augment_redis_ephemeral_lineage(
         if any(p in _SKIP_PARTS for p in src_file.parts):
             continue
         rel_repo = src_file.relative_to(repo_root).as_posix()
-        mnode = manip_by_file.get(rel_repo)
-        if mnode is None:
-            continue
         try:
             raw = src_file.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
         txt = _strip_comments_keep_lines(raw, src_file.suffix)
+        if src_file.suffix in (".ts", ".js") and "BullModule.registerQueue" in txt:
+            for brm in _BULL_REGISTER_QUEUE_RE.finditer(txt):
+                for nm_m in _BULL_REG_NAME_RE.finditer(brm.group("body")):
+                    expr = nm_m.group("expr").strip()
+                    lineno = txt.count("\n", 0, brm.start() + nm_m.start()) + 1
+                    qname = resolve_string_expr(expr, src_file, ts_resolver)
+                    if qname:
+                        ensure_store(
+                            _queue_store_prefix(qname),
+                            rel_repo,
+                            lineno,
+                            f"declared BullMQ queue ({qname})",
+                        )
+                    else:
+                        add_redis_note(
+                            f"Unresolved dynamic BullModule.registerQueue name `{expr}` in {rel_repo}:{lineno}."
+                        )
+        mnode = manip_by_file.get(rel_repo)
+        if mnode is None:
+            continue
         file_entries.append((src_file, rel_repo, mnode, txt))
 
         for tr in _TASK_ROUTE_ENTRY_RE.finditer(txt):
@@ -606,7 +651,7 @@ def augment_redis_ephemeral_lineage(
             else:
                 qname = Path(rel_repo).stem
             lineno = txt.count("\n", 0, wm.start()) + 1
-            sid = ensure_store(f"queue_{qname}", rel_repo, lineno, "task queue")
+            sid = ensure_store(_queue_store_prefix(qname), rel_repo, lineno, f"task queue ({qname})")
             readers.setdefault(sid, set()).add(mnode.id)
             link(mnode.id, sid, "reads_truth", rel_repo, f"Worker consumes Redis queue `{qname}`.")
 
@@ -620,9 +665,91 @@ def augment_redis_ephemeral_lineage(
                 tsym = pm.group("task") or "tasks"
                 qname = task_queues_by_name.get(tsym, "default" if route_prefix_queues else tsym)
             lineno = txt.count("\n", 0, pm.start()) + 1
-            sid = ensure_store(f"queue_{qname}", rel_repo, lineno, "task queue")
+            sid = ensure_store(_queue_store_prefix(qname), rel_repo, lineno, f"task queue ({qname})")
             writers.setdefault(sid, set()).add(mnode.id)
             link(mnode.id, sid, "writes_truth", rel_repo, f"Enqueues job onto Redis queue `{qname}`.")
+
+        if src_file.suffix in (".ts", ".js"):
+            if re.search(r"\bextends\s+WorkerHost\b", txt):
+                worker_node_ids.add(mnode.id)
+            for np_m in _NEST_PROCESSOR_RE.finditer(txt):
+                worker_node_ids.add(mnode.id)
+                raw_arg = (np_m.group("arg") or "").strip()
+                if raw_arg.startswith("{"):
+                    nm_m = _BULL_REG_NAME_RE.search(raw_arg)
+                    expr = nm_m.group("expr").strip() if nm_m else ""
+                else:
+                    expr = raw_arg.split(",", 1)[0].strip()
+                lineno = txt.count("\n", 0, np_m.start()) + 1
+                qname = resolve_string_expr(expr, src_file, ts_resolver) if expr else None
+                if qname:
+                    sid = ensure_store(_queue_store_prefix(qname), rel_repo, lineno, f"BullMQ queue ({qname})")
+                    readers.setdefault(sid, set()).add(mnode.id)
+                    link(mnode.id, sid, "reads_truth", rel_repo, f"NestJS @Processor consumes BullMQ queue `{qname}`.")
+                else:
+                    add_redis_note(
+                        f"Unresolved dynamic BullMQ @Processor queue `{expr or '<empty>'}` in {rel_repo}:{lineno}."
+                    )
+
+            for bw_m in _BULL_NEW_WORKER_EXPR_RE.finditer(txt):
+                expr = bw_m.group("arg").strip()
+                if re.fullmatch(r"""['"][A-Za-z0-9_:-]+['"]""", expr):
+                    continue
+                worker_node_ids.add(mnode.id)
+                lineno = txt.count("\n", 0, bw_m.start()) + 1
+                qname = resolve_string_expr(expr, src_file, ts_resolver)
+                if qname:
+                    sid = ensure_store(_queue_store_prefix(qname), rel_repo, lineno, f"BullMQ queue ({qname})")
+                    readers.setdefault(sid, set()).add(mnode.id)
+                    link(mnode.id, sid, "reads_truth", rel_repo, f"Worker consumes BullMQ queue `{qname}`.")
+                else:
+                    add_redis_note(f"Unresolved dynamic BullMQ Worker queue `{expr}` in {rel_repo}:{lineno}.")
+
+            for bq_m in _BULL_NEW_QUEUE_EXPR_RE.finditer(txt):
+                expr = bq_m.group("arg").strip()
+                if re.fullmatch(r"""['"][A-Za-z0-9_:-]+['"]""", expr):
+                    continue
+                lineno = txt.count("\n", 0, bq_m.start()) + 1
+                qname = resolve_string_expr(expr, src_file, ts_resolver)
+                if qname:
+                    sid = ensure_store(_queue_store_prefix(qname), rel_repo, lineno, f"BullMQ queue ({qname})")
+                    writers.setdefault(sid, set()).add(mnode.id)
+                    link(mnode.id, sid, "writes_truth", rel_repo, f"Enqueues job onto BullMQ queue `{qname}`.")
+                else:
+                    add_redis_note(f"Unresolved dynamic BullMQ Queue name `{expr}` in {rel_repo}:{lineno}.")
+
+            for iq_m in _NEST_INJECT_QUEUE_RE.finditer(txt):
+                expr = iq_m.group("arg").strip()
+                prop = iq_m.group("prop").strip()
+                lineno = txt.count("\n", 0, iq_m.start()) + 1
+                qname = resolve_string_expr(expr, src_file, ts_resolver)
+                call_m = re.search(rf"(?:\bthis\.|(?<![.\w$])){re.escape(prop)}\s*\.\s*(?:add|addBulk)\s*\(", txt)
+                if call_m:
+                    call_line = txt.count("\n", 0, call_m.start()) + 1
+                    if qname:
+                        sid = ensure_store(_queue_store_prefix(qname), rel_repo, call_line, f"BullMQ queue ({qname})")
+                        writers.setdefault(sid, set()).add(mnode.id)
+                        link(
+                            mnode.id,
+                            sid,
+                            "writes_truth",
+                            rel_repo,
+                            f"Enqueues job onto BullMQ queue `{qname}` via `@InjectQueue` ({prop}).",
+                        )
+                    else:
+                        add_redis_note(
+                            f"Unresolved dynamic BullMQ @InjectQueue producer `{expr}` in {rel_repo}:{call_line}."
+                        )
+                elif qname:
+                    ensure_store(
+                        _queue_store_prefix(qname),
+                        rel_repo,
+                        lineno,
+                        f"declared BullMQ queue ({qname})",
+                    )
+                    add_redis_note(
+                        f"Declared BullMQ @InjectQueue `{qname}` on `{prop}` in {rel_repo}:{lineno} without `.add()` call."
+                    )
 
         # 1b. Dynamic `send_task(...)` & Scheduled Beat / Cron producers (`beat_schedule`, `add_periodic_task`, `asynq.Scheduler`)
         for stm in _SEND_TASK_RE.finditer(txt):
