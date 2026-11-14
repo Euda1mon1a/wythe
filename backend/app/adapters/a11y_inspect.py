@@ -32,6 +32,8 @@ _REGEX_PREV_KEYWORDS = frozenset(
 
 def _skip_js_regex(src: str, start: int, limit: int) -> int | None:
     """If `/` at `start` begins a valid single-line `/.../` regex literal, return index past flags."""
+    if start > 0 and src[start - 1] == "<" and re.match(r"^/(?:>|[A-Za-z][\w.:-]*\s*>)", src[start:]):
+        return None
     j = start + 1
     in_class = False
     while j < limit and src[j] not in ("\n", "\r"):
@@ -311,6 +313,162 @@ def _scan_brace_end(src: str, pos: int, limit: int | None = None) -> int | None:
             prev_sig_pos = i
         i += 1
     return None
+
+
+def _scan_paren_end(
+    src: str,
+    pos: int,
+    mask: list[bool] | None = None,
+    *,
+    skip_jsx: bool = True,
+) -> int | None:
+    """Index just past the `)` matching `(` at `pos`, respecting quotes, comments, and JSX."""
+    if pos >= len(src) or src[pos] != "(":
+        return None
+    src_mask = mask if mask is not None else js_code_mask(src)
+    n = len(src)
+    depth = 0
+    i = pos
+    while i < n:
+        if not src_mask[i]:
+            i += 1
+            continue
+        ch = src[i]
+        if skip_jsx and ch == "<":
+            found = _extract_jsx_at(src, i)
+            if found is not None:
+                i = found[1]
+                continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _unwrap_outer_parens(expr: str) -> str:
+    """Repeatedly strip outer `(...)` when the leading `(` closes at the end of `expr`."""
+    s = expr.strip()
+    while s.startswith("("):
+        mask = js_code_mask(s)
+        if _scan_paren_end(s, 0, mask) == len(s):
+            s = s[1:-1].strip()
+        else:
+            break
+    return s
+
+
+def _portal_names_from_imports(imported_components: dict[str, tuple[str, str]]) -> frozenset[str]:
+    """Return local identifiers bound to `createPortal` (plus default `"createPortal"`)."""
+    names = {"createPortal"}
+    for local, (_spec, exported) in imported_components.items():
+        if exported == "createPortal":
+            names.add(local)
+    return frozenset(names)
+
+
+def _is_portal_call_target(callee: str, portal_names: frozenset[str]) -> bool:
+    """True when a callee refers to React `createPortal` or an alias/member access to it."""
+    return callee in portal_names or callee.rsplit(".", 1)[-1] == "createPortal"
+
+
+def _split_top_level_ternary(expr: str, mask: list[bool] | None = None) -> tuple[str, str, str] | None:
+    """Split a top-level JS `cond ? cons : alt` ternary, respecting nested ternaries and JSX."""
+    src_mask = mask if mask is not None else js_code_mask(expr)
+    n = len(expr)
+    pdepth = bdepth = cdepth = qdepth = 0
+    q_pos: int | None = None
+    i = 0
+    while i < n:
+        if not src_mask[i]:
+            i += 1
+            continue
+        if pdepth == 0 and bdepth == 0 and cdepth == 0:
+            if expr.startswith("=>", i):
+                i = _slice_arrow_body_end(expr, i + 2, src_mask)
+                continue
+            if expr[i] == "<":
+                found = _extract_jsx_at(expr, i)
+                if found is not None:
+                    i = found[1]
+                    continue
+        ch = expr[i]
+        if ch == "(":
+            pdepth += 1
+        elif ch == ")" and pdepth > 0:
+            pdepth -= 1
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]" and bdepth > 0:
+            bdepth -= 1
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}" and cdepth > 0:
+            cdepth -= 1
+        elif pdepth == 0 and bdepth == 0 and cdepth == 0:
+            if ch == "?" and not expr.startswith(("?.", "??"), i):
+                if qdepth == 0:
+                    q_pos = i
+                qdepth += 1
+            elif ch == ":" and qdepth > 0:
+                qdepth -= 1
+                if qdepth == 0 and q_pos is not None:
+                    return expr[:q_pos], expr[q_pos + 1 : i], expr[i + 1 :]
+        i += 1
+    return None
+
+
+def _split_top_level_binary_ops(
+    expr: str,
+    ops: tuple[str, ...],
+    mask: list[bool] | None = None,
+) -> list[tuple[str, str | None]]:
+    """Split `expr` on any top-level 2-char operator in `ops`, skipping nested scopes and JSX."""
+    src_mask = mask if mask is not None else js_code_mask(expr)
+    n = len(expr)
+    pdepth = bdepth = cdepth = 0
+    start = 0
+    parts: list[tuple[str, str | None]] = []
+    i = 0
+    while i < n:
+        if not src_mask[i]:
+            i += 1
+            continue
+        if pdepth == 0 and bdepth == 0 and cdepth == 0:
+            if expr.startswith("=>", i):
+                i = _slice_arrow_body_end(expr, i + 2, src_mask)
+                continue
+            if expr[i] == "<":
+                found = _extract_jsx_at(expr, i)
+                if found is not None:
+                    i = found[1]
+                    continue
+        ch = expr[i]
+        if ch == "(":
+            pdepth += 1
+        elif ch == ")" and pdepth > 0:
+            pdepth -= 1
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]" and bdepth > 0:
+            bdepth -= 1
+        elif ch == "{":
+            cdepth += 1
+        elif ch == "}" and cdepth > 0:
+            cdepth -= 1
+        elif pdepth == 0 and bdepth == 0 and cdepth == 0:
+            matched_op = next((op for op in ops if expr.startswith(op, i)), None)
+            if matched_op is not None:
+                parts.append((expr[start:i], matched_op))
+                i += len(matched_op)
+                start = i
+                continue
+        i += 1
+    parts.append((expr[start:], None))
+    return parts
 
 
 def _find_matching_close_tag(
@@ -805,26 +963,6 @@ def _parse_default_params(raw_params: str) -> tuple[dict[str, str], dict[str, st
     return defaults, aliases
 
 
-def _scan_paren_end(src: str, pos: int, mask: list[bool]) -> int | None:
-    """Index just past `)` matching `(` at `pos`, respecting `mask` (JS strings/comments/regexes)."""
-    if pos >= len(src) or src[pos] != "(":
-        return None
-    depth = 1
-    i = pos + 1
-    n = len(src)
-    while i < n:
-        if mask[i]:
-            ch = src[i]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    return i + 1
-        i += 1
-    return None
-
-
 def _slice_arrow_body_end(tail: str, arrow_end: int, mask: list[bool]) -> int:
     """Return slice end index for a block- or expression-bodied arrow right after `=>`."""
     n = len(tail)
@@ -1253,39 +1391,52 @@ def _extract_jsx_at(src: str, jsx_start: int) -> tuple[str, int] | None:
     return src[jsx_start : close_span[1]], close_span[1]
 
 
-def _extract_jsx_or_conditional_branches(expr_src: str) -> list[str]:
-    """Collect JSX roots and short-circuit fallback semantics from a returned JS expression."""
-    mask = js_code_mask(expr_src)
-    branches: list[str] = []
-    n = len(expr_src)
-    i = 0
-    saw_short_circuit = False
-    saw_ternary = False
-    while i < n:
-        if not mask[i]:
-            i += 1
-            continue
-        ch = expr_src[i]
-        if ch == "<":
-            found = _extract_jsx_at(expr_src, i)
-            if found is not None:
-                jsx_slice, end_pos = found
-                branches.append(jsx_slice)
-                i = end_pos
-                continue
-        elif expr_src.startswith("&&", i) or expr_src.startswith("||", i):
-            saw_short_circuit = True
-            i += 2
-            continue
-        elif ch == "?":
-            saw_ternary = True
-        elif expr_src.startswith("=>", i):
-            i = _slice_arrow_body_end(expr_src, i + 2, mask)
-            continue
-        i += 1
-    if branches and saw_short_circuit and not saw_ternary:
-        branches.append("<!--WYTHE_EXPR-->null")
-    return branches
+def _extract_jsx_or_conditional_branches(
+    expr_src: str,
+    portal_names: frozenset[str] = frozenset({"createPortal"}),
+) -> list[str]:
+    """Collect JSX roots, portal semantics, and call uncertainty from a returned JS expression."""
+    s = _unwrap_outer_parens(expr_src)
+    if not s:
+        return ["<!--WYTHE_EXPR-->null"]
+    mask = js_code_mask(s)
+
+    ternary = _split_top_level_ternary(s, mask)
+    if ternary is not None:
+        _cond, cons, alt = ternary
+        return _extract_jsx_or_conditional_branches(
+            cons, portal_names
+        ) + _extract_jsx_or_conditional_branches(alt, portal_names)
+
+    or_parts = _split_top_level_binary_ops(s, ("||", "??"), mask)
+    if len(or_parts) > 1:
+        out: list[str] = []
+        for term, _op in or_parts:
+            out.extend(_extract_jsx_or_conditional_branches(term, portal_names))
+        return out
+
+    and_parts = _split_top_level_binary_ops(s, ("&&",), mask)
+    if len(and_parts) > 1:
+        rhs_branches = _extract_jsx_or_conditional_branches(and_parts[-1][0], portal_names)
+        return [*rhs_branches, "<!--WYTHE_EXPR-->null"]
+
+    if s.startswith("<"):
+        found = _extract_jsx_at(s, 0)
+        if found is not None and not s[found[1] :].strip():
+            return [found[0]]
+        return ["<!--WYTHE_OPAQUE-->"]
+
+    m_call = re.match(r"^(?:await\s+)?(?P<callee>[A-Za-z_$][\w$.]*)\s*(?:<[^()]*>)?\s*\(", s)
+    if m_call:
+        pend = _scan_paren_end(s, m_call.end() - 1, mask)
+        if pend == len(s):
+            if _is_portal_call_target(m_call.group("callee"), portal_names):
+                return ["<!--WYTHE_EXPR-->null"]
+            return ["<!--WYTHE_OPAQUE-->"]
+
+    if "<" in s or any(re.search(rf"\b{re.escape(pname)}\s*\(", s) for pname in portal_names):
+        return ["<!--WYTHE_OPAQUE-->"]
+    return [f"<!--WYTHE_EXPR-->{s}"]
 
 
 def _find_tsx_body_start(target_src: str, mask: str) -> tuple[bool, int] | None:
@@ -1354,7 +1505,11 @@ def _find_tsx_body_start(target_src: str, mask: str) -> tuple[bool, int] | None:
     return None
 
 
-def _extract_tsx_return_markup(target_src: str) -> str:
+def _extract_tsx_return_markup(
+    target_src: str,
+    *,
+    portal_names: frozenset[str] = frozenset({"createPortal"}),
+) -> str:
     """Extract single JSX output or `<!--WYTHE_BRANCH-->`-joined conditional returns."""
     mask = js_code_mask(target_src)
     body_info = _find_tsx_body_start(target_src, mask)
@@ -1367,15 +1522,13 @@ def _extract_tsx_return_markup(target_src: str) -> str:
         expr_tail = target_src[body_start:].strip()
         if expr_tail.endswith(";"):
             expr_tail = expr_tail[:-1].strip()
-        if expr_tail.startswith("(") and expr_tail.endswith(")"):
-            expr_tail = expr_tail[1:-1].strip()
-        if expr_tail.startswith("<"):
-            found = _extract_jsx_at(expr_tail, 0)
-            return found[0] if found is not None else ""
-        branches = _extract_jsx_or_conditional_branches(expr_tail)
-        if branches:
+        expr_tail = _unwrap_outer_parens(expr_tail)
+        if not expr_tail:
+            return ""
+        if "<" in expr_tail or any(p in expr_tail for p in portal_names):
+            branches = _extract_jsx_or_conditional_branches(expr_tail, portal_names)
             return "\n<!--WYTHE_BRANCH-->\n".join(branches)
-        return f"<!--WYTHE_EXPR-->{expr_tail}" if expr_tail else ""
+        return f"<!--WYTHE_EXPR-->{expr_tail}"
 
     body_end = _scan_brace_end(target_src, body_start) or n
     branches: list[str] = []
@@ -1418,22 +1571,6 @@ def _extract_tsx_return_markup(target_src: str) -> str:
                 pos = nxt
                 while pos < limit and target_src[pos].isspace():
                     pos += 1
-                if pos < limit and target_src[pos] == "(":
-                    inner_pos = pos + 1
-                    while inner_pos < limit and target_src[inner_pos].isspace():
-                        inner_pos += 1
-                    if inner_pos < limit and target_src[inner_pos] == "<":
-                        found = _extract_jsx_at(target_src, inner_pos)
-                        if found is not None:
-                            branches.append(found[0])
-                            i = found[1]
-                            continue
-                if pos < limit and target_src[pos] == "<":
-                    found = _extract_jsx_at(target_src, pos)
-                    if found is not None:
-                        branches.append(found[0])
-                        i = found[1]
-                        continue
                 depth = 0
                 end_pos = pos
                 while end_pos < limit:
@@ -1441,6 +1578,11 @@ def _extract_tsx_return_markup(target_src: str) -> str:
                         end_pos += 1
                         continue
                     ch = target_src[end_pos]
+                    if ch == "<":
+                        found_jsx = _extract_jsx_at(target_src, end_pos)
+                        if found_jsx is not None and found_jsx[1] <= limit:
+                            end_pos = found_jsx[1]
+                            continue
                     if ch in ("(", "[", "{"):
                         depth += 1
                     elif ch in (")", "]", "}"):
@@ -1455,8 +1597,8 @@ def _extract_tsx_return_markup(target_src: str) -> str:
                             break
                     end_pos += 1
                 raw_expr = target_src[pos:end_pos].strip()
-                if "<" in raw_expr:
-                    sub_branches = _extract_jsx_or_conditional_branches(raw_expr)
+                if "<" in raw_expr or any(p in raw_expr for p in portal_names):
+                    sub_branches = _extract_jsx_or_conditional_branches(raw_expr, portal_names)
                     if sub_branches:
                         branches.extend(sub_branches)
                     else:
@@ -1575,7 +1717,10 @@ def _extract_component_props_and_markup(
             defs, als = _parse_default_params(sig_src[m_open.end() : bend - 1])
             prop_defaults.update(defs)
             prop_aliases.update(als)
-    return prop_defaults, prop_aliases, _extract_tsx_return_markup(target_src)
+    portal_names = _portal_names_from_imports(parse_component_imports(raw_source))
+    return prop_defaults, prop_aliases, _extract_tsx_return_markup(
+        target_src, portal_names=portal_names
+    )
 
 
 def _split_top_level_coalesce_ops(expr: str) -> list[tuple[str, str | None]]:
@@ -1618,22 +1763,15 @@ def _eval_coalesce_expr(
     inner_status: str,
     unknown_fallback: str | None = None,
     depth: int = 0,
+    portal_names: frozenset[str] = frozenset({"createPortal"}),
 ) -> str:
     """Evaluate a JS `||` / `??` expression preserving nullish vs falsy semantics."""
-    s = expr.strip()
+    s = _unwrap_outer_parens(expr)
     if depth > 6:
         return "dynamic" if prop_values is None else "opaque"
     parts = _split_top_level_coalesce_ops(s)
     if len(parts) == 1:
         t = s
-        if len(t) >= 2 and t[0] == "(" and t[-1] == ")" and _scan_brace_end("{" + t[1:-1] + "}", 0) == len(t):
-            return _eval_coalesce_expr(
-                t[1:-1],
-                prop_values=prop_values,
-                inner_status=inner_status,
-                unknown_fallback=unknown_fallback,
-                depth=depth + 1,
-            )
         if t == "undefined":
             return "undefined"
         if t == "null":
@@ -1660,6 +1798,13 @@ def _eval_coalesce_expr(
         if len(t) >= 2 and t[0] == "`" and t[-1] == "`" and "${" not in t and "`" not in t[1:-1].replace("\\`", ""):
             inner = t[1:-1]
             return "named" if inner.strip() else ("blank" if inner else "empty")
+        m_portal = re.match(r"^(?:await\s+)?(?P<callee>[A-Za-z_$][\w$.]*)\s*(?:<[^()]*>)?\s*\(", t)
+        if (
+            m_portal
+            and _scan_paren_end(t, m_portal.end() - 1) == len(t)
+            and _is_portal_call_target(m_portal.group("callee"), portal_names)
+        ):
+            return "null"
         mp = re.fullmatch(r"(?:props\.)?(?P<p>[A-Za-z_$][\w$]*)", t)
         if prop_values is not None and mp and mp.group("p") in prop_values:
             return prop_values[mp.group("p")]
@@ -1677,6 +1822,7 @@ def _eval_coalesce_expr(
                 inner_status=inner_status,
                 unknown_fallback=unknown_fallback,
                 depth=depth + 1,
+                portal_names=portal_names,
             ),
             op,
         )
@@ -1713,6 +1859,7 @@ def _classify_expr_semantics(
     prop_values: dict[str, str] | None,
     inner_status: str,
     render_booleans_as_text: bool = False,
+    portal_names: frozenset[str] = frozenset({"createPortal"}),
 ) -> str:
     """Classify a `{...}` expression as `ignore`, `named`, `icon_only`, `empty`, or `opaque`."""
     expr = re.sub(r"/\*[\s\S]*?\*/", "", raw_expr).strip()
@@ -1739,6 +1886,7 @@ def _classify_expr_semantics(
         prop_values=prop_values,
         inner_status=inner_status,
         depth=0,
+        portal_names=portal_names,
     )
     if res in _BOOL_PROP_STATES:
         return "named" if render_booleans_as_text else "empty"
@@ -1749,6 +1897,240 @@ def _classify_expr_semantics(
     if res == "icon_only":
         return "icon_only"
     return "opaque"
+
+
+def _eval_component_child_inner(
+    inner_body: str,
+    *,
+    self_closing: bool,
+    imported_components: dict[str, tuple[str, str]],
+    component_resolver: Callable[..., str] | None,
+    prop_values: dict[str, str] | None,
+    inner_status: str,
+    render_booleans_as_text: bool,
+    allow_vue_kebab: bool,
+    source_offset: int,
+    portal_names: frozenset[str],
+) -> str:
+    """Summarize the `children` / default-slot value state passed into a child component."""
+    cleaned_inner = _JSX_COMMENT_RE.sub("", _HTML_COMMENT_RE.sub("", inner_body))
+    stripped_inner = cleaned_inner.strip()
+    if self_closing or cleaned_inner == "" or ("\n" in cleaned_inner and not stripped_inner):
+        return "omitted"
+    if not stripped_inner:
+        return "blank"
+    if (
+        stripped_inner.startswith("{")
+        and _scan_brace_end(stripped_inner, 0) == len(stripped_inner)
+        and "<" not in stripped_inner
+        and not stripped_inner.startswith(("{#", "{:", "{/", "{@"))
+    ):
+        expr_s = stripped_inner[1:-1].strip()
+        if (
+            render_booleans_as_text
+            and expr_s.startswith("{")
+            and expr_s.endswith("}")
+            and _scan_brace_end(expr_s, 0) == len(expr_s)
+        ):
+            expr_s = expr_s[1:-1].strip()
+        if expr_s:
+            return _eval_coalesce_expr(
+                expr_s,
+                prop_values=prop_values,
+                inner_status=inner_status,
+                portal_names=portal_names,
+            )
+        return "omitted"
+    cst, copaque, _ = _classify_markup_segment(
+        inner_body,
+        imported_components=imported_components,
+        component_resolver=component_resolver,
+        prop_values=prop_values,
+        inner_status=inner_status,
+        render_booleans_as_text=render_booleans_as_text,
+        allow_vue_kebab=allow_vue_kebab,
+        source_offset=source_offset,
+    )
+    if cst == "named":
+        return "named"
+    if copaque:
+        return "opaque"
+    if cst == "icon_only":
+        return "icon_only"
+    return "empty_node"
+
+
+def _extract_dynamic_component_selector(
+    tag_low: str,
+    attrs: str,
+    *,
+    allow_vue_kebab: bool,
+) -> tuple[bool, str | None, str]:
+    """Detect Svelte/Vue dynamic component tags and return `(matched, selector_expr, cleaned_attrs)`."""
+    if tag_low == "svelte:component":
+        m = re.search(r"(?<![\w$-])this\s*=\s*\{", attrs)
+        if m:
+            bend = _scan_brace_end(attrs, m.end() - 1)
+            if bend is None:
+                return True, None, attrs
+            return True, attrs[m.end() : bend - 1].strip(), attrs[: m.start()] + attrs[bend:]
+        ms = re.search(r"""(?<![\w$-])this\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')""", attrs)
+        if ms:
+            val = (ms.group("dq") if ms.group("dq") is not None else ms.group("sq") or "").strip()
+            return True, repr(val), attrs[: ms.start()] + attrs[ms.end() :]
+        return True, None, attrs
+    if tag_low == "component" and (
+        allow_vue_kebab or re.search(r"(?<![\w$-])(?::|v-bind:)is\s*=", attrs)
+    ):
+        mb = re.search(
+            r"""(?<![\w$-])(?::|v-bind:)is\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')""",
+            attrs,
+        )
+        if mb:
+            expr = (mb.group("dq") if mb.group("dq") is not None else mb.group("sq") or "").strip()
+            return True, expr, attrs[: mb.start()] + attrs[mb.end() :]
+        ms = re.search(r"""(?<![\w$-])is\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')""", attrs)
+        if ms:
+            val = (ms.group("dq") if ms.group("dq") is not None else ms.group("sq") or "").strip()
+            if val.startswith("vue:"):
+                val = val[4:].strip()
+            return True, repr(val), attrs[: ms.start()] + attrs[ms.end() :]
+        return True, None, attrs
+    return False, None, attrs
+
+
+def _resolve_dynamic_component_selector(
+    selector_expr: str | None,
+    *,
+    cleaned_attrs: str,
+    inner_body: str,
+    child_inner: str,
+    imported_components: dict[str, tuple[str, str]],
+    component_resolver: Callable[..., str] | None,
+    prop_values: dict[str, str] | None,
+    inner_status: str,
+    render_booleans_as_text: bool,
+    allow_vue_kebab: bool,
+    source_offset: int,
+    usage_pos: int,
+    portal_names: frozenset[str],
+    depth: int = 0,
+) -> str:
+    """Resolve `<component :is>` / `<svelte:component this={...}>` to component semantics or `"opaque"`."""
+    if depth > 4 or selector_expr is None:
+        return "opaque"
+    s = _unwrap_outer_parens(selector_expr)
+    if not s:
+        return "opaque"
+    if s in ("null", "undefined", "false", "''", '""', "``"):
+        return "empty"
+    ternary = _split_top_level_ternary(s)
+    if ternary is not None:
+        _cond, cons, alt = ternary
+        st_c = _resolve_dynamic_component_selector(
+            cons,
+            cleaned_attrs=cleaned_attrs,
+            inner_body=inner_body,
+            child_inner=child_inner,
+            imported_components=imported_components,
+            component_resolver=component_resolver,
+            prop_values=prop_values,
+            inner_status=inner_status,
+            render_booleans_as_text=render_booleans_as_text,
+            allow_vue_kebab=allow_vue_kebab,
+            source_offset=source_offset,
+            usage_pos=usage_pos,
+            portal_names=portal_names,
+            depth=depth + 1,
+        )
+        st_a = _resolve_dynamic_component_selector(
+            alt,
+            cleaned_attrs=cleaned_attrs,
+            inner_body=inner_body,
+            child_inner=child_inner,
+            imported_components=imported_components,
+            component_resolver=component_resolver,
+            prop_values=prop_values,
+            inner_status=inner_status,
+            render_booleans_as_text=render_booleans_as_text,
+            allow_vue_kebab=allow_vue_kebab,
+            source_offset=source_offset,
+            usage_pos=usage_pos,
+            portal_names=portal_names,
+            depth=depth + 1,
+        )
+        return st_c if st_c == st_a else "opaque"
+
+    target: str | None = None
+    lit = _unwrap_static_js_string(s)
+    if lit is not None:
+        target = lit[4:].strip() if lit.startswith("vue:") else lit.strip()
+        if not target:
+            return "empty"
+    elif re.fullmatch(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?", s):
+        root = s.split(".", 1)[0]
+        if prop_values is not None and root in prop_values:
+            pval = prop_values[root]
+            if pval in _EMPTY_PROP_STATES or pval in ("omitted", "bool_false"):
+                return "empty"
+            return "opaque"
+        if _normalize_component_lookup(
+            s, imported_components, allow_vue_case_insensitive=allow_vue_kebab
+        ) is None:
+            return "opaque"
+        target = s
+    else:
+        return "opaque"
+
+    assert target is not None
+    tlow = target.lower()
+    if tlow in ("script", "style") or _is_aria_hidden_true(cleaned_attrs):
+        return "empty"
+    if tlow == "img":
+        return _eval_inline_graphic_name(cleaned_attrs, allow_alt=True, prop_values=prop_values)
+    if tlow in ("svg", "i"):
+        gst, gopaque = _classify_graphic_element(
+            tlow,
+            cleaned_attrs,
+            inner_body,
+            imported_components=imported_components,
+            component_resolver=component_resolver,
+            prop_values=prop_values,
+            inner_status=inner_status,
+            render_booleans_as_text=render_booleans_as_text,
+            allow_vue_kebab=allow_vue_kebab,
+            source_offset=source_offset,
+        )
+        return "opaque" if gopaque else gst
+    matched_imp = _normalize_component_lookup(
+        target, imported_components, allow_vue_case_insensitive=allow_vue_kebab
+    )
+    if target[0].isupper() or "." in target or "-" in target or matched_imp is not None:
+        return _resolve_component_tag(
+            target,
+            cleaned_attrs,
+            child_inner,
+            imported_components=imported_components,
+            component_resolver=component_resolver,
+            prop_values=prop_values,
+            allow_vue_kebab=allow_vue_kebab,
+            usage_pos=usage_pos,
+        )
+    own_name = _eval_element_own_name(cleaned_attrs, allow_alt=False, prop_values=prop_values)
+    if own_name in ("named", "opaque"):
+        return own_name
+    inj = _eval_injected_html_name(
+        cleaned_attrs, prop_values=prop_values, inner_status=inner_status
+    )
+    if inj in ("named", "icon_only", "opaque"):
+        return inj
+    if child_inner == "named":
+        return "named"
+    if child_inner == "opaque":
+        return "opaque"
+    if child_inner == "icon_only":
+        return "icon_only"
+    return "empty"
 
 
 def _classify_markup_segment(
@@ -1767,6 +2149,7 @@ def _classify_markup_segment(
     has_icon = False
     has_empty_comp = False
     opaque_tags: list[str] = []
+    portal_names = _portal_names_from_imports(imported_components)
     n = len(src)
     i = 0
 
@@ -1799,6 +2182,7 @@ def _classify_markup_segment(
                 prop_values=prop_values,
                 inner_status=inner_status,
                 render_booleans_as_text=render_booleans_as_text,
+                portal_names=portal_names,
             )
             if sem == "named":
                 has_named = True
@@ -1863,7 +2247,7 @@ def _classify_markup_segment(
                 tag, imported_components, allow_vue_case_insensitive=allow_vue_kebab
             )
             root_imp = matched_imp[1] if matched_imp is not None else None
-            if root_imp and _ICON_PKG_SPEC_RE.match(root_imp[0]):
+            if root_imp and _ICON_PKG_SPEC_RE.match(root_imp[0]) and component_resolver is None:
                 merge_status(
                     _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values),
                     tag,
@@ -1896,57 +2280,73 @@ def _classify_markup_segment(
                         merge_status(slot_st, "slot")
                 i = next_i
                 continue
-            if tag_low in ("script", "style") or _is_aria_hidden_true(attrs):
+            if tag_low in ("script", "style"):
                 i = next_i
                 continue
-            if tag[0].isupper() or "." in tag or "-" in tag or matched_imp is not None:
-                cleaned_inner = _JSX_COMMENT_RE.sub("", _HTML_COMMENT_RE.sub("", inner_body))
-                stripped_inner = cleaned_inner.strip()
-                if self_closing or cleaned_inner == "" or ("\n" in cleaned_inner and not stripped_inner):
-                    child_inner = "omitted"
-                elif not stripped_inner:
-                    child_inner = "blank"
-                elif (
-                    stripped_inner.startswith("{")
-                    and _scan_brace_end(stripped_inner, 0) == len(stripped_inner)
-                    and "<" not in stripped_inner
-                    and not stripped_inner.startswith(("{#", "{:", "{/", "{@"))
-                ):
-                    expr_s = stripped_inner[1:-1].strip()
-                    if (
-                        render_booleans_as_text
-                        and expr_s.startswith("{")
-                        and expr_s.endswith("}")
-                        and _scan_brace_end(expr_s, 0) == len(expr_s)
-                    ):
-                        expr_s = expr_s[1:-1].strip()
-                    if expr_s:
-                        child_inner = _eval_coalesce_expr(
-                            expr_s,
-                            prop_values=prop_values,
-                            inner_status=inner_status,
-                        )
-                    else:
-                        child_inner = "omitted"
-                else:
-                    cst, copaque, _ = _classify_markup_segment(
-                        inner_body,
+            if _is_aria_hidden_true(attrs):
+                if root_imp and _ICON_PKG_SPEC_RE.match(root_imp[0]):
+                    resolved = _resolve_component_tag(
+                        tag,
+                        attrs,
+                        "omitted",
                         imported_components=imported_components,
                         component_resolver=component_resolver,
                         prop_values=prop_values,
-                        inner_status=inner_status,
-                        render_booleans_as_text=render_booleans_as_text,
                         allow_vue_kebab=allow_vue_kebab,
-                        source_offset=source_offset + open_end,
+                        usage_pos=source_offset + i,
                     )
-                    if cst == "named":
-                        child_inner = "named"
-                    elif copaque:
-                        child_inner = "opaque"
-                    elif cst == "icon_only":
-                        child_inner = "icon_only"
-                    else:
-                        child_inner = "empty_node"
+                    merge_status("empty" if resolved == "named" else resolved, tag)
+                i = next_i
+                continue
+            is_dyn_comp, dyn_sel, dyn_attrs = _extract_dynamic_component_selector(
+                tag_low,
+                attrs,
+                allow_vue_kebab=allow_vue_kebab,
+            )
+            if is_dyn_comp:
+                child_inner = _eval_component_child_inner(
+                    inner_body,
+                    self_closing=self_closing,
+                    imported_components=imported_components,
+                    component_resolver=component_resolver,
+                    prop_values=prop_values,
+                    inner_status=inner_status,
+                    render_booleans_as_text=render_booleans_as_text,
+                    allow_vue_kebab=allow_vue_kebab,
+                    source_offset=source_offset + open_end,
+                    portal_names=portal_names,
+                )
+                dyn_status = _resolve_dynamic_component_selector(
+                    dyn_sel,
+                    cleaned_attrs=dyn_attrs,
+                    inner_body=inner_body,
+                    child_inner=child_inner,
+                    imported_components=imported_components,
+                    component_resolver=component_resolver,
+                    prop_values=prop_values,
+                    inner_status=inner_status,
+                    render_booleans_as_text=render_booleans_as_text,
+                    allow_vue_kebab=allow_vue_kebab,
+                    source_offset=source_offset + open_end,
+                    usage_pos=source_offset + i,
+                    portal_names=portal_names,
+                )
+                merge_status(dyn_status, tag)
+                i = next_i
+                continue
+            if tag[0].isupper() or "." in tag or "-" in tag or matched_imp is not None:
+                child_inner = _eval_component_child_inner(
+                    inner_body,
+                    self_closing=self_closing,
+                    imported_components=imported_components,
+                    component_resolver=component_resolver,
+                    prop_values=prop_values,
+                    inner_status=inner_status,
+                    render_booleans_as_text=render_booleans_as_text,
+                    allow_vue_kebab=allow_vue_kebab,
+                    source_offset=source_offset + open_end,
+                    portal_names=portal_names,
+                )
                 resolved = _resolve_component_tag(
                     tag,
                     attrs,
@@ -2200,7 +2600,7 @@ def _classify_graphic_element(
     own_name = _eval_element_own_name(attrs, allow_alt=False, prop_values=prop_values)
     if own_name == "named":
         return "named", []
-    if inner_body and not _is_aria_hidden_true(attrs) and not _has_presentational_role(attrs):
+    if inner_body and not _is_aria_hidden_true(attrs):
         if tag_low == "i":
             cst, copaque, _ = _classify_markup_segment(
                 inner_body,
@@ -2216,7 +2616,7 @@ def _classify_graphic_element(
                 return "named", []
             if copaque:
                 return "opaque", copaque
-        elif tag_low == "svg":
+        elif tag_low == "svg" and not _has_presentational_role(attrs):
             child_opaque: list[str] = []
             for cm in _SVG_NAME_CHILD_RE.finditer(inner_body):
                 cattrs = cm.group("cattrs") or ""
@@ -2261,16 +2661,16 @@ def _resolve_component_tag(
     allow_vue_kebab: bool = False,
     usage_pos: int | None = None,
 ) -> str:
+    if component_resolver is not None:
+        if getattr(component_resolver, "_wythe_accepts_usage_pos", False):
+            return component_resolver(tag, attrs, inner_status, usage_pos=usage_pos)
+        return component_resolver(tag, attrs, inner_status)
     matched = _normalize_component_lookup(
         tag, imported_components, allow_vue_case_insensitive=allow_vue_kebab
     )
     imp = matched[1] if matched is not None else None
     if imp and _ICON_PKG_SPEC_RE.match(imp[0]):
         return _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values)
-    if component_resolver is not None:
-        if getattr(component_resolver, "_wythe_accepts_usage_pos", False):
-            return component_resolver(tag, attrs, inner_status, usage_pos=usage_pos)
-        return component_resolver(tag, attrs, inner_status)
     return "opaque"
 
 
@@ -2305,25 +2705,27 @@ def make_local_component_resolver(
         matched = _normalize_component_lookup(
             tag_name, imports, allow_vue_case_insensitive=vue_kebab_caller
         )
-        root_name = matched[0] if matched is not None else tag_name.split(".", 1)[0]
         imp = matched[1] if matched is not None else None
-        if imp is not None and _ICON_PKG_SPEC_RE.match(imp[0]):
-            return _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=_parent_props)
+        raw_root = tag_name.split(".", 1)[0]
         effective_usage_pos = usage_pos if usage_pos is not None else _fallback_scope_pos
         scope_status = "missing"
         local_decl_pos: int | None = None
-        if imp is None and caller_file.suffix in (".tsx", ".jsx"):
+        if caller_file.suffix in (".tsx", ".jsx"):
             scope_status, local_decl_pos = _find_lexical_tsx_decl_pos(
-                caller_source, root_name, effective_usage_pos
+                caller_source, raw_root, effective_usage_pos
             )
             if scope_status == "ambiguous":
                 return "opaque"
+            if scope_status == "found" and "." in tag_name:
+                return "opaque"
         same_file = scope_status == "found" and local_decl_pos is not None
+        if not same_file and imp is not None and _ICON_PKG_SPEC_RE.match(imp[0]):
+            return _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=_parent_props)
         if _depth >= 3 or (imp is None and not same_file):
             return "opaque"
         if same_file:
             target = caller_file
-            exported = root_name
+            exported = raw_root
             initial_ckey = (target, f"__local__:{local_decl_pos}:{exported}")
         else:
             assert imp is not None
@@ -2498,12 +2900,15 @@ def make_local_component_resolver(
         child_vue_kebab = resolved_path.suffix == ".vue"
 
         def classify_branch(branch: str) -> str:
+            if branch == "<!--WYTHE_OPAQUE-->":
+                return "opaque"
             if branch.startswith("<!--WYTHE_EXPR-->"):
                 sem = _classify_expr_semantics(
                     branch[len("<!--WYTHE_EXPR-->") :],
                     prop_values=merged_props,
                     inner_status=effective_inner,
                     render_booleans_as_text=child_bool_as_text,
+                    portal_names=_portal_names_from_imports(target_imports),
                 )
                 return "empty" if sem == "ignore" else sem
             st, _, _ = _classify_markup_segment(

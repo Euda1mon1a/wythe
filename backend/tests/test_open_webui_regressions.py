@@ -788,3 +788,89 @@ def test_zero_falsy_injected_html_expr_returns_case_isolation_and_lexical_scope_
     assert disp_lines == [11, 21, 23, 24, 25, 26, 30, 32], res.findings
 
 
+def test_shadowing_presentational_italic_dynamic_components_and_portals_a11y(
+    tmp_path: Path,
+) -> None:
+    """Verify local shadowing over imports, `<i role=presentation>`, dynamic components, and portals."""
+    from app.adapters.sveltekit_display import SvelteKitDisplayAdapter
+    from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+    from app.adapters.vue_sfc import VueSfcDisplayAdapter
+
+    tsx_root = tmp_path / "tsx_app"
+    put(
+        tsx_root,
+        "components/Icon.tsx",
+        "export default function Icon() { return <svg />; }\n",
+    )
+    put(
+        tsx_root,
+        "app/page.tsx",
+        "import Label from '../components/Icon';\n"
+        "import { Check as LucideIcon } from 'lucide-react';\n"
+        "import { createPortal } from 'react-dom';\n"
+        "function wrapHelper(node: unknown) { return node; }\n"
+        "function TooltipPortal() { return createPortal(<span>Save</span>, document.body); }\n"
+        "function ReactDomPortal() { return ReactDOM.createPortal(<span>Save</span>, document.body); }\n"
+        "function Wrapped() { return wrapHelper(<span>Save</span>); }\n"
+        "export function App() {\n"
+        "  const Label = () => <span>Save</span>;\n"
+        "  const LucideIcon = () => <span>Save</span>;\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <button><Label /></button>\n"
+        "      <button><LucideIcon /></button>\n"
+        "      <button><span><i role='presentation'>Save</i></span></button>\n"
+        "      <button><span><i role='none'>Save</i></span></button>\n"
+        "      <button><span><i role='presentation' /></span></button>\n"
+        "      <button><span><i aria-hidden='true'>Save</i></span></button>\n"
+        "      <button><svg /><TooltipPortal /></button>\n"
+        "      <button><svg /><ReactDomPortal /></button>\n"
+        "      <button><svg />{createPortal(<span>Save</span>, document.body)}</button>\n"
+        "      <button><svg /><Wrapped /></button>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n"
+        "export function Unshadowed() { return <button><Label /></button>; }\n"
+        "export function UnshadowedIcon() { return <button><LucideIcon /></button>; }\n",
+    )
+    tsx_res = TypeScriptNextJsAdapter().extract(tsx_root, ".")
+    tsx_lines = sorted(f.line for f in tsx_res.findings if f.rule_code == "DISP-005")
+    assert tsx_lines == [17, 18, 19, 20, 21, 26, 27], tsx_res.findings
+
+    vue_root = tmp_path / "vue_app"
+    put(vue_root, "src/components/Label.vue", "<template><span>Save</span></template>\n")
+    put(vue_root, "src/components/IconOnly.vue", "<template><svg /></template>\n")
+    put(
+        vue_root,
+        "src/App.vue",
+        "<script setup>\n"
+        "import Label from './components/Label.vue';\n"
+        "import IconOnly from './components/IconOnly.vue';\n"
+        "const dynamicComp = 'unknown';\n"
+        "</script>\n"
+        "<template>\n"
+        "  <button><component :is=\"Label\" /><svg /></button>\n"
+        "  <button><component :is=\"IconOnly\" /></button>\n"
+        "  <button><component :is=\"dynamicComp\" /><svg /></button>\n"
+        "</template>\n",
+    )
+    vue_res = VueSfcDisplayAdapter().extract(vue_root, ".")
+    vue_lines = sorted(f.line for f in vue_res.findings if f.rule_code == "DISP-005")
+    assert vue_lines == [8], vue_res.findings
+
+    sv_root = tmp_path / "svelte_app"
+    put(sv_root, "src/lib/Label.svelte", "<span>Save</span>\n")
+    put(sv_root, "src/lib/IconOnly.svelte", "<svg />\n")
+    put(
+        sv_root,
+        "src/routes/+page.svelte",
+        "<script>import Label from '$lib/Label.svelte'; import IconOnly from '$lib/IconOnly.svelte'; let dynamicComp;</script>\n"
+        "<button><svelte:component this={Label} /><svg /></button>\n"
+        "<button><svelte:component this={IconOnly} /></button>\n"
+        "<button><svelte:component this={dynamicComp} /><svg /></button>\n",
+    )
+    sv_res = SvelteKitDisplayAdapter().extract(sv_root, ".")
+    sv_lines = sorted(f.line for f in sv_res.findings if f.rule_code == "DISP-005")
+    assert sv_lines == [3], sv_res.findings
+
+
