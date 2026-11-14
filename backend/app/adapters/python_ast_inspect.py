@@ -1134,9 +1134,9 @@ def _live_param_expr_nodes(
                             fin_states.extend(try_continues)
                         if not fin_states:
                             fin_states.append((entry_live or lt, exc_base_defs, exc_base_st))
-                        fin_union_l = any(l for l, _, _ in fin_states)
+                        fin_union_l = any(lv for lv, _, _ in fin_states)
                         fin_union_d = _merge_defs(*(d for _, d, _ in fin_states))
-                        fin_union_s = _merge_stored([(l, st) for l, _, st in fin_states])
+                        fin_union_s = _merge_stored([(lv, st) for lv, _, st in fin_states])
                         walk_stmts(
                             s.finalbody,
                             fin_union_l,
@@ -1170,33 +1170,33 @@ def _live_param_expr_nodes(
 
                         if all_returns and abrupt_returns is not None:
                             rl, rd, rs, rf = eval_finalizer(
-                                any(l for l, _, _ in all_returns),
+                                any(lv for lv, _, _ in all_returns),
                                 _merge_defs(*(d for _, d, _ in all_returns)),
-                                _merge_stored([(l, st) for l, _, st in all_returns]),
+                                _merge_stored([(lv, st) for lv, _, st in all_returns]),
                             )
                             if rf:
                                 abrupt_returns.append((rl, rd, rs))
                         if uncaught_raises and abrupt_raises is not None:
                             rl, rd, rs, rf = eval_finalizer(
-                                any(l for l, _, _ in uncaught_raises),
+                                any(lv for lv, _, _ in uncaught_raises),
                                 _merge_defs(*(d for _, d, _ in uncaught_raises)),
-                                _merge_stored([(l, st) for l, _, st in uncaught_raises]),
+                                _merge_stored([(lv, st) for lv, _, st in uncaught_raises]),
                             )
                             if rf:
                                 abrupt_raises.append((rl, rd, rs))
                         if try_breaks and loop_breaks is not None:
                             rl, rd, rs, rf = eval_finalizer(
-                                any(l for l, _, _ in try_breaks),
+                                any(lv for lv, _, _ in try_breaks),
                                 _merge_defs(*(d for _, d, _ in try_breaks)),
-                                _merge_stored([(l, st) for l, _, st in try_breaks]),
+                                _merge_stored([(lv, st) for lv, _, st in try_breaks]),
                             )
                             if rf:
                                 loop_breaks.append((rl, rd, rs))
                         if try_continues and loop_continues is not None:
                             rl, rd, rs, rf = eval_finalizer(
-                                any(l for l, _, _ in try_continues),
+                                any(lv for lv, _, _ in try_continues),
                                 _merge_defs(*(d for _, d, _ in try_continues)),
-                                _merge_stored([(l, st) for l, _, st in try_continues]),
+                                _merge_stored([(lv, st) for lv, _, st in try_continues]),
                             )
                             if rf:
                                 loop_continues.append((rl, rd, rs))
@@ -1281,9 +1281,9 @@ def _live_param_expr_nodes(
                 body, True, init_defs, init_stored, init_guarded, None, None, top_returns, None
             )
             exit_states = ([(end_live, end_defs, end_st)] if end_fall else []) + top_returns
-            exit_stored = _merge_stored([(l, st) for l, _, st in exit_states])
-            if any(l for l, _, _ in exit_states):
-                live_exit_defs = _merge_defs(*(d for l, d, _ in exit_states if l))
+            exit_stored = _merge_stored([(lv, st) for lv, _, st in exit_states])
+            if any(lv for lv, _, _ in exit_states):
+                live_exit_defs = _merge_defs(*(d for lv, d, _ in exit_states if lv))
                 for fn_name, fn_nodes in list(live_exit_defs.items()):
                     if any(id(fn_node) not in dead_refs for fn_node in fn_nodes):
                         activate_defs(fn_name, live_exit_defs, exit_stored, init_guarded)

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { AtlasNode } from '@/api/atlas';
 import { createAtomicDeltahedra, createWytheAtomicMaterial, type AtomicMaterialOptions } from './wytheAtomicShader';
+import type { EdgeLinePattern } from './wytheSceneLenses';
 import type { PolygonRenderMode } from './wytheTheme';
 
 export const DETAIL_DIAMETER_PX = 18;
@@ -203,17 +204,70 @@ export interface SceneRenderEdge {
   end: [number, number, number];
   color: number;
   opacity: number;
+  pattern?: EdgeLinePattern;
+}
+
+const EDGE_PATTERN_SPANS: Record<EdgeLinePattern, ReadonlyArray<readonly [number, number]>> = {
+  solid: [[0, 1]],
+  dashed: [
+    [0, 0.19],
+    [0.27, 0.46],
+    [0.54, 0.73],
+    [0.81, 1],
+  ],
+  dotted: [
+    [0, 0.05],
+    [0.16, 0.21],
+    [0.32, 0.37],
+    [0.48, 0.53],
+    [0.64, 0.69],
+    [0.8, 0.85],
+    [0.95, 1],
+  ],
+  broken_gap: [
+    [0, 0.34],
+    [0.66, 1],
+  ],
+};
+
+function interpolatePoint(
+  a: [number, number, number],
+  b: [number, number, number],
+  t: number,
+): [number, number, number] {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
 }
 
 export function createBatchedEdges(edges: SceneRenderEdge[]): THREE.Group {
   const group = new THREE.Group();
   const buckets = new Map<number, { positions: number[]; colors: number[] }>();
+  const patternCounts: Record<EdgeLinePattern, number> = {
+    solid: 0,
+    dashed: 0,
+    dotted: 0,
+    broken_gap: 0,
+  };
+  const patternSegmentCounts: Record<EdgeLinePattern, number> = {
+    solid: 0,
+    dashed: 0,
+    dotted: 0,
+    broken_gap: 0,
+  };
+
   for (const edge of edges) {
     if (!buckets.has(edge.opacity)) buckets.set(edge.opacity, { positions: [], colors: [] });
     const bucket = buckets.get(edge.opacity)!;
     const color = new THREE.Color(edge.color);
-    bucket.positions.push(...edge.start, ...edge.end);
-    bucket.colors.push(color.r, color.g, color.b, color.r, color.g, color.b);
+    const pattern: EdgeLinePattern = edge.pattern ?? 'solid';
+    const spans = EDGE_PATTERN_SPANS[pattern];
+    patternCounts[pattern] += 1;
+    patternSegmentCounts[pattern] += spans.length;
+    for (const [t0, t1] of spans) {
+      const p0 = t0 === 0 ? edge.start : interpolatePoint(edge.start, edge.end, t0);
+      const p1 = t1 === 1 ? edge.end : interpolatePoint(edge.start, edge.end, t1);
+      bucket.positions.push(...p0, ...p1);
+      bucket.colors.push(color.r, color.g, color.b, color.r, color.g, color.b);
+    }
   }
   for (const [opacity, bucket] of buckets) {
     const geometry = new THREE.BufferGeometry();
@@ -223,5 +277,7 @@ export function createBatchedEdges(edges: SceneRenderEdge[]): THREE.Group {
       vertexColors: true, transparent: true, opacity, depthWrite: false,
     })));
   }
+  group.userData.patternCounts = patternCounts;
+  group.userData.patternSegmentCounts = patternSegmentCounts;
   return group;
 }

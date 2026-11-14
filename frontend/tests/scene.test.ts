@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import * as THREE from 'three';
-import type { AtlasEdge, AtlasNode } from '../src/api/atlas';
+import type { AtlasEdge, AtlasNode, BoundaryFinding, PortableReferenceExemplar } from '../src/api/atlas';
 import { selectSceneGraph, collectNeighborhood, type SceneGraphFilters } from '../src/lib/wytheSceneGraph';
-import { computeScenePositions } from '../src/lib/wytheSceneLenses';
+import {
+  computeScenePositions,
+  evaluateEdgeVisual,
+  getEdgeVerificationLegendItems,
+} from '../src/lib/wytheSceneLenses';
 import { createBatchedNodes, createBatchedEdges, fitGraphCamera, type SceneRenderNode } from '../src/lib/wytheSceneBatches';
 import { buildLiveViewportDigest } from '../src/lib/wytheVisionBridge';
+import { buildDiagnosticBrief, selectReferenceExemplar } from '../src/lib/wytheBriefBuilder';
 import { WYTHE_PRESETS } from '../src/lib/wytheTheme';
 
 const node = (id: string, overrides: Partial<AtlasNode> = {}): AtlasNode => ({
@@ -207,4 +212,127 @@ test('viewport digest reports the filtered graph and clears an empty view', () =
   assert.equal(empty.inFrustumCount, 0);
   assert.equal(empty.visibleNodeCount, 0);
   assert.deepEqual(empty.referencedNodeIds, []);
+});
+
+test('edge visuals, filters, patterns, and legend distinguish all 4 verification states', () => {
+  const states: Array<AtlasEdge['verification']> = ['verified', 'declared', 'unverified', 'broken'];
+  const fixtureEdges: AtlasEdge[] = states.map((verification, idx) => ({
+    id: `e-${verification}`,
+    source_id: `src-${idx}`,
+    target_id: `dst-${idx}`,
+    kind: 'writes_truth',
+    verification,
+    evidence_path: `backend/file_${idx}.py:${idx + 1}`,
+    evidence_note: `Edge marked ${verification}`,
+  }));
+
+  const visuals = fixtureEdges.map((item) => evaluateEdgeVisual(item, 'all'));
+  assert.deepEqual(visuals.map((v) => v.pattern), ['solid', 'dashed', 'dotted', 'broken_gap']);
+  assert.equal(new Set(visuals.map((v) => v.hex)).size, 4);
+  for (const state of states) {
+    const filtered = fixtureEdges.filter((item) => evaluateEdgeVisual(item, state).visible);
+    assert.deepEqual(filtered.map((f) => f.verification), [state]);
+  }
+
+  const group = createBatchedEdges(
+    visuals.map((vis, idx) => ({
+      start: [0, idx, 0],
+      end: [10, idx, 0],
+      color: vis.hex,
+      opacity: 0.9,
+      pattern: vis.pattern,
+    })),
+  );
+  assert.deepEqual(group.userData.patternCounts, { solid: 1, dashed: 1, dotted: 1, broken_gap: 1 });
+  assert.deepEqual(group.userData.patternSegmentCounts, { solid: 1, dashed: 4, dotted: 7, broken_gap: 2 });
+
+  const legend = getEdgeVerificationLegendItems(fixtureEdges);
+  assert.equal(legend.length, 4);
+  assert.deepEqual(legend.map((l) => [l.verification, l.pattern, l.count]), [
+    ['verified', 'solid', 1],
+    ['declared', 'dashed', 1],
+    ['unverified', 'dotted', 1],
+    ['broken', 'broken_gap', 1],
+  ]);
+});
+
+test('diagnostic briefs default to investigation, qualify exemplars, and disclose neighbor truncation', () => {
+  const solverNode = node('manip:solver:sched', { subkind: 'solver', status: 'policy_in_code', line: 12 });
+  const unrelatedCleanSvc = node('manip:svc:billing', { subkind: 'service', status: 'clean' });
+  const unwiredComp = node('disp:comp:legacy', { tier: 'display', subkind: 'component', status: 'unwired' });
+  const cleanSameSubkind = node('manip:solver:clean', { subkind: 'solver', status: 'clean', line: 3 });
+
+  // Unrelated clean service is never selected as exemplar for a solver node.
+  const noMatch = selectReferenceExemplar(solverNode, new Map([[solverNode.id, solverNode], [unrelatedCleanSvc.id, unrelatedCleanSvc]]));
+  assert.equal(noMatch.kind, 'none');
+
+  // Same-subkind clean neighbor is explicitly flagged as unvalidated.
+  const unvalMatch = selectReferenceExemplar(solverNode, new Map([[solverNode.id, solverNode], [cleanSameSubkind.id, cleanSameSubkind]]));
+  assert.equal(unvalMatch.kind, 'unvalidated_neighbor');
+  assert.match(unvalMatch.caveat, /UNVALIDATED/);
+
+  // Configured authority overrides unvalidated clean neighbor.
+  const configured: PortableReferenceExemplar[] = [{
+    title: 'Approved Solver Reference',
+    pointer: 'backend/services/approved_solver.py:1',
+    applies_to_tiers: ['manipulate'],
+    applies_to_subkinds: ['solver'],
+    rationale: 'Injects DB clock authority cleanly.',
+    approved_by: 'aaron',
+  }];
+  const cfgMatch = selectReferenceExemplar(solverNode, new Map([[solverNode.id, solverNode], [cleanSameSubkind.id, cleanSameSubkind]]), configured);
+  assert.equal(cfgMatch.kind, 'configured');
+
+  // Unwired component requires retain/retire decision instead of clean-neighbor imitation.
+  const unwiredMatch = selectReferenceExemplar(
+    unwiredComp,
+    new Map([[unwiredComp.id, unwiredComp], [node('disp:comp:active', { tier: 'display', subkind: 'component', status: 'clean' }).id, node('disp:comp:active', { tier: 'display', subkind: 'component', status: 'clean' })]]),
+  );
+  assert.equal(unwiredMatch.kind, 'none');
+
+  const warnFinding: BoundaryFinding = {
+    id: 'f-warn',
+    rule_code: 'TRUTH-004',
+    tier: 'truth',
+    severity: 'warning',
+    blocks_gate: false,
+    confidence: 'candidate',
+    evidence_strength: 'heuristic',
+    node_id: solverNode.id,
+    source_file: 'backend/services/orders.py',
+    line: 88,
+    title: 'Candidate unbounded cache write',
+    detail: 'No static TTL literal found.',
+    remediation: 'Confirm store purpose or set TTL.',
+  };
+  const inboundMany = Array.from({ length: 8 }, (_, idx) => edge(`caller-${idx}`, solverNode.id, 'calls_helper'));
+  const briefDefault = buildDiagnosticBrief({
+    activeSlug: 'demo',
+    node: solverNode,
+    allNodesById: new Map([[solverNode.id, solverNode], [cleanSameSubkind.id, cleanSameSubkind]]),
+    inbound: inboundMany,
+    outbound: [],
+    nodeFindings: [warnFinding],
+    exemplar: unvalMatch,
+  });
+  assert.match(briefDefault, /\[investigate\]/);
+  assert.match(briefDefault, /INVESTIGATE ONLY/);
+  assert.match(briefDefault, /severity=warning \| confidence=candidate \| evidence=heuristic/);
+  assert.match(briefDefault, /Triggering Location: backend\/services\/orders\.py:88/);
+  assert.match(briefDefault, /Inbound Links \(6 of 8; 2 omitted\)/);
+  assert.match(briefDefault, /wythe context demo "manip:solver:sched" --full/);
+
+  const briefIssue = buildDiagnosticBrief({
+    activeSlug: 'demo',
+    node: unwiredComp,
+    allNodesById: new Map([[unwiredComp.id, unwiredComp]]),
+    inbound: [],
+    outbound: [],
+    nodeFindings: [{ ...warnFinding, node_id: unwiredComp.id }],
+    exemplar: unwiredMatch,
+    intent: 'prepare_issue',
+  });
+  assert.match(briefIssue, /\[prepare_issue\]/);
+  assert.match(briefIssue, /PREPARE ISSUE ONLY/);
+  assert.match(briefIssue, /Retain \/ Retire Decision Required/);
 });

@@ -840,10 +840,20 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "maximum": 150,
+              "maximum": 5000,
               "minimum": 5,
               "default": 40,
               "title": "Max Nodes"
+            }
+          },
+          {
+            "name": "full",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Full"
             }
           }
         ],
@@ -2314,6 +2324,25 @@
             "type": "boolean",
             "title": "Blocks Gate"
           },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "confirmed",
+              "candidate"
+            ],
+            "title": "Confidence",
+            "default": "confirmed"
+          },
+          "evidence_strength": {
+            "type": "string",
+            "enum": [
+              "ast_exact",
+              "structural_match",
+              "heuristic"
+            ],
+            "title": "Evidence Strength",
+            "default": "ast_exact"
+          },
           "node_id": {
             "anyOf": [
               {
@@ -2372,6 +2401,152 @@
           "remediation"
         ],
         "title": "BoundaryFinding"
+      },
+      "ConeCompleteness": {
+        "properties": {
+          "is_complete": {
+            "type": "boolean",
+            "title": "Is Complete",
+            "default": true
+          },
+          "full_export": {
+            "type": "boolean",
+            "title": "Full Export",
+            "default": false
+          },
+          "node_budget": {
+            "type": "integer",
+            "title": "Node Budget",
+            "default": 0
+          },
+          "nodes": {
+            "$ref": "#/components/schemas/ConeSectionCount"
+          },
+          "upstream_nodes": {
+            "$ref": "#/components/schemas/ConeSectionCount"
+          },
+          "downstream_nodes": {
+            "$ref": "#/components/schemas/ConeSectionCount"
+          },
+          "edges": {
+            "$ref": "#/components/schemas/ConeSectionCount"
+          },
+          "markdown_edges": {
+            "$ref": "#/components/schemas/ConeSectionCount"
+          },
+          "findings": {
+            "$ref": "#/components/schemas/ConeSectionCount"
+          },
+          "seed_findings": {
+            "$ref": "#/components/schemas/ConeSectionCount"
+          },
+          "chains": {
+            "$ref": "#/components/schemas/ConeSectionCount"
+          },
+          "truncation_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Truncation Reasons"
+          },
+          "full_export_hint": {
+            "type": "string",
+            "title": "Full Export Hint",
+            "default": ""
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ConeCompleteness"
+      },
+      "ConeEdgeSummary": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "target_id": {
+            "type": "string",
+            "title": "Target Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "reads_truth",
+              "writes_truth",
+              "guards_truth",
+              "calls_helper",
+              "queries_endpoint",
+              "mutates_endpoint",
+              "uses_hook",
+              "uses_client"
+            ],
+            "title": "Kind"
+          },
+          "verification": {
+            "type": "string",
+            "enum": [
+              "verified",
+              "declared",
+              "unverified",
+              "broken"
+            ],
+            "title": "Verification"
+          },
+          "evidence_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Path"
+          },
+          "evidence_note": {
+            "type": "string",
+            "title": "Evidence Note"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "source_id",
+          "target_id",
+          "kind",
+          "verification",
+          "evidence_note"
+        ],
+        "title": "ConeEdgeSummary"
+      },
+      "ConeSectionCount": {
+        "properties": {
+          "included": {
+            "type": "integer",
+            "title": "Included",
+            "default": 0
+          },
+          "eligible": {
+            "type": "integer",
+            "title": "Eligible",
+            "default": 0
+          },
+          "omitted": {
+            "type": "integer",
+            "title": "Omitted",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ConeSectionCount"
       },
       "DiffBlastRadiusReport": {
         "properties": {
@@ -2938,6 +3113,33 @@
             "type": "string",
             "title": "Source Commit"
           },
+          "worktree_dirty": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worktree Dirty"
+          },
+          "dirty_path_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dirty Path Count"
+          },
+          "content_digest": {
+            "type": "string",
+            "title": "Content Digest",
+            "default": ""
+          },
           "matched_seed_ids": {
             "items": {
               "type": "string"
@@ -2980,6 +3182,13 @@
             "type": "array",
             "title": "Cone Edges"
           },
+          "cone_edge_items": {
+            "items": {
+              "$ref": "#/components/schemas/ConeEdgeSummary"
+            },
+            "type": "array",
+            "title": "Cone Edge Items"
+          },
           "matching_chains": {
             "items": {
               "$ref": "#/components/schemas/EndToEndChain"
@@ -2993,6 +3202,16 @@
             },
             "type": "array",
             "title": "Cone Findings"
+          },
+          "completeness": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConeCompleteness"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "approx_tokens": {
             "type": "integer",
@@ -3321,6 +3540,13 @@
             },
             "type": "array",
             "title": "Audit Rulings"
+          },
+          "reference_exemplars": {
+            "items": {
+              "$ref": "#/components/schemas/PortableReferenceExemplar"
+            },
+            "type": "array",
+            "title": "Reference Exemplars"
           }
         },
         "additionalProperties": false,
@@ -3364,6 +3590,84 @@
           "recorded_by"
         ],
         "title": "PortableRatchetItem"
+      },
+      "PortableReferenceExemplar": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Id"
+          },
+          "pointer": {
+            "type": "string",
+            "title": "Pointer"
+          },
+          "applies_to_tiers": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "truth",
+                "manipulate",
+                "display"
+              ]
+            },
+            "type": "array",
+            "title": "Applies To Tiers"
+          },
+          "applies_to_subkinds": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "table",
+                "sql_function",
+                "cache_store",
+                "route",
+                "service",
+                "solver",
+                "cli",
+                "page",
+                "hook",
+                "api_client",
+                "component"
+              ]
+            },
+            "type": "array",
+            "title": "Applies To Subkinds"
+          },
+          "rationale": {
+            "type": "string",
+            "title": "Rationale"
+          },
+          "approved_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approved By"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "title",
+          "pointer",
+          "rationale"
+        ],
+        "title": "PortableReferenceExemplar"
       },
       "PortableRuleOverride": {
         "properties": {

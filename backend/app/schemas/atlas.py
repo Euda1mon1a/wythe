@@ -41,6 +41,8 @@ EdgeKind = Literal[
     "uses_client",
 ]
 VerificationState = Literal["verified", "declared", "unverified", "broken"]
+FindingConfidence = Literal["confirmed", "candidate"]
+EvidenceStrength = Literal["ast_exact", "structural_match", "heuristic"]
 GateVerdict = Literal["PASS", "RATCHET_PASS", "FAIL"]
 StoreIntendedUse = Literal[
     "derived_cache",
@@ -127,6 +129,8 @@ class BoundaryFinding(StrictSchema):
     tier: TierKind
     severity: str
     blocks_gate: bool
+    confidence: FindingConfidence = "confirmed"
+    evidence_strength: EvidenceStrength = "ast_exact"
     node_id: str | None = None
     target_node_id: str | None = None
     source_file: str
@@ -455,6 +459,16 @@ class PortableRulingItem(StrictSchema):
     recorded_by: str
 
 
+class PortableReferenceExemplar(StrictSchema):
+    title: str
+    node_id: str | None = None
+    pointer: str
+    applies_to_tiers: list[TierKind] = Field(default_factory=list)
+    applies_to_subkinds: list[NodeSubkind] = Field(default_factory=list)
+    rationale: str
+    approved_by: str | None = None
+
+
 class PortableGovernanceBundle(StrictSchema):
     schema_version: str = "1.0"
     target_slug: str
@@ -463,6 +477,7 @@ class PortableGovernanceBundle(StrictSchema):
     vocabularies: list[PortableVocabularyEntry] = Field(default_factory=list)
     ratchet_baselines: list[PortableRatchetItem] = Field(default_factory=list)
     audit_rulings: list[PortableRulingItem] = Field(default_factory=list)
+    reference_exemplars: list[PortableReferenceExemplar] = Field(default_factory=list)
 
 
 class GovernanceSyncReceipt(StrictSchema):
@@ -494,18 +509,55 @@ class LlmNodePointer(StrictSchema):
     http_paths: list[str] = Field(default_factory=list)
 
 
+class ConeEdgeSummary(StrictSchema):
+    id: str
+    source_id: str
+    target_id: str
+    kind: EdgeKind
+    verification: VerificationState
+    evidence_path: str | None = None
+    evidence_note: str
+
+
+class ConeSectionCount(StrictSchema):
+    included: int = 0
+    eligible: int = 0
+    omitted: int = 0
+
+
+class ConeCompleteness(StrictSchema):
+    is_complete: bool = True
+    full_export: bool = False
+    node_budget: int = 0
+    nodes: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    upstream_nodes: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    downstream_nodes: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    edges: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    markdown_edges: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    findings: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    seed_findings: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    chains: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    truncation_reasons: list[str] = Field(default_factory=list)
+    full_export_hint: str = ""
+
+
 class LlmContextConeReport(StrictSchema):
     target_slug: str
     query: str
     source_commit: str
+    worktree_dirty: bool | None = None
+    dirty_path_count: int | None = None
+    content_digest: str = ""
     matched_seed_ids: list[str] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
     upstream_display_nodes: list[LlmNodePointer] = Field(default_factory=list)
     manipulator_nodes: list[LlmNodePointer] = Field(default_factory=list)
     downstream_truth_nodes: list[LlmNodePointer] = Field(default_factory=list)
     cone_edges: list[str] = Field(default_factory=list)
+    cone_edge_items: list[ConeEdgeSummary] = Field(default_factory=list)
     matching_chains: list[EndToEndChain] = Field(default_factory=list)
     cone_findings: list[BoundaryFinding] = Field(default_factory=list)
+    completeness: ConeCompleteness | None = None
     approx_tokens: int = 0
     markdown: str = ""
 

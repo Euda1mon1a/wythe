@@ -10,10 +10,52 @@ from app.core.clock import utc_now, utc_today
 from app.models import RatchetBaseline, RulePolicy, ScanSnapshot
 from app.schemas.atlas import (
     BoundaryFinding,
+    EvidenceStrength,
+    FindingConfidence,
     GateEvaluation,
     RuleGateRow,
     ScanSnapshotSummary,
 )
+
+_confirmed_ast_rules = frozenset({"MANIP-001", "MANIP-002", "DISP-001", "DISP-002", "DISP-005"})
+_confirmed_structural_rules = frozenset(
+    {"TRUTH-002", "TRUTH-003", "DISP-003", "DISP-004", "MANIP-004", "MANIP-005"}
+)
+_candidate_structural_rules = frozenset({"TRUTH-005", "DISP-007"})
+_valid_confidences: tuple[FindingConfidence, ...] = ("confirmed", "candidate")
+_valid_strengths: tuple[EvidenceStrength, ...] = ("ast_exact", "structural_match", "heuristic")
+
+
+def _derive_finding_epistemics(
+    cand: RawCandidateFinding,
+) -> tuple[FindingConfidence, EvidenceStrength]:
+    """Separate confirmed/candidate status and evidence strength from rule severity."""
+    default_confidence: FindingConfidence
+    default_strength: EvidenceStrength
+    if cand.rule_code in _confirmed_ast_rules:
+        default_confidence = "confirmed"
+        default_strength = "ast_exact"
+    elif cand.rule_code in _confirmed_structural_rules:
+        default_confidence = "confirmed"
+        default_strength = "structural_match"
+    elif cand.rule_code in _candidate_structural_rules:
+        default_confidence = "candidate"
+        default_strength = "structural_match"
+    else:
+        default_confidence = "candidate"
+        default_strength = "heuristic"
+
+    confidence: FindingConfidence = (
+        cand.confidence  # type: ignore[assignment]
+        if cand.confidence in _valid_confidences
+        else default_confidence
+    )
+    strength: EvidenceStrength = (
+        cand.evidence_strength  # type: ignore[assignment]
+        if cand.evidence_strength in _valid_strengths
+        else default_strength
+    )
+    return confidence, strength
 
 
 def load_effective_rules(session: Session) -> dict[str, RulePolicy]:
@@ -53,6 +95,7 @@ def evaluate_findings_and_gate(
         if policy is None or not policy.enabled:
             continue
         counts_by_rule[cand.rule_code] = counts_by_rule.get(cand.rule_code, 0) + 1
+        confidence, evidence_strength = _derive_finding_epistemics(cand)
         materialized.append(
             BoundaryFinding(
                 id=f"f:{cand.rule_code}:{idx}",
@@ -60,6 +103,8 @@ def evaluate_findings_and_gate(
                 tier=policy.tier,  # type: ignore[arg-type]
                 severity=policy.severity,
                 blocks_gate=policy.blocks_gate,
+                confidence=confidence,
+                evidence_strength=evidence_strength,
                 node_id=cand.node_id,
                 target_node_id=cand.target_node_id,
                 source_file=cand.source_file,

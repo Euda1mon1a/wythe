@@ -31,6 +31,9 @@ class RawCandidateFinding:
     http_path: str | None = None
     # Downstream store/table impacted when the finding attaches to an upstream writer.
     target_node_id: str | None = None
+    # Explicit epistemic metadata when an adapter distinguishes evidence strength or candidacy.
+    confidence: str | None = None
+    evidence_strength: str | None = None
 
 
 @dataclass(frozen=True)

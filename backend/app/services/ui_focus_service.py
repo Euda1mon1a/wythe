@@ -231,7 +231,9 @@ def explain_ui_focus(
             if f.node_id == focus_node.id or f.target_node_id == focus_node.id
         ][:12]
         cone_edges = [
-            f"{e.source_id} --[{e.kind}]--> {e.target_id}"
+            f"{e.source_id} --[{e.kind} | {e.verification}]--> {e.target_id}"
+            + (f" @ {e.evidence_path}" if e.evidence_path else "")
+            + (f" — {e.evidence_note}" if e.evidence_note else "")
             for e in report.edges
             if e.source_id == focus_node.id or e.target_id == focus_node.id
         ][:16]
@@ -332,7 +334,7 @@ def explain_ui_focus(
     if live_vp:
         md_lines.append("\n" + live_vp)
     if active_findings:
-        md_lines.append("\n## Active Findings Explaining Highlight")
+        md_lines.append("\n## Active Findings Explaining Highlight (Requires Review)")
         for f in active_findings[:8]:
             writer_tag = (
                 f" (causal writer `{f.node_id}` -> `{f.target_node_id}`)"
@@ -340,11 +342,15 @@ def explain_ui_focus(
                 else ""
             )
             md_lines.append(
-                f"- **{f.rule_code}** [{f.severity}] `{f.source_file}:{f.line}`{writer_tag} — "
+                f"- **{f.rule_code}** [{f.severity} | {f.confidence} | {f.evidence_strength}] "
+                f"`{f.source_file}:{f.line}`{writer_tag} — "
                 f"{f.title} | Suggested remediation (unverified): {f.remediation}"
             )
     if cone_edges:
-        md_lines.append("\n## Immediate Verified Edges")
+        md_lines.append("\n## Immediate Connected Edges (Static Scope)")
+        md_lines.append(
+            "- Scope: static AST/route/config links (`verified`, `declared`, `unverified`, `broken`); does not prove runtime behavior."
+        )
         for ce in cone_edges[:10]:
             md_lines.append(f"- `{ce}`")
     if snap_path:

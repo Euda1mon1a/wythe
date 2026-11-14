@@ -30,8 +30,12 @@ export type PolicyVocabularyUpdate = components['schemas']['PolicyVocabularyUpda
 export type DiffBlastRadiusReport = components['schemas']['DiffBlastRadiusReport'];
 export type SnapshotComparisonReport = components['schemas']['SnapshotComparisonReport'];
 export type PortableGovernanceBundle = components['schemas']['PortableGovernanceBundle'];
+export type PortableReferenceExemplar = components['schemas']['PortableReferenceExemplar'];
 export type GovernanceSyncReceipt = components['schemas']['GovernanceSyncReceipt'];
 export type LlmBriefRead = components['schemas']['LlmBriefRead'];
+export type ConeEdgeSummary = components['schemas']['ConeEdgeSummary'];
+export type ConeSectionCount = components['schemas']['ConeSectionCount'];
+export type ConeCompleteness = components['schemas']['ConeCompleteness'];
 export type LlmContextConeReport = components['schemas']['LlmContextConeReport'];
 export type SourceSnippetRead = components['schemas']['SourceSnippetRead'];
 export type UiFocusStatePayload = components['schemas']['UiFocusStatePayload'];
@@ -74,10 +78,20 @@ export const atlasApi = {
     get<Record<string, unknown>>(`/scans/${targetSlug}/sarif`),
   getScanLlmsBrief: (targetSlug: string) =>
     get<LlmBriefRead>(`/scans/${targetSlug}/llms`),
-  getScanContextCone: (targetSlug: string, query: string) =>
-    get<LlmContextConeReport>(
-      `/scans/${targetSlug}/context?q=${encodeURIComponent(query)}`,
-    ),
+  getScanContextCone: (
+    targetSlug: string,
+    query: string,
+    options?: { maxNodes?: number; full?: boolean },
+  ) => {
+    const params = new URLSearchParams({ q: query });
+    if (options?.maxNodes !== undefined) {
+      params.set('max_nodes', String(options.maxNodes));
+    }
+    if (options?.full) {
+      params.set('full', 'true');
+    }
+    return get<LlmContextConeReport>(`/scans/${targetSlug}/context?${params.toString()}`);
+  },
   getScanSourceSnippet: (targetSlug: string, relPath: string, line = 1, context = 12) =>
     get<SourceSnippetRead>(
       `/scans/${targetSlug}/source?rel_path=${encodeURIComponent(relPath)}&line=${line}&context=${context}`,

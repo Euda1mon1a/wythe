@@ -2,7 +2,14 @@
 
 import { useMemo, useState, type FormEvent } from 'react';
 import { Copy, History, Stamp, X } from 'lucide-react';
-import type { AtlasEdge, AtlasNode, BoundaryFinding, StorePurposeDeclaration } from '@/api/atlas';
+import type {
+  AtlasEdge,
+  AtlasNode,
+  BoundaryFinding,
+  ConeCompleteness,
+  PortableReferenceExemplar,
+  StorePurposeDeclaration,
+} from '@/api/atlas';
 import { NodeSourceAndPromptPanel } from '@/components/NodeSourceAndPromptPanel';
 import { useCreateRuling, useFetchContextCone } from '@/hooks/useAtlas';
 import { copyTextToClipboard } from '@/lib/clipboard';
@@ -18,9 +25,26 @@ interface NodeInspectorProps {
   allNodesById: Map<string, AtlasNode>;
   edges: AtlasEdge[];
   findings: BoundaryFinding[];
+  referenceExemplars?: PortableReferenceExemplar[];
   diffOverlay?: DiffOverlaySet | null;
   onSelectNode: (nodeId: string) => void;
   onClose: () => void;
+}
+
+function edgeStateBadge(verification: AtlasEdge['verification']): {
+  tone: string;
+  text: string;
+} {
+  if (verification === 'verified') {
+    return { tone: 'text-teal-300', text: 'verified · solid' };
+  }
+  if (verification === 'declared') {
+    return { tone: 'text-violet-300', text: 'declared · dashed' };
+  }
+  if (verification === 'unverified') {
+    return { tone: 'text-amber-300', text: 'unverified · dotted' };
+  }
+  return { tone: 'text-rose-300', text: 'broken · gap' };
 }
 
 export function NodeInspector({
@@ -29,6 +53,7 @@ export function NodeInspector({
   allNodesById,
   edges,
   findings,
+  referenceExemplars = [],
   diffOverlay = null,
   onSelectNode,
   onClose,
@@ -45,6 +70,8 @@ export function NodeInspector({
   const [keyspaceScope, setKeyspaceScope] = useState('');
   const [evidenceScopeInput, setEvidenceScopeInput] = useState('');
   const [copiedConeLabel, setCopiedConeLabel] = useState<string | null>(null);
+  const [copiedFullLabel, setCopiedFullLabel] = useState<string | null>(null);
+  const [coneCompleteness, setConeCompleteness] = useState<ConeCompleteness | null>(null);
   const [showAllColumns, setShowAllColumns] = useState(false);
   const createRuling = useCreateRuling(activeSlug);
   const fetchCone = useFetchContextCone(activeSlug);
@@ -137,13 +164,14 @@ export function NodeInspector({
             {node.role ? ` · ${node.role}` : ''}
           </div>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
             disabled={fetchCone.isPending}
             onClick={() => {
               fetchCone.mutate(node.id, {
                 onSuccess: (res) => {
+                  setConeCompleteness(res.completeness ?? null);
                   void copyTextToClipboard(res.markdown).then((ok) => {
                     setCopiedConeLabel(ok ? `Copied ~${res.approx_tokens} tok` : 'Copy failed');
                     window.setTimeout(() => setCopiedConeLabel(null), 2200);
@@ -152,11 +180,35 @@ export function NodeInspector({
               });
             }}
             aria-label="Copy 3-tier LLM Lineage Cone Markdown"
-            title="Copy surgical 3-tier Lineage Cone Markdown (~300 tokens) for LLMs"
+            title="Copy budgeted 3-tier Lineage Cone Markdown (~300 tokens) with truncation summary"
             className="flex items-center gap-1 border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 font-mono text-[11px] text-sky-200 hover:bg-sky-500/25"
           >
             <Copy className="h-3 w-3" />
             {copiedConeLabel ?? 'Copy LLM Cone'}
+          </button>
+          <button
+            type="button"
+            disabled={fetchCone.isPending}
+            onClick={() => {
+              fetchCone.mutate(
+                { query: node.id, full: true },
+                {
+                  onSuccess: (res) => {
+                    setConeCompleteness(res.completeness ?? null);
+                    void copyTextToClipboard(res.markdown).then((ok) => {
+                      setCopiedFullLabel(ok ? `Full ~${res.approx_tokens} tok` : 'Copy failed');
+                      window.setTimeout(() => setCopiedFullLabel(null), 2200);
+                    });
+                  },
+                },
+              );
+            }}
+            aria-label="Copy complete un-truncated 3-tier LLM Lineage Cone Markdown"
+            title="Copy complete un-truncated 3-tier Lineage Cone (all reachable nodes, edges, and findings)"
+            className="flex items-center gap-1 border border-teal-500/40 bg-teal-500/15 px-2 py-0.5 font-mono text-[11px] text-teal-200 hover:bg-teal-500/25"
+          >
+            <Copy className="h-3 w-3" />
+            {copiedFullLabel ?? 'Full Cone'}
           </button>
           <button
             type="button"
@@ -168,6 +220,20 @@ export function NodeInspector({
           </button>
         </div>
       </div>
+
+      {coneCompleteness && (
+        <div
+          className={`border px-2.5 py-1.5 font-mono text-[10px] ${
+            coneCompleteness.is_complete
+              ? 'border-teal-500/30 bg-teal-950/20 text-teal-200'
+              : 'border-amber-500/40 bg-amber-950/25 text-amber-200'
+          }`}
+        >
+          {coneCompleteness.is_complete
+            ? `Cone export complete: nodes ${coneCompleteness.nodes?.included ?? 0}/${coneCompleteness.nodes?.eligible ?? 0}, edges ${coneCompleteness.markdown_edges?.included ?? 0}/${coneCompleteness.edges?.eligible ?? 0}, findings ${coneCompleteness.findings?.included ?? 0}/${coneCompleteness.findings?.eligible ?? 0}.`
+            : `Cone truncated: nodes ${coneCompleteness.nodes?.included ?? 0}/${coneCompleteness.nodes?.eligible ?? 0} (up ${coneCompleteness.upstream_nodes?.included ?? 0}/${coneCompleteness.upstream_nodes?.eligible ?? 0}, down ${coneCompleteness.downstream_nodes?.included ?? 0}/${coneCompleteness.downstream_nodes?.eligible ?? 0}), md edges ${coneCompleteness.markdown_edges?.included ?? 0}/${coneCompleteness.edges?.eligible ?? 0}, findings ${coneCompleteness.findings?.included ?? 0}/${coneCompleteness.findings?.eligible ?? 0} (seed ${coneCompleteness.seed_findings?.included ?? 0}/${coneCompleteness.seed_findings?.eligible ?? 0}). Use Full Cone above.`}
+        </div>
+      )}
 
       {/* Above-the-fold Why Highlighted & Active Findings Banner */}
       {(nodeFindings.length > 0 ||
@@ -190,7 +256,13 @@ export function NodeInspector({
               f.target_node_id === node.id && f.node_id !== node.id;
             return (
               <div key={f.id} className="border border-rose-500/20 bg-slate-950/75 p-2 text-[11px] text-slate-200">
-                <strong className="font-mono text-rose-300">{f.rule_code}:</strong> {f.title}
+                <div className="flex flex-wrap items-center justify-between gap-1">
+                  <strong className="font-mono text-rose-300">{f.rule_code}</strong>
+                  <span className="font-mono text-[10px] text-slate-300">
+                    {f.severity} · {f.confidence} · {f.evidence_strength}
+                  </span>
+                </div>
+                <div className="mt-0.5">{f.title}</div>
                 <div className="mt-0.5 font-mono text-[10px] text-amber-200/90">
                   {isCausalWriter
                     ? `Causal writer: ${f.node_id} @ ${f.source_file}:${f.line}`
@@ -347,23 +419,22 @@ export function NodeInspector({
         inbound={inbound}
         outbound={outbound}
         nodeFindings={nodeFindings}
+        referenceExemplars={referenceExemplars}
         onSelectNode={onSelectNode}
       />
 
-      {/* Inbound / Outbound Verified Links + Evidence Notes */}
+      {/* Inbound / Outbound Connection Evidence (4-state static verification) */}
       <div className="space-y-2 border-t border-slate-800 pt-3">
+        <div className="font-mono text-[10px] text-slate-400">
+          Static link states (`verified · solid`, `declared · dashed`, `unverified · dotted`, `broken · gap`) reflect AST/route inspection, not runtime execution.
+        </div>
         <div className="font-mono text-[10px] uppercase text-slate-400">
           Inbound Links ({inbound.length})
         </div>
         <div className="max-h-32 space-y-1.5 overflow-y-auto">
           {inbound.slice(0, 30).map((e) => {
             const peer = allNodesById.get(e.source_id);
-            const verTone =
-              e.verification === 'verified'
-                ? 'text-teal-300'
-                : e.verification === 'declared'
-                  ? 'text-sky-300'
-                  : 'text-rose-300';
+            const badge = edgeStateBadge(e.verification);
             return (
               <div key={e.id} className="border-b border-slate-900 pb-1">
                 <button
@@ -374,7 +445,8 @@ export function NodeInspector({
                   ← [{e.kind}] {peer?.label ?? e.source_id}
                 </button>
                 <div className="flex items-center gap-1.5 truncate font-mono text-[10px] text-slate-400">
-                  <span className={verTone}>{e.verification}</span>
+                  <span className={badge.tone}>{badge.text}</span>
+                  {e.evidence_path && <span title={e.evidence_path}>· {e.evidence_path}</span>}
                   {e.evidence_note && <span title={e.evidence_note}>· {e.evidence_note}</span>}
                 </div>
               </div>
@@ -388,12 +460,7 @@ export function NodeInspector({
         <div className="max-h-32 space-y-1.5 overflow-y-auto">
           {outbound.slice(0, 30).map((e) => {
             const peer = allNodesById.get(e.target_id);
-            const verTone =
-              e.verification === 'verified'
-                ? 'text-teal-300'
-                : e.verification === 'declared'
-                  ? 'text-sky-300'
-                  : 'text-rose-300';
+            const badge = edgeStateBadge(e.verification);
             return (
               <div key={e.id} className="border-b border-slate-900 pb-1">
                 <button
@@ -404,7 +471,8 @@ export function NodeInspector({
                   → [{e.kind}] {peer?.label ?? e.target_id}
                 </button>
                 <div className="flex items-center gap-1.5 truncate font-mono text-[10px] text-slate-400">
-                  <span className={verTone}>{e.verification}</span>
+                  <span className={badge.tone}>{badge.text}</span>
+                  {e.evidence_path && <span title={e.evidence_path}>· {e.evidence_path}</span>}
                   {e.evidence_note && <span title={e.evidence_note}>· {e.evidence_note}</span>}
                 </div>
               </div>

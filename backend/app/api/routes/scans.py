@@ -197,13 +197,14 @@ def export_target_lineage_cone_context(
     target_slug: str,
     db: DbSession,
     q: Annotated[str, Query(min_length=1, max_length=256)],
-    max_nodes: Annotated[int, Query(ge=5, le=150)] = DEFAULT_CONE_NODES,
+    max_nodes: Annotated[int, Query(ge=5, le=5000)] = DEFAULT_CONE_NODES,
+    full: bool = Query(default=False),
 ) -> LlmContextConeReport:
     target = get_target_by_slug(db, target_slug)
     if target is None:
         raise HTTPException(status_code=404, detail=f"Target '{target_slug}' not found")
     report = run_target_scan(db, target, strict_gate=True, persist_snapshot=False)
-    return build_lineage_cone_slice(report, q, max_nodes=max_nodes)
+    return build_lineage_cone_slice(report, q, max_nodes=max_nodes, full=full)
 
 
 @router.get("/{target_slug}/source", response_model=SourceSnippetRead)

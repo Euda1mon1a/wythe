@@ -417,16 +417,20 @@ export function buildLiveViewportDigest(params: {
               f.target_node_id === selNode.id && f.node_id !== selNode.id
                 ? `causal writer \`${f.node_id}\` @ \`${f.source_file}:${f.line}\``
                 : `\`${f.source_file}:${f.line}\``;
-            return `\`${f.rule_code}\` [${f.severity}] ${f.title} (${loc})`;
+            return `\`${f.rule_code}\` [${f.severity} | ${f.confidence} | ${f.evidence_strength}] ${f.title} (${loc})`;
           })
           .join('; ')}`,
       );
     }
     if (inb.length > 0) {
-      lines.push(`  - Inbound Callers/Readers: ${inb.map((e) => `\`${e.source_id}\` --[${e.kind}]-->`).join(', ')}`);
+      lines.push(
+        `  - Inbound Callers/Readers: ${inb.map((e) => `\`${e.source_id}\` --[${e.kind} | ${e.verification}]-->`).join(', ')}`,
+      );
     }
     if (outb.length > 0) {
-      lines.push(`  - Outbound Targets/Tables: ${outb.map((e) => `--[${e.kind}]--> \`${e.target_id}\``).join(', ')}`);
+      lines.push(
+        `  - Outbound Targets/Tables: ${outb.map((e) => `--[${e.kind} | ${e.verification}]--> \`${e.target_id}\``).join(', ')}`,
+      );
     }
   } else {
     lines.push('- **SELECTED / HIGHLIGHTED NODE**: None explicitly clicked (see Center-of-Screen nodes below).');

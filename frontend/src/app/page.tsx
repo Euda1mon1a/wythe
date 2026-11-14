@@ -41,6 +41,7 @@ import {
   useFetchContextCone,
   useFetchLlmsBrief,
   useFetchUiFocus,
+  useGovernanceBundle,
   useRegisterTarget,
   useRules,
   useScanDiff,
@@ -129,6 +130,7 @@ export default function WytheWorkspacePage() {
   const { data: vocabularies = [] } = useVocabularies();
   const { data: slots = [] } = useAdapterSlots();
   const { data: profiles = [] } = useStackProfiles();
+  const { data: govBundle } = useGovernanceBundle(activeSlug);
   const triggerScan = useTriggerScan(activeSlug);
   const fetchLlmsBrief = useFetchLlmsBrief(activeSlug);
   const fetchContextCone = useFetchContextCone(activeSlug);
@@ -456,8 +458,15 @@ export default function WytheWorkspacePage() {
     }
     fetchContextCone.mutate(selectedNodeId, {
       onSuccess: (res) => {
+        const comp = res.completeness;
+        const compNote =
+          comp && !comp.is_complete
+            ? ` (truncated ${comp.nodes?.included ?? 0}/${comp.nodes?.eligible ?? 0} nodes; use Inspector "Full Cone")`
+            : '';
         void copyTextToClipboard(res.markdown).then((ok) => {
-          flashToast(ok ? `Copied 3-tier cone (~${res.approx_tokens} tok)` : 'Clipboard copy failed');
+          flashToast(
+            ok ? `Copied 3-tier cone (~${res.approx_tokens} tok)${compNote}` : 'Clipboard copy failed',
+          );
         });
       },
     });
@@ -1474,7 +1483,10 @@ export default function WytheWorkspacePage() {
                             <option value="reads">Edges: Reads &amp; Queries</option>
                             <option value="guards">Edges: SQL Guards</option>
                             <option value="helpers">Edges: Hooks / Helpers</option>
-                            <option value="unverified">Edges: Unverified / Broken</option>
+                            <option value="verified">Edges: Statically Verified (Solid)</option>
+                            <option value="declared">Edges: Declared Only (Dashed)</option>
+                            <option value="unverified">Edges: Unverified / Heuristic (Dotted)</option>
+                            <option value="broken">Edges: Broken Only (Gap)</option>
                           </select>
                           <input
                             type="search"
@@ -1691,6 +1703,7 @@ export default function WytheWorkspacePage() {
                           allNodesById={nodesById}
                           edges={report.edges}
                           findings={report.findings}
+                          referenceExemplars={govBundle?.reference_exemplars ?? []}
                           diffOverlay={diffOverlay}
                           onSelectNode={setSelectedNodeId}
                           onClose={() => setSelectedNodeId(null)}
@@ -1746,6 +1759,7 @@ export default function WytheWorkspacePage() {
             allNodesById={nodesById}
             edges={report?.edges ?? []}
             findings={report?.findings ?? []}
+            referenceExemplars={govBundle?.reference_exemplars ?? []}
             diffOverlay={diffOverlay}
             onSelectNode={setSelectedNodeId}
             onClose={() => setSelectedNodeId(null)}

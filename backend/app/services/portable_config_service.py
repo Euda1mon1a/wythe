@@ -24,6 +24,7 @@ from app.schemas.atlas import (
     GovernanceSyncReceipt,
     PortableGovernanceBundle,
     PortableRatchetItem,
+    PortableReferenceExemplar,
     PortableRuleOverride,
     PortableRulingItem,
     PortableVocabularyEntry,
@@ -75,6 +76,17 @@ def build_portable_bundle(
         else []
     )
 
+    reference_exemplars: list[PortableReferenceExemplar] = []
+    try:
+        existing_path = resolve_existing_bundle_path(Path(target.repo_path).resolve())
+        if existing_path.is_file():
+            existing_bundle = PortableGovernanceBundle.model_validate_json(
+                existing_path.read_text(encoding="utf-8")
+            )
+            reference_exemplars = list(existing_bundle.reference_exemplars)
+    except (OSError, ValueError):
+        reference_exemplars = []
+
     return PortableGovernanceBundle(
         schema_version="1.0",
         target_slug=target.slug,
@@ -122,6 +134,7 @@ def build_portable_bundle(
             for rl in rulings
             for hist, sp, scope in (unpack_ruling_cutover_payload(rl.cutover_history),)
         ],
+        reference_exemplars=reference_exemplars,
     )
 
 
