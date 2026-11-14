@@ -23,6 +23,8 @@ from app.adapters.ts_reachability import (
     ReachabilityIndex,
     build_react_spa_reachability,
 )
+from app.adapters.ts_sdk import WorkspaceSdkIndex
+from app.adapters.ts_workspace import WorkspaceResolver
 from app.adapters.typescript_nextjs import (
     _REEXPORT_NAMED_RE,
     _REEXPORT_STAR_RE,
@@ -139,10 +141,17 @@ class TypeScriptReactSpaAdapter:
         url_const_resolver = build_frontend_url_const_resolver(src_root, _EXTS, cleaned_cache=cleaned)
         comp_resolver_for = build_a11y_component_resolver(src_root, _EXTS)
         has_gen_cfg = has_frontend_generator_config(fe_dir)
+        ws_resolver = WorkspaceResolver.build(repo_root.resolve(), (fe_dir,))
+        sdk_index = WorkspaceSdkIndex.build(repo_root, ws_resolver)
         page_paths = {p for p, n in nodes_by_path.items() if n.subkind == "page"}
         unobserved_a11y: list[str] = []
 
         for fpath, node in nodes_by_path.items():
+            sdk_calls, uses_typed_sdk = sdk_index.extract_caller_sdk_calls(
+                fpath,
+                cleaned[fpath],
+                is_tsx=fpath.suffix in (".tsx", ".jsx"),
+            )
             specs, calls, mod_findings = scan_display_module_semantics(
                 node,
                 cleaned[fpath],
@@ -152,6 +161,8 @@ class TypeScriptReactSpaAdapter:
                 component_resolver=comp_resolver_for(fpath, raw_sources[fpath]),
                 unobserved_a11y_out=unobserved_a11y,
                 has_generator_config=has_gen_cfg,
+                sdk_calls=sdk_calls,
+                uses_typed_sdk=uses_typed_sdk,
             )
             if reach is not None:
                 annotated_calls: list[FrontendHttpCall] = []
@@ -185,6 +196,8 @@ class TypeScriptReactSpaAdapter:
             findings.extend(mod_findings)
             for spec in specs:
                 dst_path = resolve_frontend_import(spec, fpath, src_root, _EXTS)
+                if dst_path is None:
+                    dst_path = ws_resolver.resolve_import(spec, fpath, exts=_EXTS)
                 if dst_path is None:
                     continue
                 for exp in barrel_targets.get(dst_path, [dst_path]):

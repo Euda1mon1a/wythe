@@ -367,7 +367,7 @@ class WorkspaceResolver:
                 hit = probe_ts_candidate((src_dir / spec[2:]).resolve(), self.repo_root, exts=exts)
                 if hit is not None:
                     return hit
-            elif spec.startswith("$lib/"):
+            elif spec.startswith(("$lib/", "#lib/")):
                 src_dir = cfg.config_dir / "src" if (cfg.config_dir / "src").is_dir() else cfg.base_url
                 lib_dir = src_dir / "lib" if (src_dir / "lib").is_dir() else src_dir
                 hit = probe_ts_candidate((lib_dir / spec[5:]).resolve(), self.repo_root, exts=exts)
@@ -767,7 +767,16 @@ def verified_import_bindings(
         return True, set()
     used_imported: set[str] = set()
     for src_name, loc_name in zip(imp.imported_names, imp.local_names):
-        if re.search(rf"(?<![.\w$]){re.escape(loc_name)}\b", exec_text):
+        esc = re.escape(loc_name)
+        is_mixed_pascal = loc_name[:1].isupper() and not loc_name.isupper()
+        if is_mixed_pascal:
+            if re.search(
+                rf"\bnew\s+{esc}\b|(?<![.\w$]){esc}\s*\(|(?<![.\w$]){esc}\s*\.|\bextends\s+{esc}\b",
+                exec_text,
+            ):
+                used_imported.add(src_name)
+                continue
+        elif re.search(rf"(?<![.\w$]){esc}\b", exec_text):
             used_imported.add(src_name)
             continue
         for prop in di_map.get(loc_name, ()):

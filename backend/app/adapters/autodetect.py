@@ -323,6 +323,12 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
         or "drizzle-orm" in (be_deps | root_deps | ws_pkgs_deps)
     )
     be_sub = be_dir.relative_to(repo_root).as_posix() if be_dir.is_dir() and be_dir != repo_root else "."
+    if "@immich/sql-tools" in (be_deps | root_deps | ws_pkgs_deps):
+        from app.adapters.sql_tools_truth import discover_sql_tools_schema_files
+
+        has_sql_tools = bool(discover_sql_tools_schema_files(repo_root, be_sub)[0])
+    else:
+        has_sql_tools = False
     kysely_deps = {"kysely", "kysely-postgres-js", "nestjs-kysely"}
     if (be_deps | root_deps | ws_pkgs_deps) & kysely_deps:
         from app.adapters.kysely_schema import discover_kysely_migrations
@@ -355,6 +361,9 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
     elif has_drizzle:
         truth_adapter = "drizzle-orm"
         signals.append("Truth: Drizzle ORM schema / migrations")
+    elif has_sql_tools:
+        truth_adapter = "sql-tools"
+        signals.append("Truth: @immich/sql-tools decorator schema")
     elif has_kysely:
         truth_adapter = "kysely-migrations"
         signals.append("Truth: Kysely migration files")

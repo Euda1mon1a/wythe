@@ -17,6 +17,8 @@ from app.adapters.frontend_common import (
     resolve_frontend_import,
     scan_display_module_semantics,
 )
+from app.adapters.ts_sdk import WorkspaceSdkIndex
+from app.adapters.ts_workspace import WorkspaceResolver
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _EXTS = (".svelte", ".ts", ".js")
@@ -67,9 +69,16 @@ class SvelteKitDisplayAdapter:
             if head == "routes" and fpath.name in ("+page.svelte", "+page.ts"):
                 lbl = _sveltekit_route_label(rel_src)
                 subkind, cluster = "page", "pages"
-            elif "stores" in parts or fpath.stem.startswith("use"):
+            elif "stores" in parts or "managers" in parts or fpath.stem.startswith("use"):
                 lbl, subkind, cluster = fpath.stem, "hook", "stores"
-            elif "api" in parts or "apis" in parts or "clients" in parts or fpath.stem in ("api", "client", "http"):
+            elif (
+                "api" in parts
+                or "apis" in parts
+                or "clients" in parts
+                or "services" in parts
+                or "queries" in parts
+                or fpath.stem in ("api", "client", "http")
+            ):
                 lbl, subkind, cluster = fpath.stem, "api_client", "api_clients"
             elif fpath.suffix == ".svelte" or "components" in parts:
                 lbl, subkind, cluster = fpath.stem, "component", "components"
@@ -140,9 +149,16 @@ class SvelteKitDisplayAdapter:
 
         url_const_resolver = build_frontend_url_const_resolver(src_root, _EXTS, cleaned_cache=cleaned)
         comp_resolver_for = build_a11y_component_resolver(src_root, _EXTS)
+        ws_resolver = WorkspaceResolver.build(repo_root.resolve(), (fe_dir,))
+        sdk_index = WorkspaceSdkIndex.build(repo_root, ws_resolver)
         unobserved_a11y: list[str] = []
 
         for fpath, node in nodes_by_path.items():
+            sdk_calls, uses_typed_sdk = sdk_index.extract_caller_sdk_calls(
+                fpath,
+                cleaned[fpath],
+                is_tsx=False,
+            )
             specs, calls, mod_findings = scan_display_module_semantics(
                 node,
                 cleaned[fpath],
@@ -151,11 +167,15 @@ class SvelteKitDisplayAdapter:
                 imported_url_consts=url_const_resolver(fpath, cleaned[fpath]),
                 component_resolver=comp_resolver_for(fpath, raw_sources[fpath]),
                 unobserved_a11y_out=unobserved_a11y,
+                sdk_calls=sdk_calls,
+                uses_typed_sdk=uses_typed_sdk,
             )
             http_calls.extend(calls)
             findings.extend(mod_findings)
             for spec in specs:
                 dst_path = resolve_frontend_import(spec, fpath, src_root, _EXTS)
+                if dst_path is None:
+                    dst_path = ws_resolver.resolve_import(spec, fpath, exts=_EXTS)
                 if dst_path and dst_path in nodes_by_path and dst_path != fpath:
                     dst = nodes_by_path[dst_path]
                     kind = "uses_hook" if dst.subkind == "hook" else "uses_client"

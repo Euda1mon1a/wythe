@@ -27,6 +27,7 @@ def test_http_api_surface_end_to_end(isolated_db_url: str) -> None:
         assert slots_by_name["typescript-nextjs"] == "implemented"
         assert slots_by_name["prisma-schema"] == "experimental"
         assert slots_by_name["kysely-migrations"] == "experimental"
+        assert slots_by_name["sql-tools"] == "experimental"
         assert slots_by_name["go-http"] == "experimental"
         assert slots_by_name["rust-wasm"] == "experimental"
         assert slots_by_name["swift-vapor"] == "planned"
@@ -43,7 +44,7 @@ def test_http_api_surface_end_to_end(isolated_db_url: str) -> None:
         exp_count = sum(
             1 for p in profiles.json() if p["implementation_status"] == "experimental"
         )
-        assert exp_count == 34
+        assert exp_count == 36
         assert profiles_by_slug["python-services"]["implementation_status"] == "experimental"
 
         targets = client.get("/api/v1/targets")
