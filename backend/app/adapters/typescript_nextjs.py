@@ -21,6 +21,8 @@ from app.adapters.base import (
 from app.adapters.treesitter_engine import (
     blank_comments_cst,
     extract_ts_http_calls_cst,
+    is_resolvable_url_const_value,
+    is_same_origin_url_path,
     resolve_url_const_head,
 )
 from app.adapters.ts_reachability import (
@@ -66,7 +68,12 @@ _TAURI_READ_CMD_PREFIXES = ("get_", "list_", "fetch_", "load_", "find_", "query_
 
 _URL_CONST_RE = re.compile(
     r"""(?:^|[;{])[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
-    r"""(?P<q>['"`])(?P<val>(?:/|\$\{)[^'"`\n]*)(?P=q)[ \t]*(?:as\s+const[ \t]*)?(?:[ \t]*/\*[^*\r\n]*\*/)*[ \t]*(?://[^\r\n]*)?(?=[;\r\n}]|$)""",
+    r"""(?P<q>['"`])(?P<val>(?:(?:/|\$\{)[^'"`\n]*)?)(?P=q)[ \t]*(?:as\s+const[ \t]*)?(?:[ \t]*/\*[^*\r\n]*\*/)*[ \t]*(?://[^\r\n]*)?(?=[;\r\n}]|$)""",
+    re.MULTILINE,
+)
+_URL_ALIAS_CONST_RE = re.compile(
+    r"""(?:^|[;{])[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
+    r"""(?P<rhs>[A-Za-z_$][\w$]*)[ \t]*(?:as\s+const[ \t]*)?(?:[ \t]*/\*[^*\r\n]*\*/)*[ \t]*(?://[^\r\n]*)?(?=[;\r\n}]|$)""",
     re.MULTILINE,
 )
 _TEMPLATE_HEAD_CONST_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
@@ -75,15 +82,24 @@ _URL_CALL_IDENT_RE = re.compile(
 )
 
 
-def _collect_url_consts(txt: str) -> dict[str, str]:
-    """Top-level `const NAME = '/path'` values usable as module-wide URL prefixes."""
-    return _build_scoped_url_consts(txt)[0]
+def _collect_url_consts(
+    txt: str,
+    *,
+    imported_consts: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Top-level `const NAME = '' | '/path'` values usable as module-wide URL prefixes."""
+    return _build_scoped_url_consts(txt, imported_consts=imported_consts)[0]
 
 
 _FN_PARAM_HEAD_RE = re.compile(
     r"""(?:\bfunction\b[A-Za-z0-9_$\s]*(?:<[^>{}()]*>)?\s*\((?P<fparams>[^)]*)\)\s*(?::[^{=]+)?\s*\{|\bcatch\s*\((?P<cparam>[^)]*)\)\s*\{|\((?P<aparams>[^()]*)\)\s*(?::[^=;\r\n)]+)?\s*=>|(?P<sparam>[A-Za-z_$][\w$]*)\s*=>)"""
 )
 _LOCAL_BIND_RE = re.compile(r"""\b(?P<kw>const|let|var|function)\s+(?P<name>[A-Za-z_$][\w$]*)\b""")
+_DESTRUCT_BIND_RE = re.compile(r"""\b(?P<kw>const|let|var)\s+(?P<pat>\{[^;\n]{1,200}\}|\[[^;\n]{1,200}\])\s*=""")
+_REASSIGN_STMT_RE = re.compile(
+    r"""(?:^|[;{}])[ \t]*(?P<name>[A-Za-z_$][\w$]*)\s*(?:\+\+|--|(?:\+=|-=|\?\?=|\|\|=|=(?!=)))""",
+    re.MULTILINE,
+)
 _FOR_HEADER_RE = re.compile(r"(?<![.\w$])for\s*(?:await\s*)?\(")
 _FOR_INNER_HEAD_RE = re.compile(r"(?:for\s*(?:await\s*)?|while\s*|with\s*)\(")
 _PARAM_MODIFIER_RE = re.compile(r"^(?:(?:public|private|protected|readonly|override)\s+)+")
@@ -271,14 +287,14 @@ def _apply_url_scope_map(outer: dict[str, str], bmap: dict[str, str | None]) -> 
     if not pending:
         return merged
     working = {**merged, **pending}
-    for _ in range(3):
+    for _ in range(4):
         for k in list(pending):
             working[k] = resolve_url_const_head(
                 working[k],
-                {ok: ov for ok, ov in working.items() if ok != k and ov.startswith("/")},
+                {ok: ov for ok, ov in working.items() if ok != k and is_resolvable_url_const_value(ov)},
             )
     for k in pending:
-        if working[k].startswith("/"):
+        if is_resolvable_url_const_value(working[k]):
             merged[k] = working[k]
     return merged
 
@@ -299,7 +315,11 @@ def _has_closing_line_quote(src: str, start: int, quote_ch: str) -> bool:
     return False
 
 
-def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], dict[str, str]]]:
+def _build_scoped_url_consts(
+    txt: str,
+    *,
+    imported_consts: dict[str, str] | None = None,
+) -> tuple[dict[str, str], Callable[[int], dict[str, str]]]:
     """Return `(root_consts, consts_at)` preserving local URL constants while shadowing rebindings."""
     n = len(txt)
     root_span = (0, n)
@@ -431,13 +451,6 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
 
     lexical_spans = [*block_spans, *loop_spans]
 
-    def innermost_block(pos: int) -> tuple[int, int]:
-        return min(
-            (sp for sp in block_spans if sp[0] < pos < sp[1]),
-            key=lambda sp: sp[1] - sp[0],
-            default=root_span,
-        )
-
     def innermost_lexical_block(pos: int) -> tuple[int, int]:
         return min(
             (sp for sp in lexical_spans if sp[0] < pos < sp[1]),
@@ -459,22 +472,88 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
         else:
             bmap[name] = val if bmap.get(name, val) == val else None
 
+    for m in _URL_ALIAS_CONST_RE.finditer(code_only):
+        name, rhs = m.group("name"), m.group("rhs")
+        npos = m.start("name")
+        if npos in url_name_positions or rhs in ("true", "false", "null", "undefined"):
+            continue
+        url_name_positions.add(npos)
+        bmap = block_decls.setdefault(innermost_lexical_block(npos), {})
+        alias_val = f"${{{rhs}}}"
+        bmap[name] = alias_val if bmap.get(name, alias_val) == alias_val else None
+
+    for m in re.finditer(
+        r"""(?:^|[;{])[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
+        r"""(?P<lhs>[A-Za-z_$][\w$]*)\s*\+\s*(?P<q>['"`])(?P<tail>/[^'"`\n]*)(?P=q)[ \t]*(?:as\s+const[ \t]*)?(?=[;\r\n}]|$)""",
+        txt,
+        re.MULTILINE,
+    ):
+        name, lhs_ident, tail = m.group("name"), m.group("lhs"), m.group("tail")
+        npos = m.start("name")
+        if npos in url_name_positions or code_only[npos : m.end("name")] != name:
+            continue
+        url_name_positions.add(npos)
+        bmap = block_decls.setdefault(innermost_lexical_block(npos), {})
+        if m.group("q") != "`" and "${" in tail:
+            bmap[name] = None
+        else:
+            concat_val = f"${{{lhs_ident}}}{tail}"
+            bmap[name] = concat_val if bmap.get(name, concat_val) == concat_val else None
+
+    fn_scopes: list[tuple[int, int]] = [root_span]
+    param_scopes: list[tuple[int, int, set[str]]] = []
+    for m in _FN_PARAM_HEAD_RE.finditer(code_only):
+        raw_params = (
+            m.group("fparams") or m.group("cparam") or m.group("aparams") or m.group("sparam") or ""
+        )
+        if m.group("fparams") is not None or m.group("cparam") is not None:
+            span = (m.end() - 1, _find_matching_delim(code_only, m.end() - 1, "{", "}"))
+        else:
+            span = (m.end(), _find_arrow_expr_end(code_only, m.end()))
+        if m.group("cparam") is None:
+            fn_scopes.append(span)
+        bound = _extract_param_bound_names(raw_params)
+        if bound:
+            param_scopes.append((span[0], span[1], bound))
+
+    def innermost_fn_scope(pos: int) -> tuple[int, int]:
+        return min(
+            (sp for sp in fn_scopes if sp[0] <= pos < sp[1]),
+            key=lambda sp: sp[1] - sp[0],
+            default=root_span,
+        )
+
     for dm in _LOCAL_BIND_RE.finditer(code_only):
         npos = dm.start("name")
         if npos in url_name_positions:
             continue
+        url_name_positions.add(npos)
         target_span = (
-            innermost_lexical_block(npos)
-            if dm.group("kw") in ("const", "let")
-            else innermost_block(npos)
+            innermost_fn_scope(npos)
+            if dm.group("kw") == "var"
+            else innermost_lexical_block(npos)
         )
         block_decls.setdefault(target_span, {})[dm.group("name")] = None
+
+    for dsm in _DESTRUCT_BIND_RE.finditer(code_only):
+        dbound: set[str] = set()
+        _collect_pattern_bound_names(dsm.group("pat"), dbound, allow_type_colon=True)
+        if not dbound:
+            continue
+        target_span = (
+            innermost_fn_scope(dsm.start())
+            if dsm.group("kw") == "var"
+            else innermost_lexical_block(dsm.start())
+        )
+        dmap = block_decls.setdefault(target_span, {})
+        for dname in dbound:
+            dmap[dname] = None
 
     for open_p, close_p, loop_end in loop_headers:
         hdr_kw, hdr_bound = _extract_for_header_binds(code_only[open_p + 1 : close_p - 1])
         if not hdr_bound:
             continue
-        hdr_span = (open_p, loop_end) if hdr_kw in ("const", "let") else innermost_block(open_p)
+        hdr_span = (open_p, loop_end) if hdr_kw in ("const", "let") else innermost_fn_scope(open_p)
         hdr_map = block_decls.setdefault(hdr_span, {})
         for bname in hdr_bound:
             if hdr_kw == "var":
@@ -482,21 +561,35 @@ def _build_scoped_url_consts(txt: str) -> tuple[dict[str, str], Callable[[int], 
             else:
                 hdr_map.setdefault(bname, None)
 
-    param_scopes: list[tuple[int, int, set[str]]] = []
-    for m in _FN_PARAM_HEAD_RE.finditer(code_only):
-        raw_params = (
-            m.group("fparams") or m.group("cparam") or m.group("aparams") or m.group("sparam") or ""
-        )
-        bound = _extract_param_bound_names(raw_params)
-        if not bound:
+    for rm in _REASSIGN_STMT_RE.finditer(code_only):
+        rpos = rm.start("name")
+        if rpos in url_name_positions:
             continue
-        if m.group("fparams") is not None or m.group("cparam") is not None:
-            span = (m.end() - 1, _find_matching_delim(code_only, m.end() - 1, "{", "}"))
-        else:
-            span = (m.end(), _find_arrow_expr_end(code_only, m.end()))
-        param_scopes.append((span[0], span[1], bound))
+        if re.search(r"<[A-Za-z][\w.]*(?:\s|$)[^>]*$", code_only[max(0, rpos - 300) : rpos]):
+            continue
+        rname = rm.group("name")
+        binding_spans = [
+            sp
+            for sp, bmap in block_decls.items()
+            if sp[0] <= rpos < sp[1] and rname in bmap
+        ] + [
+            (s, e)
+            for s, e, pnames in param_scopes
+            if s <= rpos < e and rname in pnames
+        ]
+        target_span = (
+            min(binding_spans, key=lambda sp: sp[1] - sp[0])
+            if binding_spans
+            else innermost_fn_scope(rpos)
+        )
+        block_decls.setdefault(target_span, {})[rname] = None
 
-    root_consts = _apply_url_scope_map({}, block_decls.get(root_span, {}))
+    base_outer = {
+        k: v
+        for k, v in (imported_consts or {}).items()
+        if is_resolvable_url_const_value(v)
+    }
+    root_consts = _apply_url_scope_map(base_outer, block_decls.get(root_span, {}))
     inner_blocks = [(s, e, bmap) for (s, e), bmap in block_decls.items() if (s, e) != root_span]
 
     def consts_at(pos: int) -> dict[str, str]:
@@ -828,10 +921,18 @@ def _fetch_method_from_call_tail(txt: str, pos: int, *, at_second_arg: bool = Fa
     return verb
 
 
-def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
+def _extract_ts_http_calls(
+    txt: str,
+    *,
+    imported_consts: dict[str, str] | None = None,
+) -> list[tuple[str, str, int]]:
     """Extract (verb, raw_url, lineno) via Tree-sitter TSX CST (with character-scanner fallback)."""
-    root_consts, consts_at = _build_scoped_url_consts(txt)
-    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True, url_consts=root_consts)
+    seed_consts = (
+        {k: v for k, v in imported_consts.items() if is_resolvable_url_const_value(v)}
+        if imported_consts
+        else None
+    )
+    cst_calls = extract_ts_http_calls_cst(txt, is_tsx=True, url_consts=seed_consts)
     if cst_calls is not None:
         results = list(cst_calls)
         if "createApi" in txt and "builder." in txt:
@@ -849,6 +950,7 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
                 results.append((rverb, joined_u or "/", lineno))
         return results
 
+    _root_consts, consts_at = _build_scoped_url_consts(txt, imported_consts=seed_consts)
     results = []
     n = len(txt)
     for m in _HTTP_CALL_START_RE.finditer(txt):
@@ -859,11 +961,14 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
         quote = m.group("quote")
         i = m.end()
         buf: list[str] = []
-        if quote == "`":
+        seen_heads: set[str] = set()
+        while quote == "`":
             hm = _TEMPLATE_HEAD_CONST_RE.match(txt, i)
-            if hm and hm.group("name") in local_consts:
-                buf.append(local_consts[hm.group("name")])
-                i = hm.end()
+            if not hm or hm.group("name") in seen_heads or hm.group("name") not in local_consts:
+                break
+            seen_heads.add(hm.group("name"))
+            buf.append(local_consts[hm.group("name")])
+            i = hm.end()
         if i >= n or (not buf and txt[i] != "/"):
             continue
         if quote != "`":
@@ -895,13 +1000,15 @@ def _extract_ts_http_calls(txt: str) -> list[tuple[str, str, int]]:
         if verb in _FETCH_LIKE_VERBS:
             verb = _fetch_method_from_call_tail(txt, i)
         raw_url = "".join(buf)
-        if raw_url.startswith("/"):
+        if quote == "`":
+            raw_url = resolve_url_const_head(raw_url, local_consts)
+        if is_same_origin_url_path(raw_url):
             lineno = txt.count("\n", 0, m.start()) + 1
             results.append((verb, raw_url, lineno))
     for im in _URL_CALL_IDENT_RE.finditer(txt):
         local_consts = consts_at(im.start())
         ident = im.group("ident")
-        if ident in local_consts:
+        if ident in local_consts and is_same_origin_url_path(local_consts[ident]):
             iverb = im.group("verb").upper()
             if iverb == "DEL":
                 iverb = "DELETE"
@@ -1136,10 +1243,20 @@ class TypeScriptNextJsAdapter:
     name = "typescript-nextjs"
 
     def extract(self, repo_root: Path, frontend_subdir: str) -> DisplayExtractionResult:
+        from app.adapters.frontend_common import (
+            build_a11y_component_resolver,
+            build_frontend_url_const_resolver,
+            format_unobserved_a11y_note,
+        )
+
         fe_dir = repo_root.resolve() if frontend_subdir in ("", ".") else (repo_root / frontend_subdir).resolve()
         src_root = (fe_dir / "src").resolve() if (fe_dir / "src").is_dir() else fe_dir
         if not fe_dir.is_dir():
             return DisplayExtractionResult(nodes=[], edges=[], http_calls=[], findings=[])
+        _next_exts = (".ts", ".tsx", ".js", ".jsx")
+        url_const_resolver = build_frontend_url_const_resolver(src_root, _next_exts)
+        comp_resolver_for = build_a11y_component_resolver(src_root, _next_exts)
+        unobserved_a11y: list[str] = []
 
         ts_files: list[Path] = []
         barrel_targets: dict[Path, list[Path]] = {}
@@ -1306,7 +1423,9 @@ class TypeScriptNextJsAdapter:
             file_calls = 0
             methods_seen: list[str] = []
             paths_seen: list[str] = []
-            for verb, raw_u, lineno in _extract_ts_http_calls(txt):
+            for verb, raw_u, lineno in _extract_ts_http_calls(
+                txt, imported_consts=url_const_resolver(fpath, txt)
+            ):
                 norm_u = _normalize_ts_url(raw_u)
                 file_calls += 1
                 if verb not in methods_seen:
@@ -1410,7 +1529,13 @@ class TypeScriptNextJsAdapter:
 
             # 6. DISP-005: WCAG static accessibility markup checks on JSX/TSX modules
             if fpath.suffix == ".tsx":
-                a11y_hits = scan_a11y_markup_findings(raw_texts[fpath], node.id, rel_repo)
+                a11y_hits = scan_a11y_markup_findings(
+                    raw_texts[fpath],
+                    node.id,
+                    rel_repo,
+                    component_resolver=comp_resolver_for(fpath, raw_texts[fpath]),
+                    unobserved_out=unobserved_a11y,
+                )
                 if a11y_hits:
                     if node.status == "clean":
                         node.status = "gray_zone"
@@ -1427,13 +1552,18 @@ class TypeScriptNextJsAdapter:
                         declared=True,
                     )
 
+        notes = reach.analysis_notes() if reach is not None else [
+            "Display reachability could not be analyzed; unbacked calls remain blocking."
+        ]
+        unobs_note = format_unobserved_a11y_note(unobserved_a11y)
+        if unobs_note:
+            notes = [*notes, unobs_note]
+
         return DisplayExtractionResult(
             nodes=list(nodes_by_path.values()),
             edges=edges,
             http_calls=http_calls,
             findings=findings,
             local_route_patterns=local_route_patterns,
-            notes=reach.analysis_notes() if reach is not None else [
-                "Display reachability could not be analyzed; unbacked calls remain blocking."
-            ],
+            notes=notes,
         )

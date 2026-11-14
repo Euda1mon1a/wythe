@@ -421,9 +421,22 @@ def test_gt_inside_jsx_expressions_does_not_end_the_tag() -> None:
     broken = (
         "<input disabled={count > 0} />\n"
         "<div onClick={() => open()} className={`row ${active ? 'on' : ''}`}>Row</div>\n"
-        "<button disabled={count > 0}><CloseIcon /></button>\n"
+        "<button disabled={count > 0}><svg viewBox='0 0 16 16' /></button>\n"
     )
     assert _a11y_kinds(broken) == [(1, "<input>"), (2, "<div>"), (3, "<button>")]
+    from app.adapters.a11y_inspect import scan_a11y_markup_findings
+
+    unobserved: list[str] = []
+    assert (
+        scan_a11y_markup_findings(
+            "<button disabled={count > 0}><CloseIcon /></button>",
+            "d:c:opaque",
+            "src/Opaque.tsx",
+            unobserved_out=unobserved,
+        )
+        == []
+    )
+    assert len(unobserved) == 1
 
 
 def test_enclosing_label_is_found_at_any_distance() -> None:

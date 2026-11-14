@@ -105,6 +105,7 @@ def test_celery_named_queues_and_beat_schedule_lineage(db_session: Session, tmp_
 def test_disp_005_wcag_markup_inspector_catches_violations_and_passes_accessible_markup() -> None:
     """Verify DISP-005 catches missing alt, non-keyboard div click, nameless button, and unlabeled input."""
     bad_tsx = (
+        "import { CloseIcon } from 'lucide-react';\n"
         "export function BadSurface() {\n"
         "  return (\n"
         "    <section>\n"
@@ -116,11 +117,22 @@ def test_disp_005_wcag_markup_inspector_catches_violations_and_passes_accessible
         "  );\n"
         "}\n"
     )
-    findings = scan_a11y_markup_findings(bad_tsx, "frontend/src/BadSurface.tsx", "d:comp:bad")
+    findings = scan_a11y_markup_findings(bad_tsx, "d:comp:bad", "frontend/src/BadSurface.tsx")
     codes = [f.rule_code for f in findings]
     assert codes.count("DISP-005") == 4
 
+    unobserved: list[str] = []
+    opaque_hits = scan_a11y_markup_findings(
+        "<button type='button'><OpaqueAction label='Close' /></button>",
+        "d:comp:opaque",
+        "frontend/src/Opaque.tsx",
+        unobserved_out=unobserved,
+    )
+    assert opaque_hits == []
+    assert len(unobserved) == 1 and "OpaqueAction" in unobserved[0]
+
     good_tsx = (
+        "import { CloseIcon } from 'lucide-react';\n"
         "export function GoodSurface() {\n"
         "  return (\n"
         "    <section>\n"
@@ -201,3 +213,207 @@ def test_sveltekit_drizzle_and_snapshot_comparison_deltas(
     )
     assert comp.warning_delta >= 1
     assert any(f.rule_code == "DISP-005" for f in comp.new_findings)
+
+
+def test_tsx_default_export_and_expression_arrow_a11y_resolution(tmp_path: Path) -> None:
+    """Resolve `export default` declarations in multi-component TSX files without sibling bleed."""
+    from app.adapters.typescript_react import TypeScriptReactSpaAdapter
+
+    (tmp_path / "src" / "components").mkdir(parents=True)
+    (tmp_path / "package.json").write_text('{"dependencies":{"react":"^18.0.0"}}', encoding="utf-8")
+
+    # Helper Icon precedes the actual `export default function Label`
+    (tmp_path / "src" / "components" / "Label.tsx").write_text(
+        "function HelperIcon() {\n  return <svg />;\n}\n"
+        "const localText = 'Save';\n"
+        "export default function Label(): { node: unknown } {\n"
+        "  return <span>{localText}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    # Unused helper precedes a semicolon-free expression-bodied arrow component exported by name
+    (tmp_path / "src" / "components" / "DefaultIcon.tsx").write_text(
+        "const UnusedLabel = () => (<span>Unused</span>)\n"
+        "const DefaultIcon = () => (<svg aria-hidden='true' />)\n"
+        "export default DefaultIcon;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "App.tsx").write_text(
+        "import Label from './components/Label';\n"
+        "import DefaultIcon from './components/DefaultIcon';\n"
+        "export function App() {\n"
+        "  return (\n"
+        "    <main>\n"
+        "      <button type='button'><Label /></button>\n"
+        "      <button type='button'><DefaultIcon /></button>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = TypeScriptReactSpaAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    assert [(f.source_file, f.line) for f in disp_005] == [("src/App.tsx", 7)], disp_005
+
+
+def test_tsx_spread_props_and_destructured_aliases_a11y(tmp_path: Path) -> None:
+    """Resolve static spread objects/destructured aliases and keep dynamic spreads unobserved."""
+    from app.adapters.typescript_react import TypeScriptReactSpaAdapter
+
+    (tmp_path / "src" / "components").mkdir(parents=True)
+    (tmp_path / "package.json").write_text('{"dependencies":{"react":"^18.0.0"}}', encoding="utf-8")
+
+    (tmp_path / "src" / "components" / "Label.tsx").write_text(
+        "export function Label({ text }: { text?: string }) {\n  return <span>{text}</span>;\n}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "AliasedLabel.tsx").write_text(
+        "export default function AliasedLabel({ text: caption, fallback: altTxt = '' }: { text?: string; fallback?: string }) {\n"
+        "  return <span>{caption || altTxt}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "IconOnly.tsx").write_text(
+        "export default function IconOnly({ className }: { className?: string }) {\n"
+        "  return <svg className={className} aria-hidden='true' />;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "App.tsx").write_text(
+        "import { Label } from './components/Label';\n"
+        "import AliasedLabel from './components/AliasedLabel';\n"
+        "import IconOnly from './components/IconOnly';\n"
+        "export function App(extra: Record<string, string>) {\n"
+        "  return (\n"
+        "    <main>\n"
+        "      <button type='button'><Label {...{ text: 'Save' }} /></button>\n"
+        "      <button type='button'><Label {...extra} /></button>\n"
+        "      <button type='button'><Label {...extra} text='' /></button>\n"
+        "      <button type='button'><AliasedLabel text='Save' /></button>\n"
+        "      <button type='button'><AliasedLabel caption='WrongProp' /></button>\n"
+        "      <button type='button'><IconOnly {...extra} /></button>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = TypeScriptReactSpaAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    # Line 7: static spread {text: 'Save'} -> clean; Line 8: dynamic spread -> unobserved
+    # Line 9: explicit text='' after spread -> flagged; Line 10: aliased text='Save' -> clean
+    # Line 11: passing local alias caption= instead of source text= -> flagged; Line 12: pure icon -> flagged
+    assert [(f.source_file, f.line) for f in disp_005] == [
+        ("src/App.tsx", 9),
+        ("src/App.tsx", 11),
+        ("src/App.tsx", 12),
+    ], disp_005
+
+
+def test_tsx_conditional_returns_undefined_defaults_and_default_children_a11y(
+    tmp_path: Path,
+) -> None:
+    """Handle multi-return uncertainty, explicit `undefined` prop defaults, and default children."""
+    from app.adapters.typescript_react import TypeScriptReactSpaAdapter
+
+    (tmp_path / "src" / "components").mkdir(parents=True)
+    (tmp_path / "package.json").write_text('{"dependencies":{"react":"^18.0.0"}}', encoding="utf-8")
+
+    (tmp_path / "src" / "components" / "ConditionalLabel.tsx").write_text(
+        "export function ConditionalLabel({ loading }: { loading?: boolean }) {\n"
+        "  if (loading) {\n"
+        "    return <svg aria-hidden='true' />;\n"
+        "  }\n"
+        "  return <span>Save</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "DefaultText.tsx").write_text(
+        "export function DefaultText({ text = 'Save' }: { text?: string | null }) {\n"
+        "  return <span>{text}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "DefaultChildren.tsx").write_text(
+        "export function DefaultChildren({ children = 'Save' }: { children?: unknown }) {\n"
+        "  return <span>{children}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "App.tsx").write_text(
+        "import { ConditionalLabel } from './components/ConditionalLabel';\n"
+        "import { DefaultText } from './components/DefaultText';\n"
+        "import { DefaultChildren } from './components/DefaultChildren';\n"
+        "export function App() {\n"
+        "  return (\n"
+        "    <main>\n"
+        "      <button type='button'><ConditionalLabel loading={false} /></button>\n"
+        "      <button type='button'><DefaultText text={undefined} /></button>\n"
+        "      <button type='button'><DefaultText text={null} /></button>\n"
+        "      <button type='button'><DefaultChildren /></button>\n"
+        "      <button type='button'><DefaultChildren children={undefined} /></button>\n"
+        "      <button type='button'><DefaultChildren children={null} /></button>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = TypeScriptReactSpaAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    # ConditionalLabel -> uncertain across branches (not flagged)
+    # DefaultText text={undefined} -> applies 'Save' default (clean); text={null} -> flagged (line 9)
+    # DefaultChildren -> applies 'Save' default for omitted and {undefined}; children={null} -> flagged (line 12)
+    assert [(f.source_file, f.line) for f in disp_005] == [
+        ("src/App.tsx", 9),
+        ("src/App.tsx", 12),
+    ], disp_005
+
+
+def test_tsx_signature_only_props_computed_exprs_and_aria_img_a11y(
+    tmp_path: Path,
+) -> None:
+    """Restrict prop destructuring to signature, keep computed exprs uncertain, honor img ARIA names."""
+    from app.adapters.typescript_react import TypeScriptReactSpaAdapter
+
+    (tmp_path / "src" / "components").mkdir(parents=True)
+    (tmp_path / "package.json").write_text('{"dependencies":{"react":"^18.0.0"}}', encoding="utf-8")
+
+    (tmp_path / "src" / "components" / "BodyCallLabel.tsx").write_text(
+        "const label = 'Save';\n"
+        "export function BodyCallLabel() {\n"
+        "  console.debug({ label });\n"
+        "  return <span>{label}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "LengthLabel.tsx").write_text(
+        "export function LengthLabel({ text }: { text: string }) {\n"
+        "  return <span>{text.length}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "App.tsx").write_text(
+        "import { BodyCallLabel } from './components/BodyCallLabel';\n"
+        "import { LengthLabel } from './components/LengthLabel';\n"
+        "export function App() {\n"
+        "  return (\n"
+        "    <main>\n"
+        "      <button type='button'><BodyCallLabel /></button>\n"
+        "      <button type='button'><LengthLabel text='' /></button>\n"
+        "      <button type='button'><img src='/close.svg' role='img' alt='' aria-label='Close' /></button>\n"
+        "      <button type='button'><img src='/close.svg' alt='' /></button>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = TypeScriptReactSpaAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    # Line 6: BodyCallLabel module const + console.debug({label}) -> unobserved (clean)
+    # Line 7: LengthLabel {text.length} renders '0' -> unobserved (clean)
+    # Line 8: img with aria-label='Close' -> named (clean)
+    # Line 9: img with empty alt='' and no ARIA name -> flagged icon-only
+    assert [(f.source_file, f.line) for f in disp_005] == [("src/App.tsx", 9)], disp_005

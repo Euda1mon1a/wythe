@@ -11,7 +11,10 @@ from app.adapters.base import (
     RawCandidateFinding,
 )
 from app.adapters.frontend_common import (
+    build_a11y_component_resolver,
+    build_frontend_url_const_resolver,
     extract_script_preserving_lines,
+    format_unobserved_a11y_note,
     resolve_frontend_import,
     scan_display_module_semantics,
 )
@@ -125,9 +128,19 @@ class TypeScriptReactSpaAdapter:
         http_calls: list[FrontendHttpCall] = []
         findings: list[RawCandidateFinding] = []
 
+        url_const_resolver = build_frontend_url_const_resolver(src_root, _EXTS, cleaned_cache=cleaned)
+        comp_resolver_for = build_a11y_component_resolver(src_root, _EXTS)
+        unobserved_a11y: list[str] = []
+
         for fpath, node in nodes_by_path.items():
             specs, calls, mod_findings = scan_display_module_semantics(
-                node, cleaned[fpath], node.source_file, raw_source=raw_sources[fpath]
+                node,
+                cleaned[fpath],
+                node.source_file,
+                raw_source=raw_sources[fpath],
+                imported_url_consts=url_const_resolver(fpath, cleaned[fpath]),
+                component_resolver=comp_resolver_for(fpath, raw_sources[fpath]),
+                unobserved_a11y_out=unobserved_a11y,
             )
             if reach is not None:
                 annotated_calls: list[FrontendHttpCall] = []
@@ -173,9 +186,15 @@ class TypeScriptReactSpaAdapter:
                                 )
                             )
 
+        notes: list[str] = []
+        unobs_note = format_unobserved_a11y_note(unobserved_a11y)
+        if unobs_note:
+            notes.append(unobs_note)
+
         return DisplayExtractionResult(
             nodes=list(nodes_by_path.values()),
             edges=edges,
             http_calls=http_calls,
             findings=findings,
+            notes=notes,
         )

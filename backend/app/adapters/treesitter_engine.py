@@ -188,17 +188,39 @@ def extract_ts_backend_routes_cst(source: str, mount_prefix: str = "") -> list[t
     return found
 
 
-_TEMPLATE_HEAD_CONST_RE = re.compile(r"^\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
+
+
+def is_same_origin_url_path(val: str) -> bool:
+    """True when `val` is a same-origin root-relative path (never `//host` or scheme URL)."""
+    return val.startswith("/") and not val.startswith("//")
+
+
+def is_resolvable_url_const_value(val: str) -> bool:
+    """True when `val` is a static URL/path piece (`""`, `/...`, `//...`, or scheme URL)."""
+    return val == "" or val.startswith(("/", "http://", "https://", "ws://", "wss://"))
 
 
 def resolve_url_const_head(url_val: str, url_consts: dict[str, str] | None) -> str:
-    """Expand a leading `${NAME}` when NAME is a same-file string constant holding a path."""
-    if not url_consts or not url_val.startswith("${"):
+    """Expand statically known `${NAME}` URL pieces across template/concatenation expressions."""
+    if not url_consts or "${" not in url_val:
         return url_val
-    m = _TEMPLATE_HEAD_CONST_RE.match(url_val)
-    if m and m.group("name") in url_consts:
-        return url_consts[m.group("name")] + url_val[m.end() :]
-    return url_val
+    cur = url_val
+    for _ in range(4):
+        changed = False
+
+        def _repl(m: re.Match[str]) -> str:
+            nonlocal changed
+            name = m.group("name")
+            if name in url_consts:
+                changed = True
+                return url_consts[name]
+            return m.group(0)
+
+        cur = _TEMPLATE_PLACEHOLDER_RE.sub(_repl, cur)
+        if not changed or "${" not in cur:
+            break
+    return cur
 
 
 _PARAM_CONTAINERS = frozenset(
@@ -241,6 +263,40 @@ def _collect_cst_pattern_idents(raw: bytes, node: Any, out: set[str]) -> None:
             _collect_cst_pattern_idents(raw, ch, out)
 
 
+def _cst_url_template_from_expr(raw: bytes, node: Any, depth: int = 0) -> str | None:
+    """Turn a static string, template string, identifier alias, or `+` concat into a template string."""
+    if depth > 6 or node is None:
+        return None
+    cur = node
+    while cur is not None and cur.named_children and cur.type in (
+        "parenthesized_expression",
+        "as_expression",
+        "satisfies_expression",
+        "non_null_expression",
+    ):
+        cur = cur.named_children[0]
+    if cur is None:
+        return None
+    if cur.type == "string":
+        val = _unquote_node(raw, cur)
+        return None if "${" in val else val
+    if cur.type == "template_string":
+        return _unquote_node(raw, cur)
+    if cur.type == "identifier":
+        ident = raw[cur.start_byte : cur.end_byte].decode("utf-8", errors="replace")
+        return f"${{{ident}}}"
+    if cur.type == "binary_expression" and len(cur.named_children) >= 2:
+        op_node = cur.child_by_field_name("operator") or (
+            cur.children[1] if len(cur.children) >= 3 else None
+        )
+        if op_node is not None and raw[op_node.start_byte : op_node.end_byte] == b"+":
+            left = _cst_url_template_from_expr(raw, cur.named_children[0], depth + 1)
+            right = _cst_url_template_from_expr(raw, cur.named_children[1], depth + 1)
+            if left is not None and right is not None:
+                return left + right
+    return None
+
+
 def _collect_cst_var_decl(raw: bytes, decl_node: Any, raw_local: dict[str, str | None]) -> None:
     is_const = decl_node.type == "lexical_declaration" and any(
         tok.type == "const" for tok in decl_node.children
@@ -252,25 +308,10 @@ def _collect_cst_var_decl(raw: bytes, decl_node: Any, raw_local: dict[str, str |
             decl.named_children[0] if decl.named_children else None
         )
         rhs = decl.child_by_field_name("value")
-        while (
-            rhs is not None
-            and rhs.type in ("as_expression", "satisfies_expression")
-            and rhs.named_children
-        ):
-            rhs = rhs.named_children[0]
-        if (
-            is_const
-            and lhs is not None
-            and lhs.type == "identifier"
-            and rhs is not None
-            and rhs.type in ("string", "template_string")
-        ):
+        val = _cst_url_template_from_expr(raw, rhs) if (is_const and rhs is not None) else None
+        if is_const and lhs is not None and lhs.type == "identifier" and val is not None:
             ident = raw[lhs.start_byte : lhs.end_byte].decode("utf-8", errors="replace")
-            val = _unquote_node(raw, rhs)
-            if rhs.type == "string" and "${" in val:
-                raw_local[ident] = None
-            else:
-                raw_local[ident] = val if raw_local.get(ident, val) == val else None
+            raw_local[ident] = val if raw_local.get(ident, val) == val else None
         elif lhs is not None:
             bound: set[str] = set()
             _collect_cst_pattern_idents(raw, lhs, bound)
@@ -286,13 +327,14 @@ def _merge_cst_local_consts(outer_consts: dict[str, str], raw_local: dict[str, s
     if not pending:
         return merged
     working = {**merged, **pending}
-    for _ in range(3):
+    for _ in range(4):
         for k in list(pending):
             working[k] = resolve_url_const_head(
-                working[k], {ok: ov for ok, ov in working.items() if ok != k and ov.startswith("/")}
+                working[k],
+                {ok: ov for ok, ov in working.items() if ok != k and is_resolvable_url_const_value(ov)},
             )
     for k in pending:
-        if working[k].startswith("/"):
+        if is_resolvable_url_const_value(working[k]):
             merged[k] = working[k]
     return merged
 
@@ -326,6 +368,95 @@ def _collect_hoisted_cst_vars(raw: bytes, root: Any, out: set[str]) -> None:
         stack.extend(n.named_children)
 
 
+def _cst_block_lexical_bindings(raw: bytes, scope_node: Any) -> set[str]:
+    """Collect block-scoped (`let`, `const`, `catch`, `function`, `class`) names bound in `scope_node`."""
+    names: set[str] = set()
+    if scope_node.type == "catch_clause":
+        c_param = scope_node.child_by_field_name("parameter")
+        if c_param is not None:
+            _collect_cst_pattern_idents(raw, c_param, names)
+        return names
+    if scope_node.type == "for_in_statement":
+        if any(tok.type in ("let", "const") for tok in scope_node.children):
+            left = scope_node.child_by_field_name("left")
+            if left is not None:
+                _collect_cst_pattern_idents(raw, left, names)
+        return names
+    if scope_node.type == "for_statement":
+        init_node = scope_node.child_by_field_name("initializer")
+        if init_node is not None and init_node.type == "lexical_declaration":
+            for d in init_node.named_children:
+                if d.type == "variable_declarator":
+                    lhs = d.child_by_field_name("name") or (d.named_children[0] if d.named_children else None)
+                    if lhs is not None:
+                        _collect_cst_pattern_idents(raw, lhs, names)
+        return names
+
+    candidates = list(scope_node.named_children)
+    if scope_node.type == "switch_body":
+        candidates = [
+            stmt
+            for clause in scope_node.named_children
+            if clause.type in ("switch_case", "switch_default")
+            for stmt in clause.named_children
+        ]
+    for ch in candidates:
+        decl_node = (
+            (ch.child_by_field_name("declaration") or (ch.named_children[0] if ch.named_children else None))
+            if ch.type == "export_statement"
+            else ch
+        )
+        if decl_node is None:
+            continue
+        if decl_node.type == "lexical_declaration":
+            for d in decl_node.named_children:
+                if d.type == "variable_declarator":
+                    lhs = d.child_by_field_name("name") or (d.named_children[0] if d.named_children else None)
+                    if lhs is not None:
+                        _collect_cst_pattern_idents(raw, lhs, names)
+        elif decl_node.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
+            fn_id = decl_node.child_by_field_name("name")
+            if fn_id is not None:
+                _collect_cst_pattern_idents(raw, fn_id, names)
+    return names
+
+
+def _collect_mutated_cst_vars(raw: bytes, container: Any, out: set[str]) -> None:
+    """Record outer-scope identifiers reassigned inside `container`, respecting nested lexical shadowing."""
+
+    def visit(parent: Any, shadowed: frozenset[str]) -> None:
+        for n in parent.named_children:
+            if n.type in (
+                "function_declaration",
+                "generator_function_declaration",
+                "function",
+                "function_expression",
+                "arrow_function",
+                "method_definition",
+            ):
+                continue
+            next_shadowed = shadowed
+            if n.type in ("statement_block", "for_statement", "for_in_statement", "catch_clause", "switch_body"):
+                lex = _cst_block_lexical_bindings(raw, n)
+                if lex:
+                    next_shadowed = shadowed | lex
+            if n.type in ("assignment_expression", "augmented_assignment_expression"):
+                lhs = n.child_by_field_name("left") or (n.named_children[0] if n.named_children else None)
+                if lhs is not None:
+                    hits: set[str] = set()
+                    _collect_cst_pattern_idents(raw, lhs, hits)
+                    out.update(hits - next_shadowed)
+            elif n.type == "update_expression":
+                arg = n.child_by_field_name("argument") or (n.named_children[0] if n.named_children else None)
+                if arg is not None:
+                    hits = set()
+                    _collect_cst_pattern_idents(raw, arg, hits)
+                    out.update(hits - next_shadowed)
+            visit(n, next_shadowed)
+
+    visit(container, frozenset())
+
+
 def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, str]) -> dict[str, str]:
     """Update `outer_consts` with lexical local `const X = '/...'` bindings and drop shadowed ones."""
     raw_local: dict[str, str | None] = {}
@@ -346,6 +477,10 @@ def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, s
                 _collect_cst_pattern_idents(raw, fn_id, bound_fn)
                 for b in bound_fn:
                     raw_local[b] = None
+    mutated: set[str] = set()
+    _collect_mutated_cst_vars(raw, container, mutated)
+    for b in mutated:
+        raw_local[b] = None
     return _merge_cst_local_consts(outer_consts, raw_local)
 
 
@@ -467,6 +602,11 @@ def extract_ts_http_calls_cst(
             if init_node is not None and init_node.type in ("lexical_declaration", "variable_declaration"):
                 for_local: dict[str, str | None] = {}
                 _collect_cst_var_decl(raw, init_node, for_local)
+                for_mutated: set[str] = set()
+                _collect_mutated_cst_vars(raw, node, for_mutated)
+                for b in for_mutated:
+                    if b in for_local:
+                        for_local[b] = None
                 scope_consts = _merge_cst_local_consts(scope_consts, for_local)
         elif ntype == "statement_block":
             scope_consts = _apply_cst_block_decls(raw, node, scope_consts)
@@ -493,13 +633,10 @@ def extract_ts_http_calls_cst(
                     if cmd:
                         tverb = "GET" if cmd.startswith(_TAURI_READ_PREFIXES) else "POST"
                         found.append((tverb, f"/tauri/{cmd}", fn_node.start_point[0] + 1))
-                elif first_arg is not None and first_arg.type in ("string", "template_string", "identifier"):
-                    if first_arg.type == "identifier":
-                        ident = raw[first_arg.start_byte : first_arg.end_byte].decode("utf-8", errors="replace")
-                        url_val = scope_consts.get(ident, "")
-                    else:
-                        url_val = resolve_url_const_head(_unquote_node(raw, first_arg), scope_consts)
-                    if url_val.startswith("/"):
+                elif first_arg is not None:
+                    tpl = _cst_url_template_from_expr(raw, first_arg)
+                    url_val = resolve_url_const_head(tpl, scope_consts) if tpl is not None else ""
+                    if is_same_origin_url_path(url_val):
                         upper_c = "DELETE" if callee_name.lower() == "del" else callee_name.upper()
                         if upper_c in _HTTP_VERBS:
                             found.append((upper_c, url_val, fn_node.start_point[0] + 1))
