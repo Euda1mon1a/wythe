@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+uv.lock
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 from pathlib import Path
 
 from sqlalchemy import select
@@ -288,3 +291,103 @@ def test_preserves_detected_display_framework_even_on_profile_fallback(
     assert det_fallback.display_adapter == "typescript-nextjs"
     assert det_fallback.confidence == "fallback"
     assert any("preserving detected display adapter" in s for s in det_fallback.detected_signals)
+
+
+def test_diff_and_sarif_propagate_incomplete_tier_coverage(
+    isolated_db_url: str, tmp_path: Path
+) -> None:
+    """wythe diff + SARIF must return INCOMPLETE (exit 2, executionSuccessful=False) on partial coverage."""
+    assert isolated_db_url.startswith("sqlite:")
+    repo = tmp_path / "partial_diff_repo"
+    (repo / "src" / "pages").mkdir(parents=True)
+    (repo / "package.json").write_text('{"dependencies": {"react": "18.3.0"}}', encoding="utf-8")
+    (repo / "vite.config.ts").write_text("export default {};\n", encoding="utf-8")
+    page = repo / "src" / "pages" / "HomePage.tsx"
+    page.write_text(
+        "export function HomePage() { void fetch('/api/items'); return <main><h1>Home</h1></main>; }\n",
+        encoding="utf-8",
+    )
+
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "user@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "user@example.com",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=git_env)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, env=git_env)
+    subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "commit", "-m", "baseline"],
+        cwd=repo,
+        check=True,
+        env=git_env,
+        capture_output=True,
+    )
+
+    # Clean edit inside an incomplete-coverage repo -> INCOMPLETE (exit 2), NEVER PASS (0).
+    page.write_text(
+        "export function HomePage() {\n  void fetch('/api/items');\n  return <main><h1>Updated</h1></main>;\n}\n",
+        encoding="utf-8",
+    )
+    diff_json = tmp_path / "diff.json"
+    sarif_json = tmp_path / "diff.sarif.json"
+    rc = cli_main(
+        ["diff", str(repo), "--base", "HEAD", "--json", str(diff_json), "--sarif", str(sarif_json)]
+    )
+    assert rc == 2
+    diff_doc = json.loads(diff_json.read_text(encoding="utf-8"))
+    assert diff_doc["diff_verdict"] == "INCOMPLETE"
+    sarif_doc = json.loads(sarif_json.read_text(encoding="utf-8"))
+    run = sarif_doc["runs"][0]
+    assert run["properties"]["diffVerdict"] == "INCOMPLETE"
+    assert run["properties"]["coverageComplete"] is False
+    assert run["invocations"][0]["executionSuccessful"] is False
+
+    # Introducing a blocking finding (DISP-002) on the incomplete repo still fails (exit 1) and keeps executionSuccessful=False.
+    page.write_text(
+        "export function HomePage() {\n  const day = new Date().toISOString().slice(0, 10);\n  return <main>{day}</main>;\n}\n",
+        encoding="utf-8",
+    )
+    assert cli_main(["diff", str(repo), "--base", "HEAD", "--sarif", str(sarif_json)]) == 1
+    sarif_fail = json.loads(sarif_json.read_text(encoding="utf-8"))
+    assert sarif_fail["runs"][0]["invocations"][0]["executionSuccessful"] is False
+
+
+def test_root_fastapi_with_tooling_package_json_and_script_worker_preservation(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """Tooling-only backend/package.json preserves root FastAPI; script app/worker stays python-services."""
+    fastapi_repo = tmp_path / "root_fastapi"
+    (fastapi_repo / "backend" / "app").mkdir(parents=True)
+    (fastapi_repo / "frontend" / "src" / "app").mkdir(parents=True)
+    (fastapi_repo / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["fastapi>=0.110", "sqlalchemy>=2.0"]\n', encoding="utf-8"
+    )
+    (fastapi_repo / "backend" / "package.json").write_text(
+        '{"devDependencies": {"prettier": "3.0.0"}}', encoding="utf-8"
+    )
+    (fastapi_repo / "backend" / "app" / "main.py").write_text(
+        "from fastapi import FastAPI\napp = FastAPI()\n", encoding="utf-8"
+    )
+    (fastapi_repo / "frontend" / "package.json").write_text(
+        '{"dependencies": {"next": "14.0.0", "react": "18.3.0"}}', encoding="utf-8"
+    )
+    (fastapi_repo / "frontend" / "src" / "app" / "page.tsx").write_text(
+        "export default function P() { return <div />; }\n", encoding="utf-8"
+    )
+
+    det_fa = detect_repository_stack(db_session, str(fastapi_repo))
+    assert det_fa.recommended_profile_slug == "fastapi-sqlalchemy-nextjs"
+
+    script_repo = tmp_path / "script_worker"
+    (script_repo / "app").mkdir(parents=True)
+    (script_repo / "pyproject.toml").write_text(
+        '[project]\nname = "worker-scripts"\n', encoding="utf-8"
+    )
+    (script_repo / "app" / "worker.py").write_text(
+        "def run_job():\n    return 'ok'\n", encoding="utf-8"
+    )
+    det_sc = detect_repository_stack(db_session, str(script_repo))
+    assert det_sc.manipulator_adapter == "python-services"
+    assert det_sc.recommended_profile_slug == "python-services"

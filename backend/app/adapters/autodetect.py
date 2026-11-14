@@ -157,9 +157,28 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
         for pjson in sorted(repo_root.glob(pat)):
             ws_pkgs_deps.update(_pkg_deps(pjson))
 
-    # Avoid cross-contaminating a Node backend dir with an unrelated root/auxiliary Python manifest.
-    node_owned_backend = (be_dir / "package.json").is_file() and not (
-        (be_dir / "pyproject.toml").is_file() or (be_dir / "requirements.txt").is_file() or (be_dir / "manage.py").is_file()
+    # Avoid cross-contaminating a Node backend dir with an unrelated root/auxiliary Python manifest,
+    # unless backend/package.json lacks Node backend/ORM deps or Python FastAPI source already exists.
+    node_be_markers = _NODE_BACKEND_DEPS | {
+        dep for dep, _ in _UNSUPPORTED_DB_DEPS
+    } | {"prisma", "@prisma/client", "drizzle-orm", "kysely"}
+    has_be_python_manifest = (
+        (be_dir / "pyproject.toml").is_file()
+        or (be_dir / "requirements.txt").is_file()
+        or (be_dir / "manage.py").is_file()
+        or (be_dir / "app" / "main.py").is_file()
+    )
+    node_owned_backend = (
+        (be_dir / "package.json").is_file()
+        and not has_be_python_manifest
+        and (
+            bool(be_deps & node_be_markers)
+            or (
+                not (repo_root / "pyproject.toml").is_file()
+                and not (repo_root / "requirements.txt").is_file()
+                and not (repo_root / "manage.py").is_file()
+            )
+        )
     )
     be_pyproj = _read_lower(be_dir / "pyproject.toml")
     be_reqs = _read_lower(be_dir / "requirements.txt")
@@ -241,7 +260,10 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
         and not has_django
         and not has_rust
         and not has_go
-        and (has_fastapi or ((be_dir / "app").is_dir() and _has_dir_sources(be_dir / "app", (".py",))))
+        and (
+            has_fastapi
+            or ((has_sqla_evidence or disp_ev) and (be_dir / "app").is_dir() and _has_dir_sources(be_dir / "app", (".py",)))
+        )
     )
     has_node_backend = (
         bool(all_be_js_deps & _NODE_BACKEND_DEPS)
