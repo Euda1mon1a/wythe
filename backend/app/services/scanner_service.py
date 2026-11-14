@@ -39,6 +39,7 @@ from app.schemas.atlas import (
 from app.services.gate_service import evaluate_findings_and_gate
 from app.services.governance_service import list_rulings
 from app.services.route_probe_service import apply_live_route_probe
+from app.services.ruling_metadata import apply_rulings_and_store_purpose_checks
 
 _API_VERSION_PREFIX_RE = re.compile(r"^/api/v\d+(?=/|$)")
 _ROUTE_PARAM_SEG_RE = re.compile(r"^(?:\{[^/]*\}|:[\w$]+\??|<[^>]+>|\*.*)$")
@@ -575,19 +576,9 @@ def run_target_scan(
     )
 
     rulings = list_rulings(session, target.id) if target.id else []
-    latest_ruling_by_node = {}
-    for r in rulings:
-        if r.node_id not in latest_ruling_by_node:
-            latest_ruling_by_node[r.node_id] = r
-    for node in all_nodes:
-        ruling = latest_ruling_by_node.get(node.id)
-        if ruling is not None:
-            node.ruling_summary = f"[{ruling.disposition}] {ruling.summary}"
-            node.ruling_audited_at = ruling.audited_at
-            if ruling.cutover_history:
-                node.cutover_history = ruling.cutover_history
-            if ruling.disposition == "accepted_clean":
-                node.status = "clean"
+    raw_findings = apply_rulings_and_store_purpose_checks(
+        all_nodes, all_edges, raw_findings, rulings
+    )
 
     findings, gate = evaluate_findings_and_gate(
         session, raw_findings, target_id=target.id or None, strict=strict_gate

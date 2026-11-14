@@ -34,10 +34,10 @@ _C_COMMENT_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
 
 _RECV_PAT = r"(?:redis(?:_[A-Za-z0-9_]+)?|rdb|rcache|cache|valkey|upstash|kv|[A-Za-z0-9_]+_redis)"
 _REDIS_CALL_RE = re.compile(
-    rf"""\b(?P<recv>{_RECV_PAT})\s*\.\s*(?P<op>get|mget|hget|hgetall|lrange|smembers|xread|set|setex|psetex|set_ex|hset|hmset|mset|lpush|rpush|xadd|publish|expire|pexpire|expireat|pexpireat|Get|MGet|HGet|HGetAll|Set|SetEx|SetNX|HSet|LPush|RPush|Expire)\s*\("""
+    rf"""\b(?P<recv>{_RECV_PAT})\s*\.\s*(?P<op>get|mget|hget|hgetall|lrange|smembers|xread|set|setex|psetex|set_ex|hset|hmset|mset|lpush|rpush|xadd|publish|delete|unlink|del|expire|pexpire|expireat|pexpireat|Get|MGet|HGet|HGetAll|Set|SetEx|SetNX|HSet|LPush|RPush|Delete|Del|Unlink|Expire)\s*\("""
 )
 _RUST_CMD_RE = re.compile(
-    r"""\bredis::cmd\(\s*"(?P<op>GET|MGET|HGET|HGETALL|SET|SETEX|PSETEX|HSET|LPUSH|RPUSH|EXPIRE)"\s*\)\s*\.\s*arg\(\s*"(?P<key>[A-Za-z0-9_.-]+:[A-Za-z0-9_:.*{}-]*)" """.strip()
+    r"""\bredis::cmd\(\s*"(?P<op>GET|MGET|HGET|HGETALL|SET|SETEX|PSETEX|HSET|LPUSH|RPUSH|DEL|UNLINK|EXPIRE)"\s*\)\s*\.\s*arg\(\s*"(?P<key>[A-Za-z0-9_.-]+:[A-Za-z0-9_:.*{}-]*)" """.strip()
 )
 _FIRST_STR_ARG_RE = re.compile(r"""^\s*(?:ctx\s*,\s*)?['"`](?P<key>[A-Za-z0-9_.-]+:[A-Za-z0-9_:.*{}$/-]*)['"`]""")
 _EXPIRE_CALL_RE = re.compile(
@@ -80,6 +80,22 @@ _ASYNQ_SCHED_RE = re.compile(
 _READ_OPS = frozenset({"get", "mget", "hget", "hgetall", "lrange", "smembers", "xread", "Get", "MGet", "HGet", "HGetAll", "GET", "MGET", "HGET", "HGETALL"})
 _TTL_WRITE_OPS = frozenset({"setex", "psetex", "set_ex", "SetEx", "SETEX", "PSETEX", "lpush", "rpush", "xadd", "publish", "LPush", "RPush", "LPUSH", "RPUSH"})
 _UNBOUNDED_CANDIDATE_OPS = frozenset({"set", "hset", "hmset", "mset", "Set", "SetNX", "HSet", "SET", "HSET"})
+_INVALIDATE_OPS = frozenset({"delete", "unlink", "del", "Delete", "Del", "Unlink", "DEL", "UNLINK"})
+_GENERIC_KEY_STEMS = frozenset({"default", "state", "cache", "data", "temp", "tmp", "redis", "queue", "session", "token", "limit", "limits", "rate", "ratelimit", "shadow_state"})
+
+
+def _key_domain_stem(raw: str) -> str:
+    cleaned = raw.lower()
+    for pfx in ("t:redis:", "t:sql:", "t:db:", "t:"):
+        cleaned = cleaned.removeprefix(pfx)
+    cleaned = cleaned.split(":", 1)[0]
+    for suffix in ("_copy", "_cache", "_replica", "_view", "_snapshot"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
+    if len(cleaned) > 4 and cleaned.endswith("s"):
+        cleaned = cleaned[:-1]
+    return cleaned
 
 
 def _strip_comments_keep_lines(raw: str, suffix: str) -> str:
@@ -369,6 +385,52 @@ def probe_redis_keyspace_prefixes(redis_dsn: str) -> tuple[set[str], str]:
         return set(), "redis_unreachable"
 
 
+def _find_second_authority(
+    prefix: str, written_sql_stems: dict[str, AtlasNode]
+) -> AtlasNode | None:
+    p_stem = _key_domain_stem(prefix)
+    if len(p_stem) < 4 or p_stem in _GENERIC_KEY_STEMS:
+        return None
+    direct = written_sql_stems.get(p_stem)
+    if direct is not None:
+        return direct
+    for t_stem, node in written_sql_stems.items():
+        if t_stem.startswith(f"{p_stem}_") or p_stem.startswith(f"{t_stem}_"):
+            return node
+    return None
+
+
+def _resolve_redis_call_key(
+    txt: str,
+    cm: re.Match[str],
+    has_sdk: bool,
+    py_calls: _PyRedisCalls | None,
+) -> tuple[str, ast.Call | None] | None:
+    op = cm.group("op")
+    lineno = txt.count("\n", 0, cm.start()) + 1
+    py_call = py_calls.take(lineno, op) if py_calls is not None else None
+    if py_calls is not None and py_call is None:
+        return None
+    call_args = _extract_call_window(txt, cm.end())
+    km = _FIRST_STR_ARG_RE.match(call_args)
+    if km is None and not has_sdk:
+        return None
+    literal = (
+        py_calls.key_literal(py_call)
+        if py_calls is not None and py_call is not None
+        else None
+    )
+    if km:
+        raw_key = km.group("key")
+    elif literal and ":" in literal:
+        raw_key = f"{literal.split(':', 1)[0]}:*"
+    else:
+        raw_key = "default:key"
+    if ":" not in raw_key and not has_sdk:
+        return None
+    return raw_key, py_call
+
+
 def augment_redis_ephemeral_lineage(
     repo_root: Path,
     backend_subdir: str,
@@ -386,13 +448,29 @@ def augment_redis_ephemeral_lineage(
     redis_nodes: dict[str, AtlasNode] = {}
     readers: dict[str, set[str]] = {}
     writers: dict[str, set[str]] = {}
+    ttl_stores: set[str] = set()
+    inval_stores: dict[str, list[tuple[str, int, str]]] = {}
+    unestablished_stores: set[str] = set()
+    conflict_stores: dict[str, str] = {}
     seen_edges: set[tuple[str, str, str]] = {(e.source_id, e.target_id, e.kind) for e in manip.edges}
     worker_node_ids: set[str] = set()
+    written_table_ids = {e.target_id for e in manip.edges if e.kind == "writes_truth"}
+    written_sql_stems: dict[str, AtlasNode] = {}
+    for tn in truth.nodes:
+        if tn.subkind == "table" and tn.id in written_table_ids:
+            st = _key_domain_stem(tn.id)
+            if len(st) >= 4 and st not in _GENERIC_KEY_STEMS:
+                written_sql_stems[st] = tn
 
     def ensure_store(prefix: str, rel_repo: str, line: int, kind_note: str) -> str:
         slug = re.sub(r"[^a-z0-9_.-]", "_", prefix.lower()).strip("_") or "default"
         nid = f"t:redis:{slug}"
         if nid not in redis_nodes:
+            summary = (
+                f"Unresolved dynamic Redis {kind_note} `default:*` (grouping reflects unresolved key names, not proof of shared records)."
+                if slug == "default"
+                else f"Discovered Redis {kind_note} `{slug}:*` (store role not yet declared; inferred from static operations)."
+            )
             redis_nodes[nid] = AtlasNode(
                 id=nid,
                 tier="truth",
@@ -403,7 +481,7 @@ def augment_redis_ephemeral_lineage(
                 status="clean",
                 role="ephemeral",
                 cluster="redis",
-                summary=f"Ephemeral Redis {kind_note} `{slug}:*` (non-authoritative volatile state).",
+                summary=summary,
             )
         return nid
 
@@ -479,6 +557,37 @@ def augment_redis_ephemeral_lineage(
             )
             task_queues_by_name[fn_name] = lane
             task_queues_by_name[f"{dotted_mod}.{fn_name}"] = lane
+
+    ast_trees: dict[str, ast.Module] = {}
+    named_invalidations: dict[str, tuple[str, int, str]] = {}
+    for src_file, rel_repo, _mnode, txt in file_entries:
+        has_sdk = bool(_REDIS_SDK_RE.search(txt))
+        pre_py: _PyRedisCalls | None = None
+        if src_file.suffix == ".py":
+            try:
+                tree = ast.parse(src_file.read_text(encoding="utf-8"))
+                ast_trees[rel_repo] = tree
+                pre_py = _PyRedisCalls(tree)
+            except (OSError, UnicodeError, SyntaxError, ValueError):
+                pre_py = None
+        for cm in _REDIS_CALL_RE.finditer(txt):
+            resolved = _resolve_redis_call_key(txt, cm, has_sdk, pre_py)
+            if resolved is None:
+                continue
+            raw_key, _ = resolved
+            op = cm.group("op")
+            if op in _INVALIDATE_OPS:
+                pfx_lc = raw_key.split(":", 1)[0].lower()
+                if pfx_lc != "default" and pfx_lc not in named_invalidations:
+                    lineno = txt.count("\n", 0, cm.start()) + 1
+                    named_invalidations[pfx_lc] = (rel_repo, lineno, op)
+        for rm in _RUST_CMD_RE.finditer(txt):
+            op = rm.group("op")
+            if op in _INVALIDATE_OPS:
+                pfx_lc = rm.group("key").split(":", 1)[0].lower()
+                if pfx_lc != "default" and pfx_lc not in named_invalidations:
+                    lineno = txt.count("\n", 0, rm.start()) + 1
+                    named_invalidations[pfx_lc] = (rel_repo, lineno, op)
 
     for src_file, rel_repo, mnode, txt in file_entries:
         has_sdk = bool(_REDIS_SDK_RE.search(txt))
@@ -557,44 +666,102 @@ def augment_redis_ephemeral_lineage(
             worker_node_ids.add(mnode.id)
             link(mnode.id, sid, "writes_truth", rel_repo, f"Asynq cron scheduler enqueues `{qname}`.")
 
-        # 2. Keyspace reads/writes & TRUTH-004 shadow-truth TTL check
+        # 2. Keyspace reads/writes & TRUTH-004 lifetime / authority check
         expired_recv_prefixes = {
             (em.group("recv"), em.group("key").rstrip(":").lower()) for em in _EXPIRE_CALL_RE.finditer(txt)
         }
         expired_prefixes = {pfx for _recv, pfx in expired_recv_prefixes}
 
-        py_calls: _PyRedisCalls | None = None
-        if src_file.suffix == ".py":
-            try:
-                py_calls = _PyRedisCalls(ast.parse(src_file.read_text(encoding="utf-8")))
-            except (OSError, UnicodeError, SyntaxError, ValueError):
-                py_calls = None
+        py_calls = _PyRedisCalls(ast_trees[rel_repo]) if rel_repo in ast_trees else None
+
+        def record_unbounded_write(
+            caller_node: AtlasNode,
+            caller_file: str,
+            sid: str,
+            prefix: str,
+            raw_key: str,
+            op: str,
+            lineno: int,
+            *,
+            rust_style: bool = False,
+        ) -> None:
+            inval = named_invalidations.get(prefix.lower()) if prefix.lower() != "default" else None
+            if inval is not None:
+                inval_stores.setdefault(sid, []).append(inval)
+                return
+            second_auth = _find_second_authority(prefix, written_sql_stems)
+            if second_auth is not None:
+                redis_nodes[sid].status = "duplicated_truth"
+                conflict_stores[sid] = second_auth.id
+                if caller_node.status == "clean":
+                    caller_node.status = "gray_zone"
+                manip.findings.append(
+                    RawCandidateFinding(
+                        rule_code="TRUTH-004",
+                        node_id=caller_node.id,
+                        target_node_id=sid,
+                        source_file=caller_file,
+                        line=lineno,
+                        title=f"Unbounded Redis `{op}` on `{prefix}:*` conflicts with `{second_auth.label}`",
+                        detail=(
+                            f"{caller_file}:{lineno} writes `{raw_key}` without TTL or invalidation while "
+                            f"active SQL table `{second_auth.label}` ({second_auth.id}) establishes a "
+                            "conflicting second authority."
+                        ),
+                        remediation=(
+                            "Bind writes to TTL/explicit invalidation and record `derived_cache` "
+                            f"purpose referencing `{second_auth.id}` if it is a replica/cache."
+                        ),
+                    )
+                )
+                return
+            if redis_nodes[sid].status == "clean":
+                redis_nodes[sid].status = "gray_zone"
+            unestablished_stores.add(sid)
+            if caller_node.status == "clean":
+                caller_node.status = "gray_zone"
+            title = (
+                f"Unestablished expiration on Rust Redis `{op}` for `{prefix}:*`"
+                if rust_style
+                else f"Unestablished expiration on Redis `{op}` for `{prefix}:*`"
+            )
+            manip.findings.append(
+                RawCandidateFinding(
+                    rule_code="TRUTH-004",
+                    node_id=caller_node.id,
+                    target_node_id=sid,
+                    source_file=caller_file,
+                    line=lineno,
+                    title=title,
+                    detail=(
+                        f"{caller_file}:{lineno} writes `{raw_key}` without an observed TTL (`ex`/`px`/`setex`) "
+                        "or explicit invalidation (`del`/`unlink`). Expiration is unestablished; this "
+                        "does not by itself prove duplicated authoritative truth."
+                    ),
+                    remediation=(
+                        "Add a TTL (`ex=`/`setex`), add explicit invalidation (`delete`/`unlink`), "
+                        "or declare store purpose (such as `persistent_config` with recovery expectations)."
+                    ),
+                )
+            )
 
         for cm in _REDIS_CALL_RE.finditer(txt):
+            resolved = _resolve_redis_call_key(txt, cm, has_sdk, py_calls)
+            if resolved is None:
+                continue
+            raw_key, py_call = resolved
             op = cm.group("op")
             lineno = txt.count("\n", 0, cm.start()) + 1
-            py_call = py_calls.take(lineno, op) if py_calls is not None else None
-            if py_calls is not None and py_call is None:
-                continue  # inside a string or docstring (e.g. a usage example), not a call
             call_args = _extract_call_window(txt, cm.end())
-            km = _FIRST_STR_ARG_RE.match(call_args)
-            if km is None and not has_sdk:
-                continue
-            literal = py_calls.key_literal(py_call) if py_calls is not None and py_call is not None else None
-            if km:
-                raw_key = km.group("key")
-            elif literal and ":" in literal:
-                raw_key = f"{literal.split(':', 1)[0]}:*"  # f-string / assigned key: keep its prefix
-            else:
-                raw_key = "default:key"
-            if ":" not in raw_key and not has_sdk:
-                continue
             prefix = raw_key.split(":", 1)[0]
             sid = ensure_store(prefix, rel_repo, lineno, "keyspace")
 
             if op in _READ_OPS:
                 readers.setdefault(sid, set()).add(mnode.id)
                 link(mnode.id, sid, "reads_truth", rel_repo, f"Reads Redis keyspace `{prefix}:*` via `{op}`.")
+            elif op in _INVALIDATE_OPS:
+                writers.setdefault(sid, set()).add(mnode.id)
+                link(mnode.id, sid, "writes_truth", rel_repo, f"Invalidates Redis keyspace `{prefix}:*` via `{op}`.")
             elif op in _TTL_WRITE_OPS or op in _UNBOUNDED_CANDIDATE_OPS:
                 writers.setdefault(sid, set()).add(mnode.id)
                 link(mnode.id, sid, "writes_truth", rel_repo, f"Writes Redis keyspace `{prefix}:*` via `{op}`.")
@@ -614,27 +781,16 @@ def augment_redis_ephemeral_lineage(
                         )
                     )
                 )
-                if not has_ttl:
-                    if redis_nodes[sid].status == "clean":
-                        redis_nodes[sid].status = "duplicated_truth"
-                    if mnode.status == "clean":
-                        mnode.status = "gray_zone"
-                    manip.findings.append(
-                        RawCandidateFinding(
-                            rule_code="TRUTH-004",
-                            node_id=mnode.id,
-                            source_file=rel_repo,
-                            line=lineno,
-                            title=f"Unbounded Redis `{op}` on `{prefix}:*` without TTL",
-                            detail=f"{rel_repo}:{lineno} writes `{raw_key}` to Redis without an expiration (`ex`/`px`/`setex`), risking volatile shadow truth.",
-                            remediation="Pass an explicit TTL (`ex=`/`setex`) or persist authoritative state in relational SQL truth.",
-                        )
-                    )
+                if has_ttl:
+                    ttl_stores.add(sid)
+                else:
+                    record_unbounded_write(mnode, rel_repo, sid, prefix, raw_key, op, lineno)
                 if mnode.subkind == "route" and has_service_layer:
                     manip.findings.append(
                         RawCandidateFinding(
                             rule_code="TRUTH-003",
                             node_id=mnode.id,
+                            target_node_id=sid,
                             source_file=rel_repo,
                             line=lineno,
                             title=f"HTTP route `{mnode.label}` mutates Redis `{prefix}:*` directly",
@@ -645,28 +801,25 @@ def augment_redis_ephemeral_lineage(
 
         for rm in _RUST_CMD_RE.finditer(txt):
             op = rm.group("op")
-            prefix = rm.group("key").split(":", 1)[0]
+            raw_key = rm.group("key")
+            prefix = raw_key.split(":", 1)[0]
             lineno = txt.count("\n", 0, rm.start()) + 1
             sid = ensure_store(prefix, rel_repo, lineno, "keyspace")
             if op in _READ_OPS:
                 readers.setdefault(sid, set()).add(mnode.id)
                 link(mnode.id, sid, "reads_truth", rel_repo, f"Rust `redis::cmd({op})` reads `{prefix}:*`.")
+            elif op in _INVALIDATE_OPS:
+                writers.setdefault(sid, set()).add(mnode.id)
+                link(mnode.id, sid, "writes_truth", rel_repo, f"Rust `redis::cmd({op})` invalidates `{prefix}:*`.")
             elif op in _TTL_WRITE_OPS or op in _UNBOUNDED_CANDIDATE_OPS:
                 writers.setdefault(sid, set()).add(mnode.id)
                 link(mnode.id, sid, "writes_truth", rel_repo, f"Rust `redis::cmd({op})` writes `{prefix}:*`.")
                 if op in _UNBOUNDED_CANDIDATE_OPS and prefix.lower() not in expired_prefixes:
-                    redis_nodes[sid].status = "duplicated_truth"
-                    manip.findings.append(
-                        RawCandidateFinding(
-                            rule_code="TRUTH-004",
-                            node_id=mnode.id,
-                            source_file=rel_repo,
-                            line=lineno,
-                            title=f"Unbounded Rust Redis `{op}` on `{prefix}:*` without TTL",
-                            detail=f"{rel_repo}:{lineno} executes Redis `{op}` without `SETEX`/`EXPIRE`.",
-                            remediation="Use `SETEX` or persist durable truth in PostgreSQL/SQLite.",
-                        )
+                    record_unbounded_write(
+                        mnode, rel_repo, sid, prefix, raw_key, op, lineno, rust_style=True
                     )
+                else:
+                    ttl_stores.add(sid)
 
     # Clear false MANIP-003 inert warnings on verified background queue workers
     if worker_node_ids:
@@ -690,5 +843,18 @@ def augment_redis_ephemeral_lineage(
     for sid, snode in sorted(redis_nodes.items()):
         snode.read_by_count = len(readers.get(sid, set()))
         snode.written_by_count = len(writers.get(sid, set()))
+        if sid in conflict_stores:
+            snode.verification_note = f"second authority candidate ({conflict_stores[sid]})"
+        elif sid in unestablished_stores:
+            snode.verification_note = "unknown lifetime (no TTL or invalidation observed)"
+        elif sid in inval_stores:
+            inv_path, inv_line, inv_op = inval_stores[sid][0]
+            snode.summary = (
+                f"{snode.summary} Explicit invalidation observed (`{inv_op}` at `{inv_path}:{inv_line}`; no TTL configured)."
+            )
+            snode.verification_note = f"explicit invalidation observed ({inv_path}:{inv_line})"
+        elif sid in ttl_stores:
+            snode.summary = f"{snode.summary} TTL expiration observed."
+            snode.verification_note = "TTL expiration observed"
         truth.nodes.append(snode)
     return obs_source

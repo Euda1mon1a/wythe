@@ -31,6 +31,10 @@ from app.schemas.atlas import (
     TargetProjectRead,
     TruthAtlasReport,
 )
+from app.services.ruling_metadata import (
+    pack_ruling_cutover_payload,
+    unpack_ruling_cutover_payload,
+)
 
 
 def list_stack_profiles(session: Session) -> list[StackProfileRead]:
@@ -162,7 +166,11 @@ def record_audit_ruling(
         node_id=payload.node_id,
         disposition=payload.disposition,
         summary=payload.summary,
-        cutover_history=payload.cutover_history,
+        cutover_history=pack_ruling_cutover_payload(
+            payload.cutover_history,
+            payload.store_purpose,
+            payload.evidence_scope,
+        ),
         audited_commit=audited_commit,
         audited_at=today,
         effective_from=today,
@@ -319,13 +327,16 @@ def _to_rule_read(r: RulePolicy) -> RulePolicyRead:
 
 
 def _to_ruling_read(r: AuditRuling) -> AuditRulingRead:
+    clean_history, store_purpose, evidence_scope = unpack_ruling_cutover_payload(r.cutover_history)
     return AuditRulingRead(
         id=r.id,
         target_id=r.target_id,
         node_id=r.node_id,
         disposition=r.disposition,
         summary=r.summary,
-        cutover_history=r.cutover_history,
+        cutover_history=clean_history,
+        store_purpose=store_purpose,
+        evidence_scope=evidence_scope,
         audited_commit=r.audited_commit,
         audited_at=r.audited_at,
         effective_from=r.effective_from,

@@ -2012,6 +2012,27 @@
               }
             ],
             "title": "Ruling Audited At"
+          },
+          "store_purpose": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StorePurposeDeclaration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verification_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verification Note"
           }
         },
         "additionalProperties": false,
@@ -2130,6 +2151,23 @@
             ],
             "title": "Cutover History"
           },
+          "store_purpose": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StorePurposeDeclaration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence_scope": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Evidence Scope"
+          },
           "recorded_by": {
             "type": "string",
             "maxLength": 64,
@@ -2179,6 +2217,23 @@
               }
             ],
             "title": "Cutover History"
+          },
+          "store_purpose": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StorePurposeDeclaration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence_scope": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Evidence Scope"
           },
           "audited_commit": {
             "type": "string",
@@ -2269,6 +2324,17 @@
               }
             ],
             "title": "Node Id"
+          },
+          "target_node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Node Id"
           },
           "source_file": {
             "type": "string",
@@ -3358,6 +3424,23 @@
             ],
             "title": "Cutover History"
           },
+          "store_purpose": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StorePurposeDeclaration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence_scope": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Evidence Scope"
+          },
           "audited_commit": {
             "type": "string",
             "title": "Audited Commit"
@@ -4020,6 +4103,97 @@
           "description"
         ],
         "title": "StackProfileRead"
+      },
+      "StorePurposeDeclaration": {
+        "properties": {
+          "intended_use": {
+            "type": "string",
+            "enum": [
+              "derived_cache",
+              "read_replica",
+              "materialized_view",
+              "historical_snapshot",
+              "persistent_config",
+              "ephemeral_state",
+              "queue_buffer",
+              "authoritative_store"
+            ],
+            "title": "Intended Use"
+          },
+          "authoritative_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authoritative Source"
+          },
+          "copy_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Copy Reason"
+          },
+          "refresh_policy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refresh Policy"
+          },
+          "recovery_expectation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Expectation"
+          },
+          "keyspace_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Keyspace Scope"
+          },
+          "verification_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verification Summary"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "intended_use"
+        ],
+        "title": "StorePurposeDeclaration",
+        "description": "Declared copy/storage intent, kept distinct from static verification."
       },
       "TargetProjectCreate": {
         "properties": {

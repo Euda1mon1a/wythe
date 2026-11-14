@@ -284,8 +284,11 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         "Ground all repository, node, color, rule, and lineage statements strictly in the Live 3D Camera & X-Ray "
         "facts below (SQL Truth, Backend Manipulate, Frontend Display). Cite exact rule codes (e.g. TRUTH-002, "
         "MANIP-001, DISP-005), node names, on-screen colors, and `file:line` pointers, and never invent files or "
-        "tables. If the user asks a general software architecture, workflow, or Wythe UI question, answer it "
-        "directly and concisely."
+        "tables. Never treat a node's color or status (such as `gray_zone` or `duplicated_truth`) as standalone "
+        "proof of duplicate contents, authoritative ownership, or safe deletion. Keep declared store purpose "
+        "distinct from observed verification, distinguish a node's discovery coordinate from causal writer "
+        "operation lines, preserve uncertainty when expiration or invalidation is unknown, and present "
+        "remediations as suggested changes rather than verified fixes."
     )
     live_vp_override = (payload.live_viewport_brief or "").strip()
     vp_section = f"\n\n{live_vp_override[:2400]}" if live_vp_override and live_vp_override[:80] not in focus.markdown_brief else ""

@@ -61,6 +61,7 @@ def evaluate_findings_and_gate(
                 severity=policy.severity,
                 blocks_gate=policy.blocks_gate,
                 node_id=cand.node_id,
+                target_node_id=cand.target_node_id,
                 source_file=cand.source_file,
                 line=cand.line,
                 title=cand.title,

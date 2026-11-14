@@ -245,7 +245,7 @@ export function GovernanceAndDiffPanel({
             </span>
             {bundle && (
               <span className="text-[11px] text-slate-400">
-                {bundle.rule_overrides?.length ?? 0} rules · {bundle.vocabularies?.length ?? 0} vocabs
+                {bundle.audit_rulings?.length ?? 0} rulings · {bundle.rule_overrides?.length ?? 0} rules · {bundle.vocabularies?.length ?? 0} vocabs
               </span>
             )}
           </div>

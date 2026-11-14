@@ -42,12 +42,34 @@ EdgeKind = Literal[
 ]
 VerificationState = Literal["verified", "declared", "unverified", "broken"]
 GateVerdict = Literal["PASS", "RATCHET_PASS", "FAIL"]
+StoreIntendedUse = Literal[
+    "derived_cache",
+    "read_replica",
+    "materialized_view",
+    "historical_snapshot",
+    "persistent_config",
+    "ephemeral_state",
+    "queue_buffer",
+    "authoritative_store",
+]
 
 
 class StrictSchema(BaseModel):
     """Forbid undeclared fields across all API boundaries."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class StorePurposeDeclaration(StrictSchema):
+    """Declared copy/storage intent, kept distinct from static verification."""
+
+    intended_use: StoreIntendedUse
+    authoritative_source: str | None = None
+    copy_reason: str | None = None
+    refresh_policy: str | None = None
+    recovery_expectation: str | None = None
+    keyspace_scope: str | None = None
+    verification_summary: str | None = None
 
 
 class AtlasNode(StrictSchema):
@@ -69,6 +91,8 @@ class AtlasNode(StrictSchema):
     cutover_history: str | None = None
     ruling_summary: str | None = None
     ruling_audited_at: date | None = None
+    store_purpose: StorePurposeDeclaration | None = None
+    verification_note: str | None = None
 
 
 class AtlasEdge(StrictSchema):
@@ -104,6 +128,7 @@ class BoundaryFinding(StrictSchema):
     severity: str
     blocks_gate: bool
     node_id: str | None = None
+    target_node_id: str | None = None
     source_file: str
     line: int = 1
     title: str
@@ -176,6 +201,8 @@ class AuditRulingRead(StrictSchema):
     disposition: str
     summary: str
     cutover_history: str | None = None
+    store_purpose: StorePurposeDeclaration | None = None
+    evidence_scope: list[str] = Field(default_factory=list)
     audited_commit: str
     audited_at: date
     effective_from: date
@@ -189,6 +216,8 @@ class AuditRulingCreate(StrictSchema):
     disposition: str = Field(min_length=1, max_length=48)
     summary: str = Field(min_length=1)
     cutover_history: str | None = None
+    store_purpose: StorePurposeDeclaration | None = None
+    evidence_scope: list[str] = Field(default_factory=list)
     recorded_by: str = Field(min_length=1, max_length=64)
 
 
@@ -420,6 +449,8 @@ class PortableRulingItem(StrictSchema):
     disposition: str
     summary: str
     cutover_history: str | None = None
+    store_purpose: StorePurposeDeclaration | None = None
+    evidence_scope: list[str] = Field(default_factory=list)
     audited_commit: str
     recorded_by: str
 

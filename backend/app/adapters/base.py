@@ -29,6 +29,8 @@ class RawCandidateFinding:
     # Set on unbacked frontend calls so an optional live probe can re-check them.
     http_method: str | None = None
     http_path: str | None = None
+    # Downstream store/table impacted when the finding attaches to an upstream writer.
+    target_node_id: str | None = None
 
 
 @dataclass(frozen=True)
