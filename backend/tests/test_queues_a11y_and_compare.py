@@ -213,3 +213,45 @@ def test_sveltekit_drizzle_and_snapshot_comparison_deltas(
     )
     assert comp.warning_delta >= 1
     assert any(f.rule_code == "DISP-005" for f in comp.new_findings)
+
+
+def test_tsx_default_export_and_expression_arrow_a11y_resolution(tmp_path: Path) -> None:
+    """Resolve `export default` declarations in multi-component TSX files without sibling bleed."""
+    from app.adapters.typescript_react import TypeScriptReactSpaAdapter
+
+    (tmp_path / "src" / "components").mkdir(parents=True)
+    (tmp_path / "package.json").write_text('{"dependencies":{"react":"^18.0.0"}}', encoding="utf-8")
+
+    # Helper Icon precedes the actual `export default function Label`
+    (tmp_path / "src" / "components" / "Label.tsx").write_text(
+        "function HelperIcon() {\n  return <svg />;\n}\n"
+        "const localText = 'Save';\n"
+        "export default function Label(): { node: unknown } {\n"
+        "  return <span>{localText}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    # Unused helper precedes a semicolon-free expression-bodied arrow component exported by name
+    (tmp_path / "src" / "components" / "DefaultIcon.tsx").write_text(
+        "const UnusedLabel = () => (<span>Unused</span>)\n"
+        "const DefaultIcon = () => (<svg aria-hidden='true' />)\n"
+        "export default DefaultIcon;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "App.tsx").write_text(
+        "import Label from './components/Label';\n"
+        "import DefaultIcon from './components/DefaultIcon';\n"
+        "export function App() {\n"
+        "  return (\n"
+        "    <main>\n"
+        "      <button type='button'><Label /></button>\n"
+        "      <button type='button'><DefaultIcon /></button>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = TypeScriptReactSpaAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    assert [(f.source_file, f.line) for f in disp_005] == [("src/App.tsx", 7)], disp_005

@@ -7,6 +7,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from app.adapters.a11y_inspect import (
+    is_js_module_stmt_in_code,
+    js_code_mask,
     make_local_component_resolver,
     scan_a11y_markup_findings,
 )
@@ -51,24 +53,19 @@ def extract_script_preserving_lines(raw_source: str, suffix: str) -> str:
 
 
 _NAMED_IMPORT_STMT_RE = re.compile(
-    r"""^\s*import\s+(?!type\b)(?:[A-Za-z_$][\w$]*\s*,\s*)?\{(?P<clause>[^}]+)\}\s*from\s*['"](?P<spec>[^'"]+)['"]""",
-    re.MULTILINE,
+    r"""(?:^|[;\r\n])[ \t]*import\s+(?!type\b)(?:[A-Za-z_$][\w$]*\s*,\s*)?\{(?P<clause>[^}]+)\}\s*from\s*['"](?P<spec>[^'"]+)['"]""",
 )
 _EXPORT_CONST_NAME_RE = re.compile(
-    r"""(?:^|[;{])[ \t]*export\s+const\s+(?P<name>[A-Za-z_$][\w$]*)\b""",
-    re.MULTILINE,
+    r"""(?:^|[;\r\n])[ \t]*export\s+const\s+(?P<name>[A-Za-z_$][\w$]*)\b""",
 )
 _EXPORT_LOCAL_CLAUSE_RE = re.compile(
-    r"""^\s*export\s+(?!type\b)\{(?P<clause>[^}]+)\}\s*(?:[;\r\n]|$)""",
-    re.MULTILINE,
+    r"""(?:^|[;\r\n])[ \t]*export\s+(?!type\b)\{(?P<clause>[^}]+)\}\s*(?:[;\r\n]|$)""",
 )
 _REEXPORT_FROM_RE = re.compile(
-    r"""^\s*export\s+(?!type\b)\{(?P<clause>[^}]+)\}\s*from\s*['"](?P<spec>[^'"]+)['"]""",
-    re.MULTILINE,
+    r"""(?:^|[;\r\n])[ \t]*export\s+(?!type\b)\{(?P<clause>[^}]+)\}\s*from\s*['"](?P<spec>[^'"]+)['"]""",
 )
 _REEXPORT_ALL_RE = re.compile(
-    r"""^\s*export\s+\*\s+from\s*['"](?P<spec>[^'"]+)['"]""",
-    re.MULTILINE,
+    r"""(?:^|[;\r\n])[ \t]*export\s+\*\s+from\s*['"](?P<spec>[^'"]+)['"]""",
 )
 
 
@@ -152,8 +149,11 @@ def build_frontend_url_const_resolver(
 
         next_visiting = visiting | {fpath}
         hit_cycle = False
+        mask = js_code_mask(cleaned)
         imported: dict[str, str] = {}
         for im in _NAMED_IMPORT_STMT_RE.finditer(cleaned):
+            if not is_js_module_stmt_in_code(cleaned, mask, im):
+                continue
             target = resolve_frontend_import(im.group("spec"), fpath, src_root, extensions)
             if target is None:
                 continue
@@ -166,12 +166,16 @@ def build_frontend_url_const_resolver(
         local_consts, _ = _build_scoped_url_consts(cleaned, imported_consts=imported)
         exported: dict[str, str] = {}
         for rm in _REEXPORT_ALL_RE.finditer(cleaned):
+            if not is_js_module_stmt_in_code(cleaned, mask, rm):
+                continue
             target = resolve_frontend_import(rm.group("spec"), fpath, src_root, extensions)
             if target is not None:
                 target_exports, cyc = _exports_of(target, next_visiting, depth + 1)
                 hit_cycle = hit_cycle or cyc
                 exported.update(target_exports)
         for rm in _REEXPORT_FROM_RE.finditer(cleaned):
+            if not is_js_module_stmt_in_code(cleaned, mask, rm):
+                continue
             target = resolve_frontend_import(rm.group("spec"), fpath, src_root, extensions)
             if target is not None:
                 target_exports, cyc = _exports_of(target, next_visiting, depth + 1)
@@ -180,10 +184,14 @@ def build_frontend_url_const_resolver(
                     if orig_name in target_exports:
                         exported[export_name] = target_exports[orig_name]
         for em in _EXPORT_CONST_NAME_RE.finditer(cleaned):
+            if not is_js_module_stmt_in_code(cleaned, mask, em):
+                continue
             cname = em.group("name")
             if cname in local_consts:
                 exported[cname] = local_consts[cname]
         for lm in _EXPORT_LOCAL_CLAUSE_RE.finditer(cleaned):
+            if not is_js_module_stmt_in_code(cleaned, mask, lm):
+                continue
             for local_name, export_name in _parse_specifier_pairs(lm.group("clause")):
                 if local_name in local_consts:
                     exported[export_name] = local_consts[local_name]
@@ -194,8 +202,11 @@ def build_frontend_url_const_resolver(
     def imported_consts_for(fpath: Path, cleaned_txt: str) -> dict[str, str]:
         resolved_path = fpath.resolve()
         text_cache.setdefault(resolved_path, cleaned_txt)
+        mask = js_code_mask(cleaned_txt)
         imported: dict[str, str] = {}
         for im in _NAMED_IMPORT_STMT_RE.finditer(cleaned_txt):
+            if not is_js_module_stmt_in_code(cleaned_txt, mask, im):
+                continue
             target = resolve_frontend_import(im.group("spec"), resolved_path, src_root, extensions)
             if target is None or target == resolved_path:
                 continue

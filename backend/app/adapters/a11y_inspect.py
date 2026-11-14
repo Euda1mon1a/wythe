@@ -21,8 +21,7 @@ _ICON_PKG_SPEC_RE = re.compile(
     r"^(?:lucide-react|lucide-svelte|@lucide/|@heroicons/|react-icons/|@tabler/icons|@radix-ui/react-icons|phosphor-react|@phosphor-icons/|svelte-hero-icons|svelte-lucide)"
 )
 _COMPONENT_IMPORT_RE = re.compile(
-    r"""^\s*import\s+(?!type\b)(?P<clause>[A-Za-z_$][\w$]*(?:\s*,\s*\{[^;{}]*\})?|\{[^;{}]*\})\s+from\s+['"](?P<spec>[^'"]+)['"]""",
-    re.MULTILINE,
+    r"""(?:^|[;\r\n])[ \t]*import\s+(?!type\b)(?P<clause>[A-Za-z_$][\w$]*(?:\s*,\s*\{[^;{}]*\})?|\{[^;{}]*\})\s+from\s+['"](?P<spec>[^'"]+)['"]"""
 )
 _OPEN_TAG_SCAN_LIMIT = 8000
 _REGEX_PREV_CHARS = frozenset("({[,;=!&|?+~^*%-<>:")
@@ -355,10 +354,96 @@ def _find_matching_close_tag(
     return None
 
 
+def js_code_mask(src: str) -> list[bool]:
+    """Return per-char mask (`True` outside JS/TS comments, strings, templates, and regexes)."""
+    n = len(src)
+    mask = [False] * n
+    stack: list[str] = []
+    expr_floors = [0]
+    prev_sig_pos = -1
+    i = 0
+    while i < n:
+        ch = src[i]
+        top = stack[-1] if stack else ""
+        if top == "`":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "`":
+                stack.pop()
+                prev_sig_pos = i
+            elif src.startswith("${", i):
+                stack.append("{")
+                expr_floors.append(i + 2)
+                prev_sig_pos = i + 1
+                i += 2
+                continue
+            i += 1
+            continue
+        if src.startswith("//", i):
+            nl = src.find("\n", i)
+            i = n if nl < 0 else nl
+            continue
+        if src.startswith("/*", i):
+            close = src.find("*/", i + 2)
+            i = n if close < 0 else close + 2
+            continue
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n and src[j] not in (ch, "\n"):
+                j += 2 if src[j] == "\\" else 1
+            prev_sig_pos = min(j, n - 1)
+            i = j + 1
+            continue
+        if ch == "/" and _can_start_js_regex(src, prev_sig_pos, expr_floors[-1]):
+            rend = _skip_js_regex(src, i, n)
+            if rend is not None:
+                prev_sig_pos = rend - 1
+                i = rend
+                continue
+        if ch == "`":
+            stack.append("`")
+            i += 1
+            continue
+        mask[i] = True
+        if ch == "{":
+            stack.append("{")
+            expr_floors.append(i + 1)
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+            if len(expr_floors) > 1:
+                expr_floors.pop()
+        if not ch.isspace():
+            prev_sig_pos = i
+        i += 1
+    return mask
+
+
+def is_js_module_stmt_in_code(src: str, mask: list[bool], match: re.Match[str]) -> bool:
+    """Return True when a module `import`/`export` regex match sits in real JS/TS code."""
+    pos = match.start()
+    end = match.end()
+    while pos < end and (src[pos].isspace() or src[pos] in ";{}"):
+        pos += 1
+    if pos >= end or not mask[pos]:
+        return False
+    if "spec" in match.groupdict():
+        spec_quote = match.start("spec") - 1
+        if spec_quote <= pos:
+            return False
+        return all(mask[k] or src[k].isspace() for k in range(pos, spec_quote))
+    return all(mask[k] or src[k].isspace() for k in range(pos, end))
+
+
 def parse_component_imports(raw_source: str) -> dict[str, tuple[str, str]]:
     """Map imported local component identifier -> `(module_spec, exported_name)`."""
+    script_blocks = [sm.group("body") for sm in _SCRIPT_BLOCK_RE.finditer(raw_source)]
+    scan_src = "\n".join(script_blocks) if script_blocks else raw_source
+    mask = js_code_mask(scan_src)
     mapping: dict[str, tuple[str, str]] = {}
-    for m in _COMPONENT_IMPORT_RE.finditer(raw_source):
+    for m in _COMPONENT_IMPORT_RE.finditer(scan_src):
+        if not is_js_module_stmt_in_code(scan_src, mask, m):
+            continue
         clause = m.group("clause").strip()
         spec = m.group("spec").strip()
         if not spec or clause.startswith("type "):
@@ -474,6 +559,232 @@ def _parse_default_params(raw_params: str) -> dict[str, str]:
     return defaults
 
 
+def _scan_paren_end(src: str, pos: int, mask: list[bool]) -> int | None:
+    """Index just past `)` matching `(` at `pos`, respecting `mask` (JS strings/comments/regexes)."""
+    if pos >= len(src) or src[pos] != "(":
+        return None
+    depth = 1
+    i = pos + 1
+    n = len(src)
+    while i < n:
+        if mask[i]:
+            ch = src[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return None
+
+
+def _slice_arrow_body_end(tail: str, arrow_end: int, mask: list[bool]) -> int:
+    """Return slice end index for a block- or expression-bodied arrow right after `=>`."""
+    n = len(tail)
+    j = arrow_end
+    while j < n:
+        if tail[j].isspace():
+            j += 1
+        elif tail.startswith("//", j):
+            nl = tail.find("\n", j + 2)
+            j = n if nl < 0 else nl + 1
+        elif tail.startswith("/*", j):
+            close = tail.find("*/", j + 2)
+            j = n if close < 0 else close + 2
+        else:
+            break
+    if j >= n:
+        return n
+    if tail[j] == "{":
+        bend = _scan_brace_end(tail, j)
+        return bend if bend is not None else n
+    if tail[j] == "(":
+        pend = _scan_paren_end(tail, j, mask)
+        return pend if pend is not None else n
+    if tail.startswith("<>", j):
+        fend = tail.find("</>", j + 2)
+        return fend + 3 if fend >= 0 else n
+    if tail[j] == "<":
+        tm = re.match(r"<([A-Za-z][\w.]*)", tail[j:])
+        if tm:
+            open_end = scan_open_tag_end(tail, j + tm.end())
+            if open_end is not None:
+                if tail[j + tm.end() : open_end - 1].rstrip().endswith("/"):
+                    return open_end
+                close_span = _find_matching_close_tag(tail, open_end, tm.group(1))
+                if close_span is not None:
+                    return close_span[1]
+    p_d = b_d = c_d = 0
+    k = j
+    while k < n:
+        ch = tail[k]
+        if ch == "\n" and p_d == 0 and b_d == 0 and c_d == 0:
+            return k
+        if mask[k]:
+            if ch == "(":
+                p_d += 1
+            elif ch == ")":
+                p_d = max(0, p_d - 1)
+            elif ch == "[":
+                b_d += 1
+            elif ch == "]":
+                b_d = max(0, b_d - 1)
+            elif ch == "{":
+                c_d += 1
+            elif ch == "}":
+                c_d = max(0, c_d - 1)
+            elif ch == ";" and p_d == 0 and b_d == 0 and c_d == 0:
+                return k + 1
+        k += 1
+    return n
+
+
+def _slice_tsx_decl_body(raw_source: str, decl_start: int) -> str:
+    """Slice from `decl_start` to the end of the target function/component declaration."""
+    tail = raw_source[decl_start:]
+    m_hoc = re.match(
+        r"""^(?:export\s+default\s+|(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*(?::[^=;\n]+)?=\s*)"""
+        r"""(?:React\.)?(?:memo|forwardRef)\s*(?:<[^;()]{0,160}?>)?\s*\(""",
+        tail,
+    )
+    if m_hoc:
+        tail = tail[m_hoc.end() :]
+    mask = js_code_mask(tail)
+    n = len(tail)
+    i = 0
+    paren_depth = 0
+    angle_depth = 0
+    saw_fn_kw = bool(re.match(r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\b", tail))
+    saw_params_end = False
+    in_return_type = False
+    last_sig = ""
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        ch = tail[i]
+        if paren_depth == 0 and angle_depth == 0 and tail.startswith("function", i):
+            prev_ok = i == 0 or not (tail[i - 1].isalnum() or tail[i - 1] in "_$")
+            nxt_pos = i + 8
+            next_ok = nxt_pos >= n or not (tail[nxt_pos].isalnum() or tail[nxt_pos] in "_$")
+            if prev_ok and next_ok:
+                saw_fn_kw = True
+        if ch == "(" and angle_depth == 0:
+            paren_depth += 1
+            last_sig = "("
+        elif ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+            if paren_depth == 0:
+                saw_params_end = True
+            last_sig = ")"
+        elif paren_depth == 0:
+            if angle_depth == 0 and tail.startswith("=>", i):
+                return tail[: _slice_arrow_body_end(tail, i + 2, mask)]
+            if ch == "<" and (saw_params_end or saw_fn_kw):
+                angle_depth += 1
+                last_sig = "<"
+            elif ch == ">" and angle_depth > 0 and (i == 0 or tail[i - 1] != "="):
+                angle_depth -= 1
+                last_sig = ">"
+            elif ch == ":" and saw_params_end and angle_depth == 0:
+                in_return_type = True
+                last_sig = ":"
+            elif ch == "{" and angle_depth == 0:
+                if in_return_type and last_sig in (":", "|", "&"):
+                    type_end = _scan_brace_end(tail, i)
+                    if type_end is not None:
+                        last_sig = "}"
+                        i = type_end
+                        continue
+                if saw_fn_kw and saw_params_end:
+                    body_end = _scan_brace_end(tail, i)
+                    return tail[:body_end] if body_end is not None else tail
+                skip_end = _scan_brace_end(tail, i)
+                if skip_end is not None:
+                    last_sig = "}"
+                    i = skip_end
+                    continue
+            elif ch == ";" and angle_depth == 0:
+                return tail[: i + 1]
+            elif not ch.isspace():
+                last_sig = ch
+        i += 1
+    return tail
+
+
+def _locate_tsx_export_source(raw_source: str, exported_name: str) -> str:
+    """Locate the declaration slice for a default or named React/JSX export."""
+    mask = js_code_mask(raw_source)
+
+    def _find_named_decl(symbol: str) -> int | None:
+        pat = re.compile(
+            rf"\b(?:async\s+)?function\s+{re.escape(symbol)}\b|"
+            rf"\b(?:const|let|var)\s+{re.escape(symbol)}\s*(?::[^=;\n]+)?="
+        )
+        for m in pat.finditer(raw_source):
+            if mask[m.start()]:
+                return m.start()
+        return None
+
+    def _resolve_hoc_target(m: re.Match[str]) -> str | None:
+        inner_tail = raw_source[m.end() :].lstrip()
+        m_ref = re.match(r"^(?P<ref>[A-Za-z_$][\w$]*)\s*(?:,|\))", inner_tail)
+        if m_ref:
+            ref_pos = _find_named_decl(m_ref.group("ref"))
+            if ref_pos is not None:
+                return _slice_tsx_decl_body(raw_source, ref_pos)
+        return _slice_tsx_decl_body(raw_source, m.end())
+
+    if exported_name == "default":
+        for pat in (
+            r"\bexport\s+default\s+(?:async\s+)?function\b",
+            r"\bexport\s+default\s+(?:async\s+)?\(",
+            r"\bexport\s+default\s+(?:async\s+)?[A-Za-z_$][\w$]*\s*=>",
+        ):
+            for m in re.finditer(pat, raw_source):
+                if mask[m.start()]:
+                    return _slice_tsx_decl_body(raw_source, m.start())
+        for m in re.finditer(
+            r"\bexport\s+default\s+(?:React\.)?(?:memo|forwardRef)\s*(?:<[^;()]{0,160}?>)?\s*\(",
+            raw_source,
+        ):
+            if mask[m.start()]:
+                resolved = _resolve_hoc_target(m)
+                if resolved is not None:
+                    return resolved
+        for m in re.finditer(
+            r"\bexport\s+default\s+(?!(?:async\s+)?function\b|class\b)(?P<ref>[A-Za-z_$][\w$]*)\b(?!\s*=>)",
+            raw_source,
+        ):
+            if mask[m.start()]:
+                ref_pos = _find_named_decl(m.group("ref"))
+                if ref_pos is not None:
+                    return _slice_tsx_decl_body(raw_source, ref_pos)
+        for m in re.finditer(
+            r"\bexport\s*\{[^}]*\b(?P<ref>[A-Za-z_$][\w$]*)\s+as\s+default\b[^}]*\}",
+            raw_source,
+        ):
+            if mask[m.start()]:
+                ref_pos = _find_named_decl(m.group("ref"))
+                if ref_pos is not None:
+                    return _slice_tsx_decl_body(raw_source, ref_pos)
+        return raw_source
+
+    direct_pos = _find_named_decl(exported_name)
+    if direct_pos is not None:
+        return _slice_tsx_decl_body(raw_source, direct_pos)
+    for m in re.finditer(
+        rf"\bexport\s*\{{[^}}]*\b(?P<ref>[A-Za-z_$][\w$]*)\s+as\s+{re.escape(exported_name)}\b[^}}]*\}}",
+        raw_source,
+    ):
+        if mask[m.start()]:
+            ref_pos = _find_named_decl(m.group("ref"))
+            if ref_pos is not None:
+                return _slice_tsx_decl_body(raw_source, ref_pos)
+    return raw_source
+
+
 def _extract_component_props_and_markup(
     raw_source: str,
     suffix: str,
@@ -515,15 +826,8 @@ def _extract_component_props_and_markup(
         tm = _VUE_TPL_RE.search(raw_source)
         return prop_defaults, tm.group("body") if tm else ""
 
-    # .tsx / .jsx: locate JSX root block
-    target_src = raw_source
-    if exported_name != "default":
-        m_fn = re.search(
-            rf"\b(?:function\s+{re.escape(exported_name)}\b|const\s+{re.escape(exported_name)}\s*=)",
-            raw_source,
-        )
-        if m_fn:
-            target_src = raw_source[m_fn.start() :]
+    # .tsx / .jsx: locate the target exported component declaration
+    target_src = _locate_tsx_export_source(raw_source, exported_name)
     m_props = re.search(r"\(\s*\{(?P<inner>[^})]{0,300})\}", target_src)
     if m_props:
         prop_defaults.update(_parse_default_params(m_props.group("inner")))
@@ -584,6 +888,10 @@ def _classify_expr_semantics(
         return "empty"
     if re.search(r"""['"][^'"\s][^'"]*['"]""", expr):
         return "named"
+    # Expressions inside an inspected child component that do not depend on a known prop
+    # (e.g. local constants or i18n helper calls like `{t(key)}`) are uncertain, not proven empty.
+    if idents or re.search(r"[A-Za-z0-9_$]", expr):
+        return "opaque"
     return "empty"
 
 

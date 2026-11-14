@@ -305,3 +305,77 @@ def test_opaque_and_local_component_a11y_inspection(tmp_path: Path) -> None:
     assert lines == [8, 9, 10, 12], disp_005
     assert any("unobserved" in n.lower() and "OpaqueWidget" in n for n in res.notes), res.notes
 
+
+def test_template_literal_import_and_nested_block_shadowing(tmp_path: Path, monkeypatch) -> None:
+    """Ignore fake imports/exports in template literals & isolate nested block lexical shadowing."""
+    put(tmp_path, "src/lib/local.ts", "export const API = '/internal';\n")
+    put(
+        tmp_path,
+        "src/lib/constants.ts",
+        "export const API = '/api/v1';\n"
+        "export const DOC = `\nexport const FAKED = '/bad';\n`;\n",
+    )
+    put(
+        tmp_path,
+        "src/routes/demo/+page.ts",
+        "import { API as EXT_API } from 'external-config';\n"
+        "import { API as REAL_API, FAKED } from '$lib/constants';\n"
+        "const docs = `\nimport { EXT_API } from '../lib/local';\n`;\n"
+        "const SCOPED = '/scoped';\n"
+        "{\n"
+        "  let SCOPED;\n"
+        "  SCOPED = '/shadowed';\n"
+        "}\n"
+        "export function load(cond: boolean) {\n"
+        "  fetch(`${EXT_API}/should-not-emit`);\n"
+        "  fetch(`${SCOPED}/items`);\n"
+        "  fetch(`${FAKED}/never`);\n"
+        "  if (cond) {\n"
+        "    REAL_API = '/mutated';\n"
+        "  }\n"
+        "  return fetch(`${REAL_API}/after-mutation`);\n"
+        "}\n",
+    )
+    put(tmp_path, "src/routes/demo/+page.svelte", "<main>Demo</main>\n")
+
+    adapter = SvelteKitDisplayAdapter()
+    for disable_ts in ("0", "1"):
+        if disable_ts == "1":
+            monkeypatch.setenv("WYTHE_DISABLE_TREESITTER", "1")
+        else:
+            monkeypatch.delenv("WYTHE_DISABLE_TREESITTER", raising=False)
+        res = adapter.extract(tmp_path, ".")
+        paths = {c.normalized_path for c in res.http_calls}
+        assert "/scoped/items" in paths, (disable_ts, paths)
+        assert "/internal/should-not-emit" not in paths, (disable_ts, paths)
+        assert "/bad/never" not in paths, (disable_ts, paths)
+        assert "/api/v1/after-mutation" not in paths, (disable_ts, paths)
+
+
+def test_inline_script_imports_and_child_local_expr_a11y(tmp_path: Path) -> None:
+    """Resolve inline single-line <script> imports and treat non-prop child exprs as unobserved."""
+    put(
+        tmp_path,
+        "src/lib/components/SaveLabel.svelte",
+        "<script lang='ts'>const label = 'Save';</script><span>{label}</span>\n",
+    )
+    put(
+        tmp_path,
+        "src/lib/components/I18nLabel.svelte",
+        "<script lang='ts'>const key = 'actions.save'; const t = (k: string) => k;</script><span>{t(key)}</span>\n",
+    )
+    put(
+        tmp_path,
+        "src/routes/+page.svelte",
+        "<script lang='ts'>import { Menu } from 'lucide-svelte'; "
+        "import SaveLabel from '$lib/components/SaveLabel.svelte'; "
+        "import I18nLabel from '$lib/components/I18nLabel.svelte';</script>"
+        "<button type='button'><Menu /></button>"
+        "<button type='button'><SaveLabel /></button>"
+        "<button type='button'><I18nLabel /></button>\n",
+    )
+    res = SvelteKitDisplayAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    assert len(disp_005) == 1, disp_005
+    assert any("unobserved" in n.lower() for n in res.notes), res.notes
+

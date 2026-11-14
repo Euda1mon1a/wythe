@@ -451,13 +451,6 @@ def _build_scoped_url_consts(
 
     lexical_spans = [*block_spans, *loop_spans]
 
-    def innermost_block(pos: int) -> tuple[int, int]:
-        return min(
-            (sp for sp in block_spans if sp[0] < pos < sp[1]),
-            key=lambda sp: sp[1] - sp[0],
-            default=root_span,
-        )
-
     def innermost_lexical_block(pos: int) -> tuple[int, int]:
         return min(
             (sp for sp in lexical_spans if sp[0] < pos < sp[1]),
@@ -507,15 +500,38 @@ def _build_scoped_url_consts(
             concat_val = f"${{{lhs_ident}}}{tail}"
             bmap[name] = concat_val if bmap.get(name, concat_val) == concat_val else None
 
+    fn_scopes: list[tuple[int, int]] = [root_span]
+    param_scopes: list[tuple[int, int, set[str]]] = []
+    for m in _FN_PARAM_HEAD_RE.finditer(code_only):
+        raw_params = (
+            m.group("fparams") or m.group("cparam") or m.group("aparams") or m.group("sparam") or ""
+        )
+        if m.group("fparams") is not None or m.group("cparam") is not None:
+            span = (m.end() - 1, _find_matching_delim(code_only, m.end() - 1, "{", "}"))
+        else:
+            span = (m.end(), _find_arrow_expr_end(code_only, m.end()))
+        if m.group("cparam") is None:
+            fn_scopes.append(span)
+        bound = _extract_param_bound_names(raw_params)
+        if bound:
+            param_scopes.append((span[0], span[1], bound))
+
+    def innermost_fn_scope(pos: int) -> tuple[int, int]:
+        return min(
+            (sp for sp in fn_scopes if sp[0] <= pos < sp[1]),
+            key=lambda sp: sp[1] - sp[0],
+            default=root_span,
+        )
+
     for dm in _LOCAL_BIND_RE.finditer(code_only):
         npos = dm.start("name")
         if npos in url_name_positions:
             continue
         url_name_positions.add(npos)
         target_span = (
-            innermost_lexical_block(npos)
-            if dm.group("kw") in ("const", "let")
-            else innermost_block(npos)
+            innermost_fn_scope(npos)
+            if dm.group("kw") == "var"
+            else innermost_lexical_block(npos)
         )
         block_decls.setdefault(target_span, {})[dm.group("name")] = None
 
@@ -525,27 +541,19 @@ def _build_scoped_url_consts(
         if not dbound:
             continue
         target_span = (
-            innermost_lexical_block(dsm.start())
-            if dsm.group("kw") in ("const", "let")
-            else innermost_block(dsm.start())
+            innermost_fn_scope(dsm.start())
+            if dsm.group("kw") == "var"
+            else innermost_lexical_block(dsm.start())
         )
         dmap = block_decls.setdefault(target_span, {})
         for dname in dbound:
             dmap[dname] = None
 
-    for rm in _REASSIGN_STMT_RE.finditer(code_only):
-        rpos = rm.start("name")
-        if rpos in url_name_positions:
-            continue
-        if re.search(r"<[A-Za-z][\w.]*(?:\s|$)[^>]*$", code_only[max(0, rpos - 300) : rpos]):
-            continue
-        block_decls.setdefault(innermost_block(rpos), {})[rm.group("name")] = None
-
     for open_p, close_p, loop_end in loop_headers:
         hdr_kw, hdr_bound = _extract_for_header_binds(code_only[open_p + 1 : close_p - 1])
         if not hdr_bound:
             continue
-        hdr_span = (open_p, loop_end) if hdr_kw in ("const", "let") else innermost_block(open_p)
+        hdr_span = (open_p, loop_end) if hdr_kw in ("const", "let") else innermost_fn_scope(open_p)
         hdr_map = block_decls.setdefault(hdr_span, {})
         for bname in hdr_bound:
             if hdr_kw == "var":
@@ -553,19 +561,28 @@ def _build_scoped_url_consts(
             else:
                 hdr_map.setdefault(bname, None)
 
-    param_scopes: list[tuple[int, int, set[str]]] = []
-    for m in _FN_PARAM_HEAD_RE.finditer(code_only):
-        raw_params = (
-            m.group("fparams") or m.group("cparam") or m.group("aparams") or m.group("sparam") or ""
-        )
-        bound = _extract_param_bound_names(raw_params)
-        if not bound:
+    for rm in _REASSIGN_STMT_RE.finditer(code_only):
+        rpos = rm.start("name")
+        if rpos in url_name_positions:
             continue
-        if m.group("fparams") is not None or m.group("cparam") is not None:
-            span = (m.end() - 1, _find_matching_delim(code_only, m.end() - 1, "{", "}"))
-        else:
-            span = (m.end(), _find_arrow_expr_end(code_only, m.end()))
-        param_scopes.append((span[0], span[1], bound))
+        if re.search(r"<[A-Za-z][\w.]*(?:\s|$)[^>]*$", code_only[max(0, rpos - 300) : rpos]):
+            continue
+        rname = rm.group("name")
+        binding_spans = [
+            sp
+            for sp, bmap in block_decls.items()
+            if sp[0] <= rpos < sp[1] and rname in bmap
+        ] + [
+            (s, e)
+            for s, e, pnames in param_scopes
+            if s <= rpos < e and rname in pnames
+        ]
+        target_span = (
+            min(binding_spans, key=lambda sp: sp[1] - sp[0])
+            if binding_spans
+            else innermost_fn_scope(rpos)
+        )
+        block_decls.setdefault(target_span, {})[rname] = None
 
     base_outer = {
         k: v

@@ -366,29 +366,93 @@ def _collect_hoisted_cst_vars(raw: bytes, root: Any, out: set[str]) -> None:
         stack.extend(n.named_children)
 
 
-def _collect_mutated_cst_vars(raw: bytes, container: Any, out: set[str]) -> None:
-    """Record identifiers reassigned or updated inside `container` (without crossing nested functions)."""
-    stack = list(container.named_children)
-    while stack:
-        n = stack.pop()
-        if n.type in (
-            "function_declaration",
-            "generator_function_declaration",
-            "function",
-            "function_expression",
-            "arrow_function",
-            "method_definition",
-        ):
+def _cst_block_lexical_bindings(raw: bytes, scope_node: Any) -> set[str]:
+    """Collect block-scoped (`let`, `const`, `catch`, `function`, `class`) names bound in `scope_node`."""
+    names: set[str] = set()
+    if scope_node.type == "catch_clause":
+        c_param = scope_node.child_by_field_name("parameter")
+        if c_param is not None:
+            _collect_cst_pattern_idents(raw, c_param, names)
+        return names
+    if scope_node.type == "for_in_statement":
+        if any(tok.type in ("let", "const") for tok in scope_node.children):
+            left = scope_node.child_by_field_name("left")
+            if left is not None:
+                _collect_cst_pattern_idents(raw, left, names)
+        return names
+    if scope_node.type == "for_statement":
+        init_node = scope_node.child_by_field_name("initializer")
+        if init_node is not None and init_node.type == "lexical_declaration":
+            for d in init_node.named_children:
+                if d.type == "variable_declarator":
+                    lhs = d.child_by_field_name("name") or (d.named_children[0] if d.named_children else None)
+                    if lhs is not None:
+                        _collect_cst_pattern_idents(raw, lhs, names)
+        return names
+
+    candidates = list(scope_node.named_children)
+    if scope_node.type == "switch_body":
+        candidates = [
+            stmt
+            for clause in scope_node.named_children
+            if clause.type in ("switch_case", "switch_default")
+            for stmt in clause.named_children
+        ]
+    for ch in candidates:
+        decl_node = (
+            (ch.child_by_field_name("declaration") or (ch.named_children[0] if ch.named_children else None))
+            if ch.type == "export_statement"
+            else ch
+        )
+        if decl_node is None:
             continue
-        if n.type in ("assignment_expression", "augmented_assignment_expression"):
-            lhs = n.child_by_field_name("left") or (n.named_children[0] if n.named_children else None)
-            if lhs is not None:
-                _collect_cst_pattern_idents(raw, lhs, out)
-        elif n.type == "update_expression":
-            arg = n.child_by_field_name("argument") or (n.named_children[0] if n.named_children else None)
-            if arg is not None:
-                _collect_cst_pattern_idents(raw, arg, out)
-        stack.extend(n.named_children)
+        if decl_node.type == "lexical_declaration":
+            for d in decl_node.named_children:
+                if d.type == "variable_declarator":
+                    lhs = d.child_by_field_name("name") or (d.named_children[0] if d.named_children else None)
+                    if lhs is not None:
+                        _collect_cst_pattern_idents(raw, lhs, names)
+        elif decl_node.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
+            fn_id = decl_node.child_by_field_name("name")
+            if fn_id is not None:
+                _collect_cst_pattern_idents(raw, fn_id, names)
+    return names
+
+
+def _collect_mutated_cst_vars(raw: bytes, container: Any, out: set[str]) -> None:
+    """Record outer-scope identifiers reassigned inside `container`, respecting nested lexical shadowing."""
+
+    def visit(parent: Any, shadowed: frozenset[str]) -> None:
+        for n in parent.named_children:
+            if n.type in (
+                "function_declaration",
+                "generator_function_declaration",
+                "function",
+                "function_expression",
+                "arrow_function",
+                "method_definition",
+            ):
+                continue
+            next_shadowed = shadowed
+            if n.type in ("statement_block", "for_statement", "for_in_statement", "catch_clause", "switch_body"):
+                lex = _cst_block_lexical_bindings(raw, n)
+                if lex:
+                    next_shadowed = shadowed | lex
+            if n.type in ("assignment_expression", "augmented_assignment_expression"):
+                lhs = n.child_by_field_name("left") or (n.named_children[0] if n.named_children else None)
+                if lhs is not None:
+                    hits: set[str] = set()
+                    _collect_cst_pattern_idents(raw, lhs, hits)
+                    out.update(hits - next_shadowed)
+            elif n.type == "update_expression":
+                arg = n.child_by_field_name("argument") or (n.named_children[0] if n.named_children else None)
+                if arg is not None:
+                    hits = set()
+                    _collect_cst_pattern_idents(raw, arg, hits)
+                    out.update(hits - next_shadowed)
+            visit(n, next_shadowed)
+
+    visit(container, frozenset())
 
 
 def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, str]) -> dict[str, str]:
@@ -536,6 +600,11 @@ def extract_ts_http_calls_cst(
             if init_node is not None and init_node.type in ("lexical_declaration", "variable_declaration"):
                 for_local: dict[str, str | None] = {}
                 _collect_cst_var_decl(raw, init_node, for_local)
+                for_mutated: set[str] = set()
+                _collect_mutated_cst_vars(raw, node, for_mutated)
+                for b in for_mutated:
+                    if b in for_local:
+                        for_local[b] = None
                 scope_consts = _merge_cst_local_consts(scope_consts, for_local)
         elif ntype == "statement_block":
             scope_consts = _apply_cst_block_decls(raw, node, scope_consts)
