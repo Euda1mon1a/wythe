@@ -43,6 +43,7 @@ _GENERIC_ATTR_METHODS = frozenset(
         "dumps",
         "encode",
         "endswith",
+        "exec",
         "execute",
         "exists",
         "extend",
@@ -2596,7 +2597,7 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         dotted = _dotted(target) or ""
         short = target.id if isinstance(target, ast.Name) else target.attr if isinstance(target, ast.Attribute) else ""
         if (isinstance(target, ast.Attribute) and _is_session_receiver(target.value)
-                and short in {"query", "get", "execute", "scalar", "scalars"}):
+                and short in {"query", "get", "execute", "exec", "scalar", "scalars"}):
             has_session_reads = True
 
         if dotted.endswith(".include_router") and n.args:

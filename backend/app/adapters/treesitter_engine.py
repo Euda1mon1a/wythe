@@ -496,6 +496,32 @@ def _unwrap_cst_expr(node: Any) -> Any:
     return cur
 
 
+def _cst_static_pair_key(raw: bytes, pair_node: Any) -> tuple[str, Any] | None:
+    """Extract `(key_name, value_node)` for an object-literal `pair` with a static key."""
+    if pair_node.type != "pair":
+        return None
+    k_node = pair_node.child_by_field_name("key") or (pair_node.named_children[0] if pair_node.named_children else None)
+    v_node = pair_node.child_by_field_name("value") or (
+        pair_node.named_children[-1] if len(pair_node.named_children) >= 2 else None
+    )
+    if k_node is None or v_node is None:
+        return None
+    key_name = ""
+    if k_node.type in ("property_identifier", "identifier"):
+        key_name = raw[k_node.start_byte : k_node.end_byte].decode("utf-8", errors="replace")
+    elif k_node.type in ("string", "template_string") and not any(
+        c.type == "template_substitution" for c in k_node.children
+    ):
+        key_name = _unquote_node(raw, k_node)
+    elif k_node.type == "computed_property_name" and k_node.named_children:
+        inner_k = _unwrap_cst_expr(k_node.named_children[0])
+        if inner_k is not None and inner_k.type in ("string", "template_string") and not any(
+            c.type == "template_substitution" for c in inner_k.children
+        ):
+            key_name = _unquote_node(raw, inner_k)
+    return (key_name, v_node) if key_name else None
+
+
 def _extract_cst_fetch_method(raw: bytes, opt_node: Any) -> str:
     """Read HTTP method only from a top-level `method` property on the options object literal."""
     obj = _unwrap_cst_expr(opt_node)
@@ -503,28 +529,10 @@ def _extract_cst_fetch_method(raw: bytes, opt_node: Any) -> str:
         return "GET"
     verb = "GET"
     for ch in obj.named_children:
-        if ch.type != "pair":
+        pair = _cst_static_pair_key(raw, ch)
+        if pair is None or pair[0] != "method":
             continue
-        k_node = ch.child_by_field_name("key") or (ch.named_children[0] if ch.named_children else None)
-        v_node = ch.child_by_field_name("value") or (ch.named_children[-1] if len(ch.named_children) >= 2 else None)
-        if k_node is None or v_node is None:
-            continue
-        key_name = ""
-        if k_node.type in ("property_identifier", "identifier"):
-            key_name = raw[k_node.start_byte : k_node.end_byte].decode("utf-8", errors="replace")
-        elif k_node.type in ("string", "template_string") and not any(
-            c.type == "template_substitution" for c in k_node.children
-        ):
-            key_name = _unquote_node(raw, k_node)
-        elif k_node.type == "computed_property_name" and k_node.named_children:
-            inner_k = _unwrap_cst_expr(k_node.named_children[0])
-            if inner_k is not None and inner_k.type in ("string", "template_string") and not any(
-                c.type == "template_substitution" for c in inner_k.children
-            ):
-                key_name = _unquote_node(raw, inner_k)
-        if key_name != "method":
-            continue
-        val = _unwrap_cst_expr(v_node)
+        val = _unwrap_cst_expr(pair[1])
         if (
             val is not None
             and val.type in ("string", "template_string")
@@ -535,6 +543,57 @@ def _extract_cst_fetch_method(raw: bytes, opt_node: Any) -> str:
         else:
             verb = "GET"
     return verb
+
+
+def _extract_cst_object_request(
+    raw: bytes,
+    obj_node: Any,
+    scope_consts: dict[str, str],
+    *,
+    verb_from_callee: str | None,
+) -> tuple[str, str] | None:
+    """Extract `(http_method, raw_url)` from `{ url: '/api/...', ...options }` SDK/axios request objects."""
+    obj = _unwrap_cst_expr(obj_node)
+    if obj is None or obj.type != "object":
+        return None
+    url_val: str | None = None
+    explicit_method: str | None = None
+    method_dynamic = False
+    for ch in obj.named_children:
+        pair = _cst_static_pair_key(raw, ch)
+        if pair is None:
+            continue
+        key_name, v_node = pair
+        if key_name == "url":
+            tpl = _cst_url_template_from_expr(raw, v_node)
+            cand = resolve_url_const_head(tpl, scope_consts) if tpl is not None else ""
+            if cand and is_same_origin_url_path(cand):
+                url_val = cand
+            else:
+                # A later dynamic/external `url:` overrides an earlier literal URL.
+                url_val = None
+        elif key_name == "method":
+            val = _unwrap_cst_expr(v_node)
+            if (
+                val is not None
+                and val.type in ("string", "template_string")
+                and not any(c.type == "template_substitution" for c in val.children)
+            ):
+                cand_m = _unquote_node(raw, val).strip().upper()
+                explicit_method = cand_m if cand_m in _HTTP_VERBS else "GET"
+                method_dynamic = False
+            else:
+                explicit_method = "GET"
+                method_dynamic = True
+    if not url_val:
+        return None
+    if explicit_method is not None and not method_dynamic:
+        final_verb = explicit_method
+    elif verb_from_callee is not None:
+        final_verb = verb_from_callee
+    else:
+        final_verb = explicit_method or "GET"
+    return final_verb, url_val
 
 
 def extract_ts_http_calls_cst(
@@ -636,13 +695,22 @@ def extract_ts_http_calls_cst(
                 elif first_arg is not None:
                     tpl = _cst_url_template_from_expr(raw, first_arg)
                     url_val = resolve_url_const_head(tpl, scope_consts) if tpl is not None else ""
+                    upper_c = "DELETE" if callee_name.lower() == "del" else callee_name.upper()
                     if is_same_origin_url_path(url_val):
-                        upper_c = "DELETE" if callee_name.lower() == "del" else callee_name.upper()
                         if upper_c in _HTTP_VERBS:
                             found.append((upper_c, url_val, fn_node.start_point[0] + 1))
                         elif callee_name in _FETCH_HELPERS:
                             verb = _extract_cst_fetch_method(raw, arg_items[1]) if len(arg_items) >= 2 else "GET"
                             found.append((verb, url_val, fn_node.start_point[0] + 1))
+                    elif upper_c in _HTTP_VERBS or callee_name in _FETCH_HELPERS or callee_name == "axios":
+                        obj_req = _extract_cst_object_request(
+                            raw,
+                            first_arg,
+                            scope_consts,
+                            verb_from_callee=upper_c if upper_c in _HTTP_VERBS else None,
+                        )
+                        if obj_req is not None:
+                            found.append((obj_req[0], obj_req[1], fn_node.start_point[0] + 1))
         for ch in node.children:
             walk(ch, scope_consts)
 

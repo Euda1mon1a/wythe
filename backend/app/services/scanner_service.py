@@ -107,6 +107,8 @@ def _call_segment_matches(call_seg: str, route_seg: str, id_valued: bool = False
             for part in _CALL_PARAM_SPLIT_RE.split(call_seg)
         )
         return re.fullmatch(pattern, route_seg) is not None
+    if bool(_ROUTE_PARAM_SEG_RE.match(call_seg)):
+        return route_is_param
     return not route_is_param and call_seg == route_seg
 
 
@@ -316,7 +318,7 @@ def _solve_cross_tier_lineage(
 ) -> tuple[list[AtlasEdge], list[EndToEndChain], list[RawCandidateFinding]]:
     """Bridge Display HTTP calls -> Manipulate routes -> Services -> Postgres Truth."""
     cross_edges: list[AtlasEdge] = []
-    seen_edges: set[tuple[str, str, str]] = set()
+    seen_edges: dict[tuple[str, str, str], int] = {}
     extra_findings: list[RawCandidateFinding] = []
 
     all_nodes: dict[str, AtlasNode] = {
@@ -420,26 +422,46 @@ def _solve_cross_tier_lineage(
 
         kind = "queries_endpoint" if call.http_method == "GET" else "mutates_endpoint"
         op = "read" if call.http_method == "GET" else "write"
+        is_inactive = call.reachable is False
+        edge_verification = "declared" if is_inactive else "verified"
+        if call.entry_node_ids:
+            allowed_roots = set(call.entry_node_ids)
+            candidate_pages = [
+                (root_disp_id, via_ids)
+                for root_disp_id, via_ids in upstream_pages(call.caller_node_id)
+                if root_disp_id in allowed_roots
+            ]
+            seen_roots = {root_disp_id for root_disp_id, _ in candidate_pages}
+            for eid in call.entry_node_ids:
+                if eid not in seen_roots:
+                    candidate_pages.append((eid, [] if eid == call.caller_node_id else [call.caller_node_id]))
+        else:
+            candidate_pages = upstream_pages(call.caller_node_id)
         for rdesc in matched_routes:
             ekey = (call.caller_node_id, rdesc.node_id, kind)
-            if ekey not in seen_edges:
-                seen_edges.add(ekey)
-                cross_edges.append(
-                    AtlasEdge(
-                        id=f"e:{call.caller_node_id}->{rdesc.node_id}:{kind}",
-                        source_id=call.caller_node_id,
-                        target_id=rdesc.node_id,
-                        kind=kind,  # type: ignore[arg-type]
-                        verification="verified",
-                        evidence_path=call.source_file,
-                        evidence_note=f"`{call.http_method} {call.normalized_path}` -> `{rdesc.full_path}`",
-                    )
-                )
+            new_edge = AtlasEdge(
+                id=f"e:{call.caller_node_id}->{rdesc.node_id}:{kind}",
+                source_id=call.caller_node_id,
+                target_id=rdesc.node_id,
+                kind=kind,  # type: ignore[arg-type]
+                verification=edge_verification,
+                evidence_path=call.source_file,
+                evidence_note=f"`{call.http_method} {call.normalized_path}` -> `{rdesc.full_path}`",
+            )
+            existing_idx = seen_edges.get(ekey)
+            if existing_idx is None:
+                seen_edges[ekey] = len(cross_edges)
+                cross_edges.append(new_edge)
+            elif not is_inactive and cross_edges[existing_idx].verification == "declared":
+                # Active usage supersedes an earlier inactive/declared call to the same endpoint node.
+                cross_edges[existing_idx] = new_edge
+            if is_inactive:
+                continue
 
             svcs, r_tbls, w_tbls = downstream_from_route(rdesc.node_id)
             tbls = sorted(set(r_tbls) | set(w_tbls)) if op == "write" else r_tbls or sorted(set(r_tbls) | set(w_tbls))
             route_node = all_nodes.get(rdesc.node_id)
-            for root_disp_id, via_ids in upstream_pages(call.caller_node_id):
+            for root_disp_id, via_ids in candidate_pages:
                 ckey = (root_disp_id, call.http_method, rdesc.full_path, rdesc.node_id)
                 if ckey in seen_chains or len(chains) >= 300:
                     continue

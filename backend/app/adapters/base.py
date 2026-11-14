@@ -103,6 +103,8 @@ class FrontendHttpCall:
     reachable: bool | None = None
     # Entry point -> ... -> caller, as `file#symbol` hops (empty when unknown).
     reach_trail: tuple[str, ...] = ()
+    # Entry/page AtlasNode IDs whose call chain reaches this call, when known.
+    entry_node_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -31,6 +31,9 @@ _REACT_SPA_ROOT_STEMS = frozenset(
 MODULE_SYMBOL = "<module>"
 
 _IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
+_QUAL_MEMBER_RE = re.compile(
+    r"(?<![.\w$])(?P<obj>[A-Za-z_$][\w$]*)\s*(?:\?\.)?\.\s*(?P<prop>[A-Za-z_$][\w$]*)\b"
+)
 _DECL_RE = re.compile(
     r"^(?P<export>export\s+)?(?P<default>default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?"
     r"(?:function\s*\*?|const|let|var|class|enum|interface|type)\s+(?P<name>[A-Za-z_$][\w$]*)"
@@ -385,6 +388,7 @@ class ReachabilityIndex:
         self._resolve = resolve
         self._display_root = display_root
         self._unreadable = unreadable or set()
+        self._roots = set(roots)
         self.has_roots = bool(roots)
         self._live: dict[tuple[Path, str], tuple[Path, str] | None] = {}
         self._parents: dict[tuple[Path, str], set[tuple[Path, str]]] = {}
@@ -418,11 +422,13 @@ class ReachabilityIndex:
         info = self._modules.get(path)
         if info is None:
             return False
-        if name in info.exports or name in info.reexports or name in info.type_exports:
+        base_name, dot, _member = name.partition(".")
+        candidates = (name, base_name) if dot else (name,)
+        if any(c in info.exports or c in info.reexports or c in info.type_exports for c in candidates):
             return True
         for spec in info.star_specs:
             nxt = self._resolve(spec, path)
-            if nxt is not None and self._exports_name(nxt, name, seen):
+            if nxt is not None and any(self._exports_name(nxt, c, seen) for c in candidates):
                 return True
         return False
 
@@ -442,12 +448,55 @@ class ReachabilityIndex:
             for spec in info.star_specs:
                 self._mark_import(target, spec, "*", parent)
             return
+        if "." in name and name not in info.exports and name not in info.bodies and name not in info.reexports:
+            base_name, _, member = name.partition(".")
+            local_cls = info.exports.get(base_name)
+            if local_cls is None and base_name in info.bodies:
+                local_cls = base_name
+            if local_cls is not None:
+                qual_local = f"{local_cls}.{member}"
+                if qual_local in info.bodies:
+                    self._mark(target, qual_local, parent)
+                    return
+                if local_cls in info.bodies:
+                    self._mark(target, local_cls, parent)
+                    return
+                if local_cls in info.bindings:
+                    spec, imported = info.bindings[local_cls]
+                    forwarded = f"{imported}.{member}" if imported not in ("*", "default") else imported
+                    self._mark_import(target, spec, forwarded, parent)
+                    return
+            if base_name in info.reexports:
+                spec, imported = info.reexports[base_name]
+                forwarded = f"{imported}.{member}" if imported not in ("*", "default") else imported
+                self._mark_import(target, spec, forwarded, parent)
+                return
+            if base_name in info.type_exports:
+                return
+            matched = False
+            for spec in info.star_specs:
+                nxt = self._resolve(spec, target)
+                if nxt is not None and self._exports_name(nxt, base_name, set()):
+                    matched = True
+                    self._mark_export(nxt, name, parent, seen)
+            if not matched:
+                for decl in info.bodies:
+                    self._mark(target, decl, parent)
+                for spec in info.star_specs:
+                    self._mark_import(target, spec, "*", parent)
+            return
         local = info.exports.get(name)
         if local is None and name in info.bodies:
             local = name
         if local is not None and local in info.bodies:
             self._mark(target, local, parent)
             return
+        if local is not None:
+            class_methods = [k for k in info.bodies if k.startswith(f"{local}.")]
+            if class_methods:
+                for m in class_methods:
+                    self._mark(target, m, parent)
+                return
         if local is not None and local in info.bindings:
             spec, imported = info.bindings[local]
             self._mark_import(target, spec, imported, parent)
@@ -479,6 +528,10 @@ class ReachabilityIndex:
                 continue
             if sym != MODULE_SYMBOL:
                 self._mark(path, MODULE_SYMBOL, (path, sym))
+                if "." not in sym:
+                    for m in info.bodies:
+                        if m.startswith(f"{sym}."):
+                            self._mark(path, m, (path, sym))
                 body = info.bodies.get(sym, "")
             else:
                 body = info.module_body
@@ -503,9 +556,40 @@ class ReachabilityIndex:
                 self._dynamic_sites.add((path, sym, spec or "<runtime specifier>", selected))
                 if spec is not None:
                     self._mark_import(path, spec, selected, (path, sym))
-            for tok in set(_IDENT_RE.findall(body)):
-                if tok != sym and tok in info.bodies:
-                    self._mark(path, tok, (path, sym))
+            qual_obj_spans: set[tuple[int, int]] = set()
+            for qm in _QUAL_MEMBER_RE.finditer(body):
+                obj = qm.group("obj")
+                prop = qm.group("prop")
+                qual_obj_spans.add(qm.span("obj"))
+                qual_same = f"{obj}.{prop}"
+                if qual_same != sym and qual_same in info.bodies:
+                    self._mark(path, qual_same, (path, sym))
+                elif obj != sym and obj in info.bodies and not any(k.startswith(f"{obj}.") for k in info.bodies):
+                    self._mark(path, obj, (path, sym))
+                binding = info.bindings.get(obj)
+                if binding is not None:
+                    spec, imported = binding
+                    if imported == "*":
+                        self._mark_import(path, spec, prop, (path, sym))
+                    elif imported == "default":
+                        self._mark_import(path, spec, "default", (path, sym))
+                    else:
+                        self._mark_import(path, spec, f"{imported}.{prop}", (path, sym))
+            bare_tokens: set[str] = set()
+            for tm in _IDENT_RE.finditer(body):
+                start, end = tm.span()
+                if (start, end) in qual_obj_spans:
+                    continue
+                if start > 0 and body[start - 1] == ".":
+                    continue
+                bare_tokens.add(tm.group(0))
+            for tok in bare_tokens:
+                if tok != sym:
+                    if tok in info.bodies:
+                        self._mark(path, tok, (path, sym))
+                    for m in info.bodies:
+                        if m.startswith(f"{tok}."):
+                            self._mark(path, m, (path, sym))
                 binding = info.bindings.get(tok)
                 if binding is not None:
                     self._mark_import(path, binding[0], binding[1], (path, sym))
@@ -560,9 +644,16 @@ class ReachabilityIndex:
     def enclosing_symbol(self, path: Path, line: int) -> str:
         info = self._modules.get(path)
         if info is not None:
-            matches = [name for name, first, last in info.decl_ranges if first <= line <= last]
+            matches = [(name, first, last) for name, first, last in info.decl_ranges if first <= line <= last]
             if len(matches) == 1:
-                return matches[0]
+                return matches[0][0]
+            if len(matches) == 2:
+                # A class declaration spans its own static/instance methods; pick the nested method.
+                (n1, f1, l1), (n2, f2, l2) = matches
+                if n2.startswith(f"{n1}.") and f1 <= f2 and l2 <= l1:
+                    return n2
+                if n1.startswith(f"{n2}.") and f2 <= f1 and l1 <= l2:
+                    return n1
             # Calls currently carry line numbers, not columns. Shared-line declarations
             # cannot be separated reliably and must retain module-level reachability.
         return MODULE_SYMBOL
@@ -575,6 +666,39 @@ class ReachabilityIndex:
         if any(spec == "<runtime specifier>" for _, _, spec, _ in self._dynamic_sites):
             return None  # A runtime-selected module could be this one; do not assert dead code.
         return False
+
+    def reaching_roots(
+        self,
+        path: Path,
+        sym: str,
+        stop_paths: set[Path] | None = None,
+    ) -> list[Path]:
+        """Return entry/page file paths whose execution graph actually reaches `(path, sym)`."""
+        start = (path, sym)
+        if start not in self._live:
+            return []
+        stops = stop_paths or set()
+        if path in stops:
+            return [path]
+        found: set[Path] = set()
+        seen: set[tuple[Path, str]] = {start}
+        queue: deque[tuple[Path, str]] = deque([start])
+        while queue:
+            cur = queue.popleft()
+            parents = self._parents.get(cur, set())
+            if not parents:
+                if cur[0] in self._roots or cur[0] in stops:
+                    found.add(cur[0])
+                continue
+            for parent in parents:
+                p_path = parent[0]
+                if p_path != path and p_path in stops:
+                    found.add(p_path)
+                    continue
+                if parent not in seen:
+                    seen.add(parent)
+                    queue.append(parent)
+        return sorted(found)
 
     def trail(self, path: Path, sym: str, limit: int = 8) -> tuple[str, ...]:
         hops: list[str] = []

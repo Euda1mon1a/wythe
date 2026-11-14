@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import configparser
 import copy
 import re
 import subprocess
@@ -85,7 +86,7 @@ _RECORD_SUFFIXES = (
     "_versions",
     "transaction",
 )
-_DECLARATIVE_ROOT_BASES = frozenset({"DeclarativeBase", "DeclarativeBaseNoMeta"})
+_DECLARATIVE_ROOT_BASES = frozenset({"DeclarativeBase", "DeclarativeBaseNoMeta", "SQLModel"})
 _DECLARATIVE_FACTORIES = frozenset({"declarative_base", "generate_base"})
 _DEFAULT_GROUP = ""  # models whose base is imported from outside the models package
 _UNRESOLVED = "\x00"  # an f-string part whose value is not known statically
@@ -116,13 +117,18 @@ def _expr_name(node: ast.expr) -> str:
 
 @dataclass
 class _ModelScan:
-    """Models, class -> base names, and declarative roots found in one module."""
+    """Models, class -> base names, columns, and declarative roots found in one module."""
 
     models: list[tuple[str, str, int, list[str], str, list[str]]] = field(default_factory=list)
     class_bases: dict[str, list[str]] = field(default_factory=dict)
+    class_columns: dict[str, list[str]] = field(default_factory=dict)
     roots: set[str] = field(default_factory=set)
     # (referencing table, "table" key or "class" name of the referenced side) from ForeignKey(...).
     fk_refs: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+def _is_classvar_annotation(ann: ast.expr | None) -> bool:
+    return ann is not None and _expr_name(ann) == "ClassVar"
 
 
 def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
@@ -161,8 +167,18 @@ def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
             continue
         base_names = [_expr_name(b) for b in node.bases]
         scan.class_bases[node.name] = base_names
+        is_sqlmodel_table = any(
+            kw.arg == "table" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+            for kw in node.keywords
+        )
+        uses_sqlmodel = is_sqlmodel_table or "SQLModel" in base_names or any(
+            b in scan.class_bases and "SQLModel" in scan.class_bases[b] for b in base_names
+        )
         decorated_root = any("declarative" in _expr_name(d) for d in node.decorator_list)
-        if decorated_root or any(b in _DECLARATIVE_ROOT_BASES for b in base_names):
+        if uses_sqlmodel:
+            # SQLModel is the shared metadata root; non-table base classes (e.g. UserBase) remain mixins.
+            scan.roots.add("SQLModel")
+        elif decorated_root or any(b in (_DECLARATIVE_ROOT_BASES - {"SQLModel"}) for b in base_names):
             scan.roots.add(node.name)
 
         table_name: str | None = None
@@ -188,21 +204,29 @@ def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
                         fn_name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
                         if fn_name in ("Column", "mapped_column"):
                             columns.append(target.id)
-            elif (
-                isinstance(stmt, ast.AnnAssign)
-                and isinstance(stmt.target, ast.Name)
-                and isinstance(stmt.value, ast.Call)
-            ):
-                fn = stmt.value.func
-                fn_name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
-                if fn_name in ("Column", "mapped_column"):
-                    columns.append(stmt.target.id)
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                col_name = stmt.target.id
+                if col_name.startswith("__") or _is_classvar_annotation(stmt.annotation):
+                    continue
+                if isinstance(stmt.value, ast.Call):
+                    fn = stmt.value.func
+                    fn_name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
+                    if fn_name in ("Column", "mapped_column") or (
+                        (uses_sqlmodel or fn_name == "Field") and fn_name != "Relationship"
+                    ):
+                        columns.append(col_name)
+                elif uses_sqlmodel:
+                    columns.append(col_name)
 
-        if table_name and not is_abstract:
+        scan.class_columns[node.name] = columns
+        effective_table = (table_name or node.name.lower()) if (is_sqlmodel_table and not is_abstract) else (
+            table_name if not is_abstract else None
+        )
+        if effective_table:
             qualified = (
-                f"{table_schema.lower()}.{table_name}"
+                f"{table_schema.lower()}.{effective_table}"
                 if table_schema and table_schema.lower() != "public"
-                else table_name
+                else effective_table
             )
             doc = (ast.get_docstring(node) or "").strip().splitlines()
             first_line = doc[0].strip() if doc else f"Persisted table `{qualified}` ({rel_path})."
@@ -216,6 +240,10 @@ def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
                     targets = [sub.args[0]]
                 elif callee == "ForeignKeyConstraint" and len(sub.args) >= 2 and isinstance(sub.args[1], (ast.List, ast.Tuple)):
                     targets = list(sub.args[1].elts)
+                elif callee == "Field":
+                    for kw in sub.keywords:
+                        if kw.arg == "foreign_key" and kw.value is not None:
+                            targets.append(kw.value)
                 for tgt in targets:
                     text_target = str_value(tgt)
                     fk_table = _fk_target_table(text_target) if text_target else None
@@ -3712,32 +3740,113 @@ def _order_migrations(
     return ordered
 
 
-_MODEL_SCAN_SKIP_PARTS = frozenset({"__pycache__", "tests", "test"})
+_MODEL_SCAN_SKIP_PARTS = frozenset({"__pycache__", "tests", "test", "alembic"})
+
+
+def _is_migration_subpath(rel_parts: tuple[str, ...]) -> bool:
+    """True for nested Alembic trees (e.g. `alembic/...` or `migrations/{versions,env.py}`)."""
+    if "alembic" in rel_parts:
+        return True
+    return "migrations" in rel_parts[:-1] and ("versions" in rel_parts or rel_parts[-1] == "env.py")
+
+
+def _discover_alembic_versions_dir(backend_dir: Path, app_dir: Path | None) -> Path:
+    """Resolve Alembic `versions/` directory from `alembic.ini` `script_location` or nested fallbacks."""
+    backend_resolved = backend_dir.resolve()
+    ini_candidates = [backend_dir / "alembic.ini"]
+    if app_dir is not None and app_dir.parent != backend_dir:
+        ini_candidates.append(app_dir.parent / "alembic.ini")
+    for ini_path in ini_candidates:
+        if not ini_path.is_file() or ini_path.is_symlink():
+            continue
+        parser = configparser.ConfigParser(defaults={"here": str(ini_path.parent)})
+        try:
+            parser.read(ini_path, encoding="utf-8")
+            script_loc = parser.get("alembic", "script_location", fallback="").strip()
+        except (configparser.Error, OSError, UnicodeError):
+            script_loc = ""
+        if script_loc:
+            cand = Path(script_loc)
+            if not cand.is_absolute():
+                cand = ini_path.parent / cand
+            versions = cand / "versions"
+            try:
+                versions_resolved = versions.resolve()
+            except OSError:
+                versions_resolved = versions
+            if versions_resolved.is_relative_to(backend_resolved) and versions.is_dir() and not versions.is_symlink():
+                return versions
+    candidates = [
+        backend_dir / "alembic" / "versions",
+        backend_dir / "migrations" / "versions",
+    ]
+    if app_dir is not None:
+        candidates.extend([app_dir / "alembic" / "versions", app_dir / "migrations" / "versions"])
+    for cand in candidates:
+        if cand.is_dir() and not cand.is_symlink():
+            return cand
+    return backend_dir / "alembic" / "versions"
+
+
+def _resolve_class_columns(
+    cls_name: str,
+    class_bases: dict[str, list[str]],
+    class_columns: dict[str, list[str]],
+    seen: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Merge inherited mixin/SQLModel base columns with the class's own columns."""
+    if cls_name in seen:
+        return []
+    next_seen = seen | {cls_name}
+    merged: list[str] = []
+    seen_cols: set[str] = set()
+    for base in class_bases.get(cls_name, ()):
+        if base in class_columns or base in class_bases:
+            for col in _resolve_class_columns(base, class_bases, class_columns, next_seen):
+                if col not in seen_cols:
+                    seen_cols.add(col)
+                    merged.append(col)
+    for col in class_columns.get(cls_name, ()):
+        if col not in seen_cols:
+            seen_cols.add(col)
+            merged.append(col)
+    return merged
 
 
 def _model_source_files(app_dir: Path, models_dir: Path) -> list[Path]:
     """Python files that may declare ORM models or declarative bases.
 
     Every file under `app/models`, then any other file in the app package whose text declares
-    a `__tablename__` or a declarative base (models and bases also live in `db/`, feature
-    packages, and so on).
+    a `__tablename__`, `SQLModel`, or a declarative base (models and bases also live in `db/`,
+    `models.py`, feature packages, and so on).
     """
     files = (
-        [p for p in sorted(models_dir.rglob("*.py")) if "__pycache__" not in p.parts and not p.is_symlink()]
+        [
+            p
+            for p in sorted(models_dir.rglob("*.py"))
+            if "__pycache__" not in p.parts
+            and not p.is_symlink()
+            and not _is_migration_subpath(p.relative_to(models_dir).parts)
+        ]
         if models_dir.is_dir()
         else []
     )
     seen = set(files)
     if app_dir.is_dir():
         for py_file in sorted(app_dir.rglob("*.py")):
-            if (py_file in seen or py_file.is_symlink()
-                    or _MODEL_SCAN_SKIP_PARTS.intersection(py_file.relative_to(app_dir).parts)):
+            rel_parts = py_file.relative_to(app_dir).parts
+            if (
+                py_file in seen
+                or py_file.is_symlink()
+                or _MODEL_SCAN_SKIP_PARTS.intersection(rel_parts)
+                or _is_migration_subpath(rel_parts)
+            ):
                 continue
             try:
                 text = py_file.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 continue
-            if "__tablename__" in text or "declarative" in text.lower():
+            if "__tablename__" in text or "SQLModel" in text or "declarative" in text.lower():
                 files.append(py_file)
     return files
 
@@ -3784,24 +3893,25 @@ class PostgresSqlAlchemyAdapter:
         app_dir, layout_notes = discover_python_app(backend_dir)
         models_dir = app_dir / "models" if app_dir else backend_dir / "app" / "models"
         schema_sql_path = backend_dir / "schema.sql"
-        alembic_dir = backend_dir / "alembic" / "versions"
+        alembic_dir = _discover_alembic_versions_dir(backend_dir, app_dir)
 
         nodes: list[AtlasNode] = []
         table_symbol_map: dict[str, str] = {}
         function_symbol_map: dict[str, str] = {}
         findings: list[RawCandidateFinding] = []
         notes: list[str] = list(layout_notes)
-        if app_dir and app_dir.name != "app":
+        if app_dir and app_dir.name != "app" and not alembic_dir.is_dir():
             notes.append(
-                f"SQLAlchemy models use the {app_dir.name}/ package. Migration discovery still "
-                "uses backend/schema.sql and backend/alembic/versions; package-internal "
-                "migrations are not inspected."
+                f"SQLAlchemy models use the {app_dir.name}/ package. Migration discovery checks "
+                "`alembic.ini` (`script_location`), `backend/alembic/versions`, and package-internal "
+                "`alembic/versions` or `migrations/versions`; none were found."
             )
 
         # 1. Models, grouped by the declarative base they inherit from.
         orm_tables: dict[str, tuple[str, int, list[str], str, list[str]]] = {}
         model_bases: dict[str, list[str]] = {}
         class_bases: dict[str, list[str]] = {}
+        class_columns: dict[str, list[str]] = {}
         class_modules: dict[str, set[str]] = {}
         model_modules: set[str] = set()
         model_fk_refs: list[tuple[str, str, str, str]] = []  # (src table, kind, target, evidence path)
@@ -3812,6 +3922,7 @@ class PostgresSqlAlchemyAdapter:
             rel_path = py_file.relative_to(repo_root).as_posix()
             scan = _scan_model_module(py_file, rel_path)
             class_bases.update(scan.class_bases)
+            class_columns.update(scan.class_columns)
             roots |= scan.roots
             module = _dotted_module(app_dir, py_file)
             if scan.models or models_dir in py_file.parents:
@@ -3821,10 +3932,14 @@ class PostgresSqlAlchemyAdapter:
                 class_modules.setdefault(cls_name, set()).add(module)
                 key = tbl_name.lower()
                 if key not in orm_tables:
-                    orm_tables[key] = (rel_path, lineno, cols, summary, [cls_name])
+                    orm_tables[key] = (rel_path, lineno, list(cols), summary, [cls_name])
                     model_bases[key] = bases
                 else:
                     orm_tables[key][4].append(cls_name)
+        for key, (_rel, _ln, cols, _sum, cls_names) in orm_tables.items():
+            resolved_cols = _resolve_class_columns(cls_names[0], class_bases, class_columns)
+            if resolved_cols:
+                cols[:] = resolved_cols
 
         table_group = {
             key: _model_group(model_bases.get(key, []), class_bases, roots) for key in orm_tables
@@ -3873,6 +3988,8 @@ class PostgresSqlAlchemyAdapter:
         migration_entries: list[tuple[Path, _MigrationEffects]] = []
         if alembic_dir.is_dir():
             for mig_file in sorted(alembic_dir.glob("*.py")):
+                if mig_file.is_symlink():
+                    continue
                 try:
                     tree = ast.parse(mig_file.read_text(encoding="utf-8"))
                 except (OSError, UnicodeError, SyntaxError):
