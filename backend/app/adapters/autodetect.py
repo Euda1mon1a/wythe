@@ -322,6 +322,14 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
         any((d / f).is_file() for d in (be_dir, repo_root) for f in ("drizzle.config.ts", "drizzle.config.js"))
         or "drizzle-orm" in (be_deps | root_deps | ws_pkgs_deps)
     )
+    be_sub = be_dir.relative_to(repo_root).as_posix() if be_dir.is_dir() and be_dir != repo_root else "."
+    kysely_deps = {"kysely", "kysely-postgres-js", "nestjs-kysely"}
+    if (be_deps | root_deps | ws_pkgs_deps) & kysely_deps:
+        from app.adapters.kysely_schema import discover_kysely_migrations
+
+        has_kysely = bool(discover_kysely_migrations(repo_root, be_sub))
+    else:
+        has_kysely = False
 
     if disp_adapter == "no-display" and manip_adapter not in ("python-services",):
         # Backend-only Rust/Go/Django without UI still picks standard non-display fallback only if Python services
@@ -347,6 +355,9 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
     elif has_drizzle:
         truth_adapter = "drizzle-orm"
         signals.append("Truth: Drizzle ORM schema / migrations")
+    elif has_kysely:
+        truth_adapter = "kysely-migrations"
+        signals.append("Truth: Kysely migration files")
     elif has_python_services:
         truth_adapter = "sql-ddl"
         truth_ev = (be_dir / "schema.sql").is_file() or (repo_root / "schema.sql").is_file() or bool(list(repo_root.glob("*.sql")))

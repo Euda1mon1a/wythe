@@ -245,6 +245,17 @@ class AdapterRegistry:
                 ],
             ),
             AdapterSlotSchema(
+                name="kysely-migrations",
+                tier="truth",
+                language="TypeScript / SQL",
+                frameworks=["PostgreSQL", "MySQL", "SQLite", "Kysely"],
+                implementation_status="experimental",
+                capabilities=[
+                    "Kysely SchemaBuilder migration replay (`up` DDL & `down` exclusion)",
+                    "Migration SQL function/trigger guards & CamelCasePlugin query mapping",
+                ],
+            ),
+            AdapterSlotSchema(
                 name="django-orm",
                 tier="truth",
                 language="Python / SQL",

@@ -6,6 +6,7 @@ from app.adapters.base import AdapterRegistry
 from app.adapters.django_truth import DjangoOrmAdapter
 from app.adapters.drizzle_truth import DrizzleOrmAdapter
 from app.adapters.go_http import GoHttpAdapter
+from app.adapters.kysely_schema import KyselySchemaAdapter
 from app.adapters.no_coverage import NoManipulatorAdapter, NoTruthAdapter
 from app.adapters.postgres_sqlalchemy import PostgresSqlAlchemyAdapter
 from app.adapters.prisma_truth import PrismaSchemaAdapter
@@ -31,6 +32,7 @@ def build_default_registry() -> AdapterRegistry:
     registry.register_truth(PostgresSqlAlchemyAdapter())
     registry.register_truth(PrismaSchemaAdapter())
     registry.register_truth(DrizzleOrmAdapter())
+    registry.register_truth(KyselySchemaAdapter())
     registry.register_truth(DjangoOrmAdapter())
     registry.register_truth(SqlDdlTruthAdapter())
     registry.register_truth(RustSqlTruthAdapter())

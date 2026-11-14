@@ -334,7 +334,7 @@ def _solve_cross_tier_lineage(
     manip_reads: dict[str, set[str]] = {}
     manip_writes: dict[str, set[str]] = {}
     for e in manip.edges:
-        if e.kind == "calls_helper":
+        if e.kind == "calls_helper" and e.verification != "declared":
             manip_adj.setdefault(e.source_id, set()).add(e.target_id)
         elif e.kind in ("reads_truth", "guards_truth"):
             manip_reads.setdefault(e.source_id, set()).add(e.target_id)
