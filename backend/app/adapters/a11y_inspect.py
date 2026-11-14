@@ -880,6 +880,37 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str], dic
                 props[base_key] = "dynamic"
                 raw_exprs[base_key] = base_key
                 record_explicit(base_key)
+            elif i < n and attrs[i] == ":":
+                # Skip namespaced directives like Svelte `use:action` or `let:item`.
+                i += 1
+                dm = re.match(r"[\w.:$-]+", attrs[i:])
+                if dm:
+                    i += dm.end()
+                    while i < n and attrs[i].isspace():
+                        i += 1
+                    if i < n and attrs[i] == "=":
+                        i += 1
+                        while i < n and attrs[i].isspace():
+                            i += 1
+                        if i < n and attrs[i] in ("'", '"'):
+                            q = attrs[i]
+                            j = i + 1
+                            while j < n and attrs[j] != q:
+                                j += 2 if attrs[j] == "\\" else 1
+                            i = min(j + 1, n)
+                        elif i < n and attrs[i] == "{":
+                            bend = _scan_brace_end(attrs, i)
+                            i = bend if bend is not None else i + 1
+            elif not key.startswith("v-"):
+                base_key = key.split(".", 1)[0]
+                props[base_key] = "bool_true"
+                raw_exprs.pop(base_key, None)
+                record_explicit(base_key)
+                if "-" in base_key:
+                    camel = re.sub(r"-([a-zA-Z0-9])", lambda m: m.group(1).upper(), base_key)
+                    props[camel] = "bool_true"
+                    raw_exprs.pop(camel, None)
+                    record_explicit(camel)
             continue
         i += 1
         while i < n and attrs[i].isspace():
@@ -2443,7 +2474,7 @@ def _resolve_dynamic_component_selector(
 
     assert target is not None
     tlow = target.lower()
-    if tlow in ("script", "style") or _is_aria_hidden_true(cleaned_attrs):
+    if tlow in ("script", "style") or _is_aria_hidden_true(cleaned_attrs) or _is_natively_hidden(cleaned_attrs):
         return "empty"
     if tlow == "img":
         return _eval_inline_graphic_name(cleaned_attrs, allow_alt=True, prop_values=prop_values)
@@ -2495,6 +2526,101 @@ def _resolve_dynamic_component_selector(
     return "empty"
 
 
+_SVELTE_CLOSE_TAG_RE = re.compile(r"^\{\s*/\s*(?:if|each|await|key|snippet)\s*\}")
+
+
+def _scan_markup_brace_end(src: str, pos: int) -> int | None:
+    """Variant of `_scan_brace_end` that handles Svelte closing tags like `{/if}` safely."""
+    cm = _SVELTE_CLOSE_TAG_RE.match(src[pos:])
+    if cm is not None:
+        return pos + cm.end()
+    return _scan_brace_end(src, pos)
+
+
+def _parse_svelte_if_block(
+    src: str, first_cond: str, first_bend: int
+) -> tuple[list[tuple[str | None, int, str]], int] | None:
+    """Parse `{#if ...}...{:else if ...}...{:else}...{/if}` into `[(cond_or_None, offset, body), ...]` and end index."""
+    n = len(src)
+    branches: list[tuple[str | None, int, str]] = []
+    cur_cond: str | None = first_cond
+    branch_start = first_bend
+    p = first_bend
+    block_depth = 1
+    while p < n:
+        if src.startswith("<!--", p):
+            cend = src.find("-->", p + 4)
+            p = cend + 3 if cend >= 0 else n
+            continue
+        if src[p] == "<" and not src.startswith(("</", "<>"), p):
+            tm = re.match(r"<([A-Za-z][\w.:-]*)", src[p:])
+            if tm:
+                open_end = scan_open_tag_end(src, p + tm.end())
+                if open_end is not None:
+                    p = open_end
+                    continue
+        if src[p] == "{":
+            nbend = _scan_markup_brace_end(src, p)
+            if nbend is None:
+                p += 1
+                continue
+            token = src[p + 1 : nbend - 1].strip()
+            if re.match(r"^#(?:if|each|await|key|snippet)(?:\b|[\s(])", token):
+                block_depth += 1
+            elif re.match(r"^/(?:if|each|await|key|snippet)\b", token):
+                block_depth -= 1
+                if block_depth == 0:
+                    branches.append((cur_cond, branch_start, src[branch_start:p]))
+                    return branches, nbend
+            elif block_depth == 1 and token.startswith(":"):
+                m_elif = re.match(r"^:else\s+if(?:\s+(?P<cond>[\s\S]*)|(?P<paren>\([\s\S]*))$", token)
+                if m_elif:
+                    branches.append((cur_cond, branch_start, src[branch_start:p]))
+                    cur_cond = (m_elif.group("cond") or m_elif.group("paren") or "").strip()
+                    branch_start = nbend
+                elif re.match(r"^:else\b", token):
+                    branches.append((cur_cond, branch_start, src[branch_start:p]))
+                    cur_cond = None
+                    branch_start = nbend
+            p = nbend
+            continue
+        p += 1
+    return None
+
+
+def _eval_svelte_condition_truthiness(
+    cond: str,
+    *,
+    prop_values: dict[str, str] | None,
+    inner_status: str,
+    portal_names: frozenset[str],
+) -> str:
+    """Return `"true"`, `"false"`, or `"unknown"` for a Svelte `{#if cond}` guard."""
+    s = _unwrap_outer_parens(cond)
+    inverted = False
+    while s.startswith("!") and not s.startswith("!="):
+        inverted = not inverted
+        s = _unwrap_outer_parens(s[1:])
+    if not s:
+        return "unknown"
+    res = _eval_coalesce_expr(
+        s,
+        prop_values=prop_values,
+        inner_status=inner_status,
+        depth=0,
+        portal_names=portal_names,
+    )
+    if res in ("bool_false", "undefined", "null", "empty", "num_zero"):
+        truth = "false"
+    elif res in ("bool_true", "named", "blank"):
+        truth = "true"
+    else:
+        return "unknown"
+    if inverted:
+        return "true" if truth == "false" else "false"
+    return truth
+
+
 def _classify_markup_segment(
     src: str,
     *,
@@ -2535,10 +2661,66 @@ def _classify_markup_segment(
             i = cend + 3 if cend >= 0 else n
             continue
         if ch == "{":
-            bend = _scan_brace_end(src, i)
+            bend = _scan_markup_brace_end(src, i)
             if bend is None:
                 i += 1
                 continue
+            block_hdr = src[i + 1 : bend - 1].strip()
+            m_sif = re.match(
+                r"^#if(?:\s+(?P<cond>[\s\S]*)|(?P<paren>\([\s\S]*))$", block_hdr
+            )
+            if m_sif:
+                init_cond = (m_sif.group("cond") or m_sif.group("paren") or "").strip()
+                parsed_if = _parse_svelte_if_block(src, init_cond, bend)
+                if parsed_if is not None:
+                    sbranches, block_end = parsed_if
+                    possible_statuses: set[str] = set()
+                    definitive_hit = False
+                    for b_cond, b_off, b_body in sbranches:
+                        if b_cond is None:
+                            bst, _, _ = _classify_markup_segment(
+                                b_body,
+                                imported_components=imported_components,
+                                component_resolver=component_resolver,
+                                prop_values=prop_values,
+                                inner_status=inner_status,
+                                render_booleans_as_text=render_booleans_as_text,
+                                allow_vue_kebab=allow_vue_kebab,
+                                source_offset=source_offset + b_off,
+                            )
+                            possible_statuses.add(bst)
+                            definitive_hit = True
+                            break
+                        truth = _eval_svelte_condition_truthiness(
+                            b_cond,
+                            prop_values=prop_values,
+                            inner_status=inner_status,
+                            portal_names=portal_names,
+                        )
+                        if truth == "false":
+                            continue
+                        bst, _, _ = _classify_markup_segment(
+                            b_body,
+                            imported_components=imported_components,
+                            component_resolver=component_resolver,
+                            prop_values=prop_values,
+                            inner_status=inner_status,
+                            render_booleans_as_text=render_booleans_as_text,
+                            allow_vue_kebab=allow_vue_kebab,
+                            source_offset=source_offset + b_off,
+                        )
+                        possible_statuses.add(bst)
+                        if truth == "true":
+                            definitive_hit = True
+                            break
+                    if not definitive_hit:
+                        possible_statuses.add("empty")
+                    if len(possible_statuses) == 1:
+                        merge_status(next(iter(possible_statuses)), "#if")
+                    else:
+                        merge_status("opaque", "#if")
+                    i = block_end
+                    continue
             sem = _classify_expr_semantics(
                 src[i + 1 : bend - 1],
                 prop_values=prop_values,
@@ -2578,6 +2760,38 @@ def _classify_markup_segment(
                     inner_body = src[open_end : cspan[0]]
                     next_i = cspan[1]
             tag_low = tag.lower()
+            matched_imp = _normalize_component_lookup(
+                tag, imported_components, allow_vue_case_insensitive=allow_vue_kebab
+            )
+            root_imp = matched_imp[1] if matched_imp is not None else None
+            is_native_hidden = _is_natively_hidden(attrs)
+            if is_native_hidden:
+                if (
+                    tag[0].islower()
+                    and matched_imp is None
+                    and tag_low not in ("slot", "component", "template")
+                    and not tag_low.startswith("svelte:")
+                ):
+                    i = next_i
+                    continue
+                if root_imp and _ICON_PKG_SPEC_RE.match(root_imp[0]):
+                    if component_resolver is None:
+                        i = next_i
+                        continue
+                    resolved = _resolve_component_tag(
+                        tag,
+                        attrs,
+                        "omitted",
+                        imported_components=imported_components,
+                        component_resolver=component_resolver,
+                        prop_values=prop_values,
+                        allow_vue_kebab=allow_vue_kebab,
+                        usage_pos=source_offset + i,
+                    )
+                    if resolved != "icon_only":
+                        merge_status(resolved, tag)
+                    i = next_i
+                    continue
             if tag_low in ("svg", "i"):
                 gst, gopaque = _classify_graphic_element(
                     tag_low,
@@ -2605,10 +2819,6 @@ def _classify_markup_segment(
                 )
                 i = next_i
                 continue
-            matched_imp = _normalize_component_lookup(
-                tag, imported_components, allow_vue_case_insensitive=allow_vue_kebab
-            )
-            root_imp = matched_imp[1] if matched_imp is not None else None
             if root_imp and _ICON_PKG_SPEC_RE.match(root_imp[0]) and component_resolver is None:
                 merge_status(
                     _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values),
@@ -2798,6 +3008,86 @@ def _is_aria_hidden_true(attrs: str) -> bool:
     )
 
 
+def _is_natively_hidden(attrs: str) -> bool:
+    """True when element attributes statically set HTML `hidden` outside quoted values."""
+    i = 0
+    n = len(attrs)
+    while i < n:
+        while i < n and (attrs[i].isspace() or attrs[i] == "/"):
+            i += 1
+        if i >= n:
+            break
+        if attrs[i] == "{":
+            bend = _scan_brace_end(attrs, i)
+            i = bend if bend is not None else i + 1
+            continue
+        km = re.match(r"[:\w$.-]+", attrs[i:])
+        if not km:
+            i += 1
+            continue
+        key = km.group(0)
+        i += km.end()
+        while i < n and attrs[i].isspace():
+            i += 1
+        if i >= n or attrs[i] != "=":
+            if key == "hidden":
+                return True
+            continue
+        i += 1
+        while i < n and attrs[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        if attrs[i] in ("'", '"'):
+            q = attrs[i]
+            j = i + 1
+            while j < n and attrs[j] != q:
+                j += 2 if attrs[j] == "\\" else 1
+            val = attrs[i + 1 : j].strip()
+            if key == "hidden":
+                return True
+            if key in (":hidden", "v-bind:hidden") and val in (
+                "true",
+                "'true'",
+                '"true"',
+                "''",
+                '""',
+                "'hidden'",
+                '"hidden"',
+                "'until-found'",
+                '"until-found"',
+            ):
+                return True
+            i = min(j + 1, n)
+        elif attrs[i] == "{":
+            bend = _scan_brace_end(attrs, i)
+            if bend is None:
+                break
+            inner = attrs[i + 1 : bend - 1].strip()
+            if key == "hidden" and inner in (
+                "true",
+                "'true'",
+                '"true"',
+                "''",
+                '""',
+                "'hidden'",
+                '"hidden"',
+                "'until-found'",
+                '"until-found"',
+            ):
+                return True
+            i = bend
+        else:
+            vm = re.match(r"\S+", attrs[i:])
+            val = vm.group(0) if vm else ""
+            if key == "hidden":
+                return True
+            if key in (":hidden", "v-bind:hidden") and val == "true":
+                return True
+            i += vm.end() if vm else 1
+    return False
+
+
 def _has_presentational_role(attrs: str) -> bool:
     """True when `role` is statically `presentation` or `none`, stripping implicit/ARIA naming."""
     return bool(
@@ -2815,7 +3105,7 @@ def _eval_element_own_name(
     prop_values: dict[str, str] | None,
 ) -> str | None:
     """Evaluate ARIA/`title`/`alt` accessible name attributes on an element as `named`, `opaque`, or `None`."""
-    if _is_aria_hidden_true(attrs) or _has_presentational_role(attrs):
+    if _is_aria_hidden_true(attrs) or _is_natively_hidden(attrs) or _has_presentational_role(attrs):
         return None
     attr_names = ("aria-label", "aria-labelledby", "title") + (("alt",) if allow_alt else ())
     saw_opaque = False
@@ -2920,7 +3210,7 @@ def _eval_injected_html_name(
     render_booleans_as_text: bool = False,
 ) -> str | None:
     """Classify `dangerouslySetInnerHTML`, `v-html`/`innerHTML`, or `v-text`/text bindings."""
-    if _is_aria_hidden_true(attrs) or _has_presentational_role(attrs):
+    if _is_aria_hidden_true(attrs) or _is_natively_hidden(attrs) or _has_presentational_role(attrs):
         return None
     md = re.search(r"(?<![\w$-])dangerouslySetInnerHTML\s*=\s*\{", attrs)
     if md:
@@ -3008,7 +3298,7 @@ def _classify_graphic_element(
     own_name = _eval_element_own_name(attrs, allow_alt=False, prop_values=prop_values)
     if own_name == "named":
         return "named", []
-    if inner_body and not _is_aria_hidden_true(attrs):
+    if inner_body and not (_is_aria_hidden_true(attrs) or _is_natively_hidden(attrs)):
         if tag_low == "i":
             cst, copaque, _ = _classify_markup_segment(
                 inner_body,
@@ -3028,7 +3318,7 @@ def _classify_graphic_element(
             child_opaque: list[str] = []
             for cm in _SVG_NAME_CHILD_RE.finditer(inner_body):
                 cattrs = cm.group("cattrs") or ""
-                if _is_aria_hidden_true(cattrs) or _has_presentational_role(cattrs):
+                if _is_aria_hidden_true(cattrs) or _is_natively_hidden(cattrs) or _has_presentational_role(cattrs):
                     continue
                 cst, copaque, _ = _classify_markup_segment(
                     cm.group("cbody") or "",
@@ -3418,7 +3708,7 @@ def scan_a11y_markup_findings(
 
     # 3. Icon-only or empty-label <button> without aria-label / aria-labelledby / title
     for m, attrs, end in _open_tags(raw_source, _BUTTON_OPEN_RE):
-        if attrs.rstrip().endswith("/"):
+        if attrs.rstrip().endswith("/") or _is_natively_hidden(attrs):
             continue
         if re.search(r"\b(?:aria-label|aria-labelledby|title)\s*=", attrs) or "{..." in attrs:
             continue
@@ -3479,7 +3769,7 @@ def scan_a11y_markup_findings(
     wrapped_spans, labeled_ids = _label_spans_and_targets(raw_source)
     for m, attrs, end in _open_tags(raw_source, _INPUT_OPEN_RE):
         tag = m.group("tag")
-        if _HIDDEN_INPUT_RE.search(attrs) or "{..." in attrs:
+        if _HIDDEN_INPUT_RE.search(attrs) or _is_natively_hidden(attrs) or "{..." in attrs:
             continue
         if re.search(r"\b(?:aria-label|aria-labelledby|title)\s*=", attrs):
             continue

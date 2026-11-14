@@ -1010,4 +1010,78 @@ def test_named_slot_fallback_v_text_nested_method_returns_and_linear_resolver_sc
     assert elapsed < 1.0, f"Resolver took {elapsed:.3f}s for 400 local usages"
 
 
+def test_bare_jsx_props_svelte_if_branches_and_native_hidden_a11y(
+    tmp_path: Path,
+) -> None:
+    """Verify bare boolean props, Svelte directives & `{#if}` branches, and native `hidden` attrs."""
+    from app.adapters.sveltekit_display import SvelteKitDisplayAdapter
+    from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+
+    tsx_root = tmp_path / "tsx_app"
+    put(
+        tsx_root,
+        "app/page.tsx",
+        "function Label({ text = 'Save' }: { text?: unknown }) {\n"
+        "  return <span>{text}</span>;\n"
+        "}\n"
+        "export function App() {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <button><Label /><svg /></button>\n"
+        "      <button><Label text=\"Save\" /><svg /></button>\n"
+        "      <button><Label text /><svg /></button>\n"
+        "      <button><span title=\"Show hidden\">Save</span></button>\n"
+        "      <button hidden><svg /></button>\n"
+        "      <button><span hidden>Save</span><svg /></button>\n"
+        "      <button><i hidden>Save</i><svg /></button>\n"
+        "      <button><svg hidden><title>Save</title></svg><svg /></button>\n"
+        "      <button><img hidden alt=\"Save\" /><svg /></button>\n"
+        "      <button><svg hidden><title>Save</title></svg></button>\n"
+        "      <input type=\"text\" hidden />\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    tsx_res = TypeScriptNextJsAdapter().extract(tsx_root, ".")
+    tsx_lines = sorted(f.line for f in tsx_res.findings if f.rule_code == "DISP-005")
+    assert tsx_lines == [9, 12, 13, 14, 15], tsx_res.findings
+
+    svelte_root = tmp_path / "svelte_app"
+    put(
+        svelte_root,
+        "src/lib/IfLabel.svelte",
+        "<script>\n"
+        "  export let show = false;\n"
+        "</script>\n"
+        "{#if show}<span>Save</span>{/if}<svg />\n",
+    )
+    put(
+        svelte_root,
+        "src/lib/DynBothLabel.svelte",
+        "<script>\n"
+        "  export let dynamicFlag;\n"
+        "</script>\n"
+        "{#if dynamicFlag}<span>Save</span>{:else}<span>Done</span>{/if}\n",
+    )
+    put(
+        svelte_root,
+        "src/routes/+page.svelte",
+        "<script>\n"
+        "  import IfLabel from '$lib/IfLabel.svelte';\n"
+        "  import DynBothLabel from '$lib/DynBothLabel.svelte';\n"
+        "  export let dynamicFlag;\n"
+        "</script>\n"
+        "<button on:click={() => {}}><IfLabel on:click={() => {}} /></button>\n"
+        "<button><IfLabel show /></button>\n"
+        "<button><DynBothLabel /></button>\n"
+        "<button>{#if false}<span>Save</span>{:else}<svg />{/if}</button>\n"
+        "<button>{#if dynamicFlag}<span>Save</span>{:else}<svg />{/if}</button>\n"
+        "<button>{#if dynamicFlag}<span>Save</span>{:else}<span>Done</span>{/if}</button>\n"
+        "<button><svg><title hidden>Save</title></svg></button>\n",
+    )
+    svelte_res = SvelteKitDisplayAdapter().extract(svelte_root, ".")
+    svelte_lines = sorted(f.line for f in svelte_res.findings if f.rule_code == "DISP-005")
+    assert svelte_lines == [6, 9, 12], svelte_res.findings
+
+
 
