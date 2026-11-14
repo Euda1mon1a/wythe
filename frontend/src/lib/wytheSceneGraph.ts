@@ -1,5 +1,13 @@
 import type { AtlasEdge, AtlasNode } from '@/api/atlas';
-import { evaluateEdgeVisual, type EdgeFilterMode } from './wytheSceneLenses';
+import {
+  deriveDomainCluster,
+  evaluateEdgeVisual,
+  type EdgeFilterMode,
+} from './wytheSceneLenses';
+import {
+  computeBoundaryCrossings,
+  type BoundaryCrossingsResult,
+} from './wytheWorkingSet';
 
 export type NeighborhoodHops = 0 | 1 | 2;
 
@@ -46,6 +54,10 @@ export interface SceneGraphFilters {
   coneIds: Set<string>;
   isolateCone: boolean;
   neighborhoodHops: NeighborhoodHops;
+  workingSetIds?: Set<string>;
+  workingSetActive?: boolean;
+  groupBy?: 'none' | 'subkind' | 'cluster';
+  collapsedGroups?: Set<string>;
 }
 
 /** No sampling: every matching node and connection is retained. */
@@ -56,14 +68,33 @@ export function selectSceneGraph(nodes: AtlasNode[], edges: AtlasEdge[], filters
     evaluateEdgeVisual(edge, filters.edgeFilter).visible,
   );
   const pinned = new Set(filters.traceIds);
-  if (filters.selectedId) pinned.add(filters.selectedId);
+  if (filters.selectedId && (!filters.workingSetActive || filters.workingSetIds?.has(filters.selectedId))) {
+    pinned.add(filters.selectedId);
+  }
   const query = filters.searchQuery.trim().toLowerCase();
+  const groupKeyFor = (node: AtlasNode) =>
+    filters.groupBy === 'subkind'
+      ? node.subkind
+      : filters.groupBy === 'cluster'
+        ? deriveDomainCluster(node)
+        : '';
+  let collapsedCount = 0;
   const matches = (node: AtlasNode) => {
+    if (filters.workingSetActive && !(filters.workingSetIds?.has(node.id) ?? false)) return false;
     if (filters.tier !== 'all' && node.tier !== filters.tier) return false;
     if (filters.subkind !== 'all' && node.subkind !== filters.subkind) return false;
     if (filters.onlyFlagged && node.status === 'clean') return false;
-    return !query || [node.label, node.source_file, ...(node.columns ?? []), ...(node.http_paths ?? [])]
-      .some((text) => text.toLowerCase().includes(query));
+    if (query && ![node.label, node.source_file, ...(node.columns ?? []), ...(node.http_paths ?? [])]
+      .some((text) => text.toLowerCase().includes(query))) return false;
+    if (
+      filters.groupBy &&
+      filters.groupBy !== 'none' &&
+      filters.collapsedGroups?.has(groupKeyFor(node))
+    ) {
+      collapsedCount += 1;
+      return false;
+    }
+    return true;
   };
   const matchingIds = new Set(nodes.filter(matches).map((node) => node.id));
   const candidateIds = new Set([...matchingIds, ...pinned]);
@@ -81,6 +112,12 @@ export function selectSceneGraph(nodes: AtlasNode[], edges: AtlasEdge[], filters
   // No pin exception here: "Connected only" must mean an edge exists in this view.
   // A self-loop counts; a dangling edge to an absent endpoint does not.
   if (filters.connectedOnly) shown = shown.filter((node) => connected.has(node.id));
+  const finalIds = new Set(shown.map((node) => node.id));
+  const boundaryCrossings: BoundaryCrossingsResult = computeBoundaryCrossings(
+    filters.workingSetActive && filters.workingSetIds ? filters.workingSetIds : finalIds,
+    nodes,
+    eligibleEdges,
+  );
   const counts = { display: 0, manipulate: 0, truth: 0 };
   for (const node of shown) counts[node.tier] += 1;
   return {
@@ -88,7 +125,9 @@ export function selectSceneGraph(nodes: AtlasNode[], edges: AtlasEdge[], filters
     edges: shownEdges,
     counts,
     hiddenCount: nodes.length - shown.length,
+    collapsedCount,
     disconnectedCount,
     pinnedExtraCount: shown.filter((node) => !matchingIds.has(node.id)).length,
+    boundaryCrossings,
   };
 }

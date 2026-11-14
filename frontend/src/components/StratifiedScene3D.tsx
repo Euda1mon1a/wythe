@@ -14,12 +14,16 @@ import {
   evaluateNodeVisual,
   getEdgeVerificationLegendItems,
   getLensLegendItems,
+  SCENE_LAYOUT_DISTANCE_NOTES,
   SCENE_LENS_LABELS,
   type DiffOverlaySet,
   type EdgeFilterMode,
   type SceneLayoutMode,
   type SceneLens,
 } from '@/lib/wytheSceneLenses';
+import {
+  computeGroupSummaries,
+} from '@/lib/wytheWorkingSet';
 import {
   WYTHE_PRESETS,
   type PolygonRenderMode,
@@ -45,6 +49,13 @@ interface StratifiedScene3DProps {
   edgeFilter?: EdgeFilterMode;
   lens?: SceneLens;
   layoutMode?: SceneLayoutMode;
+  compactVisible?: boolean;
+  flatten2D?: boolean;
+  workingSetIds?: Set<string>;
+  workingSetActive?: boolean;
+  groupBy?: 'none' | 'subkind' | 'cluster';
+  collapsedGroups?: Set<string>;
+  pinnedPositions?: Record<string, [number, number, number]>;
   diffOverlay?: DiffOverlaySet | null;
   activeTraceChain?: EndToEndChain | null;
   onlyFlagged: boolean;
@@ -80,6 +91,12 @@ interface StratifiedScene3DProps {
   onRegisterLiveCapture?: (fn: () => string | null) => void;
   onOpenAskAi?: () => void;
   onSelectNode: (nodeId: string | null) => void;
+  onToggleWorkingSetNode?: (nodeId: string) => void;
+  onToggleCollapseGroup?: (groupKey: string) => void;
+  onExpandBoundary?: (neighborIds: string[]) => void;
+  onTogglePinNode?: (nodeId: string, pos?: [number, number, number]) => void;
+  onResetOverview?: () => void;
+  onVisibleNodeIdsChange?: (ids: string[]) => void;
 }
 
 interface HoverTip {
@@ -104,15 +121,49 @@ function disposeGroupContents(group: THREE.Group) {
       seenGeos.add(meshOrLine.geometry);
     }
     const mat = meshOrLine.material;
+    const disposeMat = (m: THREE.Material) => {
+      const spriteMat = m as THREE.SpriteMaterial;
+      if (spriteMat.map) spriteMat.map.dispose();
+      seenMats.add(m);
+    };
     if (Array.isArray(mat)) {
-      mat.forEach((m) => seenMats.add(m));
+      mat.forEach(disposeMat);
     } else if (mat) {
-      seenMats.add(mat);
+      disposeMat(mat);
     }
   });
   group.clear();
   seenGeos.forEach((g) => g.dispose());
   seenMats.forEach((m) => m.dispose());
+}
+
+function createGroupBillboardSprite(label: string, accentHex: string): THREE.Sprite | null {
+  if (typeof document === 'undefined') return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = 384;
+  canvas.height = 72;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+  ctx.strokeStyle = accentHex;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.roundRect(6, 8, canvas.width - 12, canvas.height - 16, 10);
+  ctx.fill();
+  ctx.stroke();
+  ctx.font = 'bold 24px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const clipped = label.length > 26 ? `${label.slice(0, 23)}...` : label;
+  ctx.fillText(clipped, canvas.width / 2, canvas.height / 2 + 1);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(11.5, 2.2, 1);
+  return sprite;
 }
 
 export function StratifiedScene3D({
@@ -127,6 +178,13 @@ export function StratifiedScene3D({
   edgeFilter = 'all',
   lens = 'status',
   layoutMode = 'cluster',
+  compactVisible = false,
+  flatten2D = false,
+  workingSetIds,
+  workingSetActive = false,
+  groupBy = 'none',
+  collapsedGroups,
+  pinnedPositions,
   diffOverlay = null,
   activeTraceChain = null,
   onlyFlagged,
@@ -150,6 +208,12 @@ export function StratifiedScene3D({
   onRegisterLiveCapture,
   onOpenAskAi,
   onSelectNode,
+  onToggleWorkingSetNode,
+  onToggleCollapseGroup,
+  onExpandBoundary,
+  onTogglePinNode,
+  onResetOverview,
+  onVisibleNodeIdsChange,
 }: StratifiedScene3DProps) {
   const activePalette = palette ?? WYTHE_PRESETS.stratified[polarity];
   const containerRef = useRef<HTMLDivElement>(null);
@@ -173,10 +237,11 @@ export function StratifiedScene3D({
   const traceWaypointsRef = useRef<THREE.Vector3[]>([]);
   const selectedNodeIdRef = useRef<string | null>(selectedNodeId);
   const onSelectNodeRef = useRef(onSelectNode);
-
+  const onToggleWorkingSetNodeRef = useRef(onToggleWorkingSetNode);
 
   selectedNodeIdRef.current = selectedNodeId;
   onSelectNodeRef.current = onSelectNode;
+  onToggleWorkingSetNodeRef.current = onToggleWorkingSetNode;
 
 
   const syncCameraTelemetry = useCallback(() => {
@@ -275,17 +340,74 @@ export function StratifiedScene3D({
 
   const traceHopSet = useMemo(() => new Set(traceHopIds), [traceHopIds]);
 
-  const graph = useMemo(() => selectSceneGraph(nodes, edges, {
+  const effectiveGroupBy: 'none' | 'subkind' | 'cluster' =
+    groupBy !== 'none'
+      ? groupBy
+      : layoutMode === 'subkind'
+        ? 'subkind'
+        : layoutMode === 'cluster'
+          ? 'cluster'
+          : 'none';
+
+  const preCollapseGraph = useMemo(() => selectSceneGraph(nodes, edges, {
     tier: tierFilter, subkind: subkindFilter, edgeFilter, onlyFlagged, connectedOnly,
     searchQuery, selectedId: selectedNodeId, traceIds: traceHopSet, coneIds: coneNodeIds,
-    isolateCone, neighborhoodHops,
+    isolateCone, neighborhoodHops, workingSetIds, workingSetActive,
   }), [nodes, edges, tierFilter, subkindFilter, edgeFilter, onlyFlagged, connectedOnly,
-    searchQuery, selectedNodeId, traceHopSet, coneNodeIds, isolateCone, neighborhoodHops]);
-  const { nodes: visibleNodes, edges: visibleEdges, counts: visibleByTier } = graph;
+    searchQuery, selectedNodeId, traceHopSet, coneNodeIds, isolateCone, neighborhoodHops,
+    workingSetIds, workingSetActive]);
 
-  // Filtering and camera motion never repack the map: only a layout/source change does.
-  const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
-  const positions = useMemo(() => computeScenePositions(nodes, layoutMode), [nodes, layoutMode]);
+  const graph = useMemo(() => {
+    if (effectiveGroupBy === 'none' || !collapsedGroups || collapsedGroups.size === 0) {
+      return preCollapseGraph;
+    }
+    return selectSceneGraph(nodes, edges, {
+      tier: tierFilter, subkind: subkindFilter, edgeFilter, onlyFlagged, connectedOnly,
+      searchQuery, selectedId: selectedNodeId, traceIds: traceHopSet, coneIds: coneNodeIds,
+      isolateCone, neighborhoodHops, workingSetIds, workingSetActive,
+      groupBy: effectiveGroupBy, collapsedGroups,
+    });
+  }, [preCollapseGraph, nodes, edges, tierFilter, subkindFilter, edgeFilter, onlyFlagged, connectedOnly,
+    searchQuery, selectedNodeId, traceHopSet, coneNodeIds, isolateCone, neighborhoodHops,
+    workingSetIds, workingSetActive, effectiveGroupBy, collapsedGroups]);
+
+  const { nodes: visibleNodes, edges: visibleEdges, counts: visibleByTier } = graph;
+  const visibleNodeIdList = useMemo(() => visibleNodes.map((n) => n.id), [visibleNodes]);
+  useEffect(() => {
+    onVisibleNodeIdsChange?.(visibleNodeIdList);
+  }, [visibleNodeIdList, onVisibleNodeIdsChange]);
+
+  const groupSummaries = useMemo(() => {
+    if (effectiveGroupBy === 'none') return [];
+    return computeGroupSummaries(
+      preCollapseGraph.nodes,
+      effectiveGroupBy,
+      collapsedGroups ?? new Set<string>(),
+    );
+  }, [preCollapseGraph.nodes, effectiveGroupBy, collapsedGroups]);
+
+  // Filtering and camera motion never repack the map: only explicit compaction/layout/source change does.
+  const visibleNodeIds = useMemo(() => new Set(visibleNodeIdList), [visibleNodeIdList]);
+  const positionInputNodes = useMemo(
+    () => (compactVisible ? visibleNodes : nodes),
+    [compactVisible, visibleNodes, nodes],
+  );
+  const positions = useMemo(
+    () =>
+      computeScenePositions(positionInputNodes, layoutMode, {
+        edges,
+        flatten2D,
+        pinnedPositions,
+      }),
+    [positionInputNodes, layoutMode, edges, flatten2D, pinnedPositions],
+  );
+  const fitSignature = useMemo(
+    () =>
+      `${nodes.length}|${layoutMode}|${compactVisible ? 1 : 0}|${flatten2D ? 1 : 0}|${
+        compactVisible ? visibleNodeIdList.join(',') : ''
+      }`,
+    [nodes.length, layoutMode, compactVisible, flatten2D, visibleNodeIdList],
+  );
 
   const nodesById = useMemo(() => {
     const m = new Map<string, AtlasNode>();
@@ -482,6 +604,11 @@ export function StratifiedScene3D({
       const hit = hitTest(ev as unknown as PointerEvent);
       const curSelected = selectedNodeIdRef.current;
       if (hit) {
+        if ((ev.shiftKey || ev.metaKey || ev.ctrlKey) && onToggleWorkingSetNodeRef.current) {
+          onToggleWorkingSetNodeRef.current(hit.id);
+          onSelectNodeRef.current(hit.id);
+          return;
+        }
         onSelectNodeRef.current(hit.id === curSelected ? null : hit.id);
       } else if (curSelected !== null) {
         onSelectNodeRef.current(null);
@@ -510,7 +637,7 @@ export function StratifiedScene3D({
         const segIdx = Math.min(segCount - 1, Math.floor(progress));
         const alpha = progress - segIdx;
         packetGroup.position.lerpVectors(wps[segIdx], wps[segIdx + 1], alpha);
-        const pulse = 1.0 + 0.22 * Math.sin(elapsed * 5.0);
+        const pulse = prefersReducedMotion ? 1.0 : 1.0 + 0.22 * Math.sin(elapsed * 5.0);
         packetHalo.scale.setScalar(pulse);
       } else {
         packetGroup.visible = false;
@@ -548,23 +675,24 @@ export function StratifiedScene3D({
     };
   }, [syncCameraTelemetry]);
 
-  // Fit on a new map/layout or an explicit request, never on selection/filter changes.
-  const lastFitRef = useRef<{ positions: typeof positions; serial: number } | null>(null);
+  // Fit on a new map/layout/compaction/2D transition or an explicit request, never on selection/pin/lens changes.
+  const lastFitRef = useRef<{ signature: string; serial: number } | null>(null);
   useEffect(() => {
-    if (lastFitRef.current?.positions === positions && lastFitRef.current?.serial === fitSerial) return;
+    if (lastFitRef.current?.signature === fitSignature && lastFitRef.current?.serial === fitSerial) return;
     const cam = cameraRef.current;
     const ctrl = controlsRef.current;
     if (!cam || !ctrl) return;
-    const points = visibleNodes.flatMap((node) => {
+    const sourceNodes = visibleNodes.length > 0 ? visibleNodes : nodes;
+    const points = sourceNodes.flatMap((node) => {
       const position = positions.get(node.id);
       return position ? [position] : [];
     });
     ctrl.target.copy(fitGraphCamera(cam, points));
     ctrl.maxDistance = cam.far / 2;
     ctrl.update();
-    lastFitRef.current = { positions, serial: fitSerial };
+    lastFitRef.current = { signature: fitSignature, serial: fitSerial };
     syncCameraTelemetry();
-  }, [fitSerial, positions, visibleNodes, syncCameraTelemetry]);
+  }, [fitSerial, fitSignature, positions, visibleNodes, nodes, syncCameraTelemetry]);
 
   // 3. Scene-Content Sync: updates meshes/lines/planes WITHOUT moving camera or OrbitControls!
   useEffect(() => {
@@ -586,12 +714,15 @@ export function StratifiedScene3D({
     const planeDepth = bounds.isEmpty() ? 86 : Math.max(30, bounds.max.z - bounds.min.z + 12);
     const planeCenter = bounds.isEmpty() ? new THREE.Vector3() : bounds.getCenter(new THREE.Vector3());
 
-    // Reference planes
-    for (const [y, tintHex] of [
-      [18, activePalette.display],
-      [0, activePalette.manipulate],
-      [-18, activePalette.truth],
-    ] as const) {
+    // Reference planes (collapse to single y=0 working plane in flatten2D mode)
+    const planeDefs: ReadonlyArray<readonly [number, string]> = flatten2D
+      ? ([[0, activePalette.manipulate]] as const)
+      : ([
+          [18, activePalette.display],
+          [0, activePalette.manipulate],
+          [-18, activePalette.truth],
+        ] as const);
+    for (const [y, tintHex] of planeDefs) {
       const tint = new THREE.Color(tintHex);
       const planeGeo = new THREE.PlaneGeometry(planeWidth, planeDepth);
       const planeMat = new THREE.MeshBasicMaterial({
@@ -679,6 +810,40 @@ export function StratifiedScene3D({
     }
     contentGroup.add(createBatchedEdges(renderEdges));
 
+    if (effectiveGroupBy !== 'none' && groupSummaries.length > 0 && groupSummaries.length <= 25) {
+      const accum = new Map<string, { sx: number; maxY: number; sz: number; count: number }>();
+      for (const n of preCollapseGraph.nodes) {
+        const p = positions.get(n.id);
+        if (!p) continue;
+        const key = effectiveGroupBy === 'cluster' ? deriveDomainCluster(n) : n.subkind;
+        const cur = accum.get(key) ?? { sx: 0, maxY: -Infinity, sz: 0, count: 0 };
+        cur.sx += p[0];
+        cur.maxY = Math.max(cur.maxY, p[1]);
+        cur.sz += p[2];
+        cur.count += 1;
+        accum.set(key, cur);
+      }
+      for (const g of groupSummaries) {
+        const acc = accum.get(g.key);
+        if (!acc || acc.count === 0) continue;
+        const label = g.collapsed
+          ? `${g.key} (${g.count} collapsed)`
+          : `${g.key} (${g.count})`;
+        const sprite = createGroupBillboardSprite(
+          label,
+          g.collapsed ? '#f59e0b' : activePalette.manipulate,
+        );
+        if (sprite) {
+          sprite.position.set(
+            acc.sx / acc.count,
+            flatten2D ? 2.6 : acc.maxY + 3.4,
+            acc.sz / acc.count,
+          );
+          contentGroup.add(sprite);
+        }
+      }
+    }
+
     // Active Request Trace Waypoints + Golden Trajectory Beam
     const wps: THREE.Vector3[] = [];
     for (const id of traceHopIds.every((id) => visibleNodeIds.has(id)) ? traceHopIds : []) {
@@ -715,6 +880,10 @@ export function StratifiedScene3D({
     mutatorNodeIds,
     traceHopIds,
     traceHopSet,
+    flatten2D,
+    effectiveGroupBy,
+    preCollapseGraph.nodes,
+    groupSummaries,
     syncCameraTelemetry,
   ]);
 
@@ -931,27 +1100,83 @@ export function StratifiedScene3D({
 
       {/* Stratum Labels */}
       <div className="pointer-events-none absolute left-4 top-4 space-y-1.5 font-mono text-[11px]">
-        <div className="flex items-center gap-2 text-blue-300">
-          <span className="inline-block h-2 w-2" style={{ backgroundColor: activePalette.display }} />
-          <span>
-            TOP PLANE · FRONTEND DISPLAY ({polygonMode === 'atomic' ? 'Hex-12' : 'Boxes'} · {visibleByTier.display})
-          </span>
-        </div>
-        <div className="flex items-center gap-2 text-sky-300">
-          <span className="inline-block h-2 w-2 rotate-45" style={{ backgroundColor: activePalette.manipulate }} />
-          <span>
-            MID PLANE · BACKEND MANIPULATION ({polygonMode === 'atomic' ? 'Octa-8 / Solver-20' : 'Octahedra'} · {visibleByTier.manipulate})
-          </span>
-        </div>
-        <div className="flex items-center gap-2 text-teal-300">
-          <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: activePalette.truth }} />
-          <span>
-            BEDROCK · SQL TRUTH, GUARDS &amp; QUEUES ({polygonMode === 'atomic' ? 'Icosa-20 / Guard-8' : 'Cylinders'} · {visibleByTier.truth})
-          </span>
-        </div>
-        <div className="mt-2 w-fit border border-slate-700 bg-slate-950/90 px-2 py-1 text-slate-200" aria-live="polite">
-          <div>{visibleNodes.length.toLocaleString()} / {nodes.length.toLocaleString()} nodes · {visibleEdges.length.toLocaleString()} connections · {graph.hiddenCount.toLocaleString()} hidden by filters</div>
+        {flatten2D ? (
+          <div className="flex items-center gap-2 text-teal-300">
+            <span className="inline-block h-2 w-2" style={{ backgroundColor: activePalette.manipulate }} />
+            <span>
+              2D WORKING PLANE · Y=0 ({polygonMode === 'atomic' ? 'Hex-12' : 'Boxes'} · {visibleNodes.length})
+            </span>
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center gap-2 text-blue-300">
+              <span className="inline-block h-2 w-2" style={{ backgroundColor: activePalette.display }} />
+              <span>
+                TOP PLANE · FRONTEND DISPLAY ({polygonMode === 'atomic' ? 'Hex-12' : 'Boxes'} · {visibleByTier.display})
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-sky-300">
+              <span className="inline-block h-2 w-2 rotate-45" style={{ backgroundColor: activePalette.manipulate }} />
+              <span>
+                MID PLANE · BACKEND MANIPULATION ({polygonMode === 'atomic' ? 'Octa-8 / Solver-20' : 'Octahedra'} · {visibleByTier.manipulate})
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-teal-300">
+              <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: activePalette.truth }} />
+              <span>
+                BEDROCK · SQL TRUTH, GUARDS &amp; QUEUES ({polygonMode === 'atomic' ? 'Icosa-20 / Guard-8' : 'Cylinders'} · {visibleByTier.truth})
+              </span>
+            </div>
+          </>
+        )}
+        <div className="mt-2 max-w-lg border border-slate-700 bg-slate-950/90 px-2 py-1 text-slate-200" aria-live="polite">
+          <div>
+            {visibleNodes.length.toLocaleString()} / {nodes.length.toLocaleString()} nodes · {visibleEdges.length.toLocaleString()} connections · {graph.hiddenCount.toLocaleString()} hidden by filters
+            {graph.collapsedCount > 0 ? ` (${graph.collapsedCount.toLocaleString()} collapsed)` : ''}
+          </div>
           <div className="text-slate-400">In view: {renderStats.overview.toLocaleString()} dots + {renderStats.detailed.toLocaleString()} detailed · zoom in for detail</div>
+          <div className="text-[10px] text-slate-400">{SCENE_LAYOUT_DISTANCE_NOTES[layoutMode]}</div>
+          {workingSetActive && (
+            <div className="pointer-events-auto mt-1 flex flex-wrap items-center gap-2 text-[10px] text-teal-200">
+              <span>
+                Working set active ({workingSetIds?.size ?? 0} nodes{compactVisible ? ', compacted' : ''})
+              </span>
+              {graph.boundaryCrossings.crossingEdges.length > 0 && onExpandBoundary && (
+                <button
+                  type="button"
+                  onClick={() => onExpandBoundary(graph.boundaryCrossings.externalNeighborIds)}
+                  aria-label="Expand working set along boundary connections"
+                  className="border border-teal-500/40 bg-teal-950/80 px-1.5 py-0.5 text-teal-100 hover:border-teal-300"
+                >
+                  {graph.boundaryCrossings.crossingEdges.length} boundary links · +Expand (+{graph.boundaryCrossings.externalNeighborIds.length})
+                </button>
+              )}
+            </div>
+          )}
+          {effectiveGroupBy !== 'none' && groupSummaries.length > 0 && onToggleCollapseGroup && (
+            <div className="pointer-events-auto mt-1.5 flex flex-wrap items-center gap-1">
+              {groupSummaries.slice(0, 8).map((g) => (
+                <button
+                  key={g.key}
+                  type="button"
+                  onClick={() => onToggleCollapseGroup(g.key)}
+                  aria-expanded={!g.collapsed}
+                  aria-label={`${g.collapsed ? 'Expand' : 'Collapse'} ${effectiveGroupBy} group ${g.key}`}
+                  className={`border px-1.5 py-0.5 text-[10px] ${
+                    g.collapsed
+                      ? 'border-amber-500/50 bg-amber-950/70 text-amber-200'
+                      : 'border-slate-600 bg-slate-900/90 text-slate-200 hover:border-teal-400'
+                  }`}
+                >
+                  {g.collapsed ? '[+] ' : '[-] '}
+                  {g.key} ({g.count}{g.flaggedCount > 0 ? `, ${g.flaggedCount}!` : ''})
+                </button>
+              ))}
+              {groupSummaries.length > 8 && (
+                <span className="text-[10px] text-slate-400">+{groupSummaries.length - 8} more</span>
+              )}
+            </div>
+          )}
           {graph.pinnedExtraCount > 0 && <div className="text-sky-300">Includes {graph.pinnedExtraCount} selected / traced nodes outside other filters</div>}
           {selectedNodeId && !visibleNodeIds.has(selectedNodeId) && <div className="text-amber-300">Selected node has no connection in this view and is hidden</div>}
         </div>
@@ -1108,6 +1333,38 @@ export function StratifiedScene3D({
           )}
           {selectedNodeId && (
             <>
+              {onToggleWorkingSetNode && (
+                <button
+                  type="button"
+                  onClick={() => onToggleWorkingSetNode(selectedNodeId)}
+                  aria-label={workingSetIds?.has(selectedNodeId) ? 'Remove selected node from working set' : 'Add selected node to working set'}
+                  className={`border px-2.5 py-1 font-mono text-xs ${
+                    workingSetIds?.has(selectedNodeId)
+                      ? 'border-teal-400/60 bg-teal-950/80 text-teal-200'
+                      : 'border-slate-600 bg-slate-900/90 text-slate-200 hover:border-teal-400'
+                  }`}
+                >
+                  {workingSetIds?.has(selectedNodeId) ? 'In Set ✓' : '+ Set'}
+                </button>
+              )}
+              {onTogglePinNode && (
+                <button
+                  type="button"
+                  onClick={() => onTogglePinNode(selectedNodeId, positions.get(selectedNodeId))}
+                  aria-label={
+                    pinnedPositions && selectedNodeId in pinnedPositions
+                      ? 'Unpin selected node position'
+                      : 'Pin selected node position across layout changes'
+                  }
+                  className={`border px-2.5 py-1 font-mono text-xs ${
+                    pinnedPositions && selectedNodeId in pinnedPositions
+                      ? 'border-amber-400/60 bg-amber-950/80 text-amber-200'
+                      : 'border-slate-600 bg-slate-900/90 text-slate-200 hover:border-amber-400'
+                  }`}
+                >
+                  {pinnedPositions && selectedNodeId in pinnedPositions ? 'Pinned ★' : 'Pin'}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={centerCameraOnSelected}
@@ -1128,6 +1385,17 @@ export function StratifiedScene3D({
               </button>
             </>
           )}
+          {onResetOverview &&
+            (workingSetActive || compactVisible || flatten2D || (collapsedGroups?.size ?? 0) > 0 || Object.keys(pinnedPositions ?? {}).length > 0) && (
+              <button
+                type="button"
+                onClick={onResetOverview}
+                aria-label="Reset working set and layout overrides to full overview"
+                className="border border-slate-600 bg-slate-900/90 px-2.5 py-1 font-mono text-xs text-slate-200 hover:border-teal-400"
+              >
+                Reset overview
+              </button>
+            )}
           <button
             type="button"
             onClick={() => stepSelection(-1)}

@@ -2,7 +2,30 @@ import type { AtlasEdge, AtlasNode } from '@/api/atlas';
 import type { WythePaletteColors } from '@/lib/wytheTheme';
 
 export type SceneLens = 'status' | 'contention' | 'gravity' | 'subkind' | 'cluster';
-export type SceneLayoutMode = 'cluster' | 'grid';
+export type SceneLayoutMode = 'cluster' | 'grid' | 'subkind' | 'connected';
+
+export const SCENE_LAYOUT_LABELS: Record<SceneLayoutMode, string> = {
+  cluster: 'Domain Districts',
+  grid: 'Uniform Grid',
+  subkind: 'Kind Groups',
+  connected: 'Connected Components',
+};
+
+export const SCENE_LAYOUT_DISTANCE_NOTES: Record<SceneLayoutMode, string> = {
+  cluster: 'Distances group inferred domain districts across tiers; not edge coupling.',
+  grid: 'Distances pack tiers alphabetically in rows; not edge proximity.',
+  subkind: 'Distances group nodes by subkind across tiers; not runtime call flow.',
+  connected:
+    'Deterministic spring heuristic pulls linked nodes closer and packs singletons separately; illustrative only.',
+};
+
+export interface ScenePositionOptions {
+  edges?: AtlasEdge[];
+  flatten2D?: boolean;
+  pinnedPositions?:
+    | ReadonlyMap<string, [number, number, number]>
+    | Record<string, [number, number, number]>;
+}
 export type EdgeLinePattern = 'solid' | 'dashed' | 'dotted' | 'broken_gap';
 export type EdgeFilterMode =
   | 'all'
@@ -128,45 +151,32 @@ export function clusterColorHex(clusterName: string): string {
   return CLUSTER_PALETTE[Math.abs(h) % CLUSTER_PALETTE.length];
 }
 
-export function computeScenePositions(
+const TIER_ORDER: Record<AtlasNode['tier'], number> = { display: 0, manipulate: 1, truth: 2 };
+
+function packGroupedDistricts(
   nodes: AtlasNode[],
-  layoutMode: SceneLayoutMode,
+  keyFn: (node: AtlasNode) => string,
+  orderedKeys: string[] | null,
+  flatten2D: boolean,
+  yForNode: (node: AtlasNode) => number,
 ): Map<string, [number, number, number]> {
   const map = new Map<string, [number, number, number]>();
-  const yForNode = (n: AtlasNode) =>
-    n.subkind === 'sql_function' ? -15.2 : TIER_BASE_Y[n.tier];
-
-  if (layoutMode === 'grid') {
-    for (const tier of ['display', 'manipulate', 'truth'] as const) {
-      const list = nodes.filter((n) => n.tier === tier).sort((a, b) => a.id.localeCompare(b.id));
-      const count = list.length;
-      const cols = Math.max(1, Math.ceil(Math.sqrt(count * 1.5)));
-      const rows = Math.max(1, Math.ceil(count / cols));
-      const sp = count > 180 ? 2.8 : count > 50 ? 4.2 : 6.5;
-      list.forEach((n, idx) => {
-        const r = Math.floor(idx / cols);
-        const c = idx % cols;
-        const jit = ((idx * 7) % 5) * 0.14;
-        map.set(n.id, [(c - (cols - 1) / 2) * sp + jit, yForNode(n), (r - (rows - 1) / 2) * sp - jit]);
-      });
-    }
-    return map;
-  }
-
-  // Domain Cluster Layout: shared (anchorX, anchorZ) districts across all 3 strata
-  const clusterTotals = new Map<string, number>();
-  const nodeCluster = new Map<string, string>();
+  const totals = new Map<string, number>();
+  const nodeKey = new Map<string, string>();
   for (const n of nodes) {
-    const cl = deriveDomainCluster(n);
-    nodeCluster.set(n.id, cl);
-    clusterTotals.set(cl, (clusterTotals.get(cl) ?? 0) + 1);
+    const key = keyFn(n);
+    nodeKey.set(n.id, key);
+    totals.set(key, (totals.get(key) ?? 0) + 1);
   }
-  const allDistricts = [...clusterTotals.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .map(([name]) => name);
+  const allDistricts = orderedKeys
+    ? orderedKeys.filter((k) => (totals.get(k) ?? 0) > 0)
+    : [...totals.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .map(([name]) => name);
+
   const groups = new Map<string, Map<AtlasNode['tier'], AtlasNode[]>>();
   for (const node of nodes) {
-    const district = nodeCluster.get(node.id)!;
+    const district = nodeKey.get(node.id)!;
     if (!groups.has(district)) groups.set(district, new Map());
     const tiers = groups.get(district)!;
     if (!tiers.has(node.tier)) tiers.set(node.tier, []);
@@ -181,28 +191,53 @@ export function computeScenePositions(
   const widths = Array<number>(dCols).fill(0);
   const depths = Array<number>(dRows).fill(0);
   allDistricts.forEach((district, index) => {
-    for (const group of groups.get(district)!.values()) {
-      const { cols, rows, cell } = dimensions(group.length);
+    if (flatten2D) {
+      const { cols, rows, cell } = dimensions(totals.get(district) ?? 0);
       widths[index % dCols] = Math.max(widths[index % dCols], cols * cell + 8);
       depths[Math.floor(index / dCols)] = Math.max(depths[Math.floor(index / dCols)], rows * cell + 8);
+    } else {
+      for (const group of groups.get(district)!.values()) {
+        const { cols, rows, cell } = dimensions(group.length);
+        widths[index % dCols] = Math.max(widths[index % dCols], cols * cell + 8);
+        depths[Math.floor(index / dCols)] = Math.max(depths[Math.floor(index / dCols)], rows * cell + 8);
+      }
     }
   });
   const centers = (sizes: number[]) => {
     let cursor = -sizes.reduce((a, b) => a + b, 0) / 2;
-    return sizes.map((size) => { const center = cursor + size / 2; cursor += size; return center; });
+    return sizes.map((size) => {
+      const center = cursor + size / 2;
+      cursor += size;
+      return center;
+    });
   };
   const xs = centers(widths);
   const zs = centers(depths);
-  const anchors = new Map(allDistricts.map((district, index) =>
-    [district, [xs[index % dCols], zs[Math.floor(index / dCols)]]] as const,
-  ));
+  const anchors = new Map(
+    allDistricts.map((district, index) => [district, [xs[index % dCols], zs[Math.floor(index / dCols)]]] as const),
+  );
+
+  if (flatten2D) {
+    for (const dKey of allDistricts) {
+      const [ax, az] = anchors.get(dKey) ?? [0, 0];
+      const allInGroup = [...(groups.get(dKey)?.values() ?? [])]
+        .flat()
+        .sort((a, b) => TIER_ORDER[a.tier] - TIER_ORDER[b.tier] || a.id.localeCompare(b.id));
+      const { cols: gCols, rows: gRows, cell } = dimensions(allInGroup.length);
+      allInGroup.forEach((n, idx) => {
+        const r = Math.floor(idx / gCols);
+        const c = idx % gCols;
+        map.set(n.id, [ax + (c - (gCols - 1) / 2) * cell, 0, az + (r - (gRows - 1) / 2) * cell]);
+      });
+    }
+    return map;
+  }
 
   for (const tier of ['display', 'manipulate', 'truth'] as const) {
     const tierNodes = nodes.filter((n) => n.tier === tier);
     const byDistrict = new Map<string, AtlasNode[]>();
     for (const n of tierNodes) {
-      const raw = nodeCluster.get(n.id) ?? 'core';
-      const key = raw;
+      const key = nodeKey.get(n.id) ?? 'core';
       const arr = byDistrict.get(key) ?? [];
       arr.push(n);
       byDistrict.set(key, arr);
@@ -214,10 +249,283 @@ export function computeScenePositions(
       group.forEach((n, idx) => {
         const r = Math.floor(idx / gCols);
         const c = idx % gCols;
-        const lx = (c - (gCols - 1) / 2) * cell;
-        const lz = (r - (gRows - 1) / 2) * cell;
-        map.set(n.id, [ax + lx, yForNode(n), az + lz]);
+        map.set(n.id, [
+          ax + (c - (gCols - 1) / 2) * cell,
+          yForNode(n),
+          az + (r - (gRows - 1) / 2) * cell,
+        ]);
       });
+    }
+  }
+  return map;
+}
+
+function layoutConnectedComponents(
+  nodes: AtlasNode[],
+  edges: AtlasEdge[],
+  flatten2D: boolean,
+  yForNode: (node: AtlasNode) => number,
+): Map<string, [number, number, number]> {
+  const map = new Map<string, [number, number, number]>();
+  const sorted = [...nodes].sort((a, b) => a.id.localeCompare(b.id));
+  const byId = new Map(sorted.map((n) => [n.id, n]));
+  const adj = new Map<string, string[]>();
+  for (const n of sorted) adj.set(n.id, []);
+  for (const e of edges) {
+    if (e.source_id === e.target_id) continue;
+    if (!byId.has(e.source_id) || !byId.has(e.target_id)) continue;
+    adj.get(e.source_id)!.push(e.target_id);
+    adj.get(e.target_id)!.push(e.source_id);
+  }
+  for (const list of adj.values()) list.sort();
+
+  const visited = new Set<string>();
+  const components: AtlasNode[][] = [];
+  const singletons: AtlasNode[] = [];
+  for (const seed of sorted) {
+    if (visited.has(seed.id)) continue;
+    const comp: AtlasNode[] = [];
+    const queue = [seed.id];
+    visited.add(seed.id);
+    for (let qi = 0; qi < queue.length; qi += 1) {
+      const cur = queue[qi];
+      comp.push(byId.get(cur)!);
+      for (const nxt of adj.get(cur) ?? []) {
+        if (!visited.has(nxt)) {
+          visited.add(nxt);
+          queue.push(nxt);
+        }
+      }
+    }
+    if (comp.length <= 1) singletons.push(comp[0]);
+    else components.push(comp);
+  }
+  components.sort((a, b) => b.length - a.length || a[0].id.localeCompare(b[0].id));
+
+  interface Box {
+    items: Array<{ node: AtlasNode; lx: number; lz: number }>;
+    width: number;
+    depth: number;
+  }
+  const boxes: Box[] = [];
+  const idealDist = 3.2;
+  const minDist = 3.2;
+
+  for (const comp of components) {
+    const n = comp.length;
+    const root = [...comp].sort(
+      (a, b) => (adj.get(b.id)?.length ?? 0) - (adj.get(a.id)?.length ?? 0) || a.id.localeCompare(b.id),
+    )[0];
+    const bfsOrder: Array<{ id: string; depth: number }> = [];
+    const seen = new Set<string>([root.id]);
+    const bfsQ: Array<{ id: string; depth: number }> = [{ id: root.id, depth: 0 }];
+    for (let qi = 0; qi < bfsQ.length; qi += 1) {
+      const item = bfsQ[qi];
+      bfsOrder.push(item);
+      for (const nxt of adj.get(item.id) ?? []) {
+        if (seen.has(nxt)) continue;
+        seen.add(nxt);
+        bfsQ.push({ id: nxt, depth: item.depth + 1 });
+      }
+    }
+    const ringCounts = new Map<number, number>();
+    const ringIdx = new Map<number, number>();
+    for (const item of bfsOrder) ringCounts.set(item.depth, (ringCounts.get(item.depth) ?? 0) + 1);
+    const localPos = new Map<string, [number, number]>();
+    for (const item of bfsOrder) {
+      if (item.depth === 0) {
+        localPos.set(item.id, [0, 0]);
+        continue;
+      }
+      const idx = ringIdx.get(item.depth) ?? 0;
+      ringIdx.set(item.depth, idx + 1);
+      const count = ringCounts.get(item.depth) ?? 1;
+      const angle = (2 * Math.PI * idx) / count + item.depth * 0.37;
+      const radius = item.depth * 3.8 + Math.sqrt(count) * 0.6;
+      localPos.set(item.id, [Math.cos(angle) * radius, Math.sin(angle) * radius]);
+    }
+    const compIds = new Set(comp.map((c) => c.id));
+    const internalEdges = edges.filter(
+      (e) => e.source_id !== e.target_id && compIds.has(e.source_id) && compIds.has(e.target_id),
+    );
+    const cellSize = minDist;
+    for (let iter = 0; iter < 30 && n > 1; iter += 1) {
+      const forces = new Map<string, [number, number]>(comp.map((c) => [c.id, [0, 0]]));
+      for (const e of internalEdges) {
+        const pa = localPos.get(e.source_id)!;
+        const pb = localPos.get(e.target_id)!;
+        const dx = pb[0] - pa[0];
+        const dz = pb[1] - pa[1];
+        const dist = Math.hypot(dx, dz) || 0.01;
+        const pull = (dist - idealDist) * 0.14;
+        const fx = (dx / dist) * pull;
+        const fz = (dz / dist) * pull;
+        forces.get(e.source_id)![0] += fx;
+        forces.get(e.source_id)![1] += fz;
+        forces.get(e.target_id)![0] -= fx;
+        forces.get(e.target_id)![1] -= fz;
+      }
+      const buckets = new Map<string, string[]>();
+      for (const c of comp) {
+        const [x, z] = localPos.get(c.id)!;
+        const key = `${Math.floor(x / cellSize)},${Math.floor(z / cellSize)}`;
+        const arr = buckets.get(key) ?? [];
+        arr.push(c.id);
+        buckets.set(key, arr);
+      }
+      for (const c of comp) {
+        const pa = localPos.get(c.id)!;
+        const bx = Math.floor(pa[0] / cellSize);
+        const bz = Math.floor(pa[1] / cellSize);
+        for (let ox = -1; ox <= 1; ox += 1) {
+          for (let oz = -1; oz <= 1; oz += 1) {
+            for (const otherId of buckets.get(`${bx + ox},${bz + oz}`) ?? []) {
+              if (otherId <= c.id) continue;
+              const pb = localPos.get(otherId)!;
+              const dx = pa[0] - pb[0];
+              const dz = pa[1] - pb[1];
+              const dist = Math.hypot(dx, dz) || 0.01;
+              if (dist >= minDist) continue;
+              const push = ((minDist - dist) / dist) * 0.45;
+              const px = dx * push;
+              const pz = dz * push;
+              forces.get(c.id)![0] += px;
+              forces.get(c.id)![1] += pz;
+              forces.get(otherId)![0] -= px;
+              forces.get(otherId)![1] -= pz;
+            }
+          }
+        }
+      }
+      for (const c of comp) {
+        const p = localPos.get(c.id)!;
+        const f = forces.get(c.id)!;
+        const mag = Math.hypot(f[0], f[1]);
+        const clamp = mag > 1.8 ? 1.8 / mag : 1;
+        p[0] += f[0] * clamp;
+        p[1] += f[1] * clamp;
+      }
+    }
+
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (const [x, z] of localPos.values()) {
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minZ = Math.min(minZ, z);
+      maxZ = Math.max(maxZ, z);
+    }
+    const cx = (minX + maxX) / 2;
+    const cz = (minZ + maxZ) / 2;
+    boxes.push({
+      items: comp.map((node) => {
+        const [x, z] = localPos.get(node.id)!;
+        return { node, lx: x - cx, lz: z - cz };
+      }),
+      width: Math.max(6, maxX - minX + 7),
+      depth: Math.max(6, maxZ - minZ + 7),
+    });
+  }
+
+  if (singletons.length > 0) {
+    const sCols = Math.max(1, Math.ceil(Math.sqrt(singletons.length * 1.4)));
+    const sRows = Math.max(1, Math.ceil(singletons.length / sCols));
+    const cell = singletons.length > 40 ? 3.0 : 3.8;
+    boxes.push({
+      items: singletons.map((node, idx) => ({
+        node,
+        lx: ((idx % sCols) - (sCols - 1) / 2) * cell,
+        lz: (Math.floor(idx / sCols) - (sRows - 1) / 2) * cell,
+      })),
+      width: Math.max(6, sCols * cell + 7),
+      depth: Math.max(6, sRows * cell + 7),
+    });
+  }
+
+  const bCols = Math.max(1, Math.ceil(Math.sqrt(boxes.length * 1.35)));
+  const bRows = Math.max(1, Math.ceil(boxes.length / bCols));
+  const widths = Array<number>(bCols).fill(0);
+  const depths = Array<number>(bRows).fill(0);
+  boxes.forEach((box, idx) => {
+    widths[idx % bCols] = Math.max(widths[idx % bCols], box.width);
+    depths[Math.floor(idx / bCols)] = Math.max(depths[Math.floor(idx / bCols)], box.depth);
+  });
+  const centers = (sizes: number[]) => {
+    let cursor = -sizes.reduce((a, b) => a + b, 0) / 2;
+    return sizes.map((size) => {
+      const center = cursor + size / 2;
+      cursor += size;
+      return center;
+    });
+  };
+  const xs = centers(widths);
+  const zs = centers(depths);
+  boxes.forEach((box, idx) => {
+    const ax = xs[idx % bCols];
+    const az = zs[Math.floor(idx / bCols)];
+    for (const item of box.items) {
+      map.set(item.node.id, [ax + item.lx, flatten2D ? 0 : yForNode(item.node), az + item.lz]);
+    }
+  });
+  return map;
+}
+
+export function computeScenePositions(
+  nodes: AtlasNode[],
+  layoutMode: SceneLayoutMode,
+  options: ScenePositionOptions = {},
+): Map<string, [number, number, number]> {
+  const flatten2D = Boolean(options.flatten2D);
+  const yForNode = (n: AtlasNode) =>
+    flatten2D ? 0 : n.subkind === 'sql_function' ? -15.2 : TIER_BASE_Y[n.tier];
+
+  let map: Map<string, [number, number, number]>;
+  if (layoutMode === 'grid') {
+    map = new Map<string, [number, number, number]>();
+    const bands = (['display', 'manipulate', 'truth'] as const).map((tier) => {
+      const list = nodes.filter((n) => n.tier === tier).sort((a, b) => a.id.localeCompare(b.id));
+      const count = list.length;
+      const cols = Math.max(1, Math.ceil(Math.sqrt(count * 1.5)));
+      const rows = Math.max(1, Math.ceil(count / cols));
+      const sp = count > 180 ? 2.8 : count > 50 ? 4.2 : 6.5;
+      return { tier, list, cols, rows, sp, depth: rows * sp };
+    });
+    const totalDepth2D = bands.reduce((acc, b) => acc + (b.list.length ? b.depth + 6 : 0), 0);
+    let cursorZ = -totalDepth2D / 2;
+    for (const band of bands) {
+      if (band.list.length === 0) continue;
+      const bandCenterZ = flatten2D ? cursorZ + (band.depth + 6) / 2 : 0;
+      if (flatten2D) cursorZ += band.depth + 6;
+      band.list.forEach((n, idx) => {
+        const r = Math.floor(idx / band.cols);
+        const c = idx % band.cols;
+        const jit = ((idx * 7) % 5) * 0.14;
+        map.set(n.id, [
+          (c - (band.cols - 1) / 2) * band.sp + jit,
+          yForNode(n),
+          bandCenterZ + (r - (band.rows - 1) / 2) * band.sp - jit,
+        ]);
+      });
+    }
+  } else if (layoutMode === 'subkind') {
+    map = packGroupedDistricts(nodes, (n) => n.subkind, [...ALL_NODE_SUBKINDS], flatten2D, yForNode);
+  } else if (layoutMode === 'connected') {
+    map = layoutConnectedComponents(nodes, options.edges ?? [], flatten2D, yForNode);
+  } else {
+    map = packGroupedDistricts(nodes, deriveDomainCluster, null, flatten2D, yForNode);
+  }
+
+  if (options.pinnedPositions) {
+    const entries =
+      options.pinnedPositions instanceof Map
+        ? options.pinnedPositions.entries()
+        : Object.entries(options.pinnedPositions);
+    for (const [id, coords] of entries) {
+      if (map.has(id)) {
+        map.set(id, [coords[0], flatten2D ? 0 : coords[1], coords[2]]);
+      }
     }
   }
   return map;

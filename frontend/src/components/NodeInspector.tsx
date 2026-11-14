@@ -27,6 +27,8 @@ interface NodeInspectorProps {
   findings: BoundaryFinding[];
   referenceExemplars?: PortableReferenceExemplar[];
   diffOverlay?: DiffOverlaySet | null;
+  inWorkingSet?: boolean;
+  onToggleWorkingSet?: (nodeId: string) => void;
   onSelectNode: (nodeId: string) => void;
   onClose: () => void;
 }
@@ -55,6 +57,8 @@ export function NodeInspector({
   findings,
   referenceExemplars = [],
   diffOverlay = null,
+  inWorkingSet = false,
+  onToggleWorkingSet,
   onSelectNode,
   onClose,
 }: NodeInspectorProps) {
@@ -210,6 +214,20 @@ export function NodeInspector({
             <Copy className="h-3 w-3" />
             {copiedFullLabel ?? 'Full Cone'}
           </button>
+          {onToggleWorkingSet && (
+            <button
+              type="button"
+              onClick={() => onToggleWorkingSet(node.id)}
+              aria-label={inWorkingSet ? 'Remove node from working set' : 'Add node to working set'}
+              className={`border px-2 py-0.5 font-mono text-[11px] ${
+                inWorkingSet
+                  ? 'border-teal-400/60 bg-teal-500/20 text-teal-200'
+                  : 'border-slate-600 bg-slate-900 text-slate-300 hover:border-teal-400'
+              }`}
+            >
+              {inWorkingSet ? 'In Set ✓' : '+ Set'}
+            </button>
+          )}
           <button
             type="button"
             onClick={onClose}

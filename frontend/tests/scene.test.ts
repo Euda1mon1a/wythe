@@ -1,4 +1,15 @@
 import assert from 'node:assert/strict';
+import {
+  addNodesToWorkingSet,
+  computeBoundaryCrossings,
+  computeGroupSummaries,
+  expandWorkingSetBoundary,
+  parseSavedViews,
+  reconcileSavedView,
+  removeNodesFromWorkingSet,
+  serializeSavedViews,
+  toggleNodeInWorkingSet,
+} from '../src/lib/wytheWorkingSet';
 import { test } from 'node:test';
 import * as THREE from 'three';
 import type { AtlasEdge, AtlasNode, BoundaryFinding, PortableReferenceExemplar } from '../src/api/atlas';
@@ -335,4 +346,151 @@ test('diagnostic briefs default to investigation, qualify exemplars, and disclos
   assert.match(briefIssue, /\[prepare_issue\]/);
   assert.match(briefIssue, /PREPARE ISSUE ONLY/);
   assert.match(briefIssue, /Retain \/ Retire Decision Required/);
+});
+
+test('working-set compaction shrinks bounding box, preserves pins, and isolates external selection', () => {
+  const manyNodes = Array.from({ length: 120 }, (_, i) =>
+    node(`n:${i}`, {
+      tier: i % 3 === 0 ? 'truth' : i % 3 === 1 ? 'manipulate' : 'display',
+      subkind: i % 2 === 0 ? 'service' : 'component',
+      source_file: `src/domain_${i % 12}/file_${i}.ts`,
+    }),
+  );
+  const fullPos = computeScenePositions(manyNodes, 'cluster');
+  const subset = manyNodes.slice(0, 6);
+  const compactPos = computeScenePositions(subset, 'cluster');
+
+  const span = (pos: Map<string, [number, number, number]>) => {
+    const xs = Array.from(pos.values()).map((p) => p[0]);
+    const zs = Array.from(pos.values()).map((p) => p[2]);
+    return Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...zs) - Math.min(...zs));
+  };
+  assert.ok(span(compactPos) < span(fullPos), 'compact subset bounding span must shrink vs full map');
+
+  // External selection outside an active working set stays suppressed rather than leaking back in.
+  const wsList = addNodesToWorkingSet([], [manyNodes[0].id, manyNodes[1].id, manyNodes[2].id]);
+  const wsEdges = [edge(manyNodes[2].id, manyNodes[3].id, 'calls_helper'), edge(manyNodes[0].id, manyNodes[1].id, 'reads_truth')];
+  const filtered = selectSceneGraph(manyNodes, wsEdges, {
+    ...defaults,
+    selectedId: manyNodes[10].id,
+    workingSetIds: new Set(wsList),
+    workingSetActive: true,
+  });
+  assert.equal(filtered.nodes.length, 3);
+  assert.ok(!filtered.nodes.some((n) => n.id === manyNodes[10].id));
+  assert.deepEqual(filtered.boundaryCrossings.externalNeighborIds, [manyNodes[3].id]);
+
+  const expanded = expandWorkingSetBoundary(wsList, wsEdges);
+  assert.equal(expanded.length, 4);
+  assert.ok(expanded.includes(manyNodes[3].id));
+
+  // Manual pin overrides survive layout mode switches.
+  const pinCoord: [number, number, number] = [42.5, 9, -17.25];
+  const pinned = new Map<string, [number, number, number]>([[manyNodes[0].id, pinCoord]]);
+  const switchedPos = computeScenePositions(subset, 'grid', { pinnedPositions: pinned });
+  assert.deepEqual(switchedPos.get(manyNodes[0].id), pinCoord);
+
+  // Toggling and removal update working-set membership cleanly.
+  const toggled = toggleNodeInWorkingSet(wsList, manyNodes[0].id);
+  assert.equal(toggled.includes(manyNodes[0].id), false);
+  const removed = removeNodesFromWorkingSet(wsList, [manyNodes[1].id]);
+  assert.equal(removed.includes(manyNodes[1].id), false);
+});
+
+test('subkind, connected, and flatten2D layouts are deterministic with zero 2D collisions', () => {
+  const nodes = [
+    node('a1', { subkind: 'table', tier: 'truth', source_file: 'db/a.py' }),
+    node('a2', { subkind: 'route', tier: 'manipulate', source_file: 'api/a.py' }),
+    node('a3', { subkind: 'page', tier: 'display', source_file: 'ui/a.tsx' }),
+    node('b1', { subkind: 'route', tier: 'manipulate', source_file: 'api/b.py' }),
+    node('b2', { subkind: 'component', tier: 'display', source_file: 'ui/b.tsx' }),
+    node('solo1', { subkind: 'service', tier: 'manipulate', source_file: 'svc/solo1.py' }),
+    node('solo2', { subkind: 'cache_store', tier: 'truth', source_file: 'db/solo2.py' }),
+  ];
+  const edges = [
+    edge('a2', 'a1', 'reads_truth'),
+    edge('a3', 'a2', 'queries_endpoint'),
+    edge('b2', 'b1', 'queries_endpoint'),
+  ];
+
+  const sub1 = computeScenePositions(nodes, 'subkind');
+  const sub2 = computeScenePositions(nodes, 'subkind');
+  assert.deepEqual(Array.from(sub1.entries()), Array.from(sub2.entries()));
+
+  const conn = computeScenePositions(nodes, 'connected', { edges });
+  for (const [, coords] of conn.entries()) {
+    assert.ok(coords.every((c) => Number.isFinite(c)), 'connected coordinates must be finite');
+  }
+  const dist2d = (p: [number, number, number], q: [number, number, number]) =>
+    Math.hypot(p[0] - q[0], p[2] - q[2]);
+  assert.ok(
+    dist2d(conn.get('a2')!, conn.get('a1')!) < dist2d(conn.get('a2')!, conn.get('b1')!),
+    'connected layout keeps linked components closer than unlinked nodes',
+  );
+
+  for (const mode of ['cluster', 'grid', 'subkind', 'connected'] as const) {
+    const flat = computeScenePositions(nodes, mode, { edges, flatten2D: true });
+    const seenXZ = new Set<string>();
+    for (const [id, [x, y, z]] of flat.entries()) {
+      assert.equal(y, 0, `${mode} flatten2D must place ${id} at y=0`);
+      const key = `${x.toFixed(2)}:${z.toFixed(2)}`;
+      assert.ok(!seenXZ.has(key), `${mode} flatten2D collision at ${key}`);
+      seenXZ.add(key);
+    }
+  }
+});
+
+test('group summaries collapse and saved-view reconciliation flags commit drift and missing nodes', () => {
+  const nodes = [
+    node('g1', { subkind: 'route', source_file: 'api/orders/list.py', status: 'policy_in_code' }),
+    node('g2', { subkind: 'service', source_file: 'api/orders/svc.py', status: 'clean' }),
+    node('g3', { subkind: 'table', source_file: 'db/billing.py', status: 'clean' }),
+  ];
+  const collapsed = new Set<string>(['route']);
+  const summaries = computeGroupSummaries(nodes, 'subkind', collapsed);
+  const routeGroup = summaries.find((s) => s.key === 'route');
+  assert.ok(routeGroup && routeGroup.collapsed && routeGroup.count === 1 && routeGroup.flaggedCount === 1);
+
+  const groupedGraph = selectSceneGraph(nodes, [], {
+    ...defaults,
+    groupBy: 'subkind',
+    collapsedGroups: collapsed,
+  });
+  assert.equal(groupedGraph.collapsedCount, 1);
+  assert.ok(!groupedGraph.nodes.some((n) => n.id === 'g1'));
+
+  const boundary = computeBoundaryCrossings(new Set(['g1']), nodes, [edge('g1', 'g2', 'calls_helper')]);
+  assert.equal(boundary.crossingEdges.length, 1);
+  assert.deepEqual(boundary.externalNeighborIds, ['g2']);
+
+  const savedJson = serializeSavedViews([
+    {
+      id: 'v1',
+      name: 'Orders flow',
+      createdAt: '2026-11-13T00:00:00Z',
+      targetSlug: 'wythe',
+      sourceCommit: 'abc111',
+      contentDigest: 'dig111',
+      nodeIds: ['g1', 'deleted-node'],
+      layoutMode: 'connected',
+      flatten2D: true,
+      compactVisible: true,
+      lens: 'status',
+      groupBy: 'cluster',
+      collapsedGroups: ['billing'],
+      pinnedPositions: { g1: [1, 0, 2], 'deleted-node': [5, 0, 5] },
+    },
+  ]);
+  const parsed = parseSavedViews(savedJson);
+  assert.equal(parsed.length, 1);
+  const reconciled = reconcileSavedView(parsed[0], {
+    target_slug: 'wythe',
+    source_commit: 'def222',
+    content_digest: 'dig222',
+    nodes,
+  });
+  assert.deepEqual(reconciled.matchedNodeIds, ['g1']);
+  assert.deepEqual(reconciled.missingNodeIds, ['deleted-node']);
+  assert.equal(reconciled.commitChanged, true);
+  assert.equal(reconciled.digestChanged, true);
 });
