@@ -59,7 +59,7 @@ _EXPORT_CONST_NAME_RE = re.compile(
     r"""(?:^|[;\r\n])[ \t]*export\s+(?:default\s+)?(?:const|let|var|async\s+function|function|class)\s+(?P<name>[A-Za-z_$][\w$]*)\b""",
 )
 _EXPORT_LOCAL_CLAUSE_RE = re.compile(
-    r"""(?:^|[;\r\n])[ \t]*export\s+(?!type\b)\{(?P<clause>[^}]+)\}\s*(?:[;\r\n]|$)""",
+    r"""(?:^|[;\r\n])[ \t]*export\s+(?!type\b)\{(?P<clause>[^}]+)\}(?=[ \t]*(?:[;\r\n]|$))""",
 )
 _REEXPORT_FROM_RE = re.compile(
     r"""(?:^|[;\r\n])[ \t]*export\s+(?!type\b)\{(?P<clause>[^}]+)\}\s*from\s*['"](?P<spec>[^'"]+)['"]""",

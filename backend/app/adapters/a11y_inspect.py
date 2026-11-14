@@ -1869,9 +1869,13 @@ def make_local_component_resolver(
             (ln for ln, sn in aliases.items() if sn == "children"),
             "children",
         )
-        effective_children = merged_props.get(children_local, passed.get("children"))
         effective_inner = inner_status
-        if effective_inner == "empty":
+        if inner_status != "empty":
+            # Propagate resolved JSX child content into the `children` prop binding so
+            # forwarding `<Label children={children} />` receives the caller's children state.
+            merged_props[children_local] = inner_status
+        else:
+            effective_children = merged_props.get(children_local, passed.get("children"))
             if effective_children in ("named", "dynamic"):
                 effective_inner = "named"
             elif effective_children == "opaque" or (

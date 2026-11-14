@@ -523,8 +523,35 @@ def test_vue_bound_prop_expressions_and_concat_url_origin_resolution(
 
 
 def test_aria_named_elements_and_nullish_vs_or_coalescing_a11y(tmp_path: Path) -> None:
-    """ARIA-named wrapper elements satisfy `<button>`; `??` keeps `""`/`"   "` distinct from nullish."""
+    """ARIA-named wrapper elements, nullish coalescing, forwarded children, and stacked export lists."""
+    from app.adapters.sveltekit_display import SvelteKitDisplayAdapter
     from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+
+    put(
+        tmp_path,
+        "src/lib/urls.ts",
+        "const A = '/api/alpha';\n"
+        "const B = '/api/beta';\n"
+        "export { A }\n"
+        "export { B }\n",
+    )
+    put(
+        tmp_path,
+        "src/lib/sep.ts",
+        "const C = '/api/gamma'; const D = '/api/delta'; export { C }; export { D }\n",
+    )
+    put(
+        tmp_path,
+        "src/routes/+page.ts",
+        "import { A, B } from '$lib/urls';\n"
+        "import { C, D } from '$lib/sep';\n"
+        "export function load() {\n"
+        "  return Promise.all([fetch(A), fetch(B), fetch(C), fetch(D)]);\n"
+        "}\n",
+    )
+    s_res = SvelteKitDisplayAdapter().extract(tmp_path, ".")
+    s_urls = {c.normalized_path for c in s_res.http_calls}
+    assert {"/api/alpha", "/api/beta", "/api/gamma", "/api/delta"}.issubset(s_urls), s_urls
 
     put(
         tmp_path,
@@ -534,12 +561,18 @@ def test_aria_named_elements_and_nullish_vs_or_coalescing_a11y(tmp_path: Path) -
         "}\n"
         "export function OrLabel({ text }: { text?: string | null }) {\n"
         "  return <span>{text || 'Save'}</span>;\n"
+        "}\n"
+        "export function ChildLeaf({ children }: { children?: unknown }) {\n"
+        "  return <span>{children}</span>;\n"
+        "}\n"
+        "export function ChildWrapper({ children }: { children?: unknown }) {\n"
+        "  return <ChildLeaf children={children} />;\n"
         "}\n",
     )
     put(
         tmp_path,
         "app/page.tsx",
-        "import { NullishLabel, OrLabel } from '../components/Coalesce';\n"
+        "import { ChildWrapper, NullishLabel, OrLabel } from '../components/Coalesce';\n"
         "export function Page() {\n"
         "  return (\n"
         "    <div>\n"
@@ -555,6 +588,7 @@ def test_aria_named_elements_and_nullish_vs_or_coalescing_a11y(tmp_path: Path) -
         "      <button><OrLabel text='' /></button>\n"
         "      <button><OrLabel text='   ' /></button>\n"
         "      <button><OrLabel text={null} /></button>\n"
+        "      <button><ChildWrapper>Save</ChildWrapper></button>\n"
         "    </div>\n"
         "  );\n"
         "}\n",
