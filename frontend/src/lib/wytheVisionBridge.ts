@@ -12,7 +12,7 @@ import {
   type DiffOverlaySet,
   type SceneLayoutMode,
   type SceneLens,
-} from '@/lib/wytheSceneLenses';
+} from './wytheSceneLenses';
 import type { WythePaletteColors } from '@/lib/wytheTheme';
 
 export interface VisualFocusFiducial {
@@ -226,7 +226,7 @@ export interface LiveViewportDigest {
 
 function classifyRenderedColor(hex: string, hollow: boolean, dimmed: boolean): string {
   if (dimmed) return 'Dimmed / Outside Focus';
-  if (hollow) return 'Hollow Wireframe (orphaned / unwired)';
+  if (hollow) return 'Hollow marker (orphaned / unwired)';
   const h = hex.trim().toLowerCase();
   if (['#f43f5e', '#ef4444', '#fb7185', '#e11d48', '#dc2626'].includes(h)) return 'Red / Crimson';
   if (['#f59e0b', '#facc15', '#eab308', '#fbbf24'].includes(h)) return 'Amber / Gold';
@@ -254,6 +254,11 @@ export function buildLiveViewportDigest(params: {
   tierFilter: string;
   subkindFilter: string;
   onlyFlagged: boolean;
+  connectedOnly?: boolean;
+  neighborhoodHops?: 0 | 1 | 2;
+  renderedNodeIds?: Set<string>;
+  overviewNodeIds?: Set<string>;
+  traceIds?: Set<string>;
   searchQuery: string;
   diffOverlay: DiffOverlaySet | null;
   palette: WythePaletteColors;
@@ -277,6 +282,11 @@ export function buildLiveViewportDigest(params: {
     tierFilter,
     subkindFilter,
     onlyFlagged,
+    connectedOnly = false,
+    neighborhoodHops = 0,
+    renderedNodeIds,
+    overviewNodeIds,
+    traceIds,
     searchQuery,
     diffOverlay,
     palette,
@@ -320,7 +330,7 @@ export function buildLiveViewportDigest(params: {
         nz <= 1.0;
       centerDist2 = nx * nx + ny * ny;
     }
-    if (!inFrustum) continue;
+    if (renderedNodeIds ? !renderedNodeIds.has(n.id) : !inFrustum) continue;
 
     const vis = evaluateNodeVisual({
       node: n,
@@ -332,7 +342,9 @@ export function buildLiveViewportDigest(params: {
       diffOverlay,
     });
     const isDimmed =
-      vis.forceDim || (selectedNodeId !== null && n.id !== selectedNodeId && !coneNodeIds.has(n.id));
+      vis.forceDim || (traceIds?.size
+        ? !traceIds.has(n.id) && n.id !== selectedNodeId
+        : selectedNodeId !== null && n.id !== selectedNodeId && !coneNodeIds.has(n.id));
     const bucket = classifyRenderedColor(vis.barHex, vis.hollow, isDimmed);
     frustumEntries.push({ node: n, centerDist2, colorBucket: bucket, barHex: vis.barHex });
     const list = colorBuckets.get(bucket) ?? [];
@@ -349,8 +361,8 @@ export function buildLiveViewportDigest(params: {
 
   const lines: string[] = [
     `### Live 3D Camera Frustum & Exact Screen Colors (${activeSlug} @ ${sourceCommit.slice(0, 10)})`,
-    `- **Camera Frustum**: **${frustumEntries.length}** nodes currently on screen (out of ${visibleNodes.length} filtered visible nodes).`,
-    `- **Active Controls**: Lens=\`${lens}\` (${SCENE_LENS_LABELS[lens]}) | Layout=\`${layoutMode}\` | Tier=\`${tierFilter}\` | Subkind=\`${subkindFilter}\` | FlaggedOnly=\`${onlyFlagged}\`${searchQuery ? ` | Search=\`${searchQuery}\`` : ''}${diffOverlay ? ` | 3D Blast=\`${diffOverlay.label}\`` : ' | 3D Blast=`off`'}`,
+    `- **Camera Frustum**: **${frustumEntries.length}** nodes within camera bounds (out of ${visibleNodes.length} represented nodes; ${overviewNodeIds?.size ?? 0} overview dots).`,
+    `- **Active Controls**: Lens=\`${lens}\` (${SCENE_LENS_LABELS[lens]}) | Layout=\`${layoutMode}\` | Tier=\`${tierFilter}\` | Subkind=\`${subkindFilter}\` | FlaggedOnly=\`${onlyFlagged}\` | ConnectedOnly=\`${connectedOnly}\` | NeighborhoodHops=\`${neighborhoodHops}\`${searchQuery ? ` | Search=\`${searchQuery}\`` : ''}${diffOverlay ? ` | 3D Blast=\`${diffOverlay.label}\`` : ' | 3D Blast=`off`'}`,
     `- **Active Color Legend**: ${legend.map((it) => `${it.label} (${it.color})`).join(' · ')}`,
   ];
 

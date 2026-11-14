@@ -512,6 +512,8 @@ class UiFocusStatePayload(StrictSchema):
     diff_base_ref: str = Field(default="HEAD~1", max_length=128)
     only_flagged: bool = False
     isolate_cone: bool = False
+    connected_only: bool = False
+    neighborhood_hops: Literal[0, 1, 2] = 0
     search_query: str = Field(default="", max_length=200)
     active_trace_route: str | None = Field(default=None, max_length=200)
     camera_position: str | None = Field(default=None, max_length=96)

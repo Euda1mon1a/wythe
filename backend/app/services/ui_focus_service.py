@@ -267,6 +267,7 @@ def explain_ui_focus(
     md_lines = [
         f"# Wythe Live Focus X-Ray :: `{target.slug}` @ `{report.source_commit[:10]}`",
         f"> Tab: `{active_tab}` | Lens: `{lens}` | Layout: `{layout_mode}` | Blast: `{blast_mode}` ({diff_base_ref})",
+        f"> Connected only: `{saved.get('connected_only', False)}` | Neighborhood hops: `{saved.get('neighborhood_hops', 0)}`",
         f"> **Headline**: {headline}",
         f"> **Why It Looks Like This**: {color_reason}",
     ]

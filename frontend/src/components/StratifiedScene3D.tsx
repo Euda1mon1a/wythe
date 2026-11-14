@@ -5,7 +5,8 @@ import { Bot, Crosshair, Maximize2, Minimize2, Play, Sparkles, X } from 'lucide-
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { AtlasEdge, AtlasNode, BoundaryFinding, EndToEndChain } from '@/api/atlas';
-import { createAtomicDeltahedra, createWytheAtomicMaterial } from '@/lib/wytheAtomicShader';
+import { selectSceneGraph, type NeighborhoodHops } from '@/lib/wytheSceneGraph';
+import { createBatchedNodes, createBatchedEdges, fitGraphCamera, type SceneRenderNode, type SceneRenderEdge, type SceneRenderStats } from '@/lib/wytheSceneBatches';
 import {
   computeScenePositions,
   deriveDomainCluster,
@@ -47,6 +48,8 @@ interface StratifiedScene3DProps {
   activeTraceChain?: EndToEndChain | null;
   onlyFlagged: boolean;
   isolateCone?: boolean;
+  connectedOnly?: boolean;
+  neighborhoodHops?: NeighborhoodHops;
   searchQuery?: string;
   polygonMode?: PolygonRenderMode;
   palette?: WythePaletteColors;
@@ -90,103 +93,11 @@ interface HoverTip {
   metrics: string;
 }
 
-const MAX_VISIBLE_NODES = 660;
-
-function rankNodeDeterministic(n: AtlasNode, connectedIds: Set<string>): number {
-  if (n.status === 'duplicated_truth') return 1;
-  if (n.status === 'policy_in_code' || n.status === 'gray_zone') return 2;
-  if (n.subkind === 'sql_function' || n.subkind === 'cache_store' || n.subkind === 'solver') {
-    return 3;
-  }
-  if (n.status === 'clean' && connectedIds.has(n.id)) return 4;
-  if (n.status === 'clean') return 5;
-  return 6;
-}
-
-function selectStratifiedNodesStable(
-  filtered: AtlasNode[],
-  maxTotal: number,
-  connectedIds: Set<string>,
-  pinnedIds: Set<string>,
-): AtlasNode[] {
-  if (filtered.length <= maxTotal) return filtered;
-  const tiers: Array<AtlasNode['tier']> = ['display', 'manipulate', 'truth'];
-  const buckets: Record<AtlasNode['tier'], AtlasNode[]> = {
-    display: [],
-    manipulate: [],
-    truth: [],
-  };
-  for (const n of filtered) {
-    buckets[n.tier].push(n);
-  }
-  for (const t of tiers) {
-    buckets[t].sort(
-      (a, b) =>
-        rankNodeDeterministic(a, connectedIds) - rankNodeDeterministic(b, connectedIds) ||
-        a.id.localeCompare(b.id),
-    );
-  }
-
-  const activeTiers = tiers.filter((t) => buckets[t].length > 0);
-  let base: AtlasNode[];
-  if (activeTiers.length <= 1) {
-    base = filtered
-      .slice()
-      .sort(
-        (a, b) =>
-          rankNodeDeterministic(a, connectedIds) - rankNodeDeterministic(b, connectedIds) ||
-          a.id.localeCompare(b.id),
-      )
-      .slice(0, maxTotal);
-  } else {
-    const quotas: Record<AtlasNode['tier'], number> = { display: 0, manipulate: 0, truth: 0 };
-    let remaining = maxTotal;
-    const pending = [...activeTiers];
-    while (pending.length > 0 && remaining > 0) {
-      const share = Math.max(1, Math.floor(remaining / pending.length));
-      let settledAny = false;
-      for (let i = pending.length - 1; i >= 0; i -= 1) {
-        const t = pending[i];
-        if (buckets[t].length - quotas[t] <= share) {
-          const take = buckets[t].length - quotas[t];
-          quotas[t] += take;
-          remaining -= take;
-          pending.splice(i, 1);
-          settledAny = true;
-        }
-      }
-      if (!settledAny) {
-        for (const t of pending) {
-          const take = Math.min(share, remaining, buckets[t].length - quotas[t]);
-          quotas[t] += take;
-          remaining -= take;
-        }
-        break;
-      }
-    }
-    for (const t of pending) {
-      while (remaining > 0 && quotas[t] < buckets[t].length) {
-        quotas[t] += 1;
-        remaining -= 1;
-      }
-    }
-    base = [
-      ...buckets.display.slice(0, quotas.display),
-      ...buckets.manipulate.slice(0, quotas.manipulate),
-      ...buckets.truth.slice(0, quotas.truth),
-    ];
-  }
-
-  if (pinnedIds.size === 0) return base;
-  const present = new Set(base.map((n) => n.id));
-  const extras = filtered.filter((n) => pinnedIds.has(n.id) && !present.has(n.id));
-  return extras.length > 0 ? [...base, ...extras] : base;
-}
-
 function disposeGroupContents(group: THREE.Group) {
   const seenGeos = new Set<THREE.BufferGeometry>();
   const seenMats = new Set<THREE.Material>();
   group.traverse((obj) => {
+    if (obj instanceof THREE.InstancedMesh) obj.dispose();
     const meshOrLine = obj as THREE.Mesh | THREE.Line;
     if (meshOrLine.geometry) {
       seenGeos.add(meshOrLine.geometry);
@@ -219,6 +130,8 @@ export function StratifiedScene3D({
   activeTraceChain = null,
   onlyFlagged,
   isolateCone = false,
+  connectedOnly = false,
+  neighborhoodHops = 0,
   searchQuery = '',
   polygonMode = 'atomic',
   palette,
@@ -252,19 +165,21 @@ export function StratifiedScene3D({
   const controlsRef = useRef<OrbitControls | null>(null);
   const ambientRef = useRef<THREE.AmbientLight | null>(null);
   const contentGroupRef = useRef<THREE.Group | null>(null);
-  const pickablesRef = useRef<THREE.Mesh[]>([]);
-  const nodeByMeshRef = useRef<Map<THREE.Object3D, AtlasNode>>(new Map());
+  const nodeBatchRef = useRef<ReturnType<typeof createBatchedNodes> | null>(null);
+  const lodDirtyRef = useRef(true);
+  const [renderStats, setRenderStats] = useState<SceneRenderStats>({ total: 0, inFrustum: 0, detailed: 0, overview: 0 });
   const atomicMaterialsRef = useRef<THREE.ShaderMaterial[]>([]);
   const traceWaypointsRef = useRef<THREE.Vector3[]>([]);
   const selectedNodeIdRef = useRef<string | null>(selectedNodeId);
   const onSelectNodeRef = useRef(onSelectNode);
-  const tierFilterRef = useRef(tierFilter);
+
 
   selectedNodeIdRef.current = selectedNodeId;
   onSelectNodeRef.current = onSelectNode;
-  tierFilterRef.current = tierFilter;
+
 
   const syncCameraTelemetry = useCallback(() => {
+    lodDirtyRef.current = true;
     const canvas = canvasRef.current;
     const cam = cameraRef.current;
     const ctrl = controlsRef.current;
@@ -282,17 +197,15 @@ export function StratifiedScene3D({
     }
     camSettleTimerRef.current = window.setTimeout(() => {
       setCamSettleSeq((s) => s + 1);
+      if (nodeBatchRef.current) setRenderStats({ ...nodeBatchRef.current.stats });
     }, 160);
   }, []);
 
-  const { connectedNodeIds, degreeByNode, guardedTableIds, mutatorNodeIds } = useMemo(() => {
-    const connected = new Set<string>();
+  const { degreeByNode, guardedTableIds, mutatorNodeIds } = useMemo(() => {
     const deg = new Map<string, number>();
     const guarded = new Set<string>();
     const mutators = new Set<string>();
     for (const e of edges) {
-      connected.add(e.source_id);
-      connected.add(e.target_id);
       deg.set(e.source_id, (deg.get(e.source_id) ?? 0) + 1);
       deg.set(e.target_id, (deg.get(e.target_id) ?? 0) + 1);
       if (e.kind === 'guards_truth') {
@@ -303,7 +216,6 @@ export function StratifiedScene3D({
       }
     }
     return {
-      connectedNodeIds: connected,
       degreeByNode: deg,
       guardedTableIds: guarded,
       mutatorNodeIds: mutators,
@@ -326,8 +238,8 @@ export function StratifiedScene3D({
     const bfs = (adj: Map<string, string[]>) => {
       const q = [selectedNodeId];
       const visited = new Set<string>([selectedNodeId]);
-      while (q.length > 0) {
-        const cur = q.shift()!;
+      for (let index = 0; index < q.length; index += 1) {
+        const cur = q[index];
         cone.add(cur);
         for (const nxt of adj.get(cur) ?? []) {
           if (!visited.has(nxt)) {
@@ -349,7 +261,7 @@ export function StratifiedScene3D({
       ...(activeTraceChain.via_node_ids ?? []),
       activeTraceChain.route_node_id,
       ...(activeTraceChain.manipulator_node_ids ?? []),
-      ...(activeTraceChain.truth_table_ids ?? []).slice(0, 2),
+      ...(activeTraceChain.truth_table_ids ?? []),
     ].filter(Boolean);
     const deduped: string[] = [];
     for (const id of raw) {
@@ -362,62 +274,17 @@ export function StratifiedScene3D({
 
   const traceHopSet = useMemo(() => new Set(traceHopIds), [traceHopIds]);
 
-  const { visibleNodes, totalFilteredCount, visibleByTier } = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    const pinned = new Set<string>(traceHopIds);
-    if (selectedNodeId) pinned.add(selectedNodeId);
+  const graph = useMemo(() => selectSceneGraph(nodes, edges, {
+    tier: tierFilter, subkind: subkindFilter, edgeFilter, onlyFlagged, connectedOnly,
+    searchQuery, selectedId: selectedNodeId, traceIds: traceHopSet, coneIds: coneNodeIds,
+    isolateCone, neighborhoodHops,
+  }), [nodes, edges, tierFilter, subkindFilter, edgeFilter, onlyFlagged, connectedOnly,
+    searchQuery, selectedNodeId, traceHopSet, coneNodeIds, isolateCone, neighborhoodHops]);
+  const { nodes: visibleNodes, edges: visibleEdges, counts: visibleByTier } = graph;
 
-    const filtered = nodes.filter((n) => {
-      if (pinned.has(n.id)) return true;
-      if (isolateCone && selectedNodeId && !coneNodeIds.has(n.id)) return false;
-      if (tierFilter !== 'all' && n.tier !== tierFilter && !(isolateCone && coneNodeIds.has(n.id))) {
-        return false;
-      }
-      if (subkindFilter !== 'all' && n.subkind !== subkindFilter) {
-        return false;
-      }
-      if (onlyFlagged && n.status === 'clean' && !coneNodeIds.has(n.id)) {
-        return false;
-      }
-      if (
-        q &&
-        !n.label.toLowerCase().includes(q) &&
-        !n.source_file.toLowerCase().includes(q) &&
-        !(n.columns ?? []).some((c) => c.toLowerCase().includes(q)) &&
-        !(n.http_paths ?? []).some((p) => p.toLowerCase().includes(q))
-      ) {
-        return false;
-      }
-      return true;
-    });
-    const chosen = selectStratifiedNodesStable(
-      filtered,
-      MAX_VISIBLE_NODES,
-      connectedNodeIds,
-      pinned,
-    );
-    const counts = { display: 0, manipulate: 0, truth: 0 };
-    for (const n of chosen) {
-      counts[n.tier] += 1;
-    }
-    return { visibleNodes: chosen, totalFilteredCount: filtered.length, visibleByTier: counts };
-  }, [
-    nodes,
-    tierFilter,
-    subkindFilter,
-    onlyFlagged,
-    isolateCone,
-    searchQuery,
-    selectedNodeId,
-    coneNodeIds,
-    connectedNodeIds,
-    traceHopIds,
-  ]);
-
-  const positions = useMemo(
-    () => computeScenePositions(visibleNodes, layoutMode),
-    [visibleNodes, layoutMode],
-  );
+  // Filtering and camera motion never repack the map: only a layout/source change does.
+  const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
+  const positions = useMemo(() => computeScenePositions(nodes, layoutMode), [nodes, layoutMode]);
 
   const nodesById = useMemo(() => {
     const m = new Map<string, AtlasNode>();
@@ -511,6 +378,7 @@ export function StratifiedScene3D({
     const controls = new OrbitControls(camera, canvas);
     controls.enableDamping = !prefersReducedMotion;
     controls.dampingFactor = 0.08;
+    controls.zoomToCursor = true;
     controls.target.set(0, -1, 0);
     controlsRef.current = controls;
     controls.addEventListener('change', syncCameraTelemetry);
@@ -553,6 +421,7 @@ export function StratifiedScene3D({
       renderer.setSize(w, h, false);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
+      syncCameraTelemetry();
     };
     resize();
     syncCameraTelemetry();
@@ -569,8 +438,7 @@ export function StratifiedScene3D({
       pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(pickablesRef.current, false);
-      return hits.length > 0 ? nodeByMeshRef.current.get(hits[0].object) ?? null : null;
+      return nodeBatchRef.current?.pick(raycaster, ev.clientX - rect.left, ev.clientY - rect.top) ?? null;
     };
 
     const onMove = (ev: PointerEvent) => {
@@ -647,13 +515,24 @@ export function StratifiedScene3D({
         packetGroup.visible = false;
       }
       controls.update();
+      if (lodDirtyRef.current && nodeBatchRef.current) {
+        const stats = nodeBatchRef.current.update(camera, container.clientWidth || 800, container.clientHeight || 520, renderer.getPixelRatio());
+        canvas.dataset.detailedNodes = String(stats.detailed);
+        canvas.dataset.overviewNodes = String(stats.overview);
+        canvas.dataset.representedNodes = String(stats.total);
+        lodDirtyRef.current = false;
+      }
       renderer.render(scene, camera);
+      canvas.dataset.drawCalls = String(renderer.info.render.calls);
     };
     animate();
 
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
+      if (camSettleTimerRef.current !== null) window.clearTimeout(camSettleTimerRef.current);
+      nodeBatchRef.current = null;
+      lastFitRef.current = null;
       controls.removeEventListener('change', syncCameraTelemetry);
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointermove', onMove);
@@ -668,19 +547,23 @@ export function StratifiedScene3D({
     };
   }, [syncCameraTelemetry]);
 
-  // 2. Explicit Camera Reset ONLY when user triggers Reset Camera (fitSerial > 0)
+  // Fit on a new map/layout or an explicit request, never on selection/filter changes.
+  const lastFitRef = useRef<{ positions: typeof positions; serial: number } | null>(null);
   useEffect(() => {
-    if (fitSerial === 0) return;
+    if (lastFitRef.current?.positions === positions && lastFitRef.current?.serial === fitSerial) return;
     const cam = cameraRef.current;
     const ctrl = controlsRef.current;
     if (!cam || !ctrl) return;
-    const tf = tierFilterRef.current;
-    const focusY = tf === 'display' ? 18 : tf === 'truth' ? -18 : tf === 'manipulate' ? 0 : -1;
-    cam.position.set(tf === 'all' ? 44 : 34, tf === 'all' ? 24 : focusY + 22, tf === 'all' ? 72 : 54);
-    ctrl.target.set(0, focusY, 0);
+    const points = visibleNodes.flatMap((node) => {
+      const position = positions.get(node.id);
+      return position ? [position] : [];
+    });
+    ctrl.target.copy(fitGraphCamera(cam, points));
+    ctrl.maxDistance = cam.far / 2;
     ctrl.update();
+    lastFitRef.current = { positions, serial: fitSerial };
     syncCameraTelemetry();
-  }, [fitSerial, syncCameraTelemetry]);
+  }, [fitSerial, positions, visibleNodes, syncCameraTelemetry]);
 
   // 3. Scene-Content Sync: updates meshes/lines/planes WITHOUT moving camera or OrbitControls!
   useEffect(() => {
@@ -690,15 +573,17 @@ export function StratifiedScene3D({
 
     const bgColor = new THREE.Color(activePalette.sceneBg);
     scene.background = bgColor;
-    scene.fog = new THREE.Fog(bgColor.getHex(), 95, 260);
+    scene.fog = null;
     if (ambientRef.current) {
       ambientRef.current.intensity = polarity === 'light' ? 0.92 : 0.78;
     }
 
     disposeGroupContents(contentGroup);
-    const pickables: THREE.Mesh[] = [];
-    const nodeByMesh = new Map<THREE.Object3D, AtlasNode>();
-    const atomicMaterials: THREE.ShaderMaterial[] = [];
+    const bounds = new THREE.Box3();
+    for (const position of positions.values()) bounds.expandByPoint(new THREE.Vector3(...position));
+    const planeWidth = bounds.isEmpty() ? 118 : Math.max(30, bounds.max.x - bounds.min.x + 12);
+    const planeDepth = bounds.isEmpty() ? 86 : Math.max(30, bounds.max.z - bounds.min.z + 12);
+    const planeCenter = bounds.isEmpty() ? new THREE.Vector3() : bounds.getCenter(new THREE.Vector3());
 
     // Reference planes
     for (const [y, tintHex] of [
@@ -707,7 +592,7 @@ export function StratifiedScene3D({
       [-18, activePalette.truth],
     ] as const) {
       const tint = new THREE.Color(tintHex);
-      const planeGeo = new THREE.PlaneGeometry(118, 86);
+      const planeGeo = new THREE.PlaneGeometry(planeWidth, planeDepth);
       const planeMat = new THREE.MeshBasicMaterial({
         color: tint,
         transparent: true,
@@ -717,128 +602,52 @@ export function StratifiedScene3D({
       });
       const plane = new THREE.Mesh(planeGeo, planeMat);
       plane.rotation.x = -Math.PI / 2;
-      plane.position.y = y - 0.65;
+      plane.position.set(planeCenter.x, y - 0.65, planeCenter.z);
       contentGroup.add(plane);
 
       if (polygonMode === 'simple') {
         const grid = new THREE.GridHelper(
-          108,
-          18,
+          Math.max(planeWidth, planeDepth),
+          24,
           tint.getHex(),
           polarity === 'light' ? 0xcbd5e1 : 0x1e293b,
         );
-        grid.position.y = y - 0.62;
+        grid.position.set(planeCenter.x, y - 0.62, planeCenter.z);
         (grid.material as THREE.Material).transparent = true;
         (grid.material as THREE.Material).opacity = 0.18;
         contentGroup.add(grid);
       }
     }
 
-    const sharedDelta = polygonMode === 'atomic' ? createAtomicDeltahedra() : null;
-    const simpleGeos =
-      polygonMode === 'simple'
-        ? {
-            cache: new THREE.TorusGeometry(0.68, 0.22, 12, 24),
-            sqlGuard: new THREE.OctahedronGeometry(0.72, 0),
-            truth: new THREE.CylinderGeometry(0.75, 0.75, 0.9, 18),
-            solver: new THREE.IcosahedronGeometry(0.92, 0),
-            manipulate: new THREE.OctahedronGeometry(0.82, 0),
-            display: new THREE.BoxGeometry(1.15, 0.55, 1.15),
-          }
-        : null;
-
-    visibleNodes.forEach((n, idx) => {
+    const renderNodes: SceneRenderNode[] = [];
+    visibleNodes.forEach((n) => {
       const pos = positions.get(n.id);
       if (!pos) return;
       const isSelected = n.id === selectedNodeId;
       const inTrace = traceHopSet.has(n.id);
       const inCone = (selectedNodeId !== null && coneNodeIds.has(n.id)) || inTrace;
-      const deg = degreeByNode.get(n.id) ?? 0;
-
       const vis = evaluateNodeVisual({
-        node: n,
-        lens,
-        palette: activePalette,
-        degree: deg,
-        guardedTableIds,
-        mutatorNodeIds,
-        diffOverlay,
+        node: n, lens, palette: activePalette, degree: degreeByNode.get(n.id) ?? 0,
+        guardedTableIds, mutatorNodeIds, diffOverlay,
       });
-
-      const isDimmed =
-        vis.forceDim ||
+      const dimmed = vis.forceDim ||
         (traceHopIds.length > 0 && !inTrace && !isSelected) ||
         (selectedNodeId !== null && !inCone && traceHopIds.length === 0);
-
-      let mesh: THREE.Mesh;
-      if (polygonMode === 'atomic' && sharedDelta) {
-        const geo =
-          n.subkind === 'cache_store'
-            ? sharedDelta.cache
-            : n.subkind === 'sql_function'
-              ? sharedDelta.sqlGuard
-              : n.subkind === 'solver'
-                ? sharedDelta.solver
-                : n.tier === 'truth'
-                  ? sharedDelta.truth
-                  : n.tier === 'manipulate'
-                    ? sharedDelta.manipulate
-                    : sharedDelta.display;
-        const mat = createWytheAtomicMaterial({
-          barColor: vis.barHex,
-          inquiryColor: vis.inquiryHex,
-          hollow: vis.hollow,
-          flagged: vis.flagged,
-          dimmed: isDimmed,
-          selected: isSelected || inTrace,
-          inCone,
-          phase: (idx * 0.67) % (Math.PI * 2),
-        });
-        atomicMaterials.push(mat);
-        mesh = new THREE.Mesh(geo, mat);
-      } else {
-        const geo =
-          n.subkind === 'cache_store'
-            ? simpleGeos!.cache
-            : n.subkind === 'sql_function'
-              ? simpleGeos!.sqlGuard
-              : n.subkind === 'solver'
-                ? simpleGeos!.solver
-                : n.tier === 'truth'
-                  ? simpleGeos!.truth
-                  : n.tier === 'manipulate'
-                    ? simpleGeos!.manipulate
-                    : simpleGeos!.display;
-        const col = new THREE.Color(vis.barHex).getHex();
-        const mat = new THREE.MeshStandardMaterial({
-          color: col,
-          emissive: col,
-          emissiveIntensity: isSelected || inTrace ? 0.95 : inCone ? 0.62 : isDimmed ? 0.08 : 0.3,
-          wireframe: vis.hollow,
-          transparent: isDimmed,
-          opacity: isDimmed ? 0.2 : 1.0,
-          roughness: 0.35,
-          metalness: 0.2,
-        });
-        mesh = new THREE.Mesh(geo, mat);
-      }
-
-      if (n.subkind === 'cache_store') {
-        mesh.rotation.x = Math.PI / 2;
-      }
-      mesh.position.set(pos[0], pos[1], pos[2]);
       const mult = isSelected ? 1.58 : inTrace ? 1.38 : inCone ? 1.18 : 1.0;
-      mesh.scale.setScalar(vis.scale * mult);
-      contentGroup.add(mesh);
-      pickables.push(mesh);
-      nodeByMesh.set(mesh, n);
+      renderNodes.push({
+        node: n, position: pos, scale: vis.scale * mult,
+        style: { barColor: vis.barHex, inquiryColor: vis.inquiryHex, hollow: vis.hollow,
+          flagged: vis.flagged, dimmed, selected: isSelected || inTrace, inCone, phase: 0 },
+      });
     });
+    const nodeBatch = createBatchedNodes(renderNodes, polygonMode);
+    contentGroup.add(nodeBatch.group);
+    nodeBatchRef.current = nodeBatch;
+    atomicMaterialsRef.current = nodeBatch.atomicMaterials;
 
     // Edges with 8-EdgeKind + VerificationState styling
-    const maxEdges = 1050;
-    let drawn = 0;
-    for (const e of edges) {
-      if (drawn >= maxEdges) break;
+    const renderEdges: SceneRenderEdge[] = [];
+    for (const e of visibleEdges) {
       const p1 = positions.get(e.source_id);
       const p2 = positions.get(e.target_id);
       if (!p1 || !p2) continue;
@@ -848,10 +657,7 @@ export function StratifiedScene3D({
       const inConeEdge =
         (selectedNodeId !== null && coneNodeIds.has(e.source_id) && coneNodeIds.has(e.target_id)) ||
         (traceHopSet.has(e.source_id) && traceHopSet.has(e.target_id));
-      if (selectedNodeId && !inConeEdge && edges.length > 350 && drawn > 200) continue;
 
-      const pts = [new THREE.Vector3(...p1), new THREE.Vector3(...p2)];
-      const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
       const isCrossTier = Math.abs(p1[1] - p2[1]) > 4;
       const opacity = inConeEdge
         ? 0.94
@@ -862,18 +668,13 @@ export function StratifiedScene3D({
             : isCrossTier
               ? 0.36
               : 0.18;
-      const lineMat = new THREE.LineBasicMaterial({
-        color: edgeVis.hex,
-        transparent: true,
-        opacity,
-      });
-      contentGroup.add(new THREE.Line(lineGeo, lineMat));
-      drawn += 1;
+      renderEdges.push({ start: p1, end: p2, color: edgeVis.hex, opacity });
     }
+    contentGroup.add(createBatchedEdges(renderEdges));
 
     // Active Request Trace Waypoints + Golden Trajectory Beam
     const wps: THREE.Vector3[] = [];
-    for (const id of traceHopIds) {
+    for (const id of traceHopIds.every((id) => visibleNodeIds.has(id)) ? traceHopIds : []) {
       const p = positions.get(id);
       if (p) wps.push(new THREE.Vector3(...p));
     }
@@ -888,12 +689,11 @@ export function StratifiedScene3D({
       contentGroup.add(new THREE.Line(traceGeo, traceMat));
     }
 
-    pickablesRef.current = pickables;
-    nodeByMeshRef.current = nodeByMesh;
-    atomicMaterialsRef.current = atomicMaterials;
+    syncCameraTelemetry();
   }, [
     visibleNodes,
-    edges,
+    visibleEdges,
+    visibleNodeIds,
     positions,
     selectedNodeId,
     coneNodeIds,
@@ -908,6 +708,7 @@ export function StratifiedScene3D({
     mutatorNodeIds,
     traceHopIds,
     traceHopSet,
+    syncCameraTelemetry,
   ]);
 
   const legendItems = useMemo(
@@ -941,7 +742,7 @@ export function StratifiedScene3D({
       cameraTarget: canvas?.dataset.camTarget ?? null,
       visibleNodeCount: visibleNodes.length,
     });
-  }, [hoverTip?.nodeId, visualFiducial, visibleNodes.length, onHoverFocusChange]);
+  }, [hoverTip?.nodeId, visualFiducial, visibleNodes.length, onHoverFocusChange, camSettleSeq]);
 
   useEffect(() => {
     if (!onRegisterLiveCapture) return;
@@ -949,7 +750,7 @@ export function StratifiedScene3D({
   }, [onRegisterLiveCapture]);
 
   useEffect(() => {
-    if (!onLiveViewportDigest || visibleNodes.length === 0) return;
+    if (!onLiveViewportDigest) return;
     const cam = cameraRef.current;
     let projectToNdc: ((x: number, y: number, z: number) => [number, number, number]) | null = null;
     if (cam) {
@@ -966,7 +767,7 @@ export function StratifiedScene3D({
       projectToNdc,
       visibleNodes,
       positions,
-      edges,
+      edges: visibleEdges,
       findings,
       selectedNodeId,
       hoveredNodeId: hoverTip?.nodeId ?? null,
@@ -976,6 +777,11 @@ export function StratifiedScene3D({
       tierFilter,
       subkindFilter,
       onlyFlagged,
+      connectedOnly,
+      neighborhoodHops,
+      renderedNodeIds: nodeBatchRef.current?.renderedNodeIds,
+      overviewNodeIds: nodeBatchRef.current?.overviewNodeIds,
+      traceIds: traceHopSet,
       searchQuery,
       diffOverlay,
       palette: activePalette,
@@ -1000,6 +806,10 @@ export function StratifiedScene3D({
     tierFilter,
     subkindFilter,
     onlyFlagged,
+    connectedOnly,
+    neighborhoodHops,
+    traceHopSet,
+    visibleEdges,
     searchQuery,
     diffOverlay,
     activePalette,
@@ -1100,6 +910,14 @@ export function StratifiedScene3D({
           : `Showing ${visibleNodes.length} nodes across 3D stratified atlas.`}
       </div>
 
+      {visibleNodes.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <p role="status" className="border border-slate-700 bg-slate-950/95 px-4 py-3 text-sm text-slate-200">
+            No nodes match this view. Adjust the filters to show more of the graph.
+          </p>
+        </div>
+      )}
+
       {/* Stratum Labels */}
       <div className="pointer-events-none absolute left-4 top-4 space-y-1.5 font-mono text-[11px]">
         <div className="flex items-center gap-2 text-blue-300">
@@ -1119,6 +937,12 @@ export function StratifiedScene3D({
           <span>
             BEDROCK · SQL TRUTH, GUARDS &amp; QUEUES ({polygonMode === 'atomic' ? 'Icosa-20 / Guard-8' : 'Cylinders'} · {visibleByTier.truth})
           </span>
+        </div>
+        <div className="mt-2 w-fit border border-slate-700 bg-slate-950/90 px-2 py-1 text-slate-200" aria-live="polite">
+          <div>{visibleNodes.length.toLocaleString()} / {nodes.length.toLocaleString()} nodes · {visibleEdges.length.toLocaleString()} connections · {graph.hiddenCount.toLocaleString()} hidden by filters</div>
+          <div className="text-slate-400">In view: {renderStats.overview.toLocaleString()} dots + {renderStats.detailed.toLocaleString()} detailed · zoom in for detail</div>
+          {graph.pinnedExtraCount > 0 && <div className="text-sky-300">Includes {graph.pinnedExtraCount} selected / traced nodes outside other filters</div>}
+          {selectedNodeId && !visibleNodeIds.has(selectedNodeId) && <div className="text-amber-300">Selected node has no connection in this view and is hidden</div>}
         </div>
         {selectedNodeId && coneNodeIds.size > 0 && (
           <div className="mt-1 inline-block border border-sky-500/40 bg-slate-950/90 px-2 py-0.5 text-sky-300">
@@ -1290,11 +1114,7 @@ export function StratifiedScene3D({
             onClick={() => setFitSerial((s) => s + 1)}
             className="border border-slate-700 bg-slate-900/90 px-2.5 py-1 font-mono text-xs text-slate-200 hover:border-teal-400 hover:text-teal-300"
           >
-            Reset Camera (
-            {visibleNodes.length < totalFilteredCount
-              ? `${visibleNodes.length}/${totalFilteredCount}`
-              : `${visibleNodes.length}`}{' '}
-            nodes)
+            Fit view ({visibleNodes.length} nodes)
           </button>
           {onToggleFullscreen && (
             <button

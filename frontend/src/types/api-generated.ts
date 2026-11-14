@@ -1706,6 +1706,17 @@ export interface components {
              */
             isolate_cone: boolean;
             /**
+             * Connected Only
+             * @default false
+             */
+            connected_only: boolean;
+            /**
+             * Neighborhood Hops
+             * @default 0
+             * @enum {integer}
+             */
+            neighborhood_hops: 0 | 1 | 2;
+            /**
              * Search Query
              * @default
              */

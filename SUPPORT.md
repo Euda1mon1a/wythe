@@ -7,4 +7,4 @@ Wythe is provided **as is**, under the [MIT License](LICENSE), with no warranty 
 - Issues and pull requests may be read, may be closed without comment, or may never be looked at. Opening one creates no obligation.
 - There is no security response process. Do not rely on Wythe for security guarantees.
 
-If you depend on Wythe, pin an exact version (`wythe==0.1.8`, or `Euda1mon1a/wythe@v0.1.8` in GitHub Actions) and fork it when you need changes. The MIT License lets you do that freely.
+If you depend on Wythe, pin an exact version (`wythe==0.1.9`, or `Euda1mon1a/wythe@v0.1.9` in GitHub Actions) and fork it when you need changes. The MIT License lets you do that freely.

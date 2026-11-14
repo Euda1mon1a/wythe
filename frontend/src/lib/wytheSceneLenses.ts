@@ -128,7 +128,7 @@ export function computeScenePositions(
 
   if (layoutMode === 'grid') {
     for (const tier of ['display', 'manipulate', 'truth'] as const) {
-      const list = nodes.filter((n) => n.tier === tier);
+      const list = nodes.filter((n) => n.tier === tier).sort((a, b) => a.id.localeCompare(b.id));
       const count = list.length;
       const cols = Math.max(1, Math.ceil(Math.sqrt(count * 1.5)));
       const rows = Math.max(1, Math.ceil(count / cols));
@@ -151,42 +151,56 @@ export function computeScenePositions(
     nodeCluster.set(n.id, cl);
     clusterTotals.set(cl, (clusterTotals.get(cl) ?? 0) + 1);
   }
-  const rankedClusters = [...clusterTotals.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 15)
+  const allDistricts = [...clusterTotals.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([name]) => name);
-  const clusterSet = new Set(rankedClusters);
-  const allDistricts = [...rankedClusters, ...(clusterTotals.size > 15 ? ['other'] : [])];
-
+  const groups = new Map<string, Map<AtlasNode['tier'], AtlasNode[]>>();
+  for (const node of nodes) {
+    const district = nodeCluster.get(node.id)!;
+    if (!groups.has(district)) groups.set(district, new Map());
+    const tiers = groups.get(district)!;
+    if (!tiers.has(node.tier)) tiers.set(node.tier, []);
+    tiers.get(node.tier)!.push(node);
+  }
+  const dimensions = (count: number) => {
+    const cols = Math.max(1, Math.ceil(Math.sqrt(count * 1.3)));
+    return { cols, rows: Math.max(1, Math.ceil(count / cols)), cell: count > 25 ? 2.8 : 3.5 };
+  };
   const dCols = Math.max(1, Math.ceil(Math.sqrt(allDistricts.length * 1.35)));
   const dRows = Math.max(1, Math.ceil(allDistricts.length / dCols));
-  const districtSpacingX = allDistricts.length > 9 ? 19.5 : 23.0;
-  const districtSpacingZ = allDistricts.length > 9 ? 16.5 : 19.5;
-  const anchors = new Map<string, [number, number]>();
-  allDistricts.forEach((d, idx) => {
-    const r = Math.floor(idx / dCols);
-    const c = idx % dCols;
-    anchors.set(d, [
-      (c - (dCols - 1) / 2) * districtSpacingX,
-      (r - (dRows - 1) / 2) * districtSpacingZ,
-    ]);
+  const widths = Array<number>(dCols).fill(0);
+  const depths = Array<number>(dRows).fill(0);
+  allDistricts.forEach((district, index) => {
+    for (const group of groups.get(district)!.values()) {
+      const { cols, rows, cell } = dimensions(group.length);
+      widths[index % dCols] = Math.max(widths[index % dCols], cols * cell + 8);
+      depths[Math.floor(index / dCols)] = Math.max(depths[Math.floor(index / dCols)], rows * cell + 8);
+    }
   });
+  const centers = (sizes: number[]) => {
+    let cursor = -sizes.reduce((a, b) => a + b, 0) / 2;
+    return sizes.map((size) => { const center = cursor + size / 2; cursor += size; return center; });
+  };
+  const xs = centers(widths);
+  const zs = centers(depths);
+  const anchors = new Map(allDistricts.map((district, index) =>
+    [district, [xs[index % dCols], zs[Math.floor(index / dCols)]]] as const,
+  ));
 
   for (const tier of ['display', 'manipulate', 'truth'] as const) {
     const tierNodes = nodes.filter((n) => n.tier === tier);
     const byDistrict = new Map<string, AtlasNode[]>();
     for (const n of tierNodes) {
       const raw = nodeCluster.get(n.id) ?? 'core';
-      const key = clusterSet.has(raw) ? raw : 'other';
+      const key = raw;
       const arr = byDistrict.get(key) ?? [];
       arr.push(n);
       byDistrict.set(key, arr);
     }
     for (const [dKey, group] of byDistrict.entries()) {
       const [ax, az] = anchors.get(dKey) ?? [0, 0];
-      const gCols = Math.max(1, Math.ceil(Math.sqrt(group.length * 1.3)));
-      const gRows = Math.max(1, Math.ceil(group.length / gCols));
-      const cell = group.length > 25 ? 2.45 : 3.05;
+      group.sort((a, b) => a.id.localeCompare(b.id));
+      const { cols: gCols, rows: gRows, cell } = dimensions(group.length);
       group.forEach((n, idx) => {
         const r = Math.floor(idx / gCols);
         const c = idx % gCols;

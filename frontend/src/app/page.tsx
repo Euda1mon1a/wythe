@@ -99,6 +99,14 @@ export default function WytheWorkspacePage() {
   const [tierFilter, setTierFilter] = useState<'all' | 'truth' | 'manipulate' | 'display'>('all');
   const [onlyFlagged, setOnlyFlagged] = useState(false);
   const [isolateCone, setIsolateCone] = useState(false);
+  const [connectedOnly, setConnectedOnly] = useState(false);
+  const [neighborhoodHops, setNeighborhoodHops] = useState<0 | 1 | 2>(0);
+  useEffect(() => {
+    if (!selectedNodeId) {
+      setIsolateCone(false);
+      setNeighborhoodHops(0);
+    }
+  }, [selectedNodeId]);
   const [searchQuery, setSearchQuery] = useState('');
   const [showAddTarget, setShowAddTarget] = useState(false);
   const [newSlug, setNewSlug] = useState('');
@@ -266,6 +274,8 @@ export default function WytheWorkspacePage() {
           diff_base_ref: diffBaseRef,
           only_flagged: onlyFlagged,
           isolate_cone: isolateCone,
+          connected_only: connectedOnly,
+          neighborhood_hops: neighborhoodHops,
           search_query: searchQuery,
           active_trace_route: activeTraceChain
             ? `${activeTraceChain.http_method} ${activeTraceChain.http_path}`
@@ -305,6 +315,8 @@ export default function WytheWorkspacePage() {
     diffBaseRef,
     onlyFlagged,
     isolateCone,
+    connectedOnly,
+    neighborhoodHops,
     searchQuery,
     activeTraceChain,
     liveViewportDigest?.observedAtIso,
@@ -374,6 +386,8 @@ export default function WytheWorkspacePage() {
           diff_base_ref: diffBaseRef,
           only_flagged: onlyFlagged,
           isolate_cone: isolateCone,
+          connected_only: connectedOnly,
+          neighborhood_hops: neighborhoodHops,
           search_query: searchQuery,
           active_trace_route: activeTraceChain
             ? `${activeTraceChain.http_method} ${activeTraceChain.http_path}`
@@ -409,6 +423,8 @@ export default function WytheWorkspacePage() {
       diffBaseRef,
       onlyFlagged,
       isolateCone,
+      connectedOnly,
+      neighborhoodHops,
       searchQuery,
       activeTraceChain,
       hoverFocusMeta.cameraPosition,
@@ -606,7 +622,7 @@ export default function WytheWorkspacePage() {
         subtitle: 'Hide nodes outside the selected node’s upstream/downstream 3-tier cone',
         shortcut: 'C',
         disabled: !selectedNodeId,
-        run: closeAnd(() => setIsolateCone((v) => !v)),
+        run: closeAnd(() => { setIsolateCone((v) => !v); setNeighborhoodHops(0); }),
       },
       {
         id: 'stratum-all',
@@ -787,6 +803,8 @@ export default function WytheWorkspacePage() {
     toggleBrowserNativeFullscreen,
     onlyFlagged,
     isolateCone,
+    connectedOnly,
+    neighborhoodHops,
     selectedNodeId,
     selectedNode,
     copyLlmsBriefNow,
@@ -908,6 +926,7 @@ export default function WytheWorkspacePage() {
         });
       } else if (lower === 'c' && selectedNodeId) {
         setIsolateCone((v) => !v);
+        setNeighborhoodHops(0);
       } else if (ev.key === '[' || lower === 'k') {
         setStepRequest((prev) => ({ seq: (prev?.seq ?? 0) + 1, delta: -1 }));
       } else if (ev.key === ']' || lower === 'j') {
@@ -1467,12 +1486,26 @@ export default function WytheWorkspacePage() {
                           />
                         </div>
                         <div className="flex flex-wrap items-center gap-3">
+                          <label className="flex cursor-pointer items-center gap-1.5 text-slate-300" title="Hide nodes without a connection in this filtered view. Missing connections do not prove code is unused.">
+                            <input type="checkbox" checked={connectedOnly}
+                              onChange={(e) => setConnectedOnly(e.target.checked)} className="accent-teal-400" />
+                            Connected only
+                          </label>
+                          <select aria-label="Selected node neighborhood" disabled={!selectedNodeId}
+                            value={neighborhoodHops}
+                            onChange={(e) => { setNeighborhoodHops(Number(e.target.value) as 0 | 1 | 2); setIsolateCone(false); }}
+                            title={selectedNodeId ? 'Follow connections in either direction using the active edge filter' : 'Select a node to focus its neighborhood'}
+                            className="border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200 disabled:opacity-40">
+                            <option value={0}>Neighborhood: All</option>
+                            <option value={1}>Neighborhood: 1 hop</option>
+                            <option value={2}>Neighborhood: 2 hops</option>
+                          </select>
                           <label className="flex cursor-pointer items-center gap-1.5 text-slate-300">
                             <input
                               type="checkbox"
                               checked={isolateCone}
                               disabled={!selectedNodeId}
-                              onChange={(e) => setIsolateCone(e.target.checked)}
+                              onChange={(e) => { setIsolateCone(e.target.checked); setNeighborhoodHops(0); }}
                               className="accent-sky-400 disabled:opacity-40"
                             />
                             Cone [C]
@@ -1624,6 +1657,8 @@ export default function WytheWorkspacePage() {
                       activeTraceChain={activeTraceChain}
                       onlyFlagged={onlyFlagged}
                       isolateCone={isolateCone}
+                      connectedOnly={connectedOnly}
+                      neighborhoodHops={neighborhoodHops}
                       searchQuery={searchQuery}
                       polygonMode={wytheTheme.polygonMode}
                       palette={wytheTheme.palette}

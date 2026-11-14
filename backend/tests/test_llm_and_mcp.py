@@ -117,6 +117,8 @@ def test_ui_focus_bridge_http_cli_and_mcp_what_is_this(isolated_db_url: str) -> 
                 "selected_node_id": "t:atlas_rule_policies",
                 "lens": "contention",
                 "layout_mode": "cluster",
+                "connected_only": True,
+                "neighborhood_hops": 2,
                 "blast_mode": "off",
                 "diff_base_ref": "HEAD~1",
                 "snapshot_data_url": tiny_png,
@@ -133,6 +135,11 @@ def test_ui_focus_bridge_http_cli_and_mcp_what_is_this(isolated_db_url: str) -> 
         assert exp["focused_node"]["label"] == "atlas_rule_policies"
         assert exp["has_snapshot"] is True
         assert "atlas_rule_policies" in exp["markdown_brief"]
+        assert "Connected only: `True` | Neighborhood hops: `2`" in exp["markdown_brief"]
+        invalid = client.post(
+            "/api/v1/ui-focus", json={"active_slug": "wythe", "neighborhood_hops": 3}
+        )
+        assert invalid.status_code == 422
 
         snap_resp = client.get("/api/v1/ui-focus/snapshot.png")
         assert snap_resp.status_code == 200

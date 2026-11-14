@@ -53,11 +53,20 @@ const VERTEX_SHADER = /* glsl */ `
 attribute vec3 aBary;
 varying vec3 vBary;
 varying vec3 vViewNormal;
+varying float vPhaseOffset;
 
 void main() {
   vBary = aBary;
-  vViewNormal = normalize(normalMatrix * normal);
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  vec4 localPosition = vec4(position, 1.0);
+  vec3 localNormal = normal;
+  vPhaseOffset = 0.0;
+  #ifdef USE_INSTANCING
+    localPosition = instanceMatrix * localPosition;
+    localNormal = mat3(instanceMatrix) * localNormal;
+    vPhaseOffset = dot(instanceMatrix[3].xyz, vec3(0.17, 0.31, 0.67));
+  #endif
+  vViewNormal = normalize(normalMatrix * localNormal);
+  gl_Position = projectionMatrix * modelViewMatrix * localPosition;
 }
 `;
 
@@ -74,6 +83,7 @@ uniform vec3 uInquiryColor;
 
 varying vec3 vBary;
 varying vec3 vViewNormal;
+varying float vPhaseOffset;
 
 const float PI = 3.14159265359;
 
@@ -125,7 +135,7 @@ void main() {
   float ang = mod(atan(p.x, -p.y) + PI / 3.0, sector) - PI / 3.0;
   vec2 u = length(p) * vec2(cos(ang), sin(ang));
 
-  float wave = sin(uTime * uBreathSpeed + uPhase);
+  float wave = sin(uTime * uBreathSpeed + uPhase + vPhaseOffset);
   float rIn = (uHollow > 0.5) ? 27.2 : (22.8 + uBreathAmp * wave);
   float rOut = (uHollow > 0.5) ? 35.0 : (rIn + 11.0);
   float hl = 23.5 + (rIn - 22.8) * 0.25;
