@@ -9,16 +9,16 @@
 
 **Why (`?`) → Therefore (`∴`)** — Generalizable 3-tier architecture verifier, cross-boundary lineage solver, interactive 3D WebGL latticework visualizer, and fail-closed CI gate built around three masonry wythe invariants:
 
-1. **Database holds truth** — Relational schemas (`PostgreSQL`, `MySQL`, `SQLite` via `SQLAlchemy 2.0` + `Alembic`, `Prisma`, `Drizzle ORM`, `Django ORM`, Rust `sqlx`/`Diesel`/`SeaORM`, or raw SQL DDL/`sqlc` + optional read-only catalog probes) own domain policy, thresholds, temporal validity, and write-lane guards, while `Redis` keyspaces and worker queues are modeled explicitly as ephemeral stores/lanes rather than durable shadow truth.
-2. **Backend manipulates truth** — Services, background workers, solvers, and routers (`Python/FastAPI`, `TypeScript/Node/Express/Hono/Fastify/NestJS/Next.js/SvelteKit`, `Python/Django/DRF/Ninja`, `Go net/http/chi/gin/echo`, `Rust axum/actix-web/rocket/Tauri`) execute mechanisms over database rows behind explicit transactional service/SQL doors without embedding shadow policy literals or host-clock drift.
-3. **Frontend displays truth** — UI surfaces (`Next.js`, `React/Vite/TanStack Router/Remix`, `Vue 3/Nuxt`, `Svelte 5/SvelteKit`, `Rust WASM Leptos/Dioxus/Yew` + Tauri `invoke()`) bind to typed contracts, centralized clock utilities, and WCAG-accessible markup without inventing client-side policy maps or unbacked HTTP/IPC calls.
+1. **Database holds truth** — Relational schemas (`PostgreSQL`, `MySQL`, `SQLite` via `SQLAlchemy 2.0`/`SQLModel` + `Alembic`, `Prisma`, `Drizzle ORM`, `Kysely` migrations, `@immich/sql-tools` decorators, `Django ORM`, Rust `sqlx`/`Diesel`/`SeaORM`, or raw SQL DDL/`sqlc` + optional read-only catalog probes) own domain policy, thresholds, temporal validity, and write-lane guards, while `Redis` keyspaces and worker queues are modeled explicitly as ephemeral stores/lanes with independently verified purpose declarations rather than durable shadow truth.
+2. **Backend manipulates truth** — Services, background workers, solvers, and routers (`Python/FastAPI`, `TypeScript/Node/Express/Hono/Fastify/NestJS/Next.js/SvelteKit/tRPC`, `Python/Django/DRF/Ninja`, `Go net/http/chi/gin/echo`, `Rust axum/actix-web/rocket/Tauri`) execute mechanisms over database rows behind explicit transactional service/SQL doors across single or multi-root workspaces without embedding shadow policy literals or host-clock drift.
+3. **Frontend displays truth** — UI surfaces (`Next.js`, `React/Vite/TanStack Router/Remix`, `Vue 3/Nuxt`, `Svelte 5/SvelteKit`, `Rust WASM Leptos/Dioxus/Yew` + Tauri `invoke()`) bind to typed OpenAPI SDK (`Hey API`, `oazapfts`), `tRPC`, and REST contracts, centralized clock utilities, and WCAG-accessible markup without inventing client-side policy maps or unbacked HTTP/IPC calls.
 
-Wythe supports **19 stack profiles** via `--profile auto` (**1 production-dogfooded Tier-1 profile** + **17 `experimental` profiles** + **1 `planned` slot**), pairs Python's native `ast` with an optional **Tree-sitter CST grammar engine** (`wythe[treesitter]` for TypeScript/TSX, JavaScript, Rust, and Go), traces background worker & scheduled beat queues (`Celery` / `Beat`, `BullMQ`, `Asynq`), enforces **WCAG accessibility semantics** (`DISP-005`), renders both **Simple Solids** and **120 fps Breathing Atomic Wythe Polyhedra** (with adaptive `System | Dark | Light` polarity and custom user palettes), and **self-dogfoods** its own 3-tier codebase (`wythe gate --strict wythe` passes with zero blocking and zero warning findings).
+Wythe supports **38 stack profiles** via `--profile auto` (**1 production-dogfooded Tier-1 profile** + **36 `experimental` profiles**, including partial-coverage `INCOMPLETE` profiles + **1 `planned` slot**), pairs Python's native `ast` with an optional **Tree-sitter CST grammar engine** (`wythe[treesitter]` for TypeScript/TSX, JavaScript, Rust, and Go), traces background worker & scheduled beat queues (`Celery` / `Beat`, `BullMQ` / NestJS `@Processor`/`@InjectQueue`, `Asynq`), enforces **WCAG accessibility semantics** (`DISP-005`), renders both **Simple Solids** and **120 fps Breathing Atomic Wythe Polyhedra** (with adaptive `System | Dark | Light` polarity and custom user palettes), and **self-dogfoods** its own 3-tier codebase (`wythe gate --strict wythe` passes with zero blocking and zero warning findings).
 
 > [!IMPORTANT]
 > **Status, Maturity & Zero-Maintenance Notice (`"AS IS"`)**
 > - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.2.0` or `wythe==0.2.0`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
-> - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **17 experimental profiles** (`nextjs-prisma`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, `django-react`, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
+> - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **36 experimental profiles** (`nextjs-prisma`, `node-kysely-react`, `node-sql-tools-sveltekit`, `django-nextjs`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, partial-coverage profiles, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
 
 ---
 
@@ -40,25 +40,18 @@ uv tool install "wythe[treesitter]"
 wythe serve .
 ```
 
-### Exploring the full graph
+### Exploring the full graph (see the [User Guide](docs/user-guide.md))
 
-The 3D view represents every scanned node matching the current filters. Grid and
-Districts have no node or connection sampling limit. Distant nodes appear as dots;
-zooming in reveals detailed shapes in both Atomic and Simple modes. The count panel
-separates the represented graph, nodes hidden by filters, and detail inside the camera view.
+The 3D/2D view represents every scanned node matching the current filters with no node or connection sampling limit. Distant nodes appear as dots; zooming in reveals detailed shapes in both Atomic and Simple modes. The HUD count panel separates the visible graph, nodes hidden by filters or collapsed groups, and detailed meshes inside the camera view.
 
-- **Layout [L]** switches between Grid and Districts. Districts expand to fit their contents.
-- **Connected only** hides nodes without a connection to another node in the current view
-  (self-loops count). It respects the edge, stratum, subkind, and search filters.
-- Select a node, then choose **Neighborhood: 1 hop / 2 hops** to follow the displayed
-  connections in either direction. **Cone [C]** retains the separate transitive lineage view.
-- **Fit view** frames the current selection of nodes. Filtering preserves their positions;
-  scrolling over the map zooms toward the pointer.
+- **Layout `[L]`** selects **Domain Districts** (`cluster`), **Uniform Grid** (`grid`), **Role Subkinds** (`subkind`), or **Linked Components** (`connected`, which pulls edge-connected nodes closer and packs singletons separately).
+- **`Compact visible`** repacks only the currently visible/filtered/working-set nodes to remove empty space and re-fits the camera; ordinary filters keep global coordinates stable until you opt in.
+- **`3D Tiers` ↔ `2D Flat`** flattens the three strata onto a single `y = 0` plane; **`Pin` (`Pinned ★`)** locks individual node coordinates across layout changes.
+- **Working sets & collapsible groups:** Use **`Isolate visible`**, **`+ Add visible`**, and **`Group: Domain | Subkind`** to build focused views with boundary-crossing `+Expand (+K)` links, and persist layouts as **`Saved views`** (reconciled across commit/digest changes).
+- **4-state edge styling & filters:** **Connected only** hides isolated nodes in the active view; **Neighborhood: 1 hop / 2 hops** and **Cone `[C]`** follow connections in either direction; edge styles distinguish **Solid** (`verified`), **Dashed** (`declared`), **Dotted** (`unverified`), and **Gap** (`broken`).
+- **Fit view** frames the active selection or visible set while zooming toward the pointer.
 
-Selected and traced nodes remain pinned outside ordinary filters, with the extra count
-shown explicitly. Connected-only has no pin exception. Hidden or disconnected nodes
-remain in the scan and index; missing static connections are not proof of dead code or
-safe deletion. Rendering the entire scan does not extend the scanner's coverage.
+Selected and traced nodes remain pinned outside ordinary filters (with the extra count shown explicitly; `Connected-only` has no pin exception). Hidden or disconnected nodes remain in the scan and index; missing static connections are never proof of dead code or safe deletion. Rendering the entire scan does not extend the scanner's coverage.
 
 ### GitHub Actions Integration
 
@@ -91,6 +84,8 @@ Rule severity, enablement, gate-blocking behavior, and effective-date windows li
 | `MANIP-001` | `manipulate` | Blocking | Mutable domain policy/threshold constant hardcoded in code (`atlas_policy_vocabularies`) |
 | `MANIP-002` | `manipulate` | Blocking | Direct host `date.today()` or naive `datetime.now()` / `datetime.utcnow()` call |
 | `MANIP-003` | `manipulate` | Warning | Service/solver module has zero verified inbound route, CLI, or worker callers |
+| `MANIP-004` | `manipulate` | Warning | Launchd declaration has an invalid command or literal unexpanded path |
+| `MANIP-005` | `manipulate` | Warning | Deployment declaration references an absent source file |
 | `DISP-001` | `display` | Blocking | Display tier defines domain policy threshold shadows in frontend code |
 | `DISP-002` | `display` | Blocking | Raw `new Date()` or UTC `.toISOString().slice(0, 10)` date slicing |
 | `DISP-003` | `display` | Warning | Frontend API client omits `api-generated` OpenAPI/schema types |
@@ -178,9 +173,9 @@ Full JSON scans on large repositories span megabytes; Wythe exposes five zero-co
 # 1. Token-budgeted llms.txt pointer map (~2,000 tokens regardless of repo size)
 wythe llms /path/to/repo --max-tokens 2200 --out llms-wythe.txt
 
-# 2. Surgical ~300-token 3-tier Lineage Cone around any table, file, route, or queue
+# 2. Surgical ~300-token 3-tier Lineage Cone around any table, file, route, or queue (add --full for complete slice)
 wythe context /path/to/repo audit_exports
-wythe context /path/to/repo /api/v1/scans --json
+wythe context /path/to/repo /api/v1/scans --full --json
 
 # 3. Zero-copy-paste Human <-> LLM Bridge (local state or remote private/Tailnet server)
 wythe focus
@@ -214,24 +209,28 @@ Only the dogfooded Python/SQLAlchemy/Next.js trio is classified **`Implemented`*
 
 | Stratum | Adapter Key | Maturity | Stack Coverage |
 | :--- | :--- | :--- | :--- |
-| **Tier 1 (Truth)** | `postgres-sqlalchemy` | **Implemented** | SQLAlchemy 2.0 + Alembic + `schema.sql` + PG/MySQL/SQLite live catalog |
-| **Tier 1 (Truth)** | `prisma-schema` | Experimental | Prisma `schema.prisma` (`@@map`) + `prisma/migrations/*.sql` |
-| **Tier 1 (Truth)** | `drizzle-orm` | Experimental | Drizzle `pgTable`/`mysqlTable`/`sqliteTable` + Drizzle SQL migrations |
-| **Tier 1 (Truth)** | `django-orm` | Experimental | Django `models.Model` (`Meta.db_table`) + `migrations/*.py` |
-| **Tier 1 (Truth)** | `sql-ddl` | Experimental | Multi-dialect SQL DDL + `golang-migrate`/`goose`/`Flyway` + `sqlc` |
-| **Tier 1 (Truth)** | `rust-sql` | Experimental | Rust `sqlx` (`migrations/*.sql`, `query_file!`), `Diesel` (`table!`), `SeaORM` entities |
-| **Tier 1 (Ephemeral)** | `redis-ephemeral` | **Implemented** | Cross-language Redis keyspaces + `Celery`/`Beat`, `BullMQ`, & `Asynq` named queues |
-| **Tier 2 (Manipulate)** | `python-fastapi` | **Implemented** | FastAPI routers, Python services/workers/CLI, SQLAlchemy/SQL AST |
+| **Tier 1 (Truth)** | `postgres-sqlalchemy` | **Implemented** | SQLAlchemy 1.x/2.0, `SQLModel`, nested `Alembic`, `schema.sql` + PG/MySQL/SQLite live catalog |
+| **Tier 1 (Truth)** | `prisma-schema` | Experimental | Prisma `schema.prisma` (`@@map`) + `prisma/migrations/*.sql` + live catalog probe |
+| **Tier 1 (Truth)** | `drizzle-orm` | Experimental | Drizzle `pgTable`/`mysqlTable`/`sqliteTable` + Drizzle SQL migrations + live catalog probe |
+| **Tier 1 (Truth)** | `kysely-migrations` | Experimental | Kysely `SchemaBuilder` up-migration replay (`createTable`/`alterTable`/`renameTable`/`CamelCasePlugin`) + SQL functions + live catalog probe |
+| **Tier 1 (Truth)** | `sql-tools` | Experimental | `@immich/sql-tools` `@Table`/columns/FKs/indexes/checks/triggers & `registerFunction()` + live catalog probe |
+| **Tier 1 (Truth)** | `django-orm` | Experimental | Django `models.Model` (`Meta.db_table`) + `migrations/*.py` + live catalog probe |
+| **Tier 1 (Truth)** | `sql-ddl` | Experimental | Multi-dialect SQL DDL + `golang-migrate`/`goose`/`Flyway` + `sqlc` + live catalog probe |
+| **Tier 1 (Truth)** | `rust-sql` | Experimental | Rust `sqlx` (`migrations/*.sql`, `query_file!`), `Diesel` (`table!`), `SeaORM` entities + live catalog probe |
+| **Tier 1 (Truth)** | `no-truth` | Experimental | Explicit placeholder reporting `INCOMPLETE` coverage for unsupported persistence layers |
+| **Tier 1 (Ephemeral)** | `redis-ephemeral` | **Implemented** | Cross-language Redis keyspaces, verified `StorePurposeDeclaration`s, & `Celery`/`Beat`, `BullMQ`, `Asynq` queues |
+| **Tier 2 (Manipulate)** | `python-fastapi` | **Implemented** | FastAPI routers, Python services/workers/CLI, SQLAlchemy/`SQLModel`/SQL AST |
 | **Tier 2 (Manipulate)** | `python-services` | Experimental | Python scripts/imports, shell and launchd references, JSON command declarations, literal deployment mappings |
-| **Tier 2 (Manipulate)** | `typescript-node` | Experimental | Next.js `route.ts`, SvelteKit `+page.server.ts`/`+server.ts`, Express, Hono, Fastify, NestJS |
-| **Tier 2 (Manipulate)** | `python-django` | Experimental | Django `urls.py` (`path`/`re_path`), DRF `ViewSet`/routers, Django Ninja + `Model.objects` |
+| **Tier 2 (Manipulate)** | `typescript-node` | Experimental | Multi-root TypeScript workspaces, Next.js `route.ts`, SvelteKit `+page.server.ts`/`+server.ts`, Express, Hono, Fastify, NestJS (`RouteKey` controllers, inherited DI, BullMQ `@Processor`/`@InjectQueue`), `tRPC` routers/procedures, Kysely & Prisma queries |
+| **Tier 2 (Manipulate)** | `python-django` | Experimental | Django `urls.py` & `urls/` packages (`path`, `re_path`, `include`), DRF `ViewSet`/routers, CBVs (`APIView`/`ViewSet`), Django Ninja + `Model.objects` |
 | **Tier 2 (Manipulate)** | `go-http` | Experimental | Go 1.22+ `net/http`, `chi`, `gin`, `echo` (nested router groups) + `sqlc`/GORM/SQL |
 | **Tier 2 (Manipulate)** | `rust-http` | Experimental | Rust Cargo workspaces, `axum`, `actix-web`, `rocket`, Tauri `#[tauri::command]` + `sqlx`/Diesel/SeaORM |
+| **Tier 2 (Manipulate)** | `no-manipulator` | Experimental | Explicit placeholder reporting `INCOMPLETE` coverage for frontend-only or unsupported backends |
 | **Tier 3 (Display)** | `no-display` | Experimental | Explicitly unobserved UI for the service-only profile |
-| **Tier 3 (Display)** | `typescript-nextjs` | **Implemented** | Next.js App & Pages Router + custom fetch/RTK Query + Tauri `invoke()` + WCAG `DISP-005` |
-| **Tier 3 (Display)** | `typescript-react` | Experimental | React SPA, Vite, React Router, TanStack Router, Remix + barrel exports + WCAG `DISP-005` |
+| **Tier 3 (Display)** | `typescript-nextjs` | **Implemented** | Next.js App & Pages Router + `Hey API` / `oazapfts` / `tRPC` clients + Tauri `invoke()` + cross-component WCAG `DISP-005` |
+| **Tier 3 (Display)** | `typescript-react` | Experimental | React SPA, Vite, React Router, TanStack Router, Remix + `Hey API` / `oazapfts` / `tRPC` clients + WCAG `DISP-005` |
 | **Tier 3 (Display)** | `vue-sfc` | Experimental | Vue 3 & Nuxt 3 `.vue` SFCs + composables (`$fetch`, `useFetch`) + WCAG `DISP-005` |
-| **Tier 3 (Display)** | `sveltekit` | Experimental | Svelte 5 & SvelteKit `+page.svelte`, `+page.ts`, `$lib` + WCAG `DISP-005` |
+| **Tier 3 (Display)** | `sveltekit` | Experimental | Svelte 5 & SvelteKit `+page.svelte`, `+page.ts`, `#lib`/`$lib`, `oazapfts` SDK barrels + WCAG `DISP-005` |
 | **Tier 3 (Display)** | `rust-wasm` | Experimental | Rust WASM `Leptos`, `Dioxus`, `Yew` (`gloo-net` / `reqwest` / Tauri WASM) + WCAG `DISP-005` |
 
 ---
@@ -240,37 +239,40 @@ Only the dogfooded Python/SQLAlchemy/Next.js trio is classified **`Implemented`*
 
 The [Open WebUI source audit](docs/audits/open-webui.md) records the 0.1.7 repairs, measured coverage and remaining gaps. Its FastAPI/Svelte profile remains experimental.
 
-Every stack family has been scanned against synthetic test fixtures and multi-thousand-line real-world repositories (`wythe[treesitter]`):
+Every stack family has been scanned against synthetic regression suites and pinned open-source repositories (`wythe[treesitter]==0.2.0`):
 
 | Repository | Profile (`--profile auto`) | Maturity | Tier 1 (Truth) | Tier 2 (Manipulate) | Tier 3 (Display) | Verified Edges / E2E Chains | Notes & Observed Boundaries |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`Euda1mon1a/wythe`** | `fastapi-sqlalchemy-nextjs` | **Implemented** | 7 tables, 1 SQL fn | 53 routes & services | 23 pages/hooks/clients | **260 edges / 29 E2E** | Self-dogfooded (`PASS --strict`, 0 blocking, 0 warnings) |
-| **Production scheduling stack** | `fastapi-sqlalchemy-nextjs` | **Implemented** | 294 tables, 30 SQL guards, 15 Redis | 1,362 routes, services & solvers | 630 pages, hooks & clients | **10,056 edges / 300 E2E** | Continuous multi-thousand-file production target |
-| **`umami-software/umami`** (`d3c62a805bed`) | `nextjs-prisma` | Experimental | 41 Prisma tables | 156 routes, 189 query/service modules | 64 pages, 758 hooks/components | **3,162 edges / 294 E2E** | Resolves `(main)` route groups & `prisma.client.*`; 4 dynamic URL `DISP-004`s |
-| **`sadmann7/shadcn-table`** (`f4438fda7864`) | `postgres-drizzle-nextjs` | Experimental | 1 Drizzle table | 3 routes, 5 query/db modules | 8 pages, 88 hooks/components | **140 edges / 1 E2E** | `0` `DISP-004`; Next.js Server Actions bypass HTTP routes |
-| **`vintasoftware/django-react-boilerplate`** (`340e19b11249`) | `django-react` | Experimental | 1 Django table, 1 Redis | 3 route modules, 14 services | 5 React UI modules | **13 edges / 0 E2E** | `PASS --strict` (`0` blocking); uses generated OpenAPI client |
-| **`usememos/memos`** (`9ee06fdc4722`) | `postgres-go-react` | Experimental | 13 SQL tables | 5 Go route modules, 2 services | 17 pages, 307 UI modules | **1,224 edges / 0 E2E** | Intra-tier Go + React graphs resolve; Connect-RPC (`proto/`) is non-REST |
-| **`lldap/lldap`** (`99c510a7a603`) | `rust-fullstack-wasm` | Experimental | 12 SeaORM tables | 64 Rust backend modules | 2 Yew WASM pages, 47 components | **412 edges / 0 E2E** | Intra-tier SeaORM + Yew WASM graphs resolve; GraphQL (`schema.graphql`) is non-REST |
+| **`Euda1mon1a/wythe`** (`v0.2.0`) | `fastapi-sqlalchemy-nextjs` | **Implemented** | 7 tables, 1 SQL fn | 9 routes, 65 services | 1 page, 26 hooks/clients | **322 / 29** | Self-dogfooded (`PASS --strict`, 0 blocking, 0 warnings) |
+| **`fastapi/full-stack-fastapi-template`** (`aabb90126964`) | `fastapi-react-spa` | Experimental | 2 tables | 6 routes, 7 services | 10 pages, 58 hooks/clients | **229 / 39** | SQLModel + nested Alembic + Hey API OpenAPI SDK (`0` `DISP-004`/`007`) |
+| **`makeplane/plane`** (`9cefae892c4c`) | `django-nextjs` | Experimental | 112 tables, 34 Redis | 109 routes, 238 services | 58 pages, 1,590 UI nodes | **5,095 / 300** | Imported Django URL packages & CBVs; Next.js `pages`+`app` (`300` report cap) |
+| **`docmost/docmost`** (`3a3e812f25e8`) | `node-kysely-react` | Experimental | 49 tables, 16 fn, 14 Redis/BullMQ | 70 routes, 486 services | 26 pages, 817 UI nodes | **3,854 / 300** | Kysely `CamelCasePlugin` replay + NestJS BullMQ `@Processor`/`@InjectQueue` |
+| **`calcom/cal.com`** (`ef7954d16ab5`) | `nextjs-prisma` | Experimental | 100 Prisma tables, 2 Redis | 341 routes/tRPC, 1,055 services | 80 pages, 701 UI nodes | **3,580 / 293** | Multi-root TypeScript workspace (`apps/*`, `packages/*`) + tRPC lineage |
+| **`immich-app/immich`** (`e5d6eb7be678`) | `node-sql-tools-sveltekit` | Experimental | 71 tables, 28 SQL fn | 55 routes, 348 services | 123 pages, 454 UI nodes | **3,777 / 300** | `@immich/sql-tools` + `RouteKey` + inherited DI + `oazapfts` SDK (`0` `DISP-004`/`007`) |
+| **`umami-software/umami`** (`d3c62a805bed`) | `nextjs-prisma` | Experimental | 41 Prisma tables | 156 routes, 189 query/service modules | 64 pages, 758 UI nodes | **3,162 / 294** | `(group)` route dirs & `prisma.client.*` wrappers |
+| **`usememos/memos`** (`9ee06fdc4722`) | `postgres-go-react` | Experimental | 13 SQL tables | 5 Go routes, 2 services | 17 pages, 307 UI nodes | **1,224 / 0** | Intra-tier Go + React resolve; Connect-RPC (`proto/`) is non-REST |
+| **`lldap/lldap`** (`99c510a7a603`) | `rust-fullstack-wasm` | Experimental | 12 SeaORM tables | 64 Rust modules | 2 Yew WASM pages, 47 components | **412 / 0** | Intra-tier SeaORM + Yew WASM resolve; GraphQL (`schema.graphql`) is non-REST |
 
 ---
 
 ## FAQ & Known Limitations
 
 **1. Which stacks are production-ready vs. experimental?**
-`fastapi-sqlalchemy-nextjs` (`PostgreSQL`/`SQLite` + `SQLAlchemy 2.0`/`Alembic` + `Python/FastAPI` + `Next.js/TypeScript`) is Tier-1 dogfooded (`implemented`). All 17 other enabled stack profiles are **`experimental`**. On experimental profiles, start with `wythe scan`, `wythe llms`, `wythe context`, or `wythe diff --base origin/main` (or capture a `.wythe/governance.json` ratchet ceiling) rather than turning on `wythe gate --strict` blind.
+`fastapi-sqlalchemy-nextjs` (`PostgreSQL`/`SQLite` + `SQLAlchemy 2.0`/`Alembic` + `Python/FastAPI` + `Next.js/TypeScript`) is Tier-1 dogfooded (`implemented`). All **36** other enabled stack profiles are **`experimental`**. On experimental profiles, start with `wythe scan`, `wythe llms`, `wythe context`, or `wythe diff --base origin/main` (or capture a `.wythe/governance.json` ratchet ceiling) rather than turning on `wythe gate --strict` blind.
 
-**2. What happens if my app uses GraphQL, gRPC / Connect-RPC, tRPC, or Next.js Server Actions instead of HTTP REST?**
-Wythe's cross-tier linker currently matches HTTP REST paths (`RouteDescriptor` ↔ `FrontendHttpCall`) plus Tauri `#[tauri::command]` ↔ `invoke()`. On GraphQL (`lldap`), Connect-RPC/gRPC (`memos`), tRPC, or React Server Actions (`"use server"`), Wythe still extracts intra-tier DB tables, backend call graphs, and frontend component graphs, but cross-tier HTTP E2E chains will read `0` and rules like `TRUTH-001`, `MANIP-003`, or `DISP-004` may fire until ratcheted or disabled in `.wythe/governance.json`.
+**2. What happens if my app uses GraphQL, gRPC / Connect-RPC, or Next.js Server Actions?**
+Wythe resolves **HTTP REST** (`RouteDescriptor` ↔ `FrontendHttpCall` including **Hey API** & **`oazapfts`** OpenAPI SDKs), **tRPC** (`/trpc/<procedure>` routers ↔ React/Next.js `trpc.*` hooks), and **Tauri IPC** (`#[tauri::command]` ↔ `invoke()`). On **GraphQL** (`lldap`), **Connect-RPC / gRPC** (`memos`), or **React Server Actions (`"use server"`)**, Wythe still extracts intra-tier DB tables, backend call graphs, and frontend component graphs, but cross-tier HTTP E2E chains read `0` and rules like `TRUTH-001`, `MANIP-003`, or `DISP-004` should be ratcheted or disabled in `.wythe/governance.json`.
 
-**3. Why ship a static analyzer, SARIF CI gate, interactive 3D WebGL UI, and local AI/MCP bridges in one wheel?**
+**3. Why ship a static analyzer, SARIF CI gate, interactive 3D/2D WebGL UI, and local AI/MCP bridges in one wheel?**
 So `uvx "wythe[treesitter]" serve /path/to/repo` works in one command on any machine with zero Node.js toolchain, zero cloud API keys, and zero split-version drift between the CLI gate, MCP server, and visual X-Ray UI. Core `wythe` stays lightweight; prebuilt Tree-sitter C grammars are isolated in the optional `[treesitter]` extra.
 
 **4. Is Wythe actively maintained, or can I request features / SLAs?**
 **No.** Wythe is shared openly as a free community give-back from internal R&D, provided strictly **"AS IS"** under MIT with **zero commitment to maintain, patch, review PRs, triage issues, or preserve backward compatibility**. Pin exact versions in CI and fork freely.
 
-### Architecture & Ecosystem Docs
+### User Guide, Architecture & Ecosystem Docs
+- [`docs/user-guide.md`](docs/user-guide.md) — Interactive 3D/2D WebGL usage, working-set compaction (`Compact visible`, `Linked Components`, `2D Flat`, Saved Views), keyboard shortcuts, scoped rulings/store purposes, CLI flags, and epistemic guardrails.
 - [`docs/architecture/ecosystem-and-positioning.md`](docs/architecture/ecosystem-and-positioning.md) — Ecosystem comparison (`tach`, `import-linter`, `dependency-cruiser`, `sqllineage`, `OpenLineage`, `CodeCharta`, `Semgrep`) and pairing `tach` + Wythe in CI.
-- [`docs/architecture/multi-language-extensibility.md`](docs/architecture/multi-language-extensibility.md) — Language-neutral intermediate contract, adapter maturity matrix, wild OSS corpus benchmarks, and non-REST boundaries.
+- [`docs/architecture/multi-language-extensibility.md`](docs/architecture/multi-language-extensibility.md) — Language-neutral intermediate contract, adapter maturity matrix, pinned corpus benchmarks, and non-REST transport boundaries.
 
 ---
 
