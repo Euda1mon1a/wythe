@@ -71,18 +71,38 @@ export function NodeSourceAndPromptPanel({
       .map((l) => `${l.is_focus ? '>' : ' '} ${String(l.line_number).padStart(4, ' ')} | ${l.text}`)
       .join('\n');
     const findingBlocks = nodeFindings
-      .map(
-        (f) =>
-          `- [${f.rule_code}] (${f.severity}) ${f.title} @ ${f.source_file}:${f.line}\n  Detail: ${f.detail}\n  Remediation: ${f.remediation}`,
-      )
+      .map((f) => {
+        const causal =
+          f.target_node_id === node.id && f.node_id !== node.id
+            ? ` [causal writer ${f.node_id} @ ${f.source_file}:${f.line}]`
+            : ` @ ${f.source_file}:${f.line}`;
+        return `- [${f.rule_code}] (${f.severity}) ${f.title}${causal}\n  Detail: ${f.detail}\n  Remediation: ${f.remediation}`;
+      })
       .join('\n');
+    const sp = node.store_purpose;
+    const purposeBlock = sp
+      ? [
+          `Declared Store Purpose (intent, NOT verified safety): intended_use=${sp.intended_use}`,
+          sp.authoritative_source ? `Authoritative Source: ${sp.authoritative_source}` : '',
+          sp.copy_reason ? `Copy Reason: ${sp.copy_reason}` : '',
+          sp.refresh_policy ? `Refresh / Invalidation Policy: ${sp.refresh_policy}` : '',
+          sp.recovery_expectation ? `Recovery Expectation: ${sp.recovery_expectation}` : '',
+          sp.keyspace_scope ? `Keyspace Scope: ${sp.keyspace_scope}` : '',
+          sp.verification_summary ? `Static Verification: ${sp.verification_summary}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n')
+      : node.verification_note
+        ? `Static Verification: ${node.verification_note}`
+        : '';
 
     return [
       `# Wythe 3-Tier Surgical Refactor Brief (${activeSlug})`,
       `Target Node: ${node.label} (${node.tier} :: ${node.subkind}, status=${node.status})`,
-      `Coordinate: ${node.source_file}:${node.line}`,
+      `Discovery Coordinate: ${node.source_file}:${node.line}`,
       upLabels.length > 0 ? `Inbound Links: ${upLabels.join(', ')}` : 'Inbound Links: none',
       downLabels.length > 0 ? `Outbound Links: ${downLabels.join(', ')}` : 'Outbound Links: none',
+      purposeBlock,
       cleanExemplar
         ? `Clean Same-Tier Reference Exemplar: ${cleanExemplar.label} (${cleanExemplar.source_file}:${cleanExemplar.line})`
         : '',
@@ -92,7 +112,7 @@ export function NodeSourceAndPromptPanel({
       '',
       codeLines ? `## Local Source Context (${node.source_file})\n\`\`\`\n${codeLines}\n\`\`\`` : '',
       '',
-      'Task: Refactor this surface cleanly so domain truth stays in Tier 1 (Database), computation/orchestration stays in Tier 2 (Backend Manipulation), and Tier 3 (Display) renders typed API state without policy leakage.',
+      'Task: Investigate the discovery and causal writer coordinates before assuming duplication or deletion safety. Verify refresh/invalidation and authoritative source behavior, and keep domain truth in Tier 1 (Database), computation/orchestration in Tier 2 (Backend Manipulation), and Tier 3 (Display) rendering typed API state without policy leakage.',
     ]
       .filter(Boolean)
       .join('\n');

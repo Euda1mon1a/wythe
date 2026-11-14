@@ -28,6 +28,10 @@ from app.schemas.atlas import (
     PortableRulingItem,
     PortableVocabularyEntry,
 )
+from app.services.ruling_metadata import (
+    pack_ruling_cutover_payload,
+    unpack_ruling_cutover_payload,
+)
 
 
 def default_bundle_path(target: TargetProject) -> Path:
@@ -109,11 +113,14 @@ def build_portable_bundle(
                 node_id=rl.node_id,
                 disposition=rl.disposition,
                 summary=rl.summary,
-                cutover_history=rl.cutover_history,
+                cutover_history=hist,
+                store_purpose=sp,
+                evidence_scope=scope,
                 audited_commit=rl.audited_commit,
                 recorded_by=rl.recorded_by,
             )
             for rl in rulings
+            for hist, sp, scope in (unpack_ruling_cutover_payload(rl.cutover_history),)
         ],
     )
 
@@ -226,13 +233,16 @@ def sync_portable_bundle_from_disk(
             baselines_count += 1
 
         existing_r = {
-            (rl.node_id, rl.disposition, rl.audited_commit)
+            (rl.node_id, rl.disposition, rl.audited_commit, rl.cutover_history or "")
             for rl in session.scalars(
                 select(AuditRuling).where(AuditRuling.target_id == target.id)
             ).all()
         }
         for ri in bundle.audit_rulings:
-            rkey = (ri.node_id, ri.disposition, ri.audited_commit)
+            packed_cutover = pack_ruling_cutover_payload(
+                ri.cutover_history, ri.store_purpose, ri.evidence_scope
+            )
+            rkey = (ri.node_id, ri.disposition, ri.audited_commit, packed_cutover or "")
             if rkey not in existing_r:
                 existing_r.add(rkey)
                 session.add(
@@ -241,7 +251,7 @@ def sync_portable_bundle_from_disk(
                         node_id=ri.node_id,
                         disposition=ri.disposition,
                         summary=ri.summary,
-                        cutover_history=ri.cutover_history,
+                        cutover_history=packed_cutover,
                         audited_commit=ri.audited_commit,
                         audited_at=today,
                         effective_from=today,

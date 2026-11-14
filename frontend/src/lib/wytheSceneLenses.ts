@@ -421,7 +421,7 @@ export function getLensLegendItems(
   }
   return [
     { color: '#2dd4bf', label: 'clean' },
-    { color: '#f59e0b', label: 'policy_in_code' },
+    { color: '#f59e0b', label: 'policy_in_code / gray_zone' },
     { color: '#f43f5e', label: 'duplicated_truth' },
   ];
 }

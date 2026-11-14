@@ -109,8 +109,14 @@ def build_llms_txt_brief(
     for g in guards[:6]:
         lines.append(f"- [sql_guard] `{g.label}` (`{_ptr(g)}`) — inbound={in_deg[g.id]}")
     for q in queues[:8]:
+        purpose_tag = (
+            f", purpose={q.store_purpose.intended_use}, verify={q.store_purpose.verification_summary or q.verification_note}"
+            if q.store_purpose is not None
+            else (f", verify={q.verification_note}" if q.verification_note else "")
+        )
         lines.append(
-            f"- [ephemeral_lane] `{q.label}` (`{_ptr(q)}`) — consumers={q.read_by_count}, producers={q.written_by_count}"
+            f"- [ephemeral_lane] `{q.label}` (`{_ptr(q)}`) — status={q.status}, "
+            f"consumers={q.read_by_count}, producers={q.written_by_count}{purpose_tag}"
         )
 
     lines.extend(["", "## Tier 2 — Backend Manipulation Entry Doors & Hubs"])
@@ -302,11 +308,19 @@ def build_lineage_cone_slice(
         or bool(seed_set.intersection(ch.via_node_ids))
     ][:15]
 
-    cone_findings = [f for f in report.findings if f.node_id in cone_ids][:25]
+    cone_findings = [
+        f
+        for f in report.findings
+        if f.node_id in cone_ids or f.target_node_id in cone_ids
+    ][:25]
 
     md: list[str] = [
         f"# 3-Tier Lineage Cone :: `{query}` ({report.target_slug} @ `{report.source_commit[:10]}`)",
         f"> Matched seeds ({len(seeds)}): {', '.join(f'`{s.id}` (`{_ptr(s)}`)' for s in seeds)}",
+        (
+            "> Guardrail: Distinguish declared store purpose from verified lifetime/invalidation, "
+            "discovery location from causal write `file:line`, and suggested changes from verified fixes."
+        ),
         "",
     ]
     if disp_ptrs:
@@ -322,10 +336,18 @@ def build_lineage_cone_slice(
             md.append(f"- [{p.subkind}] `{p.label}` (`{p.pointer}`) status={p.status}{hp}")
         md.append("")
     if truth_ptrs:
+        truth_by_id = {n.id: n for n in cone_nodes if n.tier == "truth"}
         md.append(f"## Tier 1 — Downstream Truth & Queues ({len(truth_ptrs)})")
         for p in truth_ptrs:
             cols = f" cols=[{', '.join(p.columns)}]" if p.columns else ""
-            md.append(f"- [{p.subkind}] `{p.label}` (`{p.pointer}`) status={p.status}{cols}")
+            tn = truth_by_id.get(p.id)
+            pnote = ""
+            if tn and tn.store_purpose is not None:
+                vsum = tn.store_purpose.verification_summary or tn.verification_note or "unverified"
+                pnote = f" | declared_purpose={tn.store_purpose.intended_use} | verification={vsum}"
+            elif tn and tn.verification_note:
+                pnote = f" | verification={tn.verification_note}"
+            md.append(f"- [{p.subkind}] `{p.label}` (discovery=`{p.pointer}`) status={p.status}{cols}{pnote}")
         md.append("")
     if matching_chains:
         md.append(f"## Verified End-to-End Chains ({len(matching_chains)})")
@@ -346,8 +368,14 @@ def build_lineage_cone_slice(
     if cone_findings:
         md.append(f"## Active Findings in Cone ({len(cone_findings)})")
         for cf in cone_findings:
+            writer_tag = (
+                f" [writer=`{cf.node_id}` -> target=`{cf.target_node_id}`]"
+                if cf.target_node_id and cf.target_node_id != cf.node_id
+                else ""
+            )
             md.append(
-                f"- **{cf.rule_code}** [{cf.severity}] `{cf.source_file}:{cf.line}` — {cf.title} | Fix: {cf.remediation}"
+                f"- **{cf.rule_code}** [{cf.severity}] `{cf.source_file}:{cf.line}`{writer_tag} — "
+                f"{cf.title} | Suggested remediation: {cf.remediation}"
             )
 
     md_text = "\n".join(md).strip()

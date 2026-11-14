@@ -7,6 +7,7 @@ import type { components } from '@/types/api-generated';
 
 export type TruthAtlasReport = components['schemas']['TruthAtlasReport'];
 export type AtlasNode = components['schemas']['AtlasNode'];
+export type StorePurposeDeclaration = components['schemas']['StorePurposeDeclaration'];
 export type AtlasEdge = components['schemas']['AtlasEdge'];
 export type EndToEndChain = components['schemas']['EndToEndChain'];
 export type BoundaryFinding = components['schemas']['BoundaryFinding'];

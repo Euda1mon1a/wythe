@@ -367,7 +367,7 @@ export function AccessibleIndexView({
                       className={
                         n.status === 'clean'
                           ? 'text-teal-300'
-                          : n.status === 'policy_in_code'
+                          : n.status === 'policy_in_code' || n.status === 'gray_zone'
                             ? 'text-amber-300'
                             : n.status === 'duplicated_truth'
                               ? 'text-rose-400'
@@ -376,6 +376,16 @@ export function AccessibleIndexView({
                     >
                       {n.status}
                     </span>
+                    {n.store_purpose && (
+                      <div className="mt-0.5 text-[10px] text-teal-200/80">
+                        intent: {n.store_purpose.intended_use}
+                      </div>
+                    )}
+                    {n.verification_note && (
+                      <div className="mt-0.5 truncate text-[10px] text-slate-400" title={n.verification_note}>
+                        {n.verification_note}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2 font-mono text-[11px] text-slate-300">
                     {n.source_file}:{n.line}

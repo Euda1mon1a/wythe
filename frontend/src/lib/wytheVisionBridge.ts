@@ -38,11 +38,19 @@ export function computeVisualFocusFiducial(params: {
   for (const n of nodes) nodesById.set(n.id, n);
 
   const findingsByNode = new Map<string, BoundaryFinding[]>();
+  const addFindingRef = (key: string | null | undefined, f: BoundaryFinding) => {
+    if (!key) return;
+    const arr = findingsByNode.get(key) ?? [];
+    if (!arr.includes(f)) {
+      arr.push(f);
+      findingsByNode.set(key, arr);
+    }
+  };
   for (const f of findings) {
-    if (!f.node_id) continue;
-    const arr = findingsByNode.get(f.node_id) ?? [];
-    arr.push(f);
-    findingsByNode.set(f.node_id, arr);
+    addFindingRef(f.node_id, f);
+    if (f.target_node_id && f.target_node_id !== f.node_id) {
+      addFindingRef(f.target_node_id, f);
+    }
   }
 
   const activeId = selectedNodeId ?? hoveredNodeId;
@@ -299,11 +307,19 @@ export function buildLiveViewportDigest(params: {
   for (const n of visibleNodes) nodesById.set(n.id, n);
 
   const findingsByNode = new Map<string, BoundaryFinding[]>();
+  const addFindingRef = (key: string | null | undefined, f: BoundaryFinding) => {
+    if (!key) return;
+    const arr = findingsByNode.get(key) ?? [];
+    if (!arr.includes(f)) {
+      arr.push(f);
+      findingsByNode.set(key, arr);
+    }
+  };
   for (const f of findings) {
-    if (!f.node_id) continue;
-    const arr = findingsByNode.get(f.node_id) ?? [];
-    arr.push(f);
-    findingsByNode.set(f.node_id, arr);
+    addFindingRef(f.node_id, f);
+    if (f.target_node_id && f.target_node_id !== f.node_id) {
+      addFindingRef(f.target_node_id, f);
+    }
   }
 
   interface FrustumEntry {
@@ -371,11 +387,39 @@ export function buildLiveViewportDigest(params: {
     const inb = edges.filter((e) => e.target_id === selNode.id).slice(0, 6);
     const outb = edges.filter((e) => e.source_id === selNode.id).slice(0, 6);
     lines.push(
-      `- **SELECTED / HIGHLIGHTED NODE (Pinned by User)**: \`${selNode.id}\` (${selNode.tier} \`${selNode.subkind}\`, label=\`${selNode.label}\`, status=\`${selNode.status}\`, district=\`${deriveDomainCluster(selNode)}\`, pointer=\`${selNode.source_file}:${selNode.line}\`)`,
+      `- **SELECTED / HIGHLIGHTED NODE (Pinned by User)**: \`${selNode.id}\` (${selNode.tier} \`${selNode.subkind}\`, label=\`${selNode.label}\`, status=\`${selNode.status}\`, district=\`${deriveDomainCluster(selNode)}\`, discovery_pointer=\`${selNode.source_file}:${selNode.line}\`)`,
     );
+    if (selNode.store_purpose) {
+      const sp = selNode.store_purpose;
+      const details = [
+        `intended_use=${sp.intended_use}`,
+        sp.authoritative_source ? `authoritative_source=${sp.authoritative_source}` : null,
+        sp.copy_reason ? `copy_reason=${sp.copy_reason}` : null,
+        sp.refresh_policy ? `refresh_policy=${sp.refresh_policy}` : null,
+        sp.recovery_expectation ? `recovery_expectation=${sp.recovery_expectation}` : null,
+        sp.keyspace_scope ? `keyspace_scope=${sp.keyspace_scope}` : null,
+      ]
+        .filter(Boolean)
+        .join(', ');
+      lines.push(`  - Declared Store Purpose (intent, NOT proof of verification): ${details}`);
+      if (sp.verification_summary) {
+        lines.push(`  - Purpose Verification: ${sp.verification_summary}`);
+      }
+    } else if (selNode.verification_note) {
+      lines.push(`  - Static Verification Note: ${selNode.verification_note}`);
+    }
     if (sf.length > 0) {
       lines.push(
-        `  - Selected Node Findings: ${sf.slice(0, 4).map((f) => `\`${f.rule_code}\` [${f.severity}] ${f.title} (line ${f.line})`).join('; ')}`,
+        `  - Selected Node Findings: ${sf
+          .slice(0, 4)
+          .map((f) => {
+            const loc =
+              f.target_node_id === selNode.id && f.node_id !== selNode.id
+                ? `causal writer \`${f.node_id}\` @ \`${f.source_file}:${f.line}\``
+                : `\`${f.source_file}:${f.line}\``;
+            return `\`${f.rule_code}\` [${f.severity}] ${f.title} (${loc})`;
+          })
+          .join('; ')}`,
       );
     }
     if (inb.length > 0) {
@@ -402,6 +446,9 @@ export function buildLiveViewportDigest(params: {
       .join(', ');
     lines.push(`- **${bucket}**: **${bucketNodes.length}** nodes on screen — e.g. ${sample}`);
   }
+  lines.push(
+    '- **Epistemic Guardrail**: Color (\`amber\`/\`gray_zone\` = unestablished lifetime or unverified store claim; \`crimson\`/\`duplicated_truth\` = conflicting authority or overlapping write evidence) indicates static risk requiring code inspection, NOT proven duplicate runtime data or safe deletion.',
+  );
 
   if (centerTop.length > 0) {
     lines.push('\n#### Top Center-of-Screen Nodes in Camera View');

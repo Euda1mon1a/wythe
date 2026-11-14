@@ -673,6 +673,9 @@ export interface components {
             ruling_summary?: string | null;
             /** Ruling Audited At */
             ruling_audited_at?: string | null;
+            store_purpose?: components["schemas"]["StorePurposeDeclaration"] | null;
+            /** Verification Note */
+            verification_note?: string | null;
         };
         /** AtlasSummaryStats */
         AtlasSummaryStats: {
@@ -716,6 +719,9 @@ export interface components {
             summary: string;
             /** Cutover History */
             cutover_history?: string | null;
+            store_purpose?: components["schemas"]["StorePurposeDeclaration"] | null;
+            /** Evidence Scope */
+            evidence_scope?: string[];
             /** Recorded By */
             recorded_by: string;
         };
@@ -733,6 +739,9 @@ export interface components {
             summary: string;
             /** Cutover History */
             cutover_history?: string | null;
+            store_purpose?: components["schemas"]["StorePurposeDeclaration"] | null;
+            /** Evidence Scope */
+            evidence_scope?: string[];
             /** Audited Commit */
             audited_commit: string;
             /**
@@ -772,6 +781,8 @@ export interface components {
             blocks_gate: boolean;
             /** Node Id */
             node_id?: string | null;
+            /** Target Node Id */
+            target_node_id?: string | null;
             /** Source File */
             source_file: string;
             /**
@@ -1220,6 +1231,9 @@ export interface components {
             summary: string;
             /** Cutover History */
             cutover_history?: string | null;
+            store_purpose?: components["schemas"]["StorePurposeDeclaration"] | null;
+            /** Evidence Scope */
+            evidence_scope?: string[];
             /** Audited Commit */
             audited_commit: string;
             /** Recorded By */
@@ -1488,6 +1502,29 @@ export interface components {
             is_enabled: boolean;
             /** Description */
             description: string;
+        };
+        /**
+         * StorePurposeDeclaration
+         * @description Declared copy/storage intent, kept distinct from static verification.
+         */
+        StorePurposeDeclaration: {
+            /**
+             * Intended Use
+             * @enum {string}
+             */
+            intended_use: "derived_cache" | "read_replica" | "materialized_view" | "historical_snapshot" | "persistent_config" | "ephemeral_state" | "queue_buffer" | "authoritative_store";
+            /** Authoritative Source */
+            authoritative_source?: string | null;
+            /** Copy Reason */
+            copy_reason?: string | null;
+            /** Refresh Policy */
+            refresh_policy?: string | null;
+            /** Recovery Expectation */
+            recovery_expectation?: string | null;
+            /** Keyspace Scope */
+            keyspace_scope?: string | null;
+            /** Verification Summary */
+            verification_summary?: string | null;
         };
         /** TargetProjectCreate */
         TargetProjectCreate: {

@@ -225,7 +225,11 @@ def explain_ui_focus(
             columns=list(focus_node.columns[:8]),
             http_paths=list(focus_node.http_paths[:6]),
         )
-        active_findings = [f for f in report.findings if f.node_id == focus_node.id][:12]
+        active_findings = [
+            f
+            for f in report.findings
+            if f.node_id == focus_node.id or f.target_node_id == focus_node.id
+        ][:12]
         cone_edges = [
             f"{e.source_id} --[{e.kind}]--> {e.target_id}"
             for e in report.edges
@@ -233,17 +237,32 @@ def explain_ui_focus(
         ][:16]
     elif dist_summary is not None:
         d_ids = {n.id for n in report.nodes if derive_node_district(n) == district}
-        active_findings = [f for f in report.findings if f.node_id in d_ids][:12]
+        active_findings = [
+            f
+            for f in report.findings
+            if f.node_id in d_ids or f.target_node_id in d_ids
+        ][:12]
 
     if focus_node and focus_node.id in crimson_ids and active_findings:
         f0 = active_findings[0]
+        origin = (
+            f" triggered by writer `{f0.node_id}` at `{f0.source_file}:{f0.line}`"
+            if f0.target_node_id == focus_node.id and f0.node_id != focus_node.id
+            else ""
+        )
         color_reason = (
-            f"Glowing crimson in 3D Blast ({diff_base_ref}) because `{focus_node.label}` triggers "
-            f"`{f0.rule_code}` ({f0.severity}): {f0.title}."
+            f"Glowing crimson in 3D Blast ({diff_base_ref}) because `{focus_node.label}` has "
+            f"`{f0.rule_code}` ({f0.severity}){origin}: {f0.title}."
         )
     elif focus_node and active_findings:
         f0 = active_findings[0]
-        color_reason = f"Flagged by `{f0.rule_code}` ({f0.severity}): {f0.title}."
+        if f0.target_node_id == focus_node.id and f0.node_id != focus_node.id:
+            color_reason = (
+                f"Flagged by causal writer finding `{f0.rule_code}` ({f0.severity}) at "
+                f"`{f0.source_file}:{f0.line}` (`{f0.node_id}`): {f0.title}."
+            )
+        else:
+            color_reason = f"Flagged by `{f0.rule_code}` ({f0.severity}): {f0.title}."
     elif focus_node and focus_node.id in touched_ids:
         color_reason = f"Glowing amber in 3D Blast ({diff_base_ref}) because `{focus_node.source_file}` changed."
     elif focus_node and focus_node.id in impacted_ids:
@@ -272,7 +291,31 @@ def explain_ui_focus(
         f"> **Why It Looks Like This**: {color_reason}",
     ]
     if ptr is not None:
-        md_lines.append(f"- **Focused Node**: `{ptr.id}` (`{ptr.pointer}`) — status=`{ptr.status}`")
+        md_lines.append(
+            f"- **Focused Node**: `{ptr.id}` (discovery pointer `{ptr.pointer}`) — status=`{ptr.status}`"
+        )
+    if focus_node is not None and focus_node.store_purpose is not None:
+        sp = focus_node.store_purpose
+        src_desc = sp.authoritative_source or "unspecified"
+        pol_desc = sp.refresh_policy or "unspecified"
+        rec_desc = sp.recovery_expectation or "unspecified"
+        ks_desc = f" · keyspace_scope=`{sp.keyspace_scope}`" if sp.keyspace_scope else ""
+        md_lines.append(
+            f"- **Declared Purpose**: `{sp.intended_use}` (source=`{src_desc}`, refresh=`{pol_desc}`, "
+            f"recovery=`{rec_desc}`{ks_desc})"
+        )
+        md_lines.append(
+            f"- **Verification**: {sp.verification_summary or focus_node.verification_note or 'not verified'}"
+        )
+    elif focus_node is not None and focus_node.verification_note:
+        md_lines.append(f"- **Verification**: {focus_node.verification_note}")
+    if focus_node is not None and (
+        focus_node.subkind == "cache_store" or focus_node.status in ("gray_zone", "duplicated_truth")
+    ):
+        md_lines.append(
+            "- **Evidence Guardrail**: Color/status or `default:*` grouping alone does not prove "
+            "duplicate contents, shared keys, or safe deletion; check causal findings and source edges."
+        )
     if secondary_hover_node is not None:
         md_lines.append(
             f"- **Cursor Also Hovering**: `{secondary_hover_node.id}` "
@@ -291,8 +334,14 @@ def explain_ui_focus(
     if active_findings:
         md_lines.append("\n## Active Findings Explaining Highlight")
         for f in active_findings[:8]:
+            writer_tag = (
+                f" (causal writer `{f.node_id}` -> `{f.target_node_id}`)"
+                if f.target_node_id and f.target_node_id != f.node_id
+                else ""
+            )
             md_lines.append(
-                f"- **{f.rule_code}** [{f.severity}] `{f.source_file}:{f.line}` — {f.title} | Fix: {f.remediation}"
+                f"- **{f.rule_code}** [{f.severity}] `{f.source_file}:{f.line}`{writer_tag} — "
+                f"{f.title} | Suggested remediation (unverified): {f.remediation}"
             )
     if cone_edges:
         md_lines.append("\n## Immediate Verified Edges")

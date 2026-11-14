@@ -2,7 +2,7 @@
 
 import { useMemo, useState, type FormEvent } from 'react';
 import { Copy, History, Stamp, X } from 'lucide-react';
-import type { AtlasEdge, AtlasNode, BoundaryFinding } from '@/api/atlas';
+import type { AtlasEdge, AtlasNode, BoundaryFinding, StorePurposeDeclaration } from '@/api/atlas';
 import { NodeSourceAndPromptPanel } from '@/components/NodeSourceAndPromptPanel';
 import { useCreateRuling, useFetchContextCone } from '@/hooks/useAtlas';
 import { copyTextToClipboard } from '@/lib/clipboard';
@@ -36,6 +36,14 @@ export function NodeInspector({
   const [disposition, setDisposition] = useState('confirmed_owner_intent');
   const [summary, setSummary] = useState('');
   const [cutoverHistory, setCutoverHistory] = useState('');
+  const [showPurposeFields, setShowPurposeFields] = useState(false);
+  const [intendedUse, setIntendedUse] = useState<StorePurposeDeclaration['intended_use'] | ''>('');
+  const [authoritativeSource, setAuthoritativeSource] = useState('');
+  const [copyReason, setCopyReason] = useState('');
+  const [refreshPolicy, setRefreshPolicy] = useState('');
+  const [recoveryExpectation, setRecoveryExpectation] = useState('');
+  const [keyspaceScope, setKeyspaceScope] = useState('');
+  const [evidenceScopeInput, setEvidenceScopeInput] = useState('');
   const [copiedConeLabel, setCopiedConeLabel] = useState<string | null>(null);
   const [showAllColumns, setShowAllColumns] = useState(false);
   const createRuling = useCreateRuling(activeSlug);
@@ -46,7 +54,9 @@ export function NodeInspector({
     return {
       inbound: edges.filter((e) => e.target_id === node.id),
       outbound: edges.filter((e) => e.source_id === node.id),
-      nodeFindings: findings.filter((f) => f.node_id === node.id),
+      nodeFindings: findings.filter(
+        (f) => f.node_id === node.id || f.target_node_id === node.id,
+      ),
     };
   }, [node, edges, findings]);
 
@@ -64,18 +74,41 @@ export function NodeInspector({
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     if (!summary.trim()) return;
+    const trimmedEvidenceScope = evidenceScopeInput
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const storePurpose: StorePurposeDeclaration | null = intendedUse
+      ? {
+          intended_use: intendedUse,
+          authoritative_source: authoritativeSource.trim() || null,
+          copy_reason: copyReason.trim() || null,
+          refresh_policy: refreshPolicy.trim() || null,
+          recovery_expectation: recoveryExpectation.trim() || null,
+          keyspace_scope: keyspaceScope.trim() || null,
+        }
+      : null;
     createRuling.mutate(
       {
         node_id: node.id,
         disposition,
         summary: summary.trim(),
         cutover_history: cutoverHistory.trim() || null,
+        store_purpose: storePurpose,
+        evidence_scope: trimmedEvidenceScope,
         recorded_by: 'operator',
       },
       {
         onSuccess: () => {
           setSummary('');
           setCutoverHistory('');
+          setIntendedUse('');
+          setAuthoritativeSource('');
+          setCopyReason('');
+          setRefreshPolicy('');
+          setRecoveryExpectation('');
+          setKeyspaceScope('');
+          setEvidenceScopeInput('');
         },
       },
     );
@@ -152,12 +185,21 @@ export function NodeInspector({
                   ? `Sky-Blue in 3D Blast (${diffOverlay.label}) · Transitive Blast Cone`
                   : `Active Boundary Findings (${nodeFindings.length})`}
           </div>
-          {nodeFindings.slice(0, 4).map((f) => (
-            <div key={f.id} className="border border-rose-500/20 bg-slate-950/75 p-2 text-[11px] text-slate-200">
-              <strong className="font-mono text-rose-300">{f.rule_code}:</strong> {f.title}
-              <div className="mt-0.5 text-[10px] text-slate-300">{f.remediation}</div>
-            </div>
-          ))}
+          {nodeFindings.slice(0, 4).map((f) => {
+            const isCausalWriter =
+              f.target_node_id === node.id && f.node_id !== node.id;
+            return (
+              <div key={f.id} className="border border-rose-500/20 bg-slate-950/75 p-2 text-[11px] text-slate-200">
+                <strong className="font-mono text-rose-300">{f.rule_code}:</strong> {f.title}
+                <div className="mt-0.5 font-mono text-[10px] text-amber-200/90">
+                  {isCausalWriter
+                    ? `Causal writer: ${f.node_id} @ ${f.source_file}:${f.line}`
+                    : `${f.source_file}:${f.line}`}
+                </div>
+                <div className="mt-0.5 text-[10px] text-slate-300">{f.remediation}</div>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -171,6 +213,60 @@ export function NodeInspector({
             Transition Provenance (Status remains {node.status})
           </div>
           <p className="mt-1 text-slate-300">{node.cutover_history}</p>
+        </div>
+      )}
+
+      {/* Declared Store Purpose vs Static Verification (kept distinct!) */}
+      {(node.store_purpose || node.verification_note) && (
+        <div className="space-y-2 border border-amber-500/30 bg-amber-950/15 p-3">
+          <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-amber-300">
+            <span>Declared Store Purpose vs Verification</span>
+            <span className="text-slate-300">status: {node.status}</span>
+          </div>
+          {node.store_purpose && (
+            <div className="space-y-1 text-[11px] text-slate-200">
+              <div>
+                <span className="font-mono text-slate-400">Declared Intent (NOT verification): </span>
+                <span className="font-mono text-teal-300">{node.store_purpose.intended_use}</span>
+              </div>
+              {node.store_purpose.authoritative_source && (
+                <div>
+                  <span className="font-mono text-slate-400">Authoritative Source: </span>
+                  <span className="font-mono">{node.store_purpose.authoritative_source}</span>
+                </div>
+              )}
+              {node.store_purpose.copy_reason && (
+                <div>
+                  <span className="font-mono text-slate-400">Copy Reason: </span>
+                  {node.store_purpose.copy_reason}
+                </div>
+              )}
+              {node.store_purpose.refresh_policy && (
+                <div>
+                  <span className="font-mono text-slate-400">Refresh / Invalidation: </span>
+                  {node.store_purpose.refresh_policy}
+                </div>
+              )}
+              {node.store_purpose.recovery_expectation && (
+                <div>
+                  <span className="font-mono text-slate-400">Recovery Expectation: </span>
+                  {node.store_purpose.recovery_expectation}
+                </div>
+              )}
+              {node.store_purpose.keyspace_scope && (
+                <div>
+                  <span className="font-mono text-slate-400">Keyspace Scope: </span>
+                  <span className="font-mono">{node.store_purpose.keyspace_scope}</span>
+                </div>
+              )}
+            </div>
+          )}
+          {(node.store_purpose?.verification_summary ?? node.verification_note) && (
+            <div className="border-t border-amber-500/20 pt-1.5 text-[11px] text-slate-300">
+              <span className="font-mono text-[10px] uppercase text-amber-200">Verification: </span>
+              {node.store_purpose?.verification_summary ?? node.verification_note}
+            </div>
+          )}
         </div>
       )}
 
@@ -326,11 +422,18 @@ export function NodeInspector({
         <select
           aria-label="Ownership ruling disposition"
           value={disposition}
-          onChange={(e) => setDisposition(e.target.value)}
+          onChange={(e) => {
+            const next = e.target.value;
+            setDisposition(next);
+            if (next === 'intentional_copy') {
+              setShowPurposeFields(true);
+            }
+          }}
           className="w-full border border-slate-800 bg-slate-900 px-2 py-1 font-mono text-xs text-slate-200"
         >
           <option value="confirmed_owner_intent">confirmed_owner_intent</option>
           <option value="accepted_clean">accepted_clean</option>
+          <option value="intentional_copy">intentional_copy</option>
           <option value="deferred_cutover">deferred_cutover</option>
         </select>
         <textarea
@@ -349,6 +452,86 @@ export function NodeInspector({
           placeholder="Optional cutover provenance note…"
           className="w-full border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-400"
         />
+        <button
+          type="button"
+          aria-label="Toggle store purpose and evidence scope fields"
+          onClick={() => setShowPurposeFields((v) => !v)}
+          className="font-mono text-[10px] text-sky-300 hover:text-sky-200"
+        >
+          {showPurposeFields ? 'Hide Store Purpose & Scope' : '+ Declare Store Purpose & Evidence Scope'}
+        </button>
+        {(showPurposeFields || disposition === 'intentional_copy') && (
+          <div className="space-y-1.5 border border-slate-800 bg-slate-900/50 p-2">
+            <select
+              aria-label="Store intended use"
+              value={intendedUse}
+              onChange={(e) =>
+                setIntendedUse(
+                  (e.target.value as StorePurposeDeclaration['intended_use']) || '',
+                )
+              }
+              className="w-full border border-slate-800 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200"
+            >
+              <option value="">-- Optional store intended_use --</option>
+              <option value="derived_cache">derived_cache</option>
+              <option value="read_replica">read_replica</option>
+              <option value="materialized_view">materialized_view</option>
+              <option value="historical_snapshot">historical_snapshot</option>
+              <option value="persistent_config">persistent_config</option>
+              <option value="ephemeral_state">ephemeral_state</option>
+              <option value="queue_buffer">queue_buffer</option>
+              <option value="authoritative_store">authoritative_store</option>
+            </select>
+            <input
+              type="text"
+              aria-label="Authoritative source"
+              value={authoritativeSource}
+              onChange={(e) => setAuthoritativeSource(e.target.value)}
+              placeholder="Authoritative source (e.g. pg:orders)"
+              className="w-full border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-400"
+            />
+            <input
+              type="text"
+              aria-label="Copy reason"
+              value={copyReason}
+              onChange={(e) => setCopyReason(e.target.value)}
+              placeholder="Copy reason…"
+              className="w-full border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-400"
+            />
+            <input
+              type="text"
+              aria-label="Refresh or invalidation policy"
+              value={refreshPolicy}
+              onChange={(e) => setRefreshPolicy(e.target.value)}
+              placeholder="Refresh / invalidation policy…"
+              className="w-full border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-400"
+            />
+            <input
+              type="text"
+              aria-label="Recovery expectation"
+              value={recoveryExpectation}
+              onChange={(e) => setRecoveryExpectation(e.target.value)}
+              placeholder="Recovery expectation (e.g. SQL seed / RDB)…"
+              className="w-full border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-400"
+            />
+            <input
+              type="text"
+              aria-label="Keyspace scope"
+              value={keyspaceScope}
+              onChange={(e) => setKeyspaceScope(e.target.value)}
+              placeholder="Keyspace scope (e.g. session:*, catalog:*)"
+              className="w-full border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-400"
+            />
+            <input
+              type="text"
+              aria-label="Evidence scope rules or files"
+              value={evidenceScopeInput}
+              onChange={(e) => setEvidenceScopeInput(e.target.value)}
+              placeholder="Evidence scope (comma-separated rule/file)"
+              className="w-full border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-400"
+            />
+          </div>
+        )}
         <button
           type="submit"
           disabled={createRuling.isPending || !summary.trim()}
