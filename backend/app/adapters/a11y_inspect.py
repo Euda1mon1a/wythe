@@ -478,19 +478,23 @@ _JSX_COMMENT_RE = re.compile(r"\{\s*/\*[\s\S]*?\*/\s*\}")
 def _normalize_component_lookup(
     tag: str,
     imported_components: dict[str, tuple[str, str]],
+    *,
+    allow_vue_case_insensitive: bool = False,
 ) -> tuple[str, tuple[str, str]] | None:
-    """Resolve JSX/Svelte/Vue component tags (including kebab-case Vue tags) to imports."""
+    """Resolve JSX/Svelte/Vue component tags to imports, scoping case-folding to Vue."""
     root_name = tag.split(".", 1)[0]
     if root_name in imported_components:
         return root_name, imported_components[root_name]
-    if "-" in root_name:
-        pascal = "".join(part[:1].upper() + part[1:] for part in root_name.split("-") if part)
-        if pascal in imported_components:
-            return pascal, imported_components[pascal]
-    collapsed = root_name.replace("-", "").lower()
-    for imp_name, val in imported_components.items():
-        if imp_name.lower() == collapsed:
-            return imp_name, val
+    if allow_vue_case_insensitive:
+        if "-" in root_name:
+            pascal = "".join(part[:1].upper() + part[1:] for part in root_name.split("-") if part)
+            if pascal in imported_components:
+                return pascal, imported_components[pascal]
+        if "-" in root_name or root_name[:1].isupper():
+            collapsed = root_name.replace("-", "").lower()
+            for imp_name, val in imported_components.items():
+                if imp_name.lower() == collapsed:
+                    return imp_name, val
     return None
 
 
@@ -506,6 +510,14 @@ def _eval_attr_value(expr: str, *, preserve_undefined: bool = False) -> str:
         return "bool_false" if preserve_undefined else "empty"
     if s == "true":
         return "bool_true" if preserve_undefined else "empty"
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", s):
+        if preserve_undefined:
+            try:
+                if float(s) == 0.0:
+                    return "num_zero"
+            except ValueError:
+                pass
+        return "named"
     if len(s) >= 2 and s[0] in ("'", '"') and s[-1] == s[0]:
         inner = s[1:-1]
         if inner.strip():
@@ -518,8 +530,11 @@ def _eval_attr_value(expr: str, *, preserve_undefined: bool = False) -> str:
         return "blank" if (preserve_undefined and inner != "") else "empty"
     if "||" in s or "??" in s:
         ev = _eval_coalesce_expr(s, prop_values={}, inner_status="empty", unknown_fallback="dynamic")
-        if not preserve_undefined and ev in ("null", "undefined", "blank", "bool_false", "bool_true"):
-            return "empty"
+        if not preserve_undefined:
+            if ev in ("null", "undefined", "blank", "bool_false", "bool_true"):
+                return "empty"
+            if ev == "num_zero":
+                return "named"
         return ev
     return "dynamic"
 
@@ -981,13 +996,124 @@ def _find_tsx_reexport_target(raw_source: str, exported_name: str) -> tuple[str,
     return None
 
 
-def _locate_tsx_export_source(
-    raw_source: str, exported_name: str, *, local_scope: bool = False
-) -> str:
-    """Locate the declaration slice for a default, named, or local React/JSX component."""
+def _js_brace_spans(raw_source: str, mask: str) -> list[tuple[int, int]]:
+    """Return balanced `{open_idx, close_idx_exclusive}` spans for lexical block lookup."""
+    spans: list[tuple[int, int]] = []
+    stack: list[int] = []
+    for idx, ch in enumerate(raw_source):
+        if not mask[idx]:
+            continue
+        if ch == "{":
+            stack.append(idx)
+        elif ch == "}" and stack:
+            spans.append((stack.pop(), idx + 1))
+    return spans
+
+
+def _find_lexical_tsx_decl_pos(
+    raw_source: str,
+    symbol: str,
+    usage_pos: int | None,
+    *,
+    mask: str | None = None,
+    brace_spans: list[tuple[int, int]] | None = None,
+) -> tuple[str, int | None]:
+    """Resolve same-file `symbol` at `usage_pos` -> `(found|ambiguous|missing, decl_pos)`."""
+    src_mask = mask if mask is not None else js_code_mask(raw_source)
+    spans = brace_spans if brace_spans is not None else _js_brace_spans(raw_source, src_mask)
+    pat = re.compile(
+        rf"\b(?:async\s+)?function\s+{re.escape(symbol)}\b|"
+        rf"\b(?:const|let|var)\s+{re.escape(symbol)}\s*(?::[^=;\n]+)?="
+    )
+    decls: list[tuple[int, tuple[int, int]]] = []
+    full_span = (0, len(raw_source))
+    for m in pat.finditer(raw_source):
+        if not src_mask[m.start()]:
+            continue
+        pos = m.start()
+        enclosing = full_span
+        best_width = full_span[1] - full_span[0]
+        for s_start, s_end in spans:
+            if s_start < pos < s_end:
+                w = s_end - s_start
+                if w < best_width:
+                    best_width = w
+                    enclosing = (s_start, s_end)
+        decls.append((pos, enclosing))
+    if not decls:
+        return "missing", None
+    if usage_pos is None:
+        return ("found", decls[0][0]) if len(decls) == 1 else ("ambiguous", None)
+    visible = [(pos, sc) for pos, sc in decls if sc[0] <= usage_pos < sc[1]]
+    if not visible:
+        return "missing", None
+    min_width = min(sc[1] - sc[0] for _pos, sc in visible)
+    innermost = [pos for pos, sc in visible if (sc[1] - sc[0]) == min_width]
+    if len(innermost) != 1:
+        return "ambiguous", None
+    return "found", innermost[0]
+
+
+def _resolve_tsx_decl_slice_with_pos(
+    raw_source: str,
+    decl_pos: int,
+    *,
+    mask: str | None = None,
+) -> tuple[str, int]:
+    """Follow simple alias/HOC wrappers from `decl_pos`, returning `(decl_slice, resolved_pos)`."""
+    src_mask = mask if mask is not None else js_code_mask(raw_source)
+    cur = decl_pos
+    seen: set[int] = set()
+    for _ in range(3):
+        if cur in seen:
+            break
+        seen.add(cur)
+        m_alias = re.match(
+            r"(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*(?::[^=;\n]+)?=\s*"
+            r"(?:(?:React\.)?(?:memo|forwardRef)\s*(?:<[^;()]{0,160}?>)?\s*\(\s*)?"
+            r"(?P<ref>[A-Za-z_$][\w$]*)\s*[);,\n]",
+            raw_source[cur:],
+        )
+        if m_alias and m_alias.group("ref") not in ("function", "async", "class", "null", "undefined"):
+            ref_pat = re.compile(
+                rf"\b(?:async\s+)?function\s+{re.escape(m_alias.group('ref'))}\b|"
+                rf"\b(?:const|let|var)\s+{re.escape(m_alias.group('ref'))}\s*(?::[^=;\n]+)?="
+            )
+            for rm in ref_pat.finditer(raw_source):
+                if src_mask[rm.start()]:
+                    cur = rm.start()
+                    break
+            else:
+                break
+            continue
+        break
+    return _slice_tsx_decl_body(raw_source, cur), cur
+
+
+def _locate_tsx_export_source_with_pos(
+    raw_source: str,
+    exported_name: str,
+    *,
+    local_scope: bool = False,
+    usage_pos: int | None = None,
+) -> tuple[str, int]:
+    """Locate `(decl_slice, decl_start_pos)` for a default, named, or local TSX component."""
     mask = js_code_mask(raw_source)
+    spans = _js_brace_spans(raw_source, mask) if (local_scope or exported_name != "default") else None
 
     def _find_named_decl(symbol: str, *, exported_only: bool = False) -> int | None:
+        if not exported_only:
+            status, pos = _find_lexical_tsx_decl_pos(
+                raw_source,
+                symbol,
+                usage_pos if local_scope else 0,
+                mask=mask,
+                brace_spans=spans,
+            )
+            if status == "found":
+                return pos
+            if status == "ambiguous":
+                return None
         prefix = r"\bexport\s+" if exported_only else r"\b"
         pat = re.compile(
             rf"{prefix}(?:async\s+)?function\s+{re.escape(symbol)}\b|"
@@ -998,39 +1124,25 @@ def _locate_tsx_export_source(
                 return m.start()
         return None
 
-    def _slice_resolved_decl(pos: int) -> str:
-        cur = pos
-        seen: set[int] = set()
-        for _ in range(3):
-            if cur in seen:
-                break
-            seen.add(cur)
-            m_alias = re.match(
-                r"(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*(?::[^=;\n]+)?=\s*"
-                r"(?:(?:React\.)?(?:memo|forwardRef)\s*(?:<[^;()]{0,160}?>)?\s*\(\s*)?"
-                r"(?P<ref>[A-Za-z_$][\w$]*)\s*[);,\n]",
-                raw_source[cur:],
-            )
-            if m_alias and m_alias.group("ref") not in ("function", "async", "class", "null", "undefined"):
-                ref_pos = _find_named_decl(m_alias.group("ref"))
-                if ref_pos is not None:
-                    cur = ref_pos
-                    continue
-            break
-        return _slice_tsx_decl_body(raw_source, cur)
+    def _slice_resolved_decl(pos: int) -> tuple[str, int]:
+        return _resolve_tsx_decl_slice_with_pos(raw_source, pos, mask=mask)
 
-    def _resolve_hoc_target(m: re.Match[str]) -> str | None:
+    def _resolve_hoc_target(m: re.Match[str]) -> tuple[str, int]:
         inner_tail = raw_source[m.end() :].lstrip()
         m_ref = re.match(r"^(?P<ref>[A-Za-z_$][\w$]*)\s*(?:,|\))", inner_tail)
         if m_ref:
             ref_pos = _find_named_decl(m_ref.group("ref"))
             if ref_pos is not None:
                 return _slice_resolved_decl(ref_pos)
-        return _slice_tsx_decl_body(raw_source, m.end())
+        return _slice_tsx_decl_body(raw_source, m.end()), m.end()
 
     if local_scope:
-        pos = _find_named_decl(exported_name)
-        return _slice_resolved_decl(pos) if pos is not None else ""
+        status, pos = _find_lexical_tsx_decl_pos(
+            raw_source, exported_name, usage_pos, mask=mask, brace_spans=spans
+        )
+        if status == "found" and pos is not None:
+            return _slice_resolved_decl(pos)
+        return "", 0
 
     if exported_name == "default":
         for pat in (
@@ -1040,15 +1152,13 @@ def _locate_tsx_export_source(
         ):
             for m in re.finditer(pat, raw_source):
                 if mask[m.start()]:
-                    return _slice_tsx_decl_body(raw_source, m.start())
+                    return _slice_tsx_decl_body(raw_source, m.start()), m.start()
         for m in re.finditer(
             r"\bexport\s+default\s+(?:React\.)?(?:memo|forwardRef)\s*(?:<[^;()]{0,160}?>)?\s*\(",
             raw_source,
         ):
             if mask[m.start()]:
-                resolved = _resolve_hoc_target(m)
-                if resolved is not None:
-                    return resolved
+                return _resolve_hoc_target(m)
         for m in re.finditer(
             r"\bexport\s+default\s+(?!(?:async\s+)?function\b|class\b)(?P<ref>[A-Za-z_$][\w$]*)\b(?!\s*=>)",
             raw_source,
@@ -1063,14 +1173,14 @@ def _locate_tsx_export_source(
             if m.group("dq") is not None or m.group("sq") is not None:
                 for _orig, exp in _parse_export_specifiers(m.group("body")):
                     if exp == "default":
-                        return ""
+                        return "", 0
                 continue
             for orig, exp in _parse_export_specifiers(m.group("body")):
                 if exp == "default":
                     ref_pos = _find_named_decl(orig)
                     if ref_pos is not None:
                         return _slice_resolved_decl(ref_pos)
-        return raw_source
+        return raw_source, 0
 
     for m in _EXPORT_BLOCK_RE.finditer(raw_source):
         if not mask[m.start()]:
@@ -1079,9 +1189,9 @@ def _locate_tsx_export_source(
         for orig, exp in _parse_export_specifiers(m.group("body")):
             if exp == exported_name:
                 if is_reexport:
-                    return ""
+                    return "", 0
                 ref_pos = _find_named_decl(orig)
-                return _slice_resolved_decl(ref_pos) if ref_pos is not None else ""
+                return _slice_resolved_decl(ref_pos) if ref_pos is not None else ("", 0)
 
     direct_export_pos = _find_named_decl(exported_name, exported_only=True)
     if direct_export_pos is not None:
@@ -1092,8 +1202,18 @@ def _locate_tsx_export_source(
         direct_pos = _find_named_decl(exported_name)
         if direct_pos is not None:
             return _slice_resolved_decl(direct_pos)
-        return raw_source
-    return ""
+        return raw_source, 0
+    return "", 0
+
+
+def _locate_tsx_export_source(
+    raw_source: str, exported_name: str, *, local_scope: bool = False
+) -> str:
+    """Locate the declaration slice for a default, named, or local React/JSX component."""
+    decl_src, _pos = _locate_tsx_export_source_with_pos(
+        raw_source, exported_name, local_scope=local_scope
+    )
+    return decl_src
 
 
 def _extract_jsx_at(src: str, jsx_start: int) -> tuple[str, int] | None:
@@ -1253,7 +1373,9 @@ def _extract_tsx_return_markup(target_src: str) -> str:
             found = _extract_jsx_at(expr_tail, 0)
             return found[0] if found is not None else ""
         branches = _extract_jsx_or_conditional_branches(expr_tail)
-        return "\n<!--WYTHE_BRANCH-->\n".join(branches) if any("<" in b for b in branches) else ""
+        if branches:
+            return "\n<!--WYTHE_BRANCH-->\n".join(branches)
+        return f"<!--WYTHE_EXPR-->{expr_tail}" if expr_tail else ""
 
     body_end = _scan_brace_end(target_src, body_start) or n
     branches: list[str] = []
@@ -1344,7 +1466,7 @@ def _extract_tsx_return_markup(target_src: str) -> str:
                 i = end_pos + 1
                 continue
         i += 1
-    if not any("<" in b and not b.startswith("<!--WYTHE_EXPR-->") for b in branches):
+    if not branches:
         return ""
     return "\n<!--WYTHE_BRANCH-->\n".join(branches)
 
@@ -1355,6 +1477,8 @@ def _extract_component_props_and_markup(
     exported_name: str = "default",
     *,
     local_scope: bool = False,
+    usage_pos: int | None = None,
+    _scope_anchor_out: list[int] | None = None,
 ) -> tuple[dict[str, str], dict[str, str], str]:
     """Return `(prop_defaults, local_to_source, template_markup)` for a local component."""
     prop_defaults: dict[str, str] = {}
@@ -1432,9 +1556,17 @@ def _extract_component_props_and_markup(
         return prop_defaults, prop_aliases, tm.group("body") if tm else ""
 
     # .tsx / .jsx: locate the target exported or same-file component declaration
-    target_src = _locate_tsx_export_source(raw_source, exported_name, local_scope=local_scope)
+    target_src, decl_pos = _locate_tsx_export_source_with_pos(
+        raw_source, exported_name, local_scope=local_scope, usage_pos=usage_pos
+    )
     tmask = js_code_mask(target_src)
     body_info = _find_tsx_body_start(target_src, tmask)
+    if _scope_anchor_out is not None:
+        if body_info is not None:
+            anchor = decl_pos + body_info[1] + (1 if body_info[0] else 0)
+        else:
+            anchor = decl_pos
+        _scope_anchor_out.append(min(anchor, max(0, len(raw_source) - 1)))
     sig_src = target_src[: body_info[1]] if body_info is not None else target_src
     m_open = re.search(r"\(\s*\{", sig_src)
     if m_open:
@@ -1513,7 +1645,10 @@ def _eval_coalesce_expr(
         if t == "true":
             return "bool_true"
         if re.fullmatch(r"-?\d+(?:\.\d+)?", t):
-            return "named"
+            try:
+                return "num_zero" if float(t) == 0.0 else "named"
+            except ValueError:
+                return "named"
         if (
             len(t) >= 2
             and t[0] in ("'", '"')
@@ -1552,7 +1687,7 @@ def _eval_coalesce_expr(
         if prev_op == "??":
             if acc in ("undefined", "null"):
                 acc = nxt_state
-            elif acc in ("empty", "empty_node", "blank", "named", "icon_only", "bool_false", "bool_true"):
+            elif acc in ("empty", "empty_node", "blank", "named", "icon_only", "num_zero", "bool_false", "bool_true"):
                 pass
             elif acc == "dynamic":
                 acc = "named" if nxt_state == "named" else "dynamic"
@@ -1560,7 +1695,7 @@ def _eval_coalesce_expr(
                 acc = "opaque"
         else:
             # Logical `||` treats empty string / false / 0 / null / undefined as falsy.
-            if acc in ("undefined", "null", "empty", "bool_false"):
+            if acc in ("undefined", "null", "empty", "bool_false", "num_zero"):
                 acc = nxt_state
             elif acc in ("empty_node", "blank", "named", "icon_only", "bool_true"):
                 pass
@@ -1591,6 +1726,8 @@ def _classify_expr_semantics(
                 return "named" if render_booleans_as_text else "empty"
             if inner_status == "omitted" or inner_status in _EMPTY_PROP_STATES:
                 return "empty"
+            if inner_status == "num_zero":
+                return "named"
             return inner_status
         return "named"
     if expr.startswith("@html"):
@@ -1607,7 +1744,7 @@ def _classify_expr_semantics(
         return "named" if render_booleans_as_text else "empty"
     if res == "omitted" or res in _EMPTY_PROP_STATES:
         return "empty"
-    if res in ("named", "dynamic"):
+    if res in ("named", "dynamic", "num_zero"):
         return "named"
     if res == "icon_only":
         return "icon_only"
@@ -1618,10 +1755,12 @@ def _classify_markup_segment(
     src: str,
     *,
     imported_components: dict[str, tuple[str, str]],
-    component_resolver: Callable[[str, str, str], str] | None,
+    component_resolver: Callable[..., str] | None,
     prop_values: dict[str, str] | None = None,
     inner_status: str = "omitted",
     render_booleans_as_text: bool = False,
+    allow_vue_kebab: bool = False,
+    source_offset: int = 0,
 ) -> tuple[str, list[str], bool]:
     """Classify markup children as `(status, opaque_tags, has_visual_empty_or_icon)`."""
     has_named = False
@@ -1703,6 +1842,8 @@ def _classify_markup_segment(
                     prop_values=prop_values,
                     inner_status=inner_status,
                     render_booleans_as_text=render_booleans_as_text,
+                    allow_vue_kebab=allow_vue_kebab,
+                    source_offset=source_offset + open_end,
                 )
                 if gst == "opaque" and gopaque:
                     for lbl in gopaque:
@@ -1718,7 +1859,9 @@ def _classify_markup_segment(
                 )
                 i = next_i
                 continue
-            matched_imp = _normalize_component_lookup(tag, imported_components)
+            matched_imp = _normalize_component_lookup(
+                tag, imported_components, allow_vue_case_insensitive=allow_vue_kebab
+            )
             root_imp = matched_imp[1] if matched_imp is not None else None
             if root_imp and _ICON_PKG_SPEC_RE.match(root_imp[0]):
                 merge_status(
@@ -1737,6 +1880,8 @@ def _classify_markup_segment(
                             prop_values=prop_values,
                             inner_status="omitted",
                             render_booleans_as_text=render_booleans_as_text,
+                            allow_vue_kebab=allow_vue_kebab,
+                            source_offset=source_offset + open_end,
                         )
                         merge_status(slot_fallback, "slot")
                     else:
@@ -1744,7 +1889,7 @@ def _classify_markup_segment(
                             slot_st = "named" if render_booleans_as_text else "empty"
                         elif inner_status == "omitted" or inner_status in _EMPTY_PROP_STATES:
                             slot_st = "empty"
-                        elif inner_status == "dynamic":
+                        elif inner_status in ("dynamic", "num_zero"):
                             slot_st = "named"
                         else:
                             slot_st = inner_status
@@ -1791,6 +1936,8 @@ def _classify_markup_segment(
                         prop_values=prop_values,
                         inner_status=inner_status,
                         render_booleans_as_text=render_booleans_as_text,
+                        allow_vue_kebab=allow_vue_kebab,
+                        source_offset=source_offset + open_end,
                     )
                     if cst == "named":
                         child_inner = "named"
@@ -1807,6 +1954,8 @@ def _classify_markup_segment(
                     imported_components=imported_components,
                     component_resolver=component_resolver,
                     prop_values=prop_values,
+                    allow_vue_kebab=allow_vue_kebab,
+                    usage_pos=source_offset + i,
                 )
                 merge_status(resolved, tag)
                 i = next_i
@@ -1818,6 +1967,21 @@ def _classify_markup_segment(
                 continue
             if own_name == "opaque":
                 merge_status("opaque", tag)
+            inj = _eval_injected_html_name(
+                attrs, prop_values=prop_values, inner_status=inner_status
+            )
+            if inj == "named":
+                has_named = True
+                i = next_i
+                continue
+            if inj == "icon_only":
+                has_icon = True
+                i = next_i
+                continue
+            if inj == "opaque":
+                merge_status("opaque", tag)
+                i = next_i
+                continue
             i = open_end
             continue
         j = i
@@ -1917,6 +2081,103 @@ def _eval_element_own_name(
     return "opaque" if saw_opaque else None
 
 
+def _unwrap_static_js_string(expr: str) -> str | None:
+    """Return unquoted string content if `expr` is a static single/double/template literal."""
+    s = expr.strip()
+    if (
+        len(s) >= 2
+        and s[0] in ("'", '"')
+        and s[-1] == s[0]
+        and s[0] not in s[1:-1].replace(f"\\{s[0]}", "")
+    ):
+        return s[1:-1]
+    if (
+        len(s) >= 2
+        and s[0] == "`"
+        and s[-1] == "`"
+        and "${" not in s
+        and "`" not in s[1:-1].replace("\\`", "")
+    ):
+        return s[1:-1]
+    return None
+
+
+def _classify_static_html_fragment(html: str) -> str:
+    """Classify a statically known HTML string fragment (`named`/`icon_only`/`empty`/`opaque`)."""
+    st, copaque, _ = _classify_markup_segment(
+        html,
+        imported_components={},
+        component_resolver=None,
+        prop_values=None,
+        inner_status="omitted",
+    )
+    if st == "named":
+        return "named"
+    if copaque:
+        return "opaque"
+    if st == "icon_only":
+        return "icon_only"
+    return "empty"
+
+
+def _eval_injected_html_name(
+    attrs: str,
+    *,
+    prop_values: dict[str, str] | None,
+    inner_status: str,
+) -> str | None:
+    """Classify `dangerouslySetInnerHTML`, `v-html`, or `innerHTML` accessible text if present."""
+    if _is_aria_hidden_true(attrs) or _has_presentational_role(attrs):
+        return None
+    md = re.search(r"(?<![\w$-])dangerouslySetInnerHTML\s*=\s*\{", attrs)
+    if md:
+        bend = _scan_brace_end(attrs, md.end() - 1)
+        if bend is None:
+            return "opaque"
+        outer = attrs[md.end() : bend - 1].strip()
+        if not (outer.startswith("{") and _scan_brace_end(outer, 0) == len(outer)):
+            return "opaque"
+        val_expr: str | None = None
+        for entry in _split_top_level_js(outer[1:-1], ","):
+            item = entry.strip()
+            if not item:
+                continue
+            if item.startswith("..."):
+                val_expr = None
+                continue
+            raw_k, raw_v = _split_first_top_level_js(item, ":")
+            if raw_v is not None and raw_k.strip().strip("'\"") == "__html":
+                val_expr = raw_v.strip()
+            elif raw_v is None and item == "__html":
+                val_expr = "__html"
+        if val_expr is None:
+            return "opaque"
+        lit = _unwrap_static_js_string(val_expr)
+        if lit is not None:
+            return _classify_static_html_fragment(lit)
+        sem = _classify_expr_semantics(
+            val_expr, prop_values=prop_values, inner_status=inner_status
+        )
+        return sem if sem in ("named", "empty", "icon_only") else "opaque"
+
+    mv = re.search(
+        r"""(?<![\w$-])(?P<kind>v-html|:innerHTML|:inner-html|innerHTML)\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')""",
+        attrs,
+    )
+    if mv:
+        raw_val = mv.group("dq") if mv.group("dq") is not None else (mv.group("sq") or "")
+        if mv.group("kind") == "innerHTML":
+            return _classify_static_html_fragment(raw_val)
+        lit = _unwrap_static_js_string(raw_val)
+        if lit is not None:
+            return _classify_static_html_fragment(lit)
+        sem = _classify_expr_semantics(
+            raw_val, prop_values=prop_values, inner_status=inner_status
+        )
+        return sem if sem in ("named", "empty", "icon_only") else "opaque"
+    return None
+
+
 _SVG_NAME_CHILD_RE = re.compile(
     r"(?is)<(?P<ctag>title|text)(?P<cattrs>[^>]*)>(?P<cbody>[\s\S]*?)</(?P=ctag)\s*>"
 )
@@ -1928,10 +2189,12 @@ def _classify_graphic_element(
     inner_body: str,
     *,
     imported_components: dict[str, tuple[str, str]],
-    component_resolver: Callable[[str, str, str], str] | None,
+    component_resolver: Callable[..., str] | None,
     prop_values: dict[str, str] | None,
     inner_status: str,
     render_booleans_as_text: bool = False,
+    allow_vue_kebab: bool = False,
+    source_offset: int = 0,
 ) -> tuple[str, list[str]]:
     """Classify inline `<i>`/`<svg>` checking ARIA/title attrs first, then naming children."""
     own_name = _eval_element_own_name(attrs, allow_alt=False, prop_values=prop_values)
@@ -1946,6 +2209,8 @@ def _classify_graphic_element(
                 prop_values=prop_values,
                 inner_status=inner_status,
                 render_booleans_as_text=render_booleans_as_text,
+                allow_vue_kebab=allow_vue_kebab,
+                source_offset=source_offset,
             )
             if cst == "named":
                 return "named", []
@@ -1964,6 +2229,8 @@ def _classify_graphic_element(
                     prop_values=prop_values,
                     inner_status=inner_status,
                     render_booleans_as_text=render_booleans_as_text,
+                    allow_vue_kebab=allow_vue_kebab,
+                    source_offset=source_offset + cm.start("cbody"),
                 )
                 if cst == "named":
                     return "named", []
@@ -1989,14 +2256,20 @@ def _resolve_component_tag(
     inner_status: str,
     *,
     imported_components: dict[str, tuple[str, str]],
-    component_resolver: Callable[[str, str, str], str] | None,
+    component_resolver: Callable[..., str] | None,
     prop_values: dict[str, str] | None = None,
+    allow_vue_kebab: bool = False,
+    usage_pos: int | None = None,
 ) -> str:
-    matched = _normalize_component_lookup(tag, imported_components)
+    matched = _normalize_component_lookup(
+        tag, imported_components, allow_vue_case_insensitive=allow_vue_kebab
+    )
     imp = matched[1] if matched is not None else None
     if imp and _ICON_PKG_SPEC_RE.match(imp[0]):
         return _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values)
     if component_resolver is not None:
+        if getattr(component_resolver, "_wythe_accepts_usage_pos", False):
+            return component_resolver(tag, attrs, inner_status, usage_pos=usage_pos)
         return component_resolver(tag, attrs, inner_status)
     return "opaque"
 
@@ -2009,38 +2282,49 @@ def make_local_component_resolver(
     _caller_imports: dict[str, tuple[str, str]] | None = None,
     _cache: dict[
         tuple[Path, str],
-        tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path, str],
+        tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path, str, int],
     ] | None = None,
     _visiting: frozenset[tuple[Path, str]] = frozenset(),
     _depth: int = 0,
     _parent_props: dict[str, str] | None = None,
     _parent_has_spread: bool = False,
-) -> Callable[[str, str, str], str]:
+    _fallback_scope_pos: int | None = None,
+) -> Callable[..., str]:
     """Build a depth-bounded, cycle-guarded local component accessibility semantics resolver."""
     imports = _caller_imports if _caller_imports is not None else parse_component_imports(caller_source)
     cache = _cache if _cache is not None else {}
+    vue_kebab_caller = caller_file.suffix == ".vue"
 
-    def resolve_tag(tag_name: str, attrs: str, inner_status: str) -> str:
-        matched = _normalize_component_lookup(tag_name, imports)
+    def resolve_tag(
+        tag_name: str,
+        attrs: str,
+        inner_status: str,
+        *,
+        usage_pos: int | None = None,
+    ) -> str:
+        matched = _normalize_component_lookup(
+            tag_name, imports, allow_vue_case_insensitive=vue_kebab_caller
+        )
         root_name = matched[0] if matched is not None else tag_name.split(".", 1)[0]
         imp = matched[1] if matched is not None else None
         if imp is not None and _ICON_PKG_SPEC_RE.match(imp[0]):
             return _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=_parent_props)
-        same_file = (
-            imp is None
-            and caller_file.suffix in (".tsx", ".jsx")
-            and bool(
-                re.search(
-                    rf"\b(?:function\s+{re.escape(root_name)}\b|const\s+{re.escape(root_name)}\s*=)",
-                    caller_source,
-                )
+        effective_usage_pos = usage_pos if usage_pos is not None else _fallback_scope_pos
+        scope_status = "missing"
+        local_decl_pos: int | None = None
+        if imp is None and caller_file.suffix in (".tsx", ".jsx"):
+            scope_status, local_decl_pos = _find_lexical_tsx_decl_pos(
+                caller_source, root_name, effective_usage_pos
             )
-        )
+            if scope_status == "ambiguous":
+                return "opaque"
+        same_file = scope_status == "found" and local_decl_pos is not None
         if _depth >= 3 or (imp is None and not same_file):
             return "opaque"
         if same_file:
             target = caller_file
-            exported = tag_name
+            exported = root_name
+            initial_ckey = (target, f"__local__:{local_decl_pos}:{exported}")
         else:
             assert imp is not None
             spec, exported = imp
@@ -2049,7 +2333,7 @@ def make_local_component_resolver(
             target = resolve_import_fn(spec, caller_file)
             if target is None:
                 return "opaque"
-        initial_ckey = (target, f"__local__:{exported}" if same_file else exported)
+            initial_ckey = (target, exported)
         if initial_ckey in _visiting:
             return "opaque"
         if initial_ckey not in cache:
@@ -2084,18 +2368,22 @@ def make_local_component_resolver(
                     final_exported = re_name
             final_ckey = (
                 final_target,
-                f"__local__:{final_exported}" if same_file else final_exported,
+                f"__local__:{local_decl_pos}:{final_exported}" if same_file else final_exported,
             )
             if final_ckey in _visiting:
                 return "opaque"
             if final_ckey not in cache:
+                anchor_box: list[int] = []
                 defaults, aliases, markup = _extract_component_props_and_markup(
                     raw_target,
                     final_target.suffix,
                     exported_name=final_exported,
                     local_scope=same_file,
+                    usage_pos=effective_usage_pos if same_file else None,
+                    _scope_anchor_out=anchor_box,
                 )
                 target_imports = imports if same_file else parse_component_imports(raw_target)
+                scope_anchor = anchor_box[0] if anchor_box else 0
                 cache[final_ckey] = (
                     defaults,
                     aliases,
@@ -2103,9 +2391,20 @@ def make_local_component_resolver(
                     target_imports,
                     final_target,
                     raw_target,
+                    scope_anchor,
                 )
             cache[initial_ckey] = cache[final_ckey]
-        defaults, aliases, markup, target_imports, resolved_path, resolved_source = cache[initial_ckey]
+        else:
+            final_ckey = initial_ckey
+        (
+            defaults,
+            aliases,
+            markup,
+            target_imports,
+            resolved_path,
+            resolved_source,
+            scope_anchor,
+        ) = cache[initial_ckey]
         if not markup.strip():
             return "opaque"
 
@@ -2126,6 +2425,7 @@ def make_local_component_resolver(
                     "empty_node",
                     "blank",
                     "null",
+                    "num_zero",
                     "bool_false",
                     "bool_true",
                 ):
@@ -2148,7 +2448,7 @@ def make_local_component_resolver(
                 merged_props[local_name] = "opaque"
             elif dstate in ("named", "dynamic"):
                 merged_props[local_name] = "named"
-            elif dstate in _EMPTY_PROP_STATES or dstate in _BOOL_PROP_STATES:
+            elif dstate == "num_zero" or dstate in _EMPTY_PROP_STATES or dstate in _BOOL_PROP_STATES:
                 merged_props[local_name] = dstate
             else:
                 # Preserve omitted/`undefined` state when no default is declared so multi-hop
@@ -2160,7 +2460,7 @@ def make_local_component_resolver(
                 if (
                     has_opaque_spread
                     and src_name not in explicit_after_spread
-                    and (pstate in _EMPTY_PROP_STATES or pstate in _BOOL_PROP_STATES)
+                    and (pstate == "num_zero" or pstate in _EMPTY_PROP_STATES or pstate in _BOOL_PROP_STATES)
                 )
                 else pstate
             )
@@ -2188,12 +2488,14 @@ def make_local_component_resolver(
             resolve_import_fn,
             _caller_imports=target_imports,
             _cache=cache,
-            _visiting=_visiting | {(resolved_path, exported)},
+            _visiting=_visiting | {initial_ckey, final_ckey},
             _depth=_depth + 1,
             _parent_props=merged_props,
             _parent_has_spread=has_opaque_spread,
+            _fallback_scope_pos=scope_anchor,
         )
         child_bool_as_text = resolved_path.suffix in (".svelte", ".vue")
+        child_vue_kebab = resolved_path.suffix == ".vue"
 
         def classify_branch(branch: str) -> str:
             if branch.startswith("<!--WYTHE_EXPR-->"):
@@ -2211,6 +2513,8 @@ def make_local_component_resolver(
                 prop_values=merged_props,
                 inner_status=effective_inner,
                 render_booleans_as_text=child_bool_as_text,
+                allow_vue_kebab=child_vue_kebab,
+                source_offset=scope_anchor,
             )
             return st
 
@@ -2220,6 +2524,7 @@ def make_local_component_resolver(
         branch_statuses = {classify_branch(b) for b in branches}
         return next(iter(branch_statuses)) if len(branch_statuses) == 1 else "opaque"
 
+    resolve_tag._wythe_accepts_usage_pos = True
     return resolve_tag
 
 
@@ -2297,6 +2602,14 @@ def scan_a11y_markup_findings(
             continue
         if re.search(r"\b(?:aria-label|aria-labelledby|title)\s*=", attrs) or "{..." in attrs:
             continue
+        lineno = raw_source.count("\n", 0, m.start()) + 1
+        btn_inj = _eval_injected_html_name(attrs, prop_values=None, inner_status="omitted")
+        if btn_inj == "named":
+            continue
+        if btn_inj == "opaque":
+            if unobserved_out is not None:
+                unobserved_out.append(f"{rel_repo}:{lineno}: opaque injected HTML inside <button>")
+            continue
         cspan = _find_matching_close_tag(raw_source, end, "button")
         if cspan is None:
             continue
@@ -2306,8 +2619,12 @@ def scan_a11y_markup_findings(
             imported_components=imported_components,
             component_resolver=component_resolver,
             render_booleans_as_text=rel_repo.endswith((".svelte", ".vue")),
+            allow_vue_kebab=rel_repo.endswith(".vue"),
+            source_offset=end,
         )
-        lineno = raw_source.count("\n", 0, m.start()) + 1
+        if status == "empty" and btn_inj == "icon_only":
+            status = "icon_only"
+            has_visual = True
         if status == "named":
             continue
         if status == "opaque":

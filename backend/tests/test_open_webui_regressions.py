@@ -733,3 +733,58 @@ def test_named_export_aliases_reexports_and_explicit_empty_children_a11y(tmp_pat
     assert disp_lines == [8, 13, 14, 15, 16, 19, 20, 21, 26], res.findings
 
 
+def test_zero_falsy_injected_html_expr_returns_case_isolation_and_lexical_scope_a11y(
+    tmp_path: Path,
+) -> None:
+    """Verify exact JSX tag casing, zero in `||`, injected HTML, expr-only returns, and lexical helpers."""
+    from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+
+    put(
+        tmp_path,
+        "components/Span.tsx",
+        "export default function Span() { return <svg />; }\n",
+    )
+    put(
+        tmp_path,
+        "app/page.tsx",
+        "import Span from '../components/Span';\n"
+        "function ZeroOrEmpty() { return <span>{0 || ''}</span>; }\n"
+        "function ZeroNullish() { return <span>{0 ?? ''}</span>; }\n"
+        "function NullReturn() { return null; }\n"
+        "function FalseReturn() { return false; }\n"
+        "function EmptyStrReturn() { return ''; }\n"
+        "const ArrowNullReturn = () => null;\n"
+        "const ArrowTextReturn = () => 'Save';\n"
+        "function First() {\n"
+        "  function Label() { return <svg />; }\n"
+        "  return <button><span><Label /></span></button>;\n"
+        "}\n"
+        "function Second() {\n"
+        "  function Label() { return <span>Save</span>; }\n"
+        "  return <button><span><Label /></span></button>;\n"
+        "}\n"
+        "export function Page({ dynamicHtml }: { dynamicHtml: { __html: string } }) {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <button><span>Save</span></button>\n"
+        "      <button><ZeroOrEmpty /></button>\n"
+        "      <button><ZeroNullish /></button>\n"
+        "      <button><NullReturn /></button>\n"
+        "      <button><FalseReturn /></button>\n"
+        "      <button><EmptyStrReturn /></button>\n"
+        "      <button><ArrowNullReturn /></button>\n"
+        "      <button><ArrowTextReturn /></button>\n"
+        "      <button><span dangerouslySetInnerHTML={{ __html: 'Save' }} /><svg /></button>\n"
+        "      <button><span dangerouslySetInnerHTML={dynamicHtml} /><svg /></button>\n"
+        "      <button><span dangerouslySetInnerHTML={{ __html: '' }} /><svg /></button>\n"
+        "      <button dangerouslySetInnerHTML={{ __html: 'Save' }}></button>\n"
+        "      <button dangerouslySetInnerHTML={{ __html: '<svg />' }}></button>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    res = TypeScriptNextJsAdapter().extract(tmp_path, ".")
+    disp_lines = sorted(f.line for f in res.findings if f.rule_code == "DISP-005")
+    assert disp_lines == [11, 21, 23, 24, 25, 26, 30, 32], res.findings
+
+
