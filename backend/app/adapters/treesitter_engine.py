@@ -191,14 +191,34 @@ def extract_ts_backend_routes_cst(source: str, mount_prefix: str = "") -> list[t
 _TEMPLATE_HEAD_CONST_RE = re.compile(r"^\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
 
 
+def is_same_origin_url_path(val: str) -> bool:
+    """True when `val` is a same-origin root-relative path (never `//host` or scheme URL)."""
+    return val.startswith("/") and not val.startswith("//")
+
+
+def is_resolvable_url_const_value(val: str) -> bool:
+    """True when `val` is an empty origin prefix `""` or a same-origin root-relative path."""
+    return val == "" or is_same_origin_url_path(val)
+
+
 def resolve_url_const_head(url_val: str, url_consts: dict[str, str] | None) -> str:
-    """Expand a leading `${NAME}` when NAME is a same-file string constant holding a path."""
-    if not url_consts or not url_val.startswith("${"):
+    """Expand leading `${NAME}` chains when NAME is a statically known constant piece."""
+    if not url_consts:
         return url_val
-    m = _TEMPLATE_HEAD_CONST_RE.match(url_val)
-    if m and m.group("name") in url_consts:
-        return url_consts[m.group("name")] + url_val[m.end() :]
-    return url_val
+    cur = url_val
+    seen: set[str] = set()
+    for _ in range(4):
+        if not cur.startswith("${"):
+            break
+        m = _TEMPLATE_HEAD_CONST_RE.match(cur)
+        if not m:
+            break
+        name = m.group("name")
+        if name in seen or name not in url_consts:
+            break
+        seen.add(name)
+        cur = url_consts[name] + cur[m.end() :]
+    return cur
 
 
 _PARAM_CONTAINERS = frozenset(
@@ -241,6 +261,40 @@ def _collect_cst_pattern_idents(raw: bytes, node: Any, out: set[str]) -> None:
             _collect_cst_pattern_idents(raw, ch, out)
 
 
+def _cst_url_template_from_expr(raw: bytes, node: Any, depth: int = 0) -> str | None:
+    """Turn a static string, template string, identifier alias, or `+` concat into a template string."""
+    if depth > 6 or node is None:
+        return None
+    cur = node
+    while cur is not None and cur.named_children and cur.type in (
+        "parenthesized_expression",
+        "as_expression",
+        "satisfies_expression",
+        "non_null_expression",
+    ):
+        cur = cur.named_children[0]
+    if cur is None:
+        return None
+    if cur.type == "string":
+        val = _unquote_node(raw, cur)
+        return None if "${" in val else val
+    if cur.type == "template_string":
+        return _unquote_node(raw, cur)
+    if cur.type == "identifier":
+        ident = raw[cur.start_byte : cur.end_byte].decode("utf-8", errors="replace")
+        return f"${{{ident}}}"
+    if cur.type == "binary_expression" and len(cur.named_children) >= 2:
+        op_node = cur.child_by_field_name("operator") or (
+            cur.children[1] if len(cur.children) >= 3 else None
+        )
+        if op_node is not None and raw[op_node.start_byte : op_node.end_byte] == b"+":
+            left = _cst_url_template_from_expr(raw, cur.named_children[0], depth + 1)
+            right = _cst_url_template_from_expr(raw, cur.named_children[1], depth + 1)
+            if left is not None and right is not None:
+                return left + right
+    return None
+
+
 def _collect_cst_var_decl(raw: bytes, decl_node: Any, raw_local: dict[str, str | None]) -> None:
     is_const = decl_node.type == "lexical_declaration" and any(
         tok.type == "const" for tok in decl_node.children
@@ -252,25 +306,10 @@ def _collect_cst_var_decl(raw: bytes, decl_node: Any, raw_local: dict[str, str |
             decl.named_children[0] if decl.named_children else None
         )
         rhs = decl.child_by_field_name("value")
-        while (
-            rhs is not None
-            and rhs.type in ("as_expression", "satisfies_expression")
-            and rhs.named_children
-        ):
-            rhs = rhs.named_children[0]
-        if (
-            is_const
-            and lhs is not None
-            and lhs.type == "identifier"
-            and rhs is not None
-            and rhs.type in ("string", "template_string")
-        ):
+        val = _cst_url_template_from_expr(raw, rhs) if (is_const and rhs is not None) else None
+        if is_const and lhs is not None and lhs.type == "identifier" and val is not None:
             ident = raw[lhs.start_byte : lhs.end_byte].decode("utf-8", errors="replace")
-            val = _unquote_node(raw, rhs)
-            if rhs.type == "string" and "${" in val:
-                raw_local[ident] = None
-            else:
-                raw_local[ident] = val if raw_local.get(ident, val) == val else None
+            raw_local[ident] = val if raw_local.get(ident, val) == val else None
         elif lhs is not None:
             bound: set[str] = set()
             _collect_cst_pattern_idents(raw, lhs, bound)
@@ -286,13 +325,14 @@ def _merge_cst_local_consts(outer_consts: dict[str, str], raw_local: dict[str, s
     if not pending:
         return merged
     working = {**merged, **pending}
-    for _ in range(3):
+    for _ in range(4):
         for k in list(pending):
             working[k] = resolve_url_const_head(
-                working[k], {ok: ov for ok, ov in working.items() if ok != k and ov.startswith("/")}
+                working[k],
+                {ok: ov for ok, ov in working.items() if ok != k and is_resolvable_url_const_value(ov)},
             )
     for k in pending:
-        if working[k].startswith("/"):
+        if is_resolvable_url_const_value(working[k]):
             merged[k] = working[k]
     return merged
 
@@ -326,6 +366,31 @@ def _collect_hoisted_cst_vars(raw: bytes, root: Any, out: set[str]) -> None:
         stack.extend(n.named_children)
 
 
+def _collect_mutated_cst_vars(raw: bytes, container: Any, out: set[str]) -> None:
+    """Record identifiers reassigned or updated inside `container` (without crossing nested functions)."""
+    stack = list(container.named_children)
+    while stack:
+        n = stack.pop()
+        if n.type in (
+            "function_declaration",
+            "generator_function_declaration",
+            "function",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+        ):
+            continue
+        if n.type in ("assignment_expression", "augmented_assignment_expression"):
+            lhs = n.child_by_field_name("left") or (n.named_children[0] if n.named_children else None)
+            if lhs is not None:
+                _collect_cst_pattern_idents(raw, lhs, out)
+        elif n.type == "update_expression":
+            arg = n.child_by_field_name("argument") or (n.named_children[0] if n.named_children else None)
+            if arg is not None:
+                _collect_cst_pattern_idents(raw, arg, out)
+        stack.extend(n.named_children)
+
+
 def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, str]) -> dict[str, str]:
     """Update `outer_consts` with lexical local `const X = '/...'` bindings and drop shadowed ones."""
     raw_local: dict[str, str | None] = {}
@@ -346,6 +411,10 @@ def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, s
                 _collect_cst_pattern_idents(raw, fn_id, bound_fn)
                 for b in bound_fn:
                     raw_local[b] = None
+    mutated: set[str] = set()
+    _collect_mutated_cst_vars(raw, container, mutated)
+    for b in mutated:
+        raw_local[b] = None
     return _merge_cst_local_consts(outer_consts, raw_local)
 
 
@@ -493,13 +562,10 @@ def extract_ts_http_calls_cst(
                     if cmd:
                         tverb = "GET" if cmd.startswith(_TAURI_READ_PREFIXES) else "POST"
                         found.append((tverb, f"/tauri/{cmd}", fn_node.start_point[0] + 1))
-                elif first_arg is not None and first_arg.type in ("string", "template_string", "identifier"):
-                    if first_arg.type == "identifier":
-                        ident = raw[first_arg.start_byte : first_arg.end_byte].decode("utf-8", errors="replace")
-                        url_val = scope_consts.get(ident, "")
-                    else:
-                        url_val = resolve_url_const_head(_unquote_node(raw, first_arg), scope_consts)
-                    if url_val.startswith("/"):
+                elif first_arg is not None:
+                    tpl = _cst_url_template_from_expr(raw, first_arg)
+                    url_val = resolve_url_const_head(tpl, scope_consts) if tpl is not None else ""
+                    if is_same_origin_url_path(url_val):
                         upper_c = "DELETE" if callee_name.lower() == "del" else callee_name.upper()
                         if upper_c in _HTTP_VERBS:
                             found.append((upper_c, url_val, fn_node.start_point[0] + 1))

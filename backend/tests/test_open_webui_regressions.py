@@ -175,3 +175,133 @@ export const documentationExample = '/api/examples';
 def test_svelte_image_alt_shorthand(attrs, missing):
     findings = scan_a11y_markup_findings(f'<img {attrs} />', 'd:image', 'Image.svelte')
     assert any('missing `alt`' in f.title for f in findings) is missing
+
+
+def test_imported_same_origin_url_constants_and_shadowing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Resolve static empty-base & imported same-origin URL constants with strict shadowing & fallback parity."""
+    from app.adapters.sveltekit_display import SvelteKitDisplayAdapter
+
+    (tmp_path / "src" / "lib" / "apis" / "records").mkdir(parents=True)
+    (tmp_path / "src" / "routes" / "records" / "[id]").mkdir(parents=True)
+
+    (tmp_path / "src" / "lib" / "constants.ts").write_text(
+        "export const BASE = '';\n"
+        "export const API = `${BASE}/api/v1`;\n"
+        "export const ALIAS = API;\n"
+        "export const REMOTE = 'https://evil.example.com';\n"
+        "export const PROTO_REL = '//cdn.example.com';\n"
+        "export const DYNAMIC = window.location.origin;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "lib" / "barrel.ts").write_text(
+        "export { API as BARREL_API, BASE } from './constants.js';\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "lib" / "cyc_a.ts").write_text(
+        "import { CYC_B } from './cyc_b';\nexport const CYC_A = `${CYC_B}/a`;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "lib" / "cyc_b.ts").write_text(
+        "import { CYC_A } from './cyc_a';\nexport const CYC_B = `${CYC_A}/b`;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "lib" / "apis" / "records" / "index.ts").write_text(
+        "import { API, ALIAS, REMOTE, PROTO_REL, DYNAMIC, BASE } from '$lib/constants';\n"
+        "import { BARREL_API as REX_API } from '../../barrel';\n"
+        "import { CYC_A } from '$lib/cyc_a';\n"
+        "export const getRecord = (id: string) => fetch(`${API}/records/${id}`);\n"
+        "export const listViaAlias = () => fetch(`${ALIAS}/records`);\n"
+        "export const createViaBarrel = () => fetch(`${REX_API}/records`, { method: 'POST' });\n"
+        "export const rejectEmpty = () => fetch(BASE);\n"
+        "export const rejectRemote = () => fetch(`${REMOTE}/leak`);\n"
+        "export const rejectProtoRel = () => fetch(`${PROTO_REL}/leak`);\n"
+        "export const rejectDynamic = () => fetch(`${DYNAMIC}/leak`);\n"
+        "export const rejectCycle = () => fetch(`${CYC_A}/leak`);\n"
+        "export const paramShadow = (API: string) => fetch(`${API}/shadowed-param`);\n"
+        "export const localShadow = () => {\n"
+        "  const API = 'https://other.example.com';\n"
+        "  return fetch(`${API}/shadowed-local`);\n"
+        "};\n"
+        "export const varShadow = () => {\n"
+        "  let REX_API = '/temp';\n"
+        "  REX_API = '/reassigned';\n"
+        "  return fetch(`${REX_API}/shadowed-reassign`);\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "routes" / "records" / "[id]" / "+page.svelte").write_text(
+        "<script lang='ts'>import { getRecord } from '$lib/apis/records';</script><main>Ok</main>\n",
+        encoding="utf-8",
+    )
+
+    adapter = SvelteKitDisplayAdapter()
+    for disable_ts in ("0", "1"):
+        if disable_ts == "1":
+            monkeypatch.setenv("WYTHE_DISABLE_TREESITTER", "1")
+        else:
+            monkeypatch.delenv("WYTHE_DISABLE_TREESITTER", raising=False)
+        res = adapter.extract(tmp_path, ".")
+        calls = {(c.http_method, c.normalized_path) for c in res.http_calls}
+        assert ("GET", "/api/v1/records/{param}") in calls
+        assert ("GET", "/api/v1/records") in calls
+        assert ("POST", "/api/v1/records") in calls
+        assert not any("leak" in p or "shadowed" in p or p == "/" for _, p in calls), calls
+        assert any("imported same-origin URL constants" in n for n in res.notes)
+
+
+def test_opaque_and_local_component_a11y_inspection(tmp_path: Path) -> None:
+    """Inspect local component text semantics before firing DISP-005; keep opaque components unobserved."""
+    from app.adapters.sveltekit_display import SvelteKitDisplayAdapter
+
+    (tmp_path / "src" / "lib" / "components" / "common").mkdir(parents=True)
+    (tmp_path / "src" / "lib" / "components" / "icons").mkdir(parents=True)
+    (tmp_path / "src" / "routes").mkdir(parents=True)
+
+    (tmp_path / "src" / "lib" / "components" / "common" / "Tooltip.svelte").write_text(
+        "<script lang='ts'>export let as = 'div'; export let content = '';</script>\n"
+        "<svelte:element this={as}><slot /></svelte:element>\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "lib" / "components" / "common" / "ModelSettingsLabel.svelte").write_text(
+        "<script lang='ts'>\n"
+        "  import Tooltip from '$lib/components/common/Tooltip.svelte';\n"
+        "  export let label = '';\n"
+        "  export let description = '';\n"
+        "</script>\n"
+        "{#if description}\n"
+        "  <Tooltip as='span' content={description}><span>{label}</span></Tooltip>\n"
+        "{:else}\n"
+        "  <span>{label}</span>\n"
+        "{/if}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "lib" / "components" / "icons" / "ChevronRight.svelte").write_text(
+        "<script lang='ts'>export let label = ''; export let className = 'size-3';</script>\n"
+        "<svg aria-hidden='true' viewBox='0 0 24 24' class={className}><path d='M8 4l8 8-8 8' /></svg>\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "routes" / "+page.svelte").write_text(
+        "<script lang='ts'>\n"
+        "  import ModelSettingsLabel from '$lib/components/common/ModelSettingsLabel.svelte';\n"
+        "  import ChevronRight from '$lib/components/icons/ChevronRight.svelte';\n"
+        "  import { Menu } from 'lucide-svelte';\n"
+        "  import { OpaqueWidget } from '@external/ui';\n"
+        "</script>\n"
+        "<button type='button'><ModelSettingsLabel label={$i18n.t('Defaults')} description='desc' /><ChevronRight /></button>\n"
+        "<button type='button'><ModelSettingsLabel /></button>\n"
+        "<button type='button'><ModelSettingsLabel label='' /></button>\n"
+        "<button type='button'><ChevronRight label='unused prop' /></button>\n"
+        "<button type='button'><OpaqueWidget label='Unknown' /></button>\n"
+        "<button type='button'><Menu /></button>\n",
+        encoding="utf-8",
+    )
+
+    res = SvelteKitDisplayAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    lines = sorted(f.line for f in disp_005)
+    # Line 7 (ModelSettingsLabel with text) -> clean; Line 11 (OpaqueWidget) -> unobserved (not DISP-005)
+    assert lines == [8, 9, 10, 12], disp_005
+    assert any("unobserved" in n.lower() and "OpaqueWidget" in n for n in res.notes), res.notes
+

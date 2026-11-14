@@ -105,6 +105,7 @@ def test_celery_named_queues_and_beat_schedule_lineage(db_session: Session, tmp_
 def test_disp_005_wcag_markup_inspector_catches_violations_and_passes_accessible_markup() -> None:
     """Verify DISP-005 catches missing alt, non-keyboard div click, nameless button, and unlabeled input."""
     bad_tsx = (
+        "import { CloseIcon } from 'lucide-react';\n"
         "export function BadSurface() {\n"
         "  return (\n"
         "    <section>\n"
@@ -116,11 +117,22 @@ def test_disp_005_wcag_markup_inspector_catches_violations_and_passes_accessible
         "  );\n"
         "}\n"
     )
-    findings = scan_a11y_markup_findings(bad_tsx, "frontend/src/BadSurface.tsx", "d:comp:bad")
+    findings = scan_a11y_markup_findings(bad_tsx, "d:comp:bad", "frontend/src/BadSurface.tsx")
     codes = [f.rule_code for f in findings]
     assert codes.count("DISP-005") == 4
 
+    unobserved: list[str] = []
+    opaque_hits = scan_a11y_markup_findings(
+        "<button type='button'><OpaqueAction label='Close' /></button>",
+        "d:comp:opaque",
+        "frontend/src/Opaque.tsx",
+        unobserved_out=unobserved,
+    )
+    assert opaque_hits == []
+    assert len(unobserved) == 1 and "OpaqueAction" in unobserved[0]
+
     good_tsx = (
+        "import { CloseIcon } from 'lucide-react';\n"
         "export function GoodSurface() {\n"
         "  return (\n"
         "    <section>\n"
