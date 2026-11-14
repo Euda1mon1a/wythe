@@ -1560,10 +1560,20 @@ def _classify_markup_segment(
                     next_i = cspan[1]
             tag_low = tag.lower()
             if tag_low in ("svg", "i"):
-                merge_status(
-                    _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values),
-                    tag,
+                gst, gopaque = _classify_graphic_element(
+                    tag_low,
+                    attrs,
+                    inner_body,
+                    imported_components=imported_components,
+                    component_resolver=component_resolver,
+                    prop_values=prop_values,
+                    inner_status=inner_status,
                 )
+                if gst == "opaque" and gopaque:
+                    for lbl in gopaque:
+                        merge_status("opaque", lbl)
+                else:
+                    merge_status(gst, tag)
                 i = next_i
                 continue
             if tag_low == "img":
@@ -1730,6 +1740,59 @@ def _eval_element_own_name(
     if "{..." in attrs or re.search(r"(?<![\w$:-])v-bind\s*=", attrs):
         return "named" if prop_values is None else "opaque"
     return "opaque" if saw_opaque else None
+
+
+_SVG_NAME_CHILD_RE = re.compile(
+    r"(?is)<(?P<ctag>title|text)(?P<cattrs>[^>]*)>(?P<cbody>[\s\S]*?)</(?P=ctag)\s*>"
+)
+
+
+def _classify_graphic_element(
+    tag_low: str,
+    attrs: str,
+    inner_body: str,
+    *,
+    imported_components: dict[str, tuple[str, str]],
+    component_resolver: Callable[[str, str, str], str] | None,
+    prop_values: dict[str, str] | None,
+    inner_status: str,
+) -> tuple[str, list[str]]:
+    """Classify inline `<i>`/`<svg>` checking ARIA/title attrs first, then naming children."""
+    own_name = _eval_element_own_name(attrs, allow_alt=False, prop_values=prop_values)
+    if own_name == "named":
+        return "named", []
+    if inner_body and not _is_aria_hidden_true(attrs) and not _has_presentational_role(attrs):
+        if tag_low == "i":
+            cst, copaque, _ = _classify_markup_segment(
+                inner_body,
+                imported_components=imported_components,
+                component_resolver=component_resolver,
+                prop_values=prop_values,
+                inner_status=inner_status,
+            )
+            if cst == "named":
+                return "named", []
+            if copaque:
+                return "opaque", copaque
+        elif tag_low == "svg":
+            child_opaque: list[str] = []
+            for cm in _SVG_NAME_CHILD_RE.finditer(inner_body):
+                cattrs = cm.group("cattrs") or ""
+                if _is_aria_hidden_true(cattrs) or _has_presentational_role(cattrs):
+                    continue
+                cst, copaque, _ = _classify_markup_segment(
+                    cm.group("cbody") or "",
+                    imported_components=imported_components,
+                    component_resolver=component_resolver,
+                    prop_values=prop_values,
+                    inner_status=inner_status,
+                )
+                if cst == "named":
+                    return "named", []
+                child_opaque.extend(copaque)
+            if child_opaque:
+                return "opaque", child_opaque
+    return (own_name or "icon_only"), []
 
 
 def _eval_inline_graphic_name(

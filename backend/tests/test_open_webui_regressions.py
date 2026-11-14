@@ -589,12 +589,17 @@ def test_aria_named_elements_and_nullish_vs_or_coalescing_a11y(tmp_path: Path) -
         "      <button><OrLabel text='   ' /></button>\n"
         "      <button><OrLabel text={null} /></button>\n"
         "      <button><ChildWrapper>Save</ChildWrapper></button>\n"
+        "      <button><span><i>Save</i></span></button>\n"
+        "      <button><span><i className='icon' /></span></button>\n"
+        "      <button><span><svg role='img'><title>Save</title></svg></span></button>\n"
+        "      <button><span><svg role='none'><title>Save</title></svg></span></button>\n"
+        "      <button><span><i aria-hidden='true'>Save</i></span></button>\n"
         "    </div>\n"
         "  );\n"
         "}\n",
     )
     res = TypeScriptNextJsAdapter().extract(tmp_path, ".")
     disp_lines = sorted(f.line for f in res.findings if f.rule_code == "DISP-005")
-    assert disp_lines == [6, 7, 8, 9, 13, 15], res.findings
+    assert disp_lines == [6, 7, 8, 9, 13, 15, 19, 21, 22], res.findings
 
 
