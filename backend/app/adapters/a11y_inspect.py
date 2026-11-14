@@ -1873,14 +1873,36 @@ def _extract_tsx_return_markup(
     branches: list[str] = []
     i = body_start + 1
     limit = min(body_end - 1, n)
+    brace_depth = 0
+    stmt_start = body_start + 1
+    has_terminal_top_return = False
     while i < limit:
         if not mask[i]:
             i += 1
             continue
         if target_src.startswith("=>", i):
+            has_terminal_top_return = False
             i = _slice_arrow_body_end(target_src, i + 2, mask)
             continue
         ch_cur = target_src[i]
+        if ch_cur == "{":
+            has_terminal_top_return = False
+            brace_depth += 1
+            i += 1
+            continue
+        if ch_cur == "}":
+            has_terminal_top_return = False
+            if brace_depth > 0:
+                brace_depth -= 1
+                if brace_depth == 0:
+                    stmt_start = i + 1
+            i += 1
+            continue
+        if ch_cur == ";":
+            if brace_depth == 0:
+                stmt_start = i + 1
+            i += 1
+            continue
         if ch_cur == "[":
             _, prev_sep = _prev_sig_char(target_src, i, mask, skip_modifiers=True)
             if prev_sep in ("", "{", ",", ";", "}"):
@@ -1904,7 +1926,9 @@ def _extract_tsx_return_markup(
                         target_src, close_br, mask, limit, allow_return_type=True
                     )
                     if method_end is not None:
+                        has_terminal_top_return = False
                         i = method_end
+                        stmt_start = i
                         continue
         if ch_cur.isalpha() or ch_cur in "_$":
             prev_ok = i == 0 or not (target_src[i - 1].isalnum() or target_src[i - 1] in "_$")
@@ -1925,12 +1949,18 @@ def _extract_tsx_return_markup(
                         allow_optional_ident=True,
                         allow_return_type=True,
                     )
+                    has_terminal_top_return = False
                     i = fn_end if fn_end is not None else word_end
+                    if brace_depth == 0 and fn_end is not None:
+                        stmt_start = i
                     continue
                 if word == "class" and prev_sig != ".":
                     cls_end = _scan_nested_class_end(target_src, word_end, mask, limit)
+                    has_terminal_top_return = False
                     if cls_end is not None:
                         i = cls_end
+                        if brace_depth == 0:
+                            stmt_start = i
                         continue
                     i = word_end
                     continue
@@ -1949,57 +1979,67 @@ def _extract_tsx_return_markup(
                             allow_return_type=member_sep in ("", "{", ",", ";", "}"),
                         )
                         if method_end is not None:
+                            has_terminal_top_return = False
                             i = method_end
+                            if brace_depth == 0:
+                                stmt_start = i
                             continue
+                    has_terminal_top_return = False
                     i = word_end
                     continue
-        if target_src.startswith("return", i):
-            prev_ok = i == 0 or not (target_src[i - 1].isalnum() or target_src[i - 1] in "_$.")
-            nxt = i + 6
-            next_ok = nxt >= limit or not (target_src[nxt].isalnum() or target_src[nxt] in "_$")
-            if prev_ok and next_ok:
-                pos = nxt
-                while pos < limit and target_src[pos].isspace():
-                    pos += 1
-                depth = 0
-                end_pos = pos
-                while end_pos < limit:
-                    if not mask[end_pos]:
-                        end_pos += 1
-                        continue
-                    ch = target_src[end_pos]
-                    if ch == "<":
-                        found_jsx = _extract_jsx_at(target_src, end_pos)
-                        if found_jsx is not None and found_jsx[1] <= limit:
-                            end_pos = found_jsx[1]
+                if word == "return" and prev_sig != ".":
+                    pos = word_end
+                    while pos < limit and target_src[pos].isspace():
+                        pos += 1
+                    depth = 0
+                    end_pos = pos
+                    while end_pos < limit:
+                        if not mask[end_pos]:
+                            end_pos += 1
                             continue
-                    if ch in ("(", "[", "{"):
-                        depth += 1
-                    elif ch in (")", "]", "}"):
-                        if depth == 0:
+                        ch = target_src[end_pos]
+                        if ch == "<":
+                            found_jsx = _extract_jsx_at(target_src, end_pos)
+                            if found_jsx is not None and found_jsx[1] <= limit:
+                                end_pos = found_jsx[1]
+                                continue
+                        if ch in ("(", "[", "{"):
+                            depth += 1
+                        elif ch in (")", "]", "}"):
+                            if depth == 0:
+                                break
+                            depth -= 1
+                        elif ch == ";" and depth == 0:
                             break
-                        depth -= 1
-                    elif ch == ";" and depth == 0:
-                        break
-                    elif ch == "\n" and depth == 0 and target_src[pos:end_pos].strip():
-                        tail_tok = target_src[pos:end_pos].rstrip()
-                        if not tail_tok.endswith(("?", ":", "&&", "||", "+", ",")):
-                            break
-                    end_pos += 1
-                raw_expr = target_src[pos:end_pos].strip()
-                if "<" in raw_expr or any(p in raw_expr for p in portal_names):
-                    sub_branches = _extract_jsx_or_conditional_branches(raw_expr, portal_names)
-                    if sub_branches:
-                        branches.extend(sub_branches)
+                        elif ch == "\n" and depth == 0 and target_src[pos:end_pos].strip():
+                            tail_tok = target_src[pos:end_pos].rstrip()
+                            if not tail_tok.endswith(("?", ":", "&&", "||", "+", ",")):
+                                break
+                        end_pos += 1
+                    raw_expr = target_src[pos:end_pos].strip()
+                    if "<" in raw_expr or any(p in raw_expr for p in portal_names):
+                        sub_branches = _extract_jsx_or_conditional_branches(raw_expr, portal_names)
+                        if sub_branches:
+                            branches.extend(sub_branches)
+                        else:
+                            branches.append(f"<!--WYTHE_EXPR-->{raw_expr or 'null'}")
                     else:
                         branches.append(f"<!--WYTHE_EXPR-->{raw_expr or 'null'}")
-                else:
-                    branches.append(f"<!--WYTHE_EXPR-->{raw_expr or 'null'}")
-                i = end_pos + 1
-                continue
+                    is_unconditional_top = brace_depth == 0 and not any(
+                        mask[p] and not target_src[p].isspace() for p in range(stmt_start, i)
+                    )
+                    has_terminal_top_return = is_unconditional_top
+                    i = end_pos + (1 if end_pos < limit and target_src[end_pos] == ";" else 0)
+                    if brace_depth == 0:
+                        stmt_start = i
+                    continue
+        if not ch_cur.isspace():
+            has_terminal_top_return = False
         i += 1
     if not branches:
         return ""
+    if not has_terminal_top_return and "<!--WYTHE_EXPR-->undefined" not in branches:
+        branches.append("<!--WYTHE_EXPR-->undefined")
     return "\n<!--WYTHE_BRANCH-->\n".join(branches)
 
 
@@ -3113,6 +3153,14 @@ def _classify_markup_segment(
                 i = next_i
                 continue
             if _is_aria_hidden_true(attrs):
+                if (
+                    tag[0].islower()
+                    and matched_imp is None
+                    and tag_low not in ("slot", "component", "template")
+                    and not tag_low.startswith("svelte:")
+                ):
+                    i = next_i
+                    continue
                 if root_imp and _ICON_PKG_SPEC_RE.match(root_imp[0]):
                     resolved = _resolve_component_tag(
                         tag,
@@ -3125,8 +3173,8 @@ def _classify_markup_segment(
                         usage_pos=source_offset + i,
                     )
                     merge_status("empty" if resolved == "named" else resolved, tag)
-                i = next_i
-                continue
+                    i = next_i
+                    continue
             is_dyn_comp, dyn_sel, dyn_attrs = _extract_dynamic_component_selector(
                 tag_low,
                 attrs,

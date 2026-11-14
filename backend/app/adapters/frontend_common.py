@@ -123,6 +123,7 @@ def build_frontend_url_const_resolver(
     """Return `imported_consts_for(file_path, cleaned_txt)` resolving static same-origin URL exports."""
     export_cache: dict[Path, dict[str, str]] = {}
     text_cache: dict[Path, str] = dict(cleaned_cache) if cleaned_cache is not None else {}
+    parsed_cache: dict[Path, tuple[str, list[tuple[Path, list[tuple[str, str]]]], list[Path], list[tuple[Path | None, list[tuple[str, str]]]], list[str], list[tuple[str, str]]]] = {}
 
     def _read_cleaned(fpath: Path) -> str:
         if fpath not in text_cache:
@@ -134,52 +135,101 @@ def build_frontend_url_const_resolver(
                 text_cache[fpath] = extract_script_preserving_lines(raw, fpath.suffix)
         return text_cache[fpath]
 
-    def _exports_of(
-        fpath: Path,
-        visiting: frozenset[Path] = frozenset(),
-        depth: int = 0,
-    ) -> tuple[dict[str, str], bool]:
-        if fpath in export_cache:
-            return export_cache[fpath], False
-        if fpath in visiting or depth > 8:
-            return {}, True
+    def _parse_module(fpath: Path):
+        cached = parsed_cache.get(fpath)
+        if cached is not None:
+            return cached
         cleaned = _read_cleaned(fpath)
         if not cleaned:
-            return {}, False
-
-        next_visiting = visiting | {fpath}
-        hit_cycle = False
+            empty = ("", [], [], [], [], [])
+            parsed_cache[fpath] = empty
+            return empty
         mask = js_code_mask(cleaned)
-        imported: dict[str, str] = {}
+        named_imports: list[tuple[Path, list[tuple[str, str]]]] = []
         for im in _NAMED_IMPORT_STMT_RE.finditer(cleaned):
             if not is_js_module_stmt_in_code(cleaned, mask, im):
                 continue
             target = resolve_frontend_import(im.group("spec"), fpath, src_root, extensions)
-            if target is None:
-                continue
-            target_exports, cyc = _exports_of(target, next_visiting, depth + 1)
-            hit_cycle = hit_cycle or cyc
-            for orig_name, local_name in _parse_specifier_pairs(im.group("clause")):
-                if orig_name in target_exports:
-                    imported[local_name] = target_exports[orig_name]
-
-        local_consts, _ = _build_scoped_url_consts(cleaned, imported_consts=imported)
-        exported: dict[str, str] = {}
+            if target is not None:
+                named_imports.append((target, _parse_specifier_pairs(im.group("clause"))))
+        reexport_all: list[Path] = []
         for rm in _REEXPORT_ALL_RE.finditer(cleaned):
             if not is_js_module_stmt_in_code(cleaned, mask, rm):
                 continue
             target = resolve_frontend_import(rm.group("spec"), fpath, src_root, extensions)
             if target is not None:
-                target_exports, cyc = _exports_of(target, next_visiting, depth + 1)
-                hit_cycle = hit_cycle or cyc
-                exported.update(target_exports)
+                reexport_all.append(target)
+        reexport_from: list[tuple[Path | None, list[tuple[str, str]]]] = []
         for rm in _REEXPORT_FROM_RE.finditer(cleaned):
             if not is_js_module_stmt_in_code(cleaned, mask, rm):
                 continue
             target = resolve_frontend_import(rm.group("spec"), fpath, src_root, extensions)
-            pairs = _parse_specifier_pairs(rm.group("clause"))
+            reexport_from.append((target, _parse_specifier_pairs(rm.group("clause"))))
+        exported_names: list[str] = []
+        for em in _EXPORT_CONST_NAME_RE.finditer(cleaned):
+            if is_js_module_stmt_in_code(cleaned, mask, em):
+                exported_names.append(em.group("name"))
+        exported_local_pairs: list[tuple[str, str]] = []
+        for lm in _EXPORT_LOCAL_CLAUSE_RE.finditer(cleaned):
+            if is_js_module_stmt_in_code(cleaned, mask, lm):
+                exported_local_pairs.extend(_parse_specifier_pairs(lm.group("clause")))
+        entry = (
+            cleaned,
+            named_imports,
+            reexport_all,
+            reexport_from,
+            exported_names,
+            exported_local_pairs,
+        )
+        parsed_cache[fpath] = entry
+        return entry
+
+    def _exports_of(
+        fpath: Path,
+        visiting: frozenset[Path],
+        depth: int,
+        run_memo: dict[Path, tuple[int, frozenset[Path], dict[str, str], bool]],
+        budget: list[int],
+    ) -> tuple[dict[str, str], bool]:
+        if fpath in export_cache:
+            return export_cache[fpath], False
+        if fpath in visiting or depth > 8 or budget[0] <= 0:
+            return {}, True
+        prev = run_memo.get(fpath)
+        if prev is not None:
+            prev_depth, prev_visiting, prev_exp, prev_cyc = prev
+            if prev_depth <= depth and prev_visiting.issubset(visiting):
+                return prev_exp, prev_cyc
+        budget[0] -= 1
+        cleaned, named_imports, reexport_all, reexport_from, exported_names, exported_local_pairs = _parse_module(fpath)
+        if not cleaned or (not reexport_all and not reexport_from and not exported_names and not exported_local_pairs):
+            export_cache[fpath] = {}
+            return {}, False
+
+        next_visiting = visiting | {fpath}
+        hit_cycle = False
+        imported: dict[str, str] = {}
+        if exported_names or exported_local_pairs:
+            for target, pairs in named_imports:
+                target_exports, cyc = _exports_of(target, next_visiting, depth + 1, run_memo, budget)
+                hit_cycle = hit_cycle or cyc
+                for orig_name, local_name in pairs:
+                    if orig_name in target_exports:
+                        imported[local_name] = target_exports[orig_name]
+
+        local_consts, _ = (
+            _build_scoped_url_consts(cleaned, imported_consts=imported)
+            if (exported_names or exported_local_pairs)
+            else ({}, set())
+        )
+        exported: dict[str, str] = {}
+        for target in reexport_all:
+            target_exports, cyc = _exports_of(target, next_visiting, depth + 1, run_memo, budget)
+            hit_cycle = hit_cycle or cyc
+            exported.update(target_exports)
+        for target, pairs in reexport_from:
             if target is not None:
-                target_exports, cyc = _exports_of(target, next_visiting, depth + 1)
+                target_exports, cyc = _exports_of(target, next_visiting, depth + 1, run_memo, budget)
                 hit_cycle = hit_cycle or cyc
                 for orig_name, export_name in pairs:
                     if orig_name in target_exports:
@@ -189,39 +239,38 @@ def build_frontend_url_const_resolver(
             else:
                 for _orig_name, export_name in pairs:
                     exported.pop(export_name, None)
-        for em in _EXPORT_CONST_NAME_RE.finditer(cleaned):
-            if not is_js_module_stmt_in_code(cleaned, mask, em):
-                continue
-            cname = em.group("name")
+        for cname in exported_names:
             if cname in local_consts:
                 exported[cname] = local_consts[cname]
             else:
                 exported.pop(cname, None)
-        for lm in _EXPORT_LOCAL_CLAUSE_RE.finditer(cleaned):
-            if not is_js_module_stmt_in_code(cleaned, mask, lm):
-                continue
-            for local_name, export_name in _parse_specifier_pairs(lm.group("clause")):
-                if local_name in local_consts:
-                    exported[export_name] = local_consts[local_name]
-                else:
-                    exported.pop(export_name, None)
+        for local_name, export_name in exported_local_pairs:
+            if local_name in local_consts:
+                exported[export_name] = local_consts[local_name]
+            else:
+                exported.pop(export_name, None)
         if not hit_cycle:
             export_cache[fpath] = exported
+        else:
+            prev = run_memo.get(fpath)
+            if prev is None or depth < prev[0]:
+                run_memo[fpath] = (depth, visiting, exported, hit_cycle)
         return exported, hit_cycle
 
     def imported_consts_for(fpath: Path, cleaned_txt: str) -> dict[str, str]:
         resolved_path = fpath.resolve()
         text_cache.setdefault(resolved_path, cleaned_txt)
-        mask = js_code_mask(cleaned_txt)
+        _, named_imports, _, _, _, _ = _parse_module(resolved_path)
+        if not named_imports:
+            return {}
         imported: dict[str, str] = {}
-        for im in _NAMED_IMPORT_STMT_RE.finditer(cleaned_txt):
-            if not is_js_module_stmt_in_code(cleaned_txt, mask, im):
+        run_memo: dict[Path, tuple[int, frozenset[Path], dict[str, str], bool]] = {}
+        budget = [256]
+        for target, pairs in named_imports:
+            if target == resolved_path:
                 continue
-            target = resolve_frontend_import(im.group("spec"), resolved_path, src_root, extensions)
-            if target is None or target == resolved_path:
-                continue
-            target_exports, _ = _exports_of(target, frozenset({resolved_path}), 0)
-            for orig_name, local_name in _parse_specifier_pairs(im.group("clause")):
+            target_exports, _ = _exports_of(target, frozenset({resolved_path}), 0, run_memo, budget)
+            for orig_name, local_name in pairs:
                 if orig_name in target_exports:
                     imported[local_name] = target_exports[orig_name]
         return imported

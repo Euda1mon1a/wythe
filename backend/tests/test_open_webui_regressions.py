@@ -1184,4 +1184,87 @@ def test_vue_conditional_rendering_and_svelte_raw_html_a11y(
     assert sv_lines == [8, 11, 12], sv_res.findings
 
 
+def test_cyclic_url_resolution_aria_hidden_prop_and_implicit_return_fallthrough(
+    tmp_path: Path,
+) -> None:
+    """Verify bounded cyclic URL resolution, non-native `aria-hidden`, and implicit fallthrough returns."""
+    import time
+
+    from app.adapters.a11y_inspect import scan_a11y_markup_findings
+    from app.adapters.frontend_common import build_a11y_component_resolver
+    from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+
+    cyc_root = tmp_path / "cyclic_mods"
+    n_mods = 40
+    for idx in range(n_mods):
+        nxt1 = (idx + 1) % n_mods
+        nxt2 = (idx + 2) % n_mods
+        put(
+            cyc_root,
+            f"src/mod_{idx}.ts",
+            f"import {{ val_{nxt1} }} from './mod_{nxt1}';\n"
+            f"import {{ val_{nxt2} }} from './mod_{nxt2}';\n"
+            f"export const val_{idx} = 'local';\n"
+            f"export const pair_{idx} = [val_{nxt1}, val_{nxt2}];\n",
+        )
+    put(
+        cyc_root,
+        "src/app/page.tsx",
+        "import { val_0 } from '../mod_0';\n"
+        "export default function Page() { return <div>{val_0}</div>; }\n",
+    )
+    t0 = time.perf_counter()
+    cyc_res = TypeScriptNextJsAdapter().extract(cyc_root, ".")
+    elapsed = time.perf_counter() - t0
+    assert cyc_res.nodes
+    assert elapsed < 1.5, f"Cyclic module scan took {elapsed:.3f}s for {n_mods} cyclic files"
+
+    tsx_root = tmp_path / "a11y_fallthrough"
+    page_src = (
+        "function IconLabel() { return <svg />; }\n"
+        "function TextLabel() { return <span>Save</span>; }\n"
+        "function MaybeLabel({ show = false }: { show?: boolean }) {\n"
+        "  if (show) {\n"
+        "    return <span>Save</span>;\n"
+        "  }\n"
+        "}\n"
+        "function CondNoBrace({ show = false }: { show?: boolean }) {\n"
+        "  if (show) return <span>Save</span>;\n"
+        "}\n"
+        "function GuaranteedLabel({ flag }: { flag?: boolean }) {\n"
+        "  if (flag) { console.log(flag); }\n"
+        "  return <span>Save</span>;\n"
+        "}\n"
+        "export function App() {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <button><IconLabel aria-hidden={true} /></button>\n"
+        "      <button><TextLabel aria-hidden={true} /><svg /></button>\n"
+        "      <button><span aria-hidden=\"true\">Save</span><svg /></button>\n"
+        "      <button><MaybeLabel /><svg /></button>\n"
+        "      <button><CondNoBrace /><svg /></button>\n"
+        "      <button><GuaranteedLabel /><svg /></button>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n"
+    )
+    page_path = tsx_root / "app/page.tsx"
+    put(tsx_root, "app/page.tsx", page_src)
+    resolver = build_a11y_component_resolver(tsx_root, (".tsx", ".ts"))
+    unobs: list[str] = []
+    findings = scan_a11y_markup_findings(
+        page_src,
+        "d:page:app.page",
+        "app/page.tsx",
+        component_resolver=resolver(page_path, page_src),
+        unobserved_out=unobs,
+    )
+    disp_lines = sorted(f.line for f in findings if f.rule_code == "DISP-005")
+    assert disp_lines == [18, 20], findings
+    unobs_text = "\n".join(unobs)
+    assert "MaybeLabel" in unobs_text
+    assert "CondNoBrace" in unobs_text
+    assert "GuaranteedLabel" not in unobs_text
+
+
 
