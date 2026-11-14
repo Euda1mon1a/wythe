@@ -17,7 +17,7 @@ Wythe supports **19 stack profiles** via `--profile auto` (**1 production-dogfoo
 
 > [!IMPORTANT]
 > **Status, Maturity & Zero-Maintenance Notice (`"AS IS"`)**
-> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.8` or `wythe==0.1.8`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
+> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.1.9` or `wythe==0.1.9`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
 > - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **17 experimental profiles** (`nextjs-prisma`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, `django-react`, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
 
 ---
@@ -40,6 +40,26 @@ uv tool install "wythe[treesitter]"
 wythe serve .
 ```
 
+### Exploring the full graph
+
+The 3D view represents every scanned node matching the current filters. Grid and
+Districts have no node or connection sampling limit. Distant nodes appear as dots;
+zooming in reveals detailed shapes in both Atomic and Simple modes. The count panel
+separates the represented graph, nodes hidden by filters, and detail inside the camera view.
+
+- **Layout [L]** switches between Grid and Districts. Districts expand to fit their contents.
+- **Connected only** hides nodes without a connection to another node in the current view
+  (self-loops count). It respects the edge, stratum, subkind, and search filters.
+- Select a node, then choose **Neighborhood: 1 hop / 2 hops** to follow the displayed
+  connections in either direction. **Cone [C]** retains the separate transitive lineage view.
+- **Fit view** frames the current selection of nodes. Filtering preserves their positions;
+  scrolling over the map zooms toward the pointer.
+
+Selected and traced nodes remain pinned outside ordinary filters, with the extra count
+shown explicitly. Connected-only has no pin exception. Hidden or disconnected nodes
+remain in the scan and index; missing static connections are not proof of dead code or
+safe deletion. Rendering the entire scan does not extend the scanner's coverage.
+
 ### GitHub Actions Integration
 
 Pin an explicit release tag (do not track unpinned branches if you want zero-surprise builds):
@@ -48,7 +68,7 @@ Pin an explicit release tag (do not track unpinned branches if you want zero-sur
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0
-- uses: Euda1mon1a/wythe@v0.1.8
+- uses: Euda1mon1a/wythe@v0.1.9
   with:
     mode: diff
     base-ref: origin/main
@@ -242,7 +262,7 @@ Every stack family has been scanned against synthetic test fixtures and multi-th
 **2. What happens if my app uses GraphQL, gRPC / Connect-RPC, tRPC, or Next.js Server Actions instead of HTTP REST?**
 Wythe's cross-tier linker currently matches HTTP REST paths (`RouteDescriptor` ↔ `FrontendHttpCall`) plus Tauri `#[tauri::command]` ↔ `invoke()`. On GraphQL (`lldap`), Connect-RPC/gRPC (`memos`), tRPC, or React Server Actions (`"use server"`), Wythe still extracts intra-tier DB tables, backend call graphs, and frontend component graphs, but cross-tier HTTP E2E chains will read `0` and rules like `TRUTH-001`, `MANIP-003`, or `DISP-004` may fire until ratcheted or disabled in `.wythe/governance.json`.
 
-**3. Why ship a static analyzer, SARIF CI gate, 120 fps 3D WebGL UI, and local AI/MCP bridges in one wheel?**
+**3. Why ship a static analyzer, SARIF CI gate, interactive 3D WebGL UI, and local AI/MCP bridges in one wheel?**
 So `uvx "wythe[treesitter]" serve /path/to/repo` works in one command on any machine with zero Node.js toolchain, zero cloud API keys, and zero split-version drift between the CLI gate, MCP server, and visual X-Ray UI. Core `wythe` stays lightweight; prebuilt Tree-sitter C grammars are isolated in the optional `[treesitter]` extra.
 
 **4. Is Wythe actively maintained, or can I request features / SLAs?**

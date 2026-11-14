@@ -4,7 +4,9 @@
  * backend server, and supports multimodal image input when Chrome's multimodal Prompt API is active.
  */
 
-import { version } from '../../package.json';
+import packageMetadata from '../../package.json';
+
+const { version } = packageMetadata;
 
 export type ChromeEngineState = 'ready' | 'downloadable' | 'downloading' | 'unavailable';
 

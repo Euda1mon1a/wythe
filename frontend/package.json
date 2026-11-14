@@ -1,12 +1,13 @@
 {
   "name": "wythe-frontend",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "scripts": {
     "dev": "next dev --port 3780 --hostname 127.0.0.1",
     "build": "next build",
     "start": "next start --port 3780 --hostname 127.0.0.1",
-    "type-check": "tsc --noEmit",
+    "type-check": "tsc --noEmit && npm run test:scene",
+    "test:scene": "node scripts/test-scene.cjs",
     "generate:types": "openapi-typescript ./openapi.json -o src/types/api-generated.ts"
   },
   "dependencies": {
