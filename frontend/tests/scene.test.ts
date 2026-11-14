@@ -173,6 +173,18 @@ test('edge batching retains every connection beyond the old limit', () => {
     (child as THREE.LineSegments).geometry.getAttribute('position').count / 2, 0), 9000);
 });
 
+test('overview counts use the dot footprint at the viewport edge', () => {
+  const camera = new THREE.PerspectiveCamera(46, 1.6, 0.1, 1000);
+  camera.position.set(0, 0, 150);
+  camera.lookAt(0, 0, 0);
+  const halfWidth = 150 * Math.tan(THREE.MathUtils.degToRad(23)) * 1.6;
+  const batch = createBatchedNodes([renderRecord(node('outside-dot'), [halfWidth * 1.01, 0, 0])], 'atomic');
+  const stats = batch.update(camera, 800, 500);
+  assert.equal(stats.total, 1);
+  assert.equal(stats.overview, 0, 'a dot four pixels beyond the edge does not overlap the viewport');
+  assert.equal(batch.renderedNodeIds.size, 0);
+});
+
 test('viewport digest reports the filtered graph and clears an empty view', () => {
   const params = {
     activeSlug: 'example', sourceCommit: '1234567890', visibleNodes: [nodes[0]],

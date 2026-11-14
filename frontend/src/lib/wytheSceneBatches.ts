@@ -149,9 +149,11 @@ export function createBatchedNodes(records: SceneRenderNode[], mode: PolygonRend
         if (-view.z < camera.near || -view.z > camera.far) continue;
         const diameter = entry.radius * height * camera.projectionMatrix.elements[5] / -view.z;
         scratch.copy(entry.center).project(camera);
-        if (Math.abs(scratch.x) > 1 + diameter / width || Math.abs(scratch.y) > 1 + diameter / height) continue;
+        const detailed = diameter >= DETAIL_DIAMETER_PX || (entry.style.selected && diameter >= 6);
+        const markerDiameter = detailed ? diameter : 5;
+        if (Math.abs(scratch.x) > 1 + markerDiameter / width || Math.abs(scratch.y) > 1 + markerDiameter / height) continue;
         renderedNodeIds.add(entry.node.id);
-        if (diameter >= DETAIL_DIAMETER_PX || (entry.style.selected && diameter >= 6)) {
+        if (detailed) {
           batch.mesh.setMatrixAt(batch.instances.length, entry.matrix);
           batch.instances.push(entry.node);
           stats.detailed += 1;
