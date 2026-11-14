@@ -30,6 +30,8 @@ from app.adapters.ts_reachability import (
     ReachabilityIndex,
     build_nextjs_reachability,
 )
+from app.adapters.ts_trpc import extract_trpc_client_calls
+from app.adapters.ts_workspace import WorkspaceResolver, extract_ts_import_bindings
 from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
@@ -103,6 +105,9 @@ _SCHEMA_BIND_MARKERS = (
     "@hey-api/",
     "oazapfts",
     "orval",
+    "@trpc/",
+    "trpc/react",
+    "/trpc",
 )
 _GENERATED_HEADER_MARKERS = (
     "@hey-api/openapi-ts",
@@ -138,6 +143,8 @@ def has_generated_contract_provenance(
     if source_file.endswith((".gen.ts", ".gen.tsx", ".generated.ts", ".generated.tsx")):
         return True
     if raw_source:
+        if "createTRPC" in raw_source:
+            return True
         head_low = raw_source[:2000].lower()
         if any(marker in head_low for marker in _GENERATED_HEADER_MARKERS):
             return True
@@ -1092,6 +1099,7 @@ def _extract_ts_http_calls(
                 joined_u = "/" + "/".join(p for p in (rtk_base.strip("/"), sub_u.strip("/")) if p)
                 lineno = txt.count("\n", 0, rm.start()) + 1
                 results.append((rverb, joined_u or "/", lineno))
+        results.extend(extract_trpc_client_calls(txt, is_tsx=True))
         return results
 
     _root_consts, consts_at = _build_scoped_url_consts(txt, imported_consts=seed_consts)
@@ -1179,6 +1187,7 @@ def _extract_ts_http_calls(
             lineno = txt.count("\n", 0, tm.start()) + 1
             results.append((tverb, f"/tauri/{cmd}", lineno))
     results.extend(_extract_object_http_calls_fallback(txt, consts_at))
+    results.extend(extract_trpc_client_calls(txt, is_tsx=True))
     return results
 _TS_POLICY_CONST_RE = re.compile(
     r"""^[ \t]*(?:export\s+)?const\s+(?P<name>[A-Z][A-Z0-9_]{3,})\s*(?::[^=]+)?=\s*(?P<val>[^\n;]+)""",
@@ -1363,13 +1372,19 @@ def _nextjs_route_label(rel_src: str) -> str:
     return "/" + "/".join(parts) if parts else "/"
 
 
-def _resolve_ts_import(spec: str, current_file: Path, src_root: Path) -> Path | None:
+def _resolve_ts_import(
+    spec: str,
+    current_file: Path,
+    src_root: Path,
+    *,
+    ws_resolver: WorkspaceResolver | None = None,
+) -> Path | None:
     if spec.startswith("@/"):
         base = src_root / spec[2:]
     elif spec.startswith("."):
         base = (current_file.parent / spec).resolve()
     else:
-        return None
+        return ws_resolver.resolve_import(spec, current_file) if ws_resolver is not None else None
     for candidate in (
         base,
         Path(f"{base}.ts"),
@@ -1379,7 +1394,7 @@ def _resolve_ts_import(spec: str, current_file: Path, src_root: Path) -> Path | 
     ):
         if candidate.is_file():
             return candidate.resolve()
-    return None
+    return ws_resolver.resolve_import(spec, current_file) if ws_resolver is not None else None
 
 
 class TypeScriptNextJsAdapter:
@@ -1401,6 +1416,7 @@ class TypeScriptNextJsAdapter:
         _next_exts = (".ts", ".tsx", ".js", ".jsx")
         url_const_resolver = build_frontend_url_const_resolver(src_root, _next_exts)
         comp_resolver_for = build_a11y_component_resolver(src_root, _next_exts)
+        ws_resolver = WorkspaceResolver.build(repo_root.resolve(), extra_roots=(fe_dir, src_root))
         has_gen_cfg = has_frontend_generator_config(fe_dir)
         unobserved_a11y: list[str] = []
 
@@ -1453,7 +1469,7 @@ class TypeScriptNextJsAdapter:
                     targets: list[Path] = []
                     for rex in (_REEXPORT_STAR_RE, _REEXPORT_NAMED_RE):
                         for m in rex.finditer(clean_txt):
-                            t = _resolve_ts_import(m.group("spec"), resolved, src_root)
+                            t = _resolve_ts_import(m.group("spec"), resolved, src_root, ws_resolver=ws_resolver)
                             if t is not None:
                                 targets.append(t)
                     barrel_targets[resolved] = targets
@@ -1558,8 +1574,8 @@ class TypeScriptNextJsAdapter:
                 has_generator_config=has_gen_cfg,
             )
 
-            for spec in imported_Specs:
-                target_path = _resolve_ts_import(spec, fpath, src_root)
+            for binding in extract_ts_import_bindings(txt, is_tsx=True):
+                target_path = _resolve_ts_import(binding.spec, fpath, src_root, ws_resolver=ws_resolver)
                 if target_path is None:
                     continue
                 expanded = barrel_targets.get(target_path, [target_path])

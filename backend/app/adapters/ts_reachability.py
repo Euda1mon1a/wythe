@@ -15,6 +15,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from app.adapters.ts_execution import dynamic_imports, module_execution
 
@@ -248,7 +249,11 @@ def load_tsconfig_paths(fe_dir: Path) -> tuple[Path | None, list[tuple[str, list
 
 
 def make_resolver(
-    fe_dir: Path, src_root: Path, known_files: set[Path]
+    fe_dir: Path,
+    src_root: Path,
+    known_files: set[Path],
+    *,
+    ws_resolver: Any | None = None,
 ) -> Callable[[str, Path], Path | None]:
     """Build a spec resolver honoring relative imports, tsconfig `paths`, `@/`, and `baseUrl`."""
     base_dir, aliases = load_tsconfig_paths(fe_dir)
@@ -296,6 +301,10 @@ def make_resolver(
                 result = _probe(src_root / spec[2:])
             if result is None and base_dir is not None:
                 result = _probe(base_dir / spec)
+            if result is None and ws_resolver is not None:
+                ws_hit = ws_resolver.resolve_import(spec, current_file, exts=GRAPH_SUFFIXES)
+                if ws_hit is not None and ws_hit.resolve() in known_files:
+                    result = ws_hit.resolve()
         cache[key] = result
         return result
 
@@ -349,6 +358,8 @@ def nextjs_route_handler_patterns(files: list[Path], src_root: Path, fe_dir: Pat
     for path in files:
         parts = _app_relative(path, src_root, fe_dir)
         if not parts:
+            continue
+        if path.stem in ("[trpc]", "[[...trpc]]") or any(p in ("[trpc]", "[[...trpc]]") for p in parts):
             continue
         if parts[0] == "app" and path.stem == "route":
             segs = list(parts[1:-1])
@@ -729,9 +740,12 @@ def build_nextjs_reachability(
     pre_cleaned: dict[Path, str] | None = None,
 ) -> tuple[ReachabilityIndex, list[str]]:
     """Return the reachability index plus `route.ts`/`pages/api` path patterns for a Next.js app."""
+    from app.adapters.ts_workspace import WorkspaceResolver
+
     files = collect_graph_files(fe_dir)
     known = set(files)
-    resolve = make_resolver(fe_dir, src_root, known)
+    ws_res = WorkspaceResolver.build(display_root, extra_roots=(fe_dir, src_root))
+    resolve = make_resolver(fe_dir, src_root, known, ws_resolver=ws_res)
     modules: dict[Path, _ModuleInfo] = {}
     for path in files:
         text = (pre_cleaned or {}).get(path)
@@ -766,9 +780,12 @@ def build_react_spa_reachability(
     pre_cleaned: dict[Path, str] | None = None,
 ) -> ReachabilityIndex:
     """Return the symbol-level reachability index for a React SPA / Vite / Remix frontend."""
+    from app.adapters.ts_workspace import WorkspaceResolver
+
     files = collect_graph_files(fe_dir)
     known = set(files)
-    resolve = make_resolver(fe_dir, src_root, known)
+    ws_res = WorkspaceResolver.build(display_root, extra_roots=(fe_dir, src_root))
+    resolve = make_resolver(fe_dir, src_root, known, ws_resolver=ws_res)
     modules: dict[Path, _ModuleInfo] = {}
     for path in files:
         text = (pre_cleaned or {}).get(path)
