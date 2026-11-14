@@ -60,12 +60,23 @@ import type { QuickActionDef } from '@/lib/wytheCommands';
 import {
   ALL_NODE_SUBKINDS,
   deriveDomainCluster,
+  SCENE_LAYOUT_LABELS,
   SCENE_LENS_LABELS,
   type DiffOverlaySet,
   type EdgeFilterMode,
   type SceneLayoutMode,
   type SceneLens,
 } from '@/lib/wytheSceneLenses';
+import {
+  SAVED_VIEWS_STORAGE_KEY,
+  addNodesToWorkingSet,
+  parseSavedViews,
+  reconcileSavedView,
+  serializeSavedViews,
+  toggleNodeInWorkingSet,
+  type SavedViewReconcileResult,
+  type SavedWorkingView,
+} from '@/lib/wytheWorkingSet';
 import { tryCopyDataUrlPngToClipboard, type LiveViewportDigest } from '@/lib/wytheVisionBridge';
 import { registerWytheWebMcpBridge } from '@/lib/wytheBrowserAi';
 import { WYTHE_PRESETS, useWytheAppearance, type AppearanceMode } from '@/lib/wytheTheme';
@@ -158,6 +169,32 @@ export default function WytheWorkspacePage() {
   const [whatsThisExplanation, setWhatsThisExplanation] = useState<UiFocusExplainRead | null>(null);
   const [whatsThisImageCopied, setWhatsThisImageCopied] = useState(false);
   const [askDrawerOpen, setAskDrawerOpen] = useState(false);
+  const [workingSetIds, setWorkingSetIds] = useState<Set<string>>(() => new Set());
+  const [workingSetActive, setWorkingSetActive] = useState(false);
+  const [compactVisible, setCompactVisible] = useState(false);
+  const [flatten2D, setFlatten2D] = useState(false);
+  const [groupBy, setGroupBy] = useState<'none' | 'cluster' | 'subkind'>('none');
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const [pinnedPositions, setPinnedPositions] = useState<Record<string, [number, number, number]>>(
+    () => ({}),
+  );
+  const [visibleSceneNodeIds, setVisibleSceneNodeIds] = useState<string[]>([]);
+  const [savedViews, setSavedViews] = useState<SavedWorkingView[]>([]);
+  const [selectedSavedViewId, setSelectedSavedViewId] = useState<string>('');
+  const [savedViewNotice, setSavedViewNotice] = useState<SavedViewReconcileResult | null>(null);
+
+  useEffect(() => {
+    setSavedViews(parseSavedViews(window.localStorage.getItem(SAVED_VIEWS_STORAGE_KEY)));
+  }, []);
+
+  useEffect(() => {
+    setWorkingSetIds(new Set());
+    setWorkingSetActive(false);
+    setPinnedPositions({});
+    setCollapsedGroups(new Set());
+    setSavedViewNotice(null);
+    setSelectedSavedViewId('');
+  }, [activeSlug]);
   const [askPrefillQuestion, setAskPrefillQuestion] = useState('');
   const [liveViewportDigest, setLiveViewportDigest] = useState<LiveViewportDigest | null>(null);
   const liveCaptureFnRef = useRef<(() => string | null) | null>(null);
@@ -519,12 +556,168 @@ export default function WytheWorkspacePage() {
   }, [flashToast]);
 
   const toggleSceneLayout = useCallback(() => {
+    const order: readonly SceneLayoutMode[] = ['cluster', 'grid', 'subkind', 'connected'];
     setSceneLayout((cur) => {
-      const next = cur === 'cluster' ? 'grid' : 'cluster';
-      flashToast(`3D Layout: ${next === 'cluster' ? 'Domain Districts' : 'Uniform Grid'}`);
+      const next = order[(order.indexOf(cur) + 1) % order.length];
+      flashToast(`3D Layout: ${SCENE_LAYOUT_LABELS[next]}`);
       return next;
     });
   }, [flashToast]);
+
+  const handleToggleWorkingSetNode = useCallback(
+    (nodeId: string) => {
+      setWorkingSetIds((prev) => {
+        const nextArr = toggleNodeInWorkingSet([...prev], nodeId);
+        setWorkingSetActive(nextArr.length > 0);
+        return new Set(nextArr);
+      });
+    },
+    [],
+  );
+
+  const handleCollectVisibleToWorkingSet = useCallback(
+    (replace: boolean) => {
+      if (visibleSceneNodeIds.length === 0) return;
+      setWorkingSetIds(
+        (prev) => new Set(addNodesToWorkingSet(replace ? [] : [...prev], visibleSceneNodeIds)),
+      );
+      setWorkingSetActive(true);
+      flashToast(
+        replace
+          ? `Working set replaced with ${visibleSceneNodeIds.length} visible nodes`
+          : `Added ${visibleSceneNodeIds.length} visible nodes to working set`,
+      );
+    },
+    [visibleSceneNodeIds, flashToast],
+  );
+
+  const handleExpandBoundary = useCallback(
+    (externalIds: string[]) => {
+      if (externalIds.length === 0) return;
+      setWorkingSetIds((prev) => new Set(addNodesToWorkingSet([...prev], externalIds)));
+      setWorkingSetActive(true);
+      flashToast(`Expanded working set by ${externalIds.length} boundary nodes`);
+    },
+    [flashToast],
+  );
+
+  const handleToggleCollapseGroup = useCallback((key: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const handleTogglePinNode = useCallback(
+    (nodeId: string, pos?: [number, number, number]) => {
+      setPinnedPositions((prev) => {
+        const next = { ...prev };
+        if (nodeId in next) {
+          delete next[nodeId];
+          flashToast('Unpinned node position');
+        } else if (pos) {
+          next[nodeId] = [...pos];
+          flashToast('Pinned node position across layout switches');
+        }
+        return next;
+      });
+    },
+    [flashToast],
+  );
+
+  const handleResetOverview = useCallback(() => {
+    setWorkingSetActive(false);
+    setCompactVisible(false);
+    setFlatten2D(false);
+    setGroupBy('none');
+    setCollapsedGroups(new Set());
+    setPinnedPositions({});
+    setSavedViewNotice(null);
+    setResetCameraRequest((n) => n + 1);
+    flashToast('Reset to full overview');
+  }, [flashToast]);
+
+  const handleSaveWorkingView = useCallback(() => {
+    if (!report || !activeSlug) return;
+    const baseIds =
+      workingSetActive && workingSetIds.size > 0 ? Array.from(workingSetIds) : visibleSceneNodeIds;
+    const view: SavedWorkingView = {
+      id: `${Date.now()}`,
+      name: `${activeSlug} · ${SCENE_LAYOUT_LABELS[sceneLayout]} (${baseIds.length})`,
+      createdAt: new Date().toISOString(),
+      targetSlug: activeSlug,
+      sourceCommit: report.source_commit ?? '',
+      contentDigest: report.content_digest ?? '',
+      nodeIds: baseIds,
+      layoutMode: sceneLayout,
+      compactVisible,
+      flatten2D,
+      lens: sceneLens,
+      groupBy,
+      pinnedPositions: { ...pinnedPositions },
+      collapsedGroups: Array.from(collapsedGroups),
+    };
+    setSavedViews((prev) => {
+      const next = [view, ...prev.slice(0, 19)];
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, serializeSavedViews(next));
+      }
+      return next;
+    });
+    setSelectedSavedViewId(view.id);
+    flashToast(`Saved view "${view.name}"`);
+  }, [
+    report,
+    activeSlug,
+    workingSetActive,
+    workingSetIds,
+    visibleSceneNodeIds,
+    pinnedPositions,
+    sceneLayout,
+    sceneLens,
+    flatten2D,
+    compactVisible,
+    groupBy,
+    collapsedGroups,
+    flashToast,
+  ]);
+
+  const handleLoadSavedView = useCallback(
+    (viewId: string) => {
+      setSelectedSavedViewId(viewId);
+      const view = savedViews.find((v) => v.id === viewId);
+      if (!view || !report) return;
+      if (view.targetSlug !== activeSlug) {
+        flashToast(`Switch target to ${view.targetSlug} before loading "${view.name}"`);
+        return;
+      }
+      const res = reconcileSavedView(view, {
+        target_slug: report.target_slug,
+        source_commit: report.source_commit ?? '',
+        content_digest: report.content_digest ?? '',
+        nodes: report.nodes,
+      });
+      const matchedSet = new Set(res.matchedNodeIds);
+      setWorkingSetIds(matchedSet);
+      setWorkingSetActive(res.matchedNodeIds.length > 0);
+      setSceneLayout(view.layoutMode);
+      setSceneLens(view.lens ?? 'status');
+      setFlatten2D(view.flatten2D);
+      setCompactVisible(view.compactVisible);
+      setGroupBy(view.groupBy ?? 'none');
+      setCollapsedGroups(new Set(view.collapsedGroups ?? []));
+      const nextPins: Record<string, [number, number, number]> = {};
+      for (const [nid, pos] of Object.entries(view.pinnedPositions ?? {})) {
+        if (matchedSet.has(nid)) nextPins[nid] = [...pos];
+      }
+      setPinnedPositions(nextPins);
+      setSavedViewNotice(res);
+      flashToast(`Loaded view "${view.name}" (${res.matchedNodeIds.length} present)`);
+    },
+    [savedViews, report, activeSlug, flashToast],
+  );
 
   const toggleBlastOverlay = useCallback(() => {
     setBlastMode((cur) => {
@@ -1586,13 +1779,135 @@ export default function WytheWorkspacePage() {
                               </button>
                             ),
                           )}
-                          <button
-                            type="button"
-                            onClick={toggleSceneLayout}
-                            className="ml-1 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
-                          >
-                            Layout [L]: {sceneLayout === 'cluster' ? 'Districts' : 'Grid'}
-                          </button>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <label className="sr-only" htmlFor="scene-layout-select">
+                              3D spatial layout arrangement
+                            </label>
+                            <select
+                              id="scene-layout-select"
+                              aria-label="3D spatial layout arrangement"
+                              value={sceneLayout}
+                              onChange={(e) => setSceneLayout(e.target.value as SceneLayoutMode)}
+                              className="ml-1 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                            >
+                              <option value="cluster">Layout [L]: Domain Districts</option>
+                              <option value="grid">Layout [L]: Uniform Grid</option>
+                              <option value="subkind">Layout [L]: Role Subkinds</option>
+                              <option value="connected">Layout [L]: Linked Components</option>
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() => setFlatten2D((v) => !v)}
+                              aria-pressed={flatten2D}
+                              aria-label="Toggle 2D flat working plane versus 3D stratified tiers"
+                              className={`border px-2 py-0.5 ${
+                                flatten2D
+                                  ? 'border-teal-400/60 bg-teal-950/80 text-teal-200'
+                                  : 'border-slate-700 bg-slate-900 text-slate-200 hover:border-teal-400'
+                              }`}
+                            >
+                              {flatten2D ? '2D Flat ✓' : '3D Tiers'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setCompactVisible((v) => !v)}
+                              aria-pressed={compactVisible}
+                              aria-label="Toggle compact layout around currently visible working set"
+                              className={`border px-2 py-0.5 ${
+                                compactVisible
+                                  ? 'border-teal-400/60 bg-teal-950/80 text-teal-200'
+                                  : 'border-slate-700 bg-slate-900 text-slate-200 hover:border-teal-400'
+                              }`}
+                            >
+                              {compactVisible ? 'Compacted ✓' : 'Compact visible'}
+                            </button>
+                            <label className="sr-only" htmlFor="scene-group-select">
+                              Collapsible node grouping
+                            </label>
+                            <select
+                              id="scene-group-select"
+                              aria-label="Collapsible node grouping"
+                              value={groupBy}
+                              onChange={(e) => {
+                                setGroupBy(e.target.value as 'none' | 'cluster' | 'subkind');
+                                setCollapsedGroups(new Set());
+                              }}
+                              className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                            >
+                              <option value="none">Group: Off</option>
+                              <option value="cluster">Group: Domain</option>
+                              <option value="subkind">Group: Subkind</option>
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() => handleCollectVisibleToWorkingSet(true)}
+                              aria-label="Isolate visible nodes into a focused working set"
+                              className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                            >
+                              Isolate visible ({visibleSceneNodeIds.length})
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleCollectVisibleToWorkingSet(false)}
+                              aria-label="Add visible nodes into the working set"
+                              className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                            >
+                              + Add visible
+                            </button>
+                            {workingSetActive && (
+                              <button
+                                type="button"
+                                onClick={() => setWorkingSetActive(false)}
+                                aria-label="Show full graph without leaving working set items cleared"
+                                className="border border-amber-500/50 bg-amber-950/70 px-2 py-0.5 text-amber-200 hover:border-amber-300"
+                              >
+                                Exit set ({workingSetIds.size})
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={handleSaveWorkingView}
+                              aria-label="Save current working set and layout view locally"
+                              className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                            >
+                              Save view
+                            </button>
+                            {savedViews.filter((v) => v.targetSlug === activeSlug).length > 0 && (
+                              <>
+                                <label className="sr-only" htmlFor="saved-view-select">
+                                  Load saved working view
+                                </label>
+                                <select
+                                  id="saved-view-select"
+                                  aria-label="Load saved working view"
+                                  value={selectedSavedViewId}
+                                  onChange={(e) => {
+                                    if (e.target.value) handleLoadSavedView(e.target.value);
+                                  }}
+                                  className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                                >
+                                  <option value="">Saved views ({savedViews.filter((v) => v.targetSlug === activeSlug).length})...</option>
+                                  {savedViews
+                                    .filter((v) => v.targetSlug === activeSlug)
+                                    .map((v) => (
+                                      <option key={v.id} value={v.id}>
+                                        {v.name}
+                                      </option>
+                                    ))}
+                                </select>
+                              </>
+                            )}
+                            {(workingSetActive || compactVisible || flatten2D || groupBy !== 'none' || Object.keys(pinnedPositions).length > 0) && (
+                              <button
+                                type="button"
+                                onClick={handleResetOverview}
+                                aria-label="Reset working set and layout overrides to overview"
+                                className="border border-slate-600 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                              >
+                                Reset overview
+                              </button>
+                            )}
+                          </div>
                         </div>
 
                         <div className="flex flex-wrap items-center gap-1.5">
@@ -1653,6 +1968,27 @@ export default function WytheWorkspacePage() {
                         </div>
                       </div>
                     </div>
+                    {savedViewNotice &&
+                      (savedViewNotice.commitChanged ||
+                        savedViewNotice.digestChanged ||
+                        savedViewNotice.missingNodeIds.length > 0) && (
+                        <div
+                          role="status"
+                          className="flex flex-wrap items-center justify-between gap-2 border border-amber-500/40 bg-amber-950/30 px-3 py-2 font-mono text-[11px] text-amber-200"
+                        >
+                          <span>
+                            {savedViewNotice.statusNote}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setSavedViewNotice(null)}
+                            aria-label="Dismiss saved view reconciliation warning"
+                            className="border border-amber-500/40 px-2 py-0.5 text-amber-100 hover:border-amber-300"
+                          >
+                            Dismiss
+                          </button>
+                        </div>
+                      )}
                     <StratifiedScene3D
                       nodes={report.nodes}
                       edges={report.edges}
@@ -1665,6 +2001,13 @@ export default function WytheWorkspacePage() {
                       edgeFilter={edgeFilter}
                       lens={sceneLens}
                       layoutMode={sceneLayout}
+                      compactVisible={compactVisible}
+                      flatten2D={flatten2D}
+                      workingSetIds={workingSetIds}
+                      workingSetActive={workingSetActive}
+                      groupBy={groupBy}
+                      collapsedGroups={collapsedGroups}
+                      pinnedPositions={pinnedPositions}
                       diffOverlay={diffOverlay}
                       activeTraceChain={activeTraceChain}
                       onlyFlagged={onlyFlagged}
@@ -1694,6 +2037,12 @@ export default function WytheWorkspacePage() {
                       }}
                       onOpenAskAi={() => openAskWytheDrawer()}
                       onSelectNode={setSelectedNodeId}
+                      onToggleWorkingSetNode={handleToggleWorkingSetNode}
+                      onToggleCollapseGroup={handleToggleCollapseGroup}
+                      onExpandBoundary={handleExpandBoundary}
+                      onTogglePinNode={handleTogglePinNode}
+                      onResetOverview={handleResetOverview}
+                      onVisibleNodeIdsChange={setVisibleSceneNodeIds}
                     />
                     {isFullscreen3D && selectedNode && (
                       <div className="fixed bottom-16 right-4 top-24 z-[46] w-96 max-w-[calc(100vw-2rem)] overflow-y-auto border border-slate-700 bg-slate-950/95 shadow-2xl backdrop-blur">
@@ -1705,6 +2054,8 @@ export default function WytheWorkspacePage() {
                           findings={report.findings}
                           referenceExemplars={govBundle?.reference_exemplars ?? []}
                           diffOverlay={diffOverlay}
+                          inWorkingSet={workingSetIds.has(selectedNode.id)}
+                          onToggleWorkingSet={handleToggleWorkingSetNode}
                           onSelectNode={setSelectedNodeId}
                           onClose={() => setSelectedNodeId(null)}
                         />
@@ -1761,6 +2112,8 @@ export default function WytheWorkspacePage() {
             findings={report?.findings ?? []}
             referenceExemplars={govBundle?.reference_exemplars ?? []}
             diffOverlay={diffOverlay}
+            inWorkingSet={selectedNode ? workingSetIds.has(selectedNode.id) : false}
+            onToggleWorkingSet={handleToggleWorkingSetNode}
             onSelectNode={setSelectedNodeId}
             onClose={() => setSelectedNodeId(null)}
           />
