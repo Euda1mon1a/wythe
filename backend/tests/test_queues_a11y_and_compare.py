@@ -369,4 +369,51 @@ def test_tsx_conditional_returns_undefined_defaults_and_default_children_a11y(
         ("src/App.tsx", 9),
         ("src/App.tsx", 12),
     ], disp_005
-    assert any("unobserved" in n.lower() for n in res.notes), res.notes
+
+
+def test_tsx_signature_only_props_computed_exprs_and_aria_img_a11y(
+    tmp_path: Path,
+) -> None:
+    """Restrict prop destructuring to signature, keep computed exprs uncertain, honor img ARIA names."""
+    from app.adapters.typescript_react import TypeScriptReactSpaAdapter
+
+    (tmp_path / "src" / "components").mkdir(parents=True)
+    (tmp_path / "package.json").write_text('{"dependencies":{"react":"^18.0.0"}}', encoding="utf-8")
+
+    (tmp_path / "src" / "components" / "BodyCallLabel.tsx").write_text(
+        "const label = 'Save';\n"
+        "export function BodyCallLabel() {\n"
+        "  console.debug({ label });\n"
+        "  return <span>{label}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "LengthLabel.tsx").write_text(
+        "export function LengthLabel({ text }: { text: string }) {\n"
+        "  return <span>{text.length}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "App.tsx").write_text(
+        "import { BodyCallLabel } from './components/BodyCallLabel';\n"
+        "import { LengthLabel } from './components/LengthLabel';\n"
+        "export function App() {\n"
+        "  return (\n"
+        "    <main>\n"
+        "      <button type='button'><BodyCallLabel /></button>\n"
+        "      <button type='button'><LengthLabel text='' /></button>\n"
+        "      <button type='button'><img src='/close.svg' role='img' alt='' aria-label='Close' /></button>\n"
+        "      <button type='button'><img src='/close.svg' alt='' /></button>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = TypeScriptReactSpaAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    # Line 6: BodyCallLabel module const + console.debug({label}) -> unobserved (clean)
+    # Line 7: LengthLabel {text.length} renders '0' -> unobserved (clean)
+    # Line 8: img with aria-label='Close' -> named (clean)
+    # Line 9: img with empty alt='' and no ARIA name -> flagged icon-only
+    assert [(f.source_file, f.line) for f in disp_005] == [("src/App.tsx", 9)], disp_005

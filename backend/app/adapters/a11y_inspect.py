@@ -1192,14 +1192,49 @@ def _extract_component_props_and_markup(
 
     # .tsx / .jsx: locate the target exported component declaration
     target_src = _locate_tsx_export_source(raw_source, exported_name)
-    m_open = re.search(r"\(\s*\{", target_src)
+    tmask = js_code_mask(target_src)
+    body_info = _find_tsx_body_start(target_src, tmask)
+    sig_src = target_src[: body_info[1]] if body_info is not None else target_src
+    m_open = re.search(r"\(\s*\{", sig_src)
     if m_open:
-        bend = _scan_brace_end(target_src, m_open.end() - 1)
+        bend = _scan_brace_end(sig_src, m_open.end() - 1)
         if bend is not None:
-            defs, als = _parse_default_params(target_src[m_open.end() : bend - 1])
+            defs, als = _parse_default_params(sig_src[m_open.end() : bend - 1])
             prop_defaults.update(defs)
             prop_aliases.update(als)
     return prop_defaults, prop_aliases, _extract_tsx_return_markup(target_src)
+
+
+def _split_top_level_or_nullish(expr: str) -> list[str]:
+    """Split a JS expression on top-level `||` or `??` outside strings and brackets."""
+    parts: list[str] = []
+    depth = 0
+    quote: str | None = None
+    start = 0
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+        elif depth == 0 and (expr.startswith("||", i) or expr.startswith("??", i)):
+            parts.append(expr[start:i])
+            i += 2
+            start = i
+            continue
+        i += 1
+    parts.append(expr[start:])
+    return parts
 
 
 def _classify_expr_semantics(
@@ -1226,24 +1261,38 @@ def _classify_expr_semantics(
         return "named"
     if expr in ("children", "props.children"):
         return inner_status
-    idents = [tok for tok in _IDENT_TOKEN_RE.findall(expr) if tok != "props"]
-    matched_props = [tok for tok in idents if tok in prop_values]
-    if matched_props:
-        states = [prop_values[tok] for tok in matched_props]
-        if any(st in ("named", "dynamic") for st in states):
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", expr):
+        return "named"
+    term_states: list[str] = []
+    all_simple = True
+    for raw_term in _split_top_level_or_nullish(expr):
+        t = raw_term.strip()
+        while len(t) >= 2 and t[0] == "(" and t[-1] == ")" and _scan_brace_end("{" + t[1:-1] + "}", 0) == len(t):
+            t = t[1:-1].strip()
+        if t in ("''", '""', "``", "null", "undefined", "false", "true"):
+            term_states.append("empty")
+        elif re.fullmatch(r"-?\d+(?:\.\d+)?", t):
+            term_states.append("named")
+        elif len(t) >= 2 and t[0] in ("'", '"') and t[-1] == t[0] and t[0] not in t[1:-1].replace(f"\\{t[0]}", ""):
+            term_states.append("named" if t[1:-1].strip() else "empty")
+        elif t in ("children", "props.children"):
+            term_states.append(inner_status)
+        else:
+            mp = re.fullmatch(r"(?:props\.)?(?P<p>[A-Za-z_$][\w$]*)", t)
+            if mp and mp.group("p") in prop_values:
+                term_states.append(prop_values[mp.group("p")])
+            else:
+                all_simple = False
+                break
+    if all_simple and term_states:
+        if any(st in ("named", "dynamic") for st in term_states):
             return "named"
-        if re.search(r"""['"][^'"\s][^'"]*['"]""", expr):
-            return "named"
-        if any(st == "opaque" for st in states):
+        if any(st == "opaque" for st in term_states):
             return "opaque"
         return "empty"
-    if re.search(r"""['"][^'"\s][^'"]*['"]""", expr):
-        return "named"
-    # Expressions inside an inspected child component that do not depend on a known prop
-    # (e.g. local constants or i18n helper calls like `{t(key)}`) are uncertain, not proven empty.
-    if idents or re.search(r"[A-Za-z0-9_$]", expr):
-        return "opaque"
-    return "empty"
+    # Computed expressions (e.g. `{text.length}`, `{t(key)}`, `{localVar}`) are uncertain
+    # rather than proven empty even if an input prop happens to be empty.
+    return "opaque"
 
 
 def _classify_markup_segment(
@@ -1322,14 +1371,17 @@ def _classify_markup_segment(
                     next_i = cspan[1]
             tag_low = tag.lower()
             if tag_low in ("svg", "i"):
-                has_icon = True
+                merge_status(
+                    _eval_inline_graphic_name(attrs, allow_alt=False, prop_values=prop_values),
+                    tag,
+                )
                 i = next_i
                 continue
             if tag_low == "img":
-                if _eval_alt_present(attrs):
-                    has_named = True
-                else:
-                    has_icon = True
+                merge_status(
+                    _eval_inline_graphic_name(attrs, allow_alt=True, prop_values=prop_values),
+                    tag,
+                )
                 i = next_i
                 continue
             if tag_low == "slot":
@@ -1396,15 +1448,46 @@ def _classify_markup_segment(
     return "empty", [], False
 
 
-def _eval_alt_present(attrs: str) -> bool:
+def _eval_inline_graphic_name(
+    attrs: str,
+    *,
+    allow_alt: bool,
+    prop_values: dict[str, str] | None,
+) -> str:
+    """Classify accessible name of inline `<img>` / `<svg>` / `<i>` as `named`, `opaque`, or `icon_only`."""
+    if re.search(r"""\baria-hidden\s*=\s*['"]true['"]""", attrs) or re.search(
+        r"""\brole\s*=\s*['"](?:presentation|none)['"]""", attrs
+    ):
+        return "icon_only"
     if "{..." in attrs:
-        return True
-    m = re.search(r"""\balt\s*=\s*(?:['"](?P<lit>[^'"]*)['"]|\{(?P<expr>[^}]+)\})""", attrs)
-    if not m:
-        return bool(re.search(r"(?:^|\s)\{\s*alt\s*\}(?=\s|$|/)", attrs))
-    if m.group("lit") is not None:
-        return bool(m.group("lit").strip())
-    return _eval_attr_value(m.group("expr") or "") != "empty"
+        return "named" if prop_values is None else "opaque"
+    attr_names = ("aria-label", "aria-labelledby", "title") + (("alt",) if allow_alt else ())
+    saw_opaque = False
+    for attr_name in attr_names:
+        m = re.search(
+            rf"""\b{re.escape(attr_name)}\s*=\s*(?:['"](?P<lit>[^'"]*)['"]|\{{(?P<expr>[^}}]+)\}})""",
+            attrs,
+        )
+        if m:
+            if m.group("lit") is not None:
+                if m.group("lit").strip():
+                    return "named"
+                continue
+            sem = _classify_expr_semantics(
+                m.group("expr") or "",
+                prop_values=prop_values,
+                inner_status="empty",
+            )
+            if sem in ("named", "dynamic"):
+                return "named"
+            if sem == "opaque":
+                saw_opaque = True
+    if allow_alt and _has_svelte_shorthand(attrs, "alt"):
+        if prop_values is None or prop_values.get("alt") in ("named", "dynamic"):
+            return "named"
+        if prop_values.get("alt") == "opaque":
+            saw_opaque = True
+    return "opaque" if saw_opaque else "icon_only"
 
 
 def _resolve_component_tag(
