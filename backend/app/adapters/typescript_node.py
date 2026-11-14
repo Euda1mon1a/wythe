@@ -16,12 +16,15 @@ from app.adapters.treesitter_engine import (
     extract_ts_backend_routes_cst,
 )
 from app.adapters.ts_kysely import extract_kysely_table_ops
+from app.adapters.ts_trpc import collect_trpc_lineage, derive_next_trpc_mount_prefix
 from app.adapters.ts_workspace import (
     WorkspaceResolver,
     executable_ts_text,
+    extract_ts_dynamic_imports,
     extract_ts_import_bindings,
     resolve_reexport_targets,
     resolve_string_expr,
+    verified_dynamic_import,
     verified_import_bindings,
 )
 from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
@@ -57,10 +60,160 @@ _TS_POLICY_RE = re.compile(
 _TS_CLOCK_RE = re.compile(r"""\b(?:new\s+Date\s*\(\s*\)|Date\.now\s*\(\s*\))""")
 _POLICY_WORDS = ("CAPACITY", "WORKLOAD", "SHIFT_CAP", "DUTY_HOUR", "WORK_HOUR", "HOUR_LIMIT", "HOURS_LIMIT", "CALL_CAP", "SUPERVISION", "PENALTY", "WEEKLY_MAX")
 _CLOCK_ALLOW = ("clock.ts", "time.ts", "date-utils.ts", "programTime.ts")
+_WS_SKIP_PARTS = frozenset(
+    {
+        "node_modules", ".next", ".svelte-kit", "dist", "build", "out", "tests", "test",
+        "__tests__", "__mocks__", "mocks", "fixtures", "e2e", "playwright", "stories",
+        "components", "views", "hooks", "styles", "embeds", "coss-ui", "ui", "emails", "types",
+    }
+)
+_WS_SKIP_PKGS = frozenset(
+    {"prisma", "types", "i18n", "dayjs", "config", "tsconfig", "ui", "coss-ui", "emails", "embeds", "sms", "testing", "app-store", "app-store-cli"}
+)
+_SERVER_TSX_MARKER_RE = re.compile(
+    r"""\b(?:initTRPC|createTRPCRouter|createNextApiHandler|fetchRequestHandler|publicProcedure|authedProcedure)\b|(?:\brouter\s*\(\s*\{)"""
+)
 
 
-def _strip_preserve_lines(source: str) -> str:
-    cst_cleaned = blank_comments_cst(source, "ts")
+def _is_server_tsx_candidate(fpath: Path, raw_text: str, rel_repo: str) -> bool:
+    if fpath.suffix != ".tsx":
+        return fpath.suffix in (".ts", ".mts")
+    head = raw_text[:200].lstrip()
+    if head.startswith(('"use client"', "'use client'")):
+        return False
+    parts = set(Path(rel_repo).parts)
+    if parts & {"server", "router", "routers", "trpc", "api", "routes"}:
+        return True
+    return bool(_SERVER_TSX_MARKER_RE.search(raw_text))
+
+
+def _is_external_ws_module_allowed(fpath: Path, repo_root: Path) -> bool:
+    try:
+        rel = fpath.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return False
+    parts = Path(rel).parts
+    if any(p in _WS_SKIP_PARTS for p in parts[:-1]):
+        return False
+    if len(parts) >= 2 and parts[0] == "packages" and parts[1] in _WS_SKIP_PKGS:
+        return False
+    name = fpath.name
+    if any(tag in name for tag in (".test.", ".spec.", ".stories.", ".e2e-spec.", ".config.")) or name.endswith(".d.ts"):
+        return False
+    return fpath.suffix in (".ts", ".mts", ".tsx")
+
+
+def _discover_workspace_backend_files(
+    repo_root: Path,
+    base_dir: Path,
+    initial_files: list[Path],
+    resolver: WorkspaceResolver,
+) -> list[Path]:
+    """Collect multi-root API handlers (`pages/api`, `app/api`) + imported workspace server modules."""
+    from collections import deque
+
+    root_res = repo_root.resolve()
+    base_res = base_dir.resolve()
+    discovered: list[Path] = []
+    seen: set[Path] = set()
+    ext_queue: deque[tuple[Path, int]] = deque()
+    seed_seen: set[Path] = set()
+
+    for f in initial_files:
+        rf = f.resolve()
+        if rf not in seen:
+            seen.add(rf)
+            discovered.append(rf)
+            ext_queue.append((rf, 0))
+            seed_seen.add(rf)
+
+    # Discover manifest-backed web app API handler dirs and server tRPC root routers
+    app_roots: list[Path] = [root_res]
+    for pat in ("apps/*", "packages/*"):
+        for d in sorted(root_res.glob(pat)):
+            if d.is_dir() and "node_modules" not in d.parts and (d / "package.json").is_file():
+                app_roots.append(d.resolve())
+    for extra in ("web", "frontend"):
+        d = root_res / extra
+        if d.is_dir() and (d / "package.json").is_file():
+            app_roots.append(d.resolve())
+
+    for aroot in app_roots:
+        for api_sub in ("pages/api", "src/pages/api", "app/api", "src/app/api"):
+            api_dir = aroot / api_sub
+            if not api_dir.is_dir():
+                continue
+            for f in sorted(api_dir.rglob("*.ts")):
+                rf = f.resolve()
+                if rf not in seed_seen and _is_external_ws_module_allowed(rf, root_res):
+                    seed_seen.add(rf)
+                    ext_queue.append((rf, 0))
+                    if rf not in seen:
+                        seen.add(rf)
+                        discovered.append(rf)
+        # Seed root tRPC router manifests (`routers/_app.{ts,tsx}`) for canonical appRouter paths
+        for app_pat in ("server/routers/_app.ts", "server/routers/_app.tsx", "src/server/routers/_app.ts", "src/server/routers/_app.tsx", "routers/_app.ts", "routers/_app.tsx"):
+            cand = aroot / app_pat
+            if cand.is_file():
+                rf = cand.resolve()
+                if rf not in seed_seen:
+                    seed_seen.add(rf)
+                    ext_queue.append((rf, 0))
+                    if rf not in seen:
+                        seen.add(rf)
+                        discovered.append(rf)
+
+    ext_added = 0
+    _reexp_spec_rx = re.compile(r"""from\s+['"](?P<spec>[^'"]+)['"]""")
+    while ext_queue and ext_added < 650:
+        cur, depth = ext_queue.popleft()
+        if depth >= 6:
+            continue
+        try:
+            raw_txt = cur.read_text(encoding="utf-8", errors="replace")
+        except (OSError, UnicodeError):
+            continue
+        is_tsx = cur.suffix == ".tsx"
+        clean_txt = _strip_preserve_lines(raw_txt, is_tsx=is_tsx)
+        specs: list[str] = [imp.spec for imp in extract_ts_import_bindings(clean_txt, is_tsx=is_tsx)]
+        exec_txt, _ = executable_ts_text(clean_txt, is_tsx=is_tsx)
+        for site in extract_ts_dynamic_imports(exec_txt, is_tsx=is_tsx):
+            if site.spec:
+                specs.append(site.spec)
+        if cur.name in ("index.ts", "index.tsx", "_router.ts", "_router.tsx", "_app.ts", "_app.tsx"):
+            for rm in _reexp_spec_rx.finditer(clean_txt):
+                specs.append(rm.group("spec"))
+
+        for sp in specs:
+            if not sp:
+                continue
+            tgt = resolver.resolve_import(sp, cur)
+            if tgt is None:
+                continue
+            rtgt = tgt.resolve()
+            if rtgt in seen:
+                continue
+            if rtgt.is_relative_to(base_res) and rtgt.suffix != ".tsx":
+                continue
+            if not _is_external_ws_module_allowed(rtgt, root_res):
+                continue
+            if rtgt.suffix == ".tsx":
+                try:
+                    t_raw = rtgt.read_text(encoding="utf-8", errors="replace")
+                except (OSError, UnicodeError):
+                    continue
+                if not _is_server_tsx_candidate(rtgt, t_raw, rtgt.relative_to(root_res).as_posix()):
+                    continue
+            seen.add(rtgt)
+            discovered.append(rtgt)
+            ext_added += 1
+            ext_queue.append((rtgt, depth + 1))
+
+    return discovered
+
+
+def _strip_preserve_lines(source: str, *, is_tsx: bool = False) -> str:
+    cst_cleaned = blank_comments_cst(source, "tsx" if is_tsx else "ts")
     if cst_cleaned is not None:
         return cst_cleaned
     return _COMMENT_STRIP_RE.sub(lambda m: "\n" * m.group(0).count("\n"), source)
@@ -163,36 +316,45 @@ class TypeScriptNodeAdapter:
                 coverage_complete=False,
             )
 
-        files: list[Path] = [
+        resolver = WorkspaceResolver.build(repo_root, extra_roots=(base_dir,))
+        initial_files: list[Path] = [
             f
             for f in sorted(base_dir.rglob("*.ts"))
             if _is_backend_ts_candidate(f.relative_to(base_dir).as_posix(), fullstack_root)
         ]
+        files = _discover_workspace_backend_files(repo_root, base_dir, initial_files, resolver)
 
         mount_map: dict[str, str] = {}
         cleaned_texts: dict[Path, str] = {}
         for f in files:
             try:
-                txt = _strip_preserve_lines(f.read_text(encoding="utf-8"))
+                txt = _strip_preserve_lines(
+                    f.read_text(encoding="utf-8", errors="replace"),
+                    is_tsx=(f.suffix == ".tsx"),
+                )
             except (OSError, UnicodeError):
                 continue
             cleaned_texts[f] = txt
             for mm in _EXPRESS_MOUNT_RE.finditer(txt):
                 mount_map[mm.group("target").lower()] = mm.group("prefix")
 
+        root_res = repo_root.resolve()
+        base_res = base_dir.resolve()
         nodes_by_path: dict[Path, AtlasNode] = {}
         for f in cleaned_texts:
-            rel_repo = f.relative_to(repo_root).as_posix()
-            rel_b = f.relative_to(base_dir).as_posix()
+            rf = f.resolve()
+            rel_repo = rf.relative_to(root_res).as_posix()
+            rel_b = rf.relative_to(base_res).as_posix() if rf.is_relative_to(base_res) else rel_repo
             is_route = (
                 rel_b.endswith(("/route.ts", "/+server.ts", "/+page.server.ts", ".controller.ts"))
+                or derive_next_trpc_mount_prefix(rf, root_res) is not None
                 or "routes" in Path(rel_b).parts
                 or "controllers" in Path(rel_b).parts
-                or "pages/api" in rel_b
+                or "pages/api" in rel_repo
                 or f.stem in ("server", "app", "index")
             )
             subkind = "route" if is_route else "service"
-            stem_id = rel_b.removesuffix(".ts").replace("/", ".")
+            stem_id = rel_b.removesuffix(".tsx").removesuffix(".ts").replace("/", ".")
             nid = f"m:{subkind}:{stem_id}"
             nodes_by_path[f] = AtlasNode(
                 id=nid,
@@ -207,7 +369,6 @@ class TypeScriptNodeAdapter:
                 summary=f"TypeScript backend {subkind} `{rel_repo}`.",
             )
 
-        resolver = WorkspaceResolver.build(repo_root, extra_roots=(base_dir,))
         edges: list[AtlasEdge] = []
         edge_map: dict[tuple[str, str, str], AtlasEdge] = {}
         routes: list[RouteDescriptor] = []
@@ -248,14 +409,67 @@ class TypeScriptNodeAdapter:
                 existing.verification = "verified"
                 existing.evidence_note = note
 
+        def _extract_truth_ops_in_text(text: str, fpath: Path) -> tuple[set[str], set[str]]:
+            r_tids: set[str] = set()
+            w_tids: set[str] = set()
+            for pm in _PRISMA_OP_RE.finditer(text):
+                tid = truth.table_symbol_map.get(pm.group("model")) or truth.table_symbol_map.get(
+                    f"prisma.{pm.group('model')}"
+                )
+                if tid:
+                    if pm.group("op").startswith(("find", "count", "aggregate", "group")):
+                        r_tids.add(tid)
+                    else:
+                        w_tids.add(tid)
+            for dm in _DRIZZLE_READ_RE.finditer(text):
+                sym = dm.group("sym") or dm.group("qsym") or ""
+                if sym in truth.table_symbol_map:
+                    r_tids.add(truth.table_symbol_map[sym])
+            for dw in _DRIZZLE_WRITE_RE.finditer(text):
+                sym = dw.group("sym")
+                if sym in truth.table_symbol_map:
+                    w_tids.add(truth.table_symbol_map[sym])
+            for sw in _RAW_SQL_WRITE_RE.finditer(text):
+                tk = sw.group(1).lower()
+                if tk in truth.table_symbol_map:
+                    w_tids.add(truth.table_symbol_map[tk])
+            for sr in _RAW_SQL_READ_RE.finditer(text):
+                tk = sr.group(1).lower()
+                if tk in truth.table_symbol_map and truth.table_symbol_map[tk] not in w_tids:
+                    r_tids.add(truth.table_symbol_map[tk])
+            rel_p = fpath.resolve().relative_to(root_res).as_posix()
+            k_r, k_w, k_n = extract_kysely_table_ops(text, rel_p, truth, fpath, resolver)
+            r_tids.update(k_r)
+            w_tids.update(k_w)
+            for kn in k_n:
+                add_note(kn)
+            return r_tids, w_tids
+
+        trpc_proc_nodes, trpc_router_files = collect_trpc_lineage(
+            repo_root=root_res,
+            cleaned_texts=cleaned_texts,
+            resolver=resolver,
+            nodes_by_path=nodes_by_path,
+            routes=routes,
+            add_edge=add_edge,
+            add_note=add_note,
+            extract_truth_ops=_extract_truth_ops_in_text,
+            table_readers=table_readers,
+            table_writers=table_writers,
+        )
+
         for f, txt in cleaned_texts.items():
+            if f.resolve() in trpc_router_files:
+                continue
             node = nodes_by_path[f]
             rel_repo = node.source_file
-            rel_b = f.relative_to(base_dir).as_posix()
+            rf = f.resolve()
+            rel_b = rf.relative_to(base_res).as_posix() if rf.is_relative_to(base_res) else rel_repo
+            is_tsx = f.suffix == ".tsx"
 
-            # 1. Cross-module runtime imports -> verified vs declared calls_helper (type-only imports excluded)
-            imp_bindings = extract_ts_import_bindings(txt, is_tsx=False)
-            exec_txt, di_map = executable_ts_text(txt, is_tsx=False)
+            # 1. Cross-module runtime imports + dynamic imports -> verified vs declared calls_helper
+            imp_bindings = extract_ts_import_bindings(txt, is_tsx=is_tsx)
+            exec_txt, di_map = executable_ts_text(txt, is_tsx=is_tsx)
             for imp in imp_bindings:
                 target = resolver.resolve_import(imp.spec, f)
                 if target is None or target == f:
@@ -292,6 +506,7 @@ class TypeScriptNodeAdapter:
                             re_note = f"Imports `{nodes_by_path[re_tgt].label}` via `{target.name}`."
                         add_edge(re_src, nodes_by_path[re_tgt].id, "calls_helper", re_ev, re_note, verification=verif)
 
+            # 1. Cross-module runtime imports + dynamic imports -> verified vs declared calls_helper
             for bare_re in resolve_reexport_targets(f, None, resolver):
                 if bare_re in nodes_by_path and bare_re != f:
                     add_edge(
@@ -302,6 +517,33 @@ class TypeScriptNodeAdapter:
                         f"Re-exports `{nodes_by_path[bare_re].label}`.",
                         verification="declared",
                     )
+
+            for d_site in extract_ts_dynamic_imports(exec_txt, is_tsx=is_tsx):
+                if d_site.spec is None:
+                    add_note(f"Unresolved dynamic import `{d_site.raw_expr}` in {rel_repo}:{d_site.line}.")
+                    continue
+                d_tgt = resolver.resolve_import(d_site.spec, f)
+                if d_tgt is None or d_tgt == f:
+                    continue
+                d_verif_flag, d_used = verified_dynamic_import(exec_txt, d_site)
+                d_verif = "verified" if d_verif_flag else "declared"
+                if d_tgt in nodes_by_path:
+                    d_verb = "Dynamically calls" if d_verif_flag else "Dynamically imports (uninvoked)"
+                    add_edge(
+                        node.id,
+                        nodes_by_path[d_tgt].id,
+                        "calls_helper",
+                        rel_repo,
+                        f"{d_verb} `{nodes_by_path[d_tgt].label}`.",
+                        verification=d_verif,
+                    )
+                for sym in sorted(d_used) if d_used else [None]:
+                    for re_tgt in resolve_reexport_targets(d_tgt, sym, resolver):
+                        if re_tgt not in nodes_by_path or re_tgt == f:
+                            continue
+                        re_src = nodes_by_path[d_tgt].id if d_tgt in nodes_by_path else node.id
+                        re_ev = nodes_by_path[d_tgt].source_file if d_tgt in nodes_by_path else rel_repo
+                        add_edge(re_src, nodes_by_path[re_tgt].id, "calls_helper", re_ev, f"Re-exports `{sym or nodes_by_path[re_tgt].label}`.", verification=d_verif)
 
             # 2. Synthesize HTTP routes
             file_methods: list[str] = []
@@ -447,38 +689,8 @@ class TypeScriptNodeAdapter:
             node.http_methods = sorted(set(file_methods))
             node.http_paths = file_paths[:20]
 
-            # 3. Extract Prisma, Drizzle, and SQL table reads vs writes
-            reads_tids: set[str] = set()
-            writes_tids: set[str] = set()
-            for pm in _PRISMA_OP_RE.finditer(txt):
-                tid = truth.table_symbol_map.get(pm.group("model")) or truth.table_symbol_map.get(f"prisma.{pm.group('model')}")
-                if tid:
-                    if pm.group("op").startswith(("find", "count", "aggregate", "group")):
-                        reads_tids.add(tid)
-                    else:
-                        writes_tids.add(tid)
-            for dm in _DRIZZLE_READ_RE.finditer(txt):
-                sym = dm.group("sym") or dm.group("qsym") or ""
-                if sym in truth.table_symbol_map:
-                    reads_tids.add(truth.table_symbol_map[sym])
-            for dw in _DRIZZLE_WRITE_RE.finditer(txt):
-                sym = dw.group("sym")
-                if sym in truth.table_symbol_map:
-                    writes_tids.add(truth.table_symbol_map[sym])
-            for sw in _RAW_SQL_WRITE_RE.finditer(txt):
-                tk = sw.group(1).lower()
-                if tk in truth.table_symbol_map:
-                    writes_tids.add(truth.table_symbol_map[tk])
-            for sr in _RAW_SQL_READ_RE.finditer(txt):
-                tk = sr.group(1).lower()
-                if tk in truth.table_symbol_map and truth.table_symbol_map[tk] not in writes_tids:
-                    reads_tids.add(truth.table_symbol_map[tk])
-
-            k_reads, k_writes, k_notes = extract_kysely_table_ops(txt, rel_repo, truth, f, resolver)
-            reads_tids.update(k_reads)
-            writes_tids.update(k_writes)
-            for kn in k_notes:
-                add_note(kn)
+            # 3. Extract Prisma, Drizzle, Kysely, and SQL table reads vs writes
+            reads_tids, writes_tids = _extract_truth_ops_in_text(txt, f)
 
             for tid in sorted(reads_tids):
                 table_readers.setdefault(tid, set()).add(node.id)
@@ -575,7 +787,7 @@ class TypeScriptNodeAdapter:
                 )
 
         return ManipulatorExtractionResult(
-            nodes=list(nodes_by_path.values()),
+            nodes=[*nodes_by_path.values(), *trpc_proc_nodes],
             edges=edges,
             routes=routes,
             findings=findings,

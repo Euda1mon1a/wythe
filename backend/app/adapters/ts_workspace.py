@@ -127,6 +127,18 @@ class TsImportBinding:
     line: int
 
 
+@dataclass(frozen=True)
+class TsDynamicImportSite:
+    spec: str | None
+    imported_names: tuple[str, ...]
+    local_names: tuple[str, ...]
+    line: int
+    raw_expr: str
+    decl_start: int = -1
+    decl_end: int = -1
+    is_direct_invoked: bool = False
+
+
 def _load_jsonc_file(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
@@ -272,7 +284,7 @@ class WorkspaceResolver:
             if rd in seen_dirs:
                 continue
             seen_dirs.add(rd)
-            for cfg_name in ("tsconfig.json", "tsconfig.base.json"):
+            for cfg_name in ("tsconfig.json", "tsconfig.server.json", "tsconfig.base.json"):
                 cfg_file = rd / cfg_name
                 if cfg_file.is_file():
                     res.tsconfigs[rd] = load_tsconfig_paths(cfg_file)
@@ -728,17 +740,18 @@ def executable_ts_text(source: str, *, is_tsx: bool = False) -> tuple[str, dict[
             mask(tree.root_node)
             return buf.decode("utf-8", errors="replace"), di_map
 
-    # Regex fallback: strip import/re-export lines, type/interface decls, and `: Type` annotations.
+    # Regex fallback: strip import/re-export lines, type/interface decls, `typeof import(...)`, and `: Type` annotations.
     cleaned = re.sub(
         r"""(?:^|[;\r\n])[ \t]*(?:import\b[\s\S]*?from\s+['"][^'"]+['"]|import\s+['"][^'"]+['"]|export\s+(?:type\s+)?(?:\*|\{[^}]*\})\s+from\s+['"][^'"]+['"]);?""",
         lambda m: "\n" * m.group(0).count("\n"),
         source,
     )
     cleaned = re.sub(
-        r"""(?:^|\n)[ \t]*(?:export\s+)?(?:interface|type)\s+[A-Za-z_$][\w$]*[\s\S]*?(?:\n\}|;)""",
+        r"""(?:^|\n)[ \t]*(?:export\s+)?(?:interface|type)\s+[A-Za-z_$][\w$]*[\s\S]*?(?:\n\};?|\n\}|;)""",
         lambda m: "\n" * m.group(0).count("\n"),
         cleaned,
     )
+    cleaned = re.sub(r"\btypeof\s+import\([^)]*\)", " ", cleaned)
     cleaned = re.sub(r":\s*[A-Za-z_$][\w$<>.,\[\]| &]*(?=[,)\n;{=])", "", cleaned)
     cleaned = re.sub(r"\b(?:as|implements)\s+[A-Za-z_$][\w$<>.,\[\] ]*", "", cleaned)
     return cleaned, di_map
@@ -765,3 +778,187 @@ def verified_import_bindings(
         if re.search(rf"(?<![.\w$]){re.escape(ns)}\b", exec_text):
             return True, used_imported
     return bool(used_imported), used_imported
+
+
+_DYN_IMPORT_ASSIGN_RE = re.compile(
+    r"""\b(?:const|let|var)\s+(?P<lhs>\{[^}]+\}|[A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*)?(?:await\s+)?import\s*\(\s*(?P<arg>[^)\n]+)\s*\)"""
+)
+_DYN_IMPORT_ANY_RE = re.compile(
+    r"""(?<![.\w$])import\s*\(\s*(?P<arg>[^)\n]+)\s*\)(?:\s*\)?\s*\.\s*(?P<prop>[A-Za-z_$][\w$]*)\s*\()?"""
+)
+_STATIC_STR_ARG_RE = re.compile(r"""^(?P<q>['"`])(?P<val>[^'"`\\]+)(?P=q)$""")
+
+
+def _parse_destructure_names(lhs: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    s = lhs.strip()
+    if s.startswith("{") and s.endswith("}"):
+        imp_names: list[str] = []
+        loc_names: list[str] = []
+        for raw_item in s[1:-1].split(","):
+            item = raw_item.strip()
+            if not item:
+                continue
+            item = item.split("=", 1)[0].strip()
+            if ":" in item:
+                src, dst = item.split(":", 1)
+                src_s, dst_s = src.strip(), dst.strip()
+            else:
+                src_s = dst_s = item
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", src_s) and re.fullmatch(r"[A-Za-z_$][\w$]*", dst_s):
+                imp_names.append(src_s)
+                loc_names.append(dst_s)
+        return tuple(imp_names), tuple(loc_names)
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", s):
+        return ("*",), (s,)
+    return (), ()
+
+
+def _static_import_arg(raw_arg: str) -> str | None:
+    stripped = raw_arg.strip().split(",", 1)[0].strip()
+    m = _STATIC_STR_ARG_RE.match(stripped)
+    if not m:
+        return None
+    val = m.group("val")
+    if "${" in val:
+        return None
+    return val
+
+
+def extract_ts_dynamic_imports(exec_text: str, *, is_tsx: bool = False) -> list[TsDynamicImportSite]:
+    """Extract runtime dynamic `import(...)` call sites from type-masked `exec_text`."""
+    if has_treesitter():
+        parser = _get_parser("tsx" if is_tsx else "ts")
+        if parser is not None:
+            raw = exec_text.encode("utf-8")
+            tree = parser.parse(raw)
+            sites: list[TsDynamicImportSite] = []
+
+            def _char_idx(byte_pos: int) -> int:
+                return len(raw[:byte_pos].decode("utf-8", errors="replace"))
+
+            def walk(node: Any) -> None:
+                if node.type == "call_expression":
+                    fn = node.child_by_field_name("function")
+                    if fn is not None and fn.type == "import":
+                        args = node.child_by_field_name("arguments")
+                        arg_nodes = [n for n in args.named_children if n.type != "comment"] if args else []
+                        raw_arg = (
+                            raw[arg_nodes[0].start_byte : arg_nodes[0].end_byte].decode("utf-8", errors="replace")
+                            if arg_nodes
+                            else ""
+                        )
+                        spec = _static_import_arg(raw_arg)
+                        lineno = node.start_point[0] + 1
+                        imp_names: tuple[str, ...] = ()
+                        loc_names: tuple[str, ...] = ()
+                        d_start, d_end = -1, -1
+                        direct = False
+                        cur = node.parent
+                        while cur is not None and cur.type in (
+                            "await_expression",
+                            "parenthesized_expression",
+                            "as_expression",
+                            "satisfies_expression",
+                            "non_null_expression",
+                        ):
+                            cur = cur.parent
+                        if cur is not None and cur.type == "member_expression":
+                            prop_n = cur.child_by_field_name("property")
+                            prop = (
+                                raw[prop_n.start_byte : prop_n.end_byte].decode("utf-8", errors="replace")
+                                if prop_n is not None
+                                else ""
+                            )
+                            p2 = cur.parent
+                            if p2 is not None and p2.type == "call_expression":
+                                direct = True
+                                if prop and prop != "then":
+                                    imp_names = (prop,)
+                        elif cur is not None and cur.type == "variable_declarator":
+                            name_n = cur.child_by_field_name("name")
+                            if name_n is not None:
+                                d_start = _char_idx(name_n.start_byte)
+                                d_end = _char_idx(name_n.end_byte)
+                                lhs_txt = raw[name_n.start_byte : name_n.end_byte].decode("utf-8", errors="replace")
+                                imp_names, loc_names = _parse_destructure_names(lhs_txt)
+                        sites.append(
+                            TsDynamicImportSite(
+                                spec=spec,
+                                imported_names=imp_names,
+                                local_names=loc_names,
+                                line=lineno,
+                                raw_expr=raw_arg.strip() or "<dynamic>",
+                                decl_start=d_start,
+                                decl_end=d_end,
+                                is_direct_invoked=direct,
+                            )
+                        )
+                for ch in node.children:
+                    walk(ch)
+
+            walk(tree.root_node)
+            return sites
+
+    sites_fb: list[TsDynamicImportSite] = []
+    covered_arg_spans: list[tuple[int, int]] = []
+    for m in _DYN_IMPORT_ASSIGN_RE.finditer(exec_text):
+        covered_arg_spans.append(m.span("arg"))
+        imp_names, loc_names = _parse_destructure_names(m.group("lhs"))
+        raw_arg = m.group("arg").strip()
+        sites_fb.append(
+            TsDynamicImportSite(
+                spec=_static_import_arg(raw_arg),
+                imported_names=imp_names,
+                local_names=loc_names,
+                line=exec_text.count("\n", 0, m.start()) + 1,
+                raw_expr=raw_arg or "<dynamic>",
+                decl_start=m.start("lhs"),
+                decl_end=m.end("lhs"),
+                is_direct_invoked=False,
+            )
+        )
+    for m in _DYN_IMPORT_ANY_RE.finditer(exec_text):
+        aspan = m.span("arg")
+        if any(cs <= aspan[0] and aspan[1] <= ce for cs, ce in covered_arg_spans):
+            continue
+        raw_arg = m.group("arg").strip()
+        prop = m.group("prop")
+        sites_fb.append(
+            TsDynamicImportSite(
+                spec=_static_import_arg(raw_arg),
+                imported_names=(prop,) if prop and prop != "then" else (),
+                local_names=(),
+                line=exec_text.count("\n", 0, m.start()) + 1,
+                raw_expr=raw_arg or "<dynamic>",
+                decl_start=-1,
+                decl_end=-1,
+                is_direct_invoked=bool(prop),
+            )
+        )
+    return sites_fb
+
+
+def verified_dynamic_import(exec_text: str, site: TsDynamicImportSite) -> tuple[bool, set[str]]:
+    """Return `(is_invoked, used_imported_symbols)` for a dynamic `import(...)` site."""
+    if site.is_direct_invoked:
+        used = {s for s in site.imported_names if s and s != "*"}
+        return True, used
+    if not site.local_names:
+        return True, set()
+    if site.decl_start >= 0 and site.decl_end > site.decl_start:
+        masked = f"{exec_text[:site.decl_start]}{' ' * (site.decl_end - site.decl_start)}{exec_text[site.decl_end:]}"
+    else:
+        masked = exec_text
+    matched = False
+    used_syms: set[str] = set()
+    pairs = (
+        zip(site.imported_names, site.local_names)
+        if len(site.imported_names) == len(site.local_names)
+        else [("*", ln) for ln in site.local_names]
+    )
+    for imp_s, loc_s in pairs:
+        if re.search(rf"(?<![.\w$]){re.escape(loc_s)}\b", masked):
+            matched = True
+            if imp_s and imp_s != "*":
+                used_syms.add(imp_s)
+    return matched, used_syms
