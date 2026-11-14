@@ -470,8 +470,9 @@ def parse_component_imports(raw_source: str) -> dict[str, tuple[str, str]]:
 
 
 _PROP_IDENT_REF_RE = re.compile(r"^(?:props\.)?(?P<ident>[A-Za-z_$][\w$]*)$")
-_EMPTY_PROP_STATES = frozenset({"empty", "blank", "null", "undefined"})
+_EMPTY_PROP_STATES = frozenset({"empty", "empty_node", "blank", "null", "undefined"})
 _BOOL_PROP_STATES = frozenset({"bool_false", "bool_true"})
+_JSX_COMMENT_RE = re.compile(r"\{\s*/\*[\s\S]*?\*/\s*\}")
 
 
 def _normalize_component_lookup(
@@ -623,7 +624,7 @@ def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str], dic
         has_opaque_spread = True
         explicit_after_spread.clear()
         for existing_k, existing_v in list(props.items()):
-            if existing_v in _EMPTY_PROP_STATES:
+            if existing_v in _EMPTY_PROP_STATES or existing_v in _BOOL_PROP_STATES:
                 props[existing_k] = "opaque"
 
     def record_explicit(prop_name: str) -> None:
@@ -943,19 +944,80 @@ def _slice_tsx_decl_body(raw_source: str, decl_start: int) -> str:
     return tail
 
 
-def _locate_tsx_export_source(raw_source: str, exported_name: str) -> str:
-    """Locate the declaration slice for a default or named React/JSX export."""
+_EXPORT_BLOCK_RE = re.compile(
+    r"\bexport\s*(?!type\b)\{(?P<body>[^}]*)\}(?:\s*from\s*(?:\"(?P<dq>[^\"]+)\"|'(?P<sq>[^']+)'))?"
+)
+
+
+def _parse_export_specifiers(body: str) -> list[tuple[str, str]]:
+    """Parse ESM `{ Orig as Alias, Name }` pairs, ignoring `type` specifiers."""
+    pairs: list[tuple[str, str]] = []
+    for raw_item in body.split(","):
+        item = raw_item.strip()
+        if not item or item.startswith("type "):
+            continue
+        m = re.fullmatch(
+            r"(?P<orig>[A-Za-z_$][\w$]*)(?:\s+as\s+(?P<alias>[A-Za-z_$][\w$]*))?",
+            item,
+        )
+        if m:
+            orig = m.group("orig")
+            pairs.append((orig, m.group("alias") or orig))
+    return pairs
+
+
+def _find_tsx_reexport_target(raw_source: str, exported_name: str) -> tuple[str, str] | None:
+    """Return `(specifier, imported_name)` when `exported_name` is re-exported from another module."""
+    mask = js_code_mask(raw_source)
+    for m in _EXPORT_BLOCK_RE.finditer(raw_source):
+        if not mask[m.start()]:
+            continue
+        spec = m.group("dq") if m.group("dq") is not None else m.group("sq")
+        if spec is None:
+            continue
+        for orig, exp in _parse_export_specifiers(m.group("body")):
+            if exp == exported_name:
+                return spec, orig
+    return None
+
+
+def _locate_tsx_export_source(
+    raw_source: str, exported_name: str, *, local_scope: bool = False
+) -> str:
+    """Locate the declaration slice for a default, named, or local React/JSX component."""
     mask = js_code_mask(raw_source)
 
-    def _find_named_decl(symbol: str) -> int | None:
+    def _find_named_decl(symbol: str, *, exported_only: bool = False) -> int | None:
+        prefix = r"\bexport\s+" if exported_only else r"\b"
         pat = re.compile(
-            rf"\b(?:async\s+)?function\s+{re.escape(symbol)}\b|"
-            rf"\b(?:const|let|var)\s+{re.escape(symbol)}\s*(?::[^=;\n]+)?="
+            rf"{prefix}(?:async\s+)?function\s+{re.escape(symbol)}\b|"
+            rf"{prefix}(?:const|let|var)\s+{re.escape(symbol)}\s*(?::[^=;\n]+)?="
         )
         for m in pat.finditer(raw_source):
             if mask[m.start()]:
                 return m.start()
         return None
+
+    def _slice_resolved_decl(pos: int) -> str:
+        cur = pos
+        seen: set[int] = set()
+        for _ in range(3):
+            if cur in seen:
+                break
+            seen.add(cur)
+            m_alias = re.match(
+                r"(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*(?::[^=;\n]+)?=\s*"
+                r"(?:(?:React\.)?(?:memo|forwardRef)\s*(?:<[^;()]{0,160}?>)?\s*\(\s*)?"
+                r"(?P<ref>[A-Za-z_$][\w$]*)\s*[);,\n]",
+                raw_source[cur:],
+            )
+            if m_alias and m_alias.group("ref") not in ("function", "async", "class", "null", "undefined"):
+                ref_pos = _find_named_decl(m_alias.group("ref"))
+                if ref_pos is not None:
+                    cur = ref_pos
+                    continue
+            break
+        return _slice_tsx_decl_body(raw_source, cur)
 
     def _resolve_hoc_target(m: re.Match[str]) -> str | None:
         inner_tail = raw_source[m.end() :].lstrip()
@@ -963,8 +1025,12 @@ def _locate_tsx_export_source(raw_source: str, exported_name: str) -> str:
         if m_ref:
             ref_pos = _find_named_decl(m_ref.group("ref"))
             if ref_pos is not None:
-                return _slice_tsx_decl_body(raw_source, ref_pos)
+                return _slice_resolved_decl(ref_pos)
         return _slice_tsx_decl_body(raw_source, m.end())
+
+    if local_scope:
+        pos = _find_named_decl(exported_name)
+        return _slice_resolved_decl(pos) if pos is not None else ""
 
     if exported_name == "default":
         for pat in (
@@ -990,29 +1056,44 @@ def _locate_tsx_export_source(raw_source: str, exported_name: str) -> str:
             if mask[m.start()]:
                 ref_pos = _find_named_decl(m.group("ref"))
                 if ref_pos is not None:
-                    return _slice_tsx_decl_body(raw_source, ref_pos)
-        for m in re.finditer(
-            r"\bexport\s*\{[^}]*\b(?P<ref>[A-Za-z_$][\w$]*)\s+as\s+default\b[^}]*\}",
-            raw_source,
-        ):
-            if mask[m.start()]:
-                ref_pos = _find_named_decl(m.group("ref"))
-                if ref_pos is not None:
-                    return _slice_tsx_decl_body(raw_source, ref_pos)
+                    return _slice_resolved_decl(ref_pos)
+        for m in _EXPORT_BLOCK_RE.finditer(raw_source):
+            if not mask[m.start()]:
+                continue
+            if m.group("dq") is not None or m.group("sq") is not None:
+                for _orig, exp in _parse_export_specifiers(m.group("body")):
+                    if exp == "default":
+                        return ""
+                continue
+            for orig, exp in _parse_export_specifiers(m.group("body")):
+                if exp == "default":
+                    ref_pos = _find_named_decl(orig)
+                    if ref_pos is not None:
+                        return _slice_resolved_decl(ref_pos)
         return raw_source
 
-    direct_pos = _find_named_decl(exported_name)
-    if direct_pos is not None:
-        return _slice_tsx_decl_body(raw_source, direct_pos)
-    for m in re.finditer(
-        rf"\bexport\s*\{{[^}}]*\b(?P<ref>[A-Za-z_$][\w$]*)\s+as\s+{re.escape(exported_name)}\b[^}}]*\}}",
-        raw_source,
-    ):
-        if mask[m.start()]:
-            ref_pos = _find_named_decl(m.group("ref"))
-            if ref_pos is not None:
-                return _slice_tsx_decl_body(raw_source, ref_pos)
-    return raw_source
+    for m in _EXPORT_BLOCK_RE.finditer(raw_source):
+        if not mask[m.start()]:
+            continue
+        is_reexport = m.group("dq") is not None or m.group("sq") is not None
+        for orig, exp in _parse_export_specifiers(m.group("body")):
+            if exp == exported_name:
+                if is_reexport:
+                    return ""
+                ref_pos = _find_named_decl(orig)
+                return _slice_resolved_decl(ref_pos) if ref_pos is not None else ""
+
+    direct_export_pos = _find_named_decl(exported_name, exported_only=True)
+    if direct_export_pos is not None:
+        return _slice_resolved_decl(direct_export_pos)
+
+    has_any_export = any(mask[em.start()] for em in re.finditer(r"\bexport\b", raw_source))
+    if not has_any_export:
+        direct_pos = _find_named_decl(exported_name)
+        if direct_pos is not None:
+            return _slice_resolved_decl(direct_pos)
+        return raw_source
+    return ""
 
 
 def _extract_jsx_at(src: str, jsx_start: int) -> tuple[str, int] | None:
@@ -1272,6 +1353,8 @@ def _extract_component_props_and_markup(
     raw_source: str,
     suffix: str,
     exported_name: str = "default",
+    *,
+    local_scope: bool = False,
 ) -> tuple[dict[str, str], dict[str, str], str]:
     """Return `(prop_defaults, local_to_source, template_markup)` for a local component."""
     prop_defaults: dict[str, str] = {}
@@ -1348,8 +1431,8 @@ def _extract_component_props_and_markup(
         tm = _VUE_TPL_RE.search(raw_source)
         return prop_defaults, prop_aliases, tm.group("body") if tm else ""
 
-    # .tsx / .jsx: locate the target exported component declaration
-    target_src = _locate_tsx_export_source(raw_source, exported_name)
+    # .tsx / .jsx: locate the target exported or same-file component declaration
+    target_src = _locate_tsx_export_source(raw_source, exported_name, local_scope=local_scope)
     tmask = js_code_mask(target_src)
     body_info = _find_tsx_body_start(target_src, tmask)
     sig_src = target_src[: body_info[1]] if body_info is not None else target_src
@@ -1442,11 +1525,11 @@ def _eval_coalesce_expr(
         if len(t) >= 2 and t[0] == "`" and t[-1] == "`" and "${" not in t and "`" not in t[1:-1].replace("\\`", ""):
             inner = t[1:-1]
             return "named" if inner.strip() else ("blank" if inner else "empty")
-        if t in ("children", "props.children"):
-            return inner_status
         mp = re.fullmatch(r"(?:props\.)?(?P<p>[A-Za-z_$][\w$]*)", t)
         if prop_values is not None and mp and mp.group("p") in prop_values:
             return prop_values[mp.group("p")]
+        if t in ("children", "props.children"):
+            return "undefined" if inner_status == "omitted" else inner_status
         if unknown_fallback is not None:
             return unknown_fallback
         return "dynamic" if prop_values is None else "opaque"
@@ -1469,7 +1552,7 @@ def _eval_coalesce_expr(
         if prev_op == "??":
             if acc in ("undefined", "null"):
                 acc = nxt_state
-            elif acc in ("empty", "blank", "named", "bool_false", "bool_true"):
+            elif acc in ("empty", "empty_node", "blank", "named", "icon_only", "bool_false", "bool_true"):
                 pass
             elif acc == "dynamic":
                 acc = "named" if nxt_state == "named" else "dynamic"
@@ -1479,7 +1562,7 @@ def _eval_coalesce_expr(
             # Logical `||` treats empty string / false / 0 / null / undefined as falsy.
             if acc in ("undefined", "null", "empty", "bool_false"):
                 acc = nxt_state
-            elif acc in ("blank", "named", "bool_true"):
+            elif acc in ("empty_node", "blank", "named", "icon_only", "bool_true"):
                 pass
             elif acc == "dynamic":
                 acc = "named" if nxt_state == "named" else "dynamic"
@@ -1496,14 +1579,20 @@ def _classify_expr_semantics(
     inner_status: str,
     render_booleans_as_text: bool = False,
 ) -> str:
-    """Classify a `{...}` expression as `ignore`, `named`, `empty`, or `opaque`."""
+    """Classify a `{...}` expression as `ignore`, `named`, `icon_only`, `empty`, or `opaque`."""
     expr = re.sub(r"/\*[\s\S]*?\*/", "", raw_expr).strip()
     if expr.startswith("{") and expr.endswith("}"):
         expr = expr[1:-1].strip()
     if not expr or expr[0] in ("#", ":", "/"):
         return "ignore"
     if expr.startswith("@render"):
-        return inner_status if "children" in expr else "named"
+        if "children" in expr:
+            if inner_status in _BOOL_PROP_STATES:
+                return "named" if render_booleans_as_text else "empty"
+            if inner_status == "omitted" or inner_status in _EMPTY_PROP_STATES:
+                return "empty"
+            return inner_status
+        return "named"
     if expr.startswith("@html"):
         expr = expr[5:].strip()
     elif expr.startswith("@"):
@@ -1516,10 +1605,12 @@ def _classify_expr_semantics(
     )
     if res in _BOOL_PROP_STATES:
         return "named" if render_booleans_as_text else "empty"
-    if res in _EMPTY_PROP_STATES:
+    if res == "omitted" or res in _EMPTY_PROP_STATES:
         return "empty"
     if res in ("named", "dynamic"):
         return "named"
+    if res == "icon_only":
+        return "icon_only"
     return "opaque"
 
 
@@ -1529,7 +1620,7 @@ def _classify_markup_segment(
     imported_components: dict[str, tuple[str, str]],
     component_resolver: Callable[[str, str, str], str] | None,
     prop_values: dict[str, str] | None = None,
-    inner_status: str = "empty",
+    inner_status: str = "omitted",
     render_booleans_as_text: bool = False,
 ) -> tuple[str, list[str], bool]:
     """Classify markup children as `(status, opaque_tags, has_visual_empty_or_icon)`."""
@@ -1572,6 +1663,8 @@ def _classify_markup_segment(
             )
             if sem == "named":
                 has_named = True
+            elif sem == "icon_only":
+                has_icon = True
             elif sem == "opaque" and prop_values is not None:
                 opaque_tags.append("{expr}")
             i = bend
@@ -1636,26 +1729,61 @@ def _classify_markup_segment(
                 continue
             if tag_low == "slot":
                 if not re.search(r"""\bname\s*=""", attrs):
-                    if inner_status == "empty" and inner_body.strip():
+                    if inner_status in ("omitted", "undefined") and inner_body.strip():
                         slot_fallback, _, _ = _classify_markup_segment(
                             inner_body,
                             imported_components=imported_components,
                             component_resolver=component_resolver,
                             prop_values=prop_values,
-                            inner_status="empty",
+                            inner_status="omitted",
                             render_booleans_as_text=render_booleans_as_text,
                         )
                         merge_status(slot_fallback, "slot")
                     else:
-                        merge_status(inner_status, "slot")
+                        if inner_status in _BOOL_PROP_STATES:
+                            slot_st = "named" if render_booleans_as_text else "empty"
+                        elif inner_status == "omitted" or inner_status in _EMPTY_PROP_STATES:
+                            slot_st = "empty"
+                        elif inner_status == "dynamic":
+                            slot_st = "named"
+                        else:
+                            slot_st = inner_status
+                        merge_status(slot_st, "slot")
                 i = next_i
                 continue
             if tag_low in ("script", "style") or _is_aria_hidden_true(attrs):
                 i = next_i
                 continue
             if tag[0].isupper() or "." in tag or "-" in tag or matched_imp is not None:
-                child_inner = "empty"
-                if inner_body:
+                cleaned_inner = _JSX_COMMENT_RE.sub("", _HTML_COMMENT_RE.sub("", inner_body))
+                stripped_inner = cleaned_inner.strip()
+                if self_closing or cleaned_inner == "" or ("\n" in cleaned_inner and not stripped_inner):
+                    child_inner = "omitted"
+                elif not stripped_inner:
+                    child_inner = "blank"
+                elif (
+                    stripped_inner.startswith("{")
+                    and _scan_brace_end(stripped_inner, 0) == len(stripped_inner)
+                    and "<" not in stripped_inner
+                    and not stripped_inner.startswith(("{#", "{:", "{/", "{@"))
+                ):
+                    expr_s = stripped_inner[1:-1].strip()
+                    if (
+                        render_booleans_as_text
+                        and expr_s.startswith("{")
+                        and expr_s.endswith("}")
+                        and _scan_brace_end(expr_s, 0) == len(expr_s)
+                    ):
+                        expr_s = expr_s[1:-1].strip()
+                    if expr_s:
+                        child_inner = _eval_coalesce_expr(
+                            expr_s,
+                            prop_values=prop_values,
+                            inner_status=inner_status,
+                        )
+                    else:
+                        child_inner = "omitted"
+                else:
                     cst, copaque, _ = _classify_markup_segment(
                         inner_body,
                         imported_components=imported_components,
@@ -1670,6 +1798,8 @@ def _classify_markup_segment(
                         child_inner = "opaque"
                     elif cst == "icon_only":
                         child_inner = "icon_only"
+                    else:
+                        child_inner = "empty_node"
                 resolved = _resolve_component_tag(
                     tag,
                     attrs,
@@ -1919,20 +2049,63 @@ def make_local_component_resolver(
             target = resolve_import_fn(spec, caller_file)
             if target is None:
                 return "opaque"
-        ckey = (target, exported)
-        if ckey in _visiting:
+        initial_ckey = (target, f"__local__:{exported}" if same_file else exported)
+        if initial_ckey in _visiting:
             return "opaque"
-        if ckey not in cache:
-            try:
-                raw_target = caller_source if same_file else target.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                return "opaque"
-            defaults, aliases, markup = _extract_component_props_and_markup(
-                raw_target, target.suffix, exported_name=exported
+        if initial_ckey not in cache:
+            seen_reexports: set[tuple[Path, str]] = set()
+            final_target = target
+            final_exported = exported
+            if same_file:
+                raw_target = caller_source
+            else:
+                raw_target = ""
+                for _ in range(3):
+                    if (final_target, final_exported) in _visiting or (
+                        final_target,
+                        final_exported,
+                    ) in seen_reexports:
+                        return "opaque"
+                    seen_reexports.add((final_target, final_exported))
+                    try:
+                        raw_target = final_target.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        return "opaque"
+                    if final_target.suffix not in (".tsx", ".jsx", ".ts", ".js"):
+                        break
+                    reexport = _find_tsx_reexport_target(raw_target, final_exported)
+                    if reexport is None:
+                        break
+                    re_spec, re_name = reexport
+                    nxt_target = resolve_import_fn(re_spec, final_target)
+                    if nxt_target is None:
+                        return "opaque"
+                    final_target = nxt_target
+                    final_exported = re_name
+            final_ckey = (
+                final_target,
+                f"__local__:{final_exported}" if same_file else final_exported,
             )
-            target_imports = imports if same_file else parse_component_imports(raw_target)
-            cache[ckey] = (defaults, aliases, markup, target_imports, target, raw_target)
-        defaults, aliases, markup, target_imports, resolved_path, resolved_source = cache[ckey]
+            if final_ckey in _visiting:
+                return "opaque"
+            if final_ckey not in cache:
+                defaults, aliases, markup = _extract_component_props_and_markup(
+                    raw_target,
+                    final_target.suffix,
+                    exported_name=final_exported,
+                    local_scope=same_file,
+                )
+                target_imports = imports if same_file else parse_component_imports(raw_target)
+                cache[final_ckey] = (
+                    defaults,
+                    aliases,
+                    markup,
+                    target_imports,
+                    final_target,
+                    raw_target,
+                )
+            cache[initial_ckey] = cache[final_ckey]
+        defaults, aliases, markup, target_imports, resolved_path, resolved_source = cache[initial_ckey]
         if not markup.strip():
             return "opaque"
 
@@ -1950,6 +2123,7 @@ def make_local_component_resolver(
                     continue
                 if has_opaque_spread and pname not in explicit_after_spread and resolved_val in (
                     "empty",
+                    "empty_node",
                     "blank",
                     "null",
                     "bool_false",
@@ -1958,6 +2132,11 @@ def make_local_component_resolver(
                     passed[pname] = "opaque"
                 else:
                     passed[pname] = resolved_val
+
+        if inner_status != "omitted":
+            passed["children"] = inner_status
+            explicit_after_spread.add("children")
+            raw_prop_exprs.pop("children", None)
 
         merged_props: dict[str, str] = {}
         for local_name, dstate in defaults.items():
@@ -1991,19 +2170,17 @@ def make_local_component_resolver(
             (ln for ln, sn in aliases.items() if sn == "children"),
             "children",
         )
-        effective_inner = inner_status
-        if inner_status != "empty":
-            # Propagate resolved JSX child content into the `children` prop binding so
-            # forwarding `<Label children={children} />` receives the caller's children state.
-            merged_props[children_local] = inner_status
+        if children_local not in merged_props:
+            merged_props[children_local] = (
+                "opaque"
+                if (has_opaque_spread and "children" not in explicit_after_spread)
+                else "undefined"
+            )
+        resolved_children = merged_props[children_local]
+        if inner_status == "omitted" and resolved_children == "undefined":
+            effective_inner = "omitted"
         else:
-            effective_children = merged_props.get(children_local, passed.get("children"))
-            if effective_children in ("named", "dynamic"):
-                effective_inner = "named"
-            elif effective_children == "opaque" or (
-                has_opaque_spread and "children" not in explicit_after_spread
-            ):
-                effective_inner = "opaque"
+            effective_inner = resolved_children
 
         nested_resolver = make_local_component_resolver(
             resolved_path,

@@ -666,3 +666,70 @@ def test_vue_kebab_case_and_framework_boolean_semantics_a11y(tmp_path: Path) -> 
     assert sv_disp == [4], sv_res.findings
 
 
+def test_named_export_aliases_reexports_and_explicit_empty_children_a11y(tmp_path: Path) -> None:
+    """Resolve export aliases/re-exports before local helpers and distinguish omitted vs empty children."""
+    from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
+
+    put(
+        tmp_path,
+        "components/ExportAliases.tsx",
+        "function Label() { return <svg />; }\n"
+        "function TextLabel() { return <span>Save</span>; }\n"
+        "export { TextLabel as Label };\n",
+    )
+    put(
+        tmp_path,
+        "components/barrel.ts",
+        "export { Label as Aliased } from './ExportAliases';\n",
+    )
+    put(
+        tmp_path,
+        "components/ChildrenDefaults.tsx",
+        "export function DefaultChild({ children = 'Save' }: { children?: unknown }) {\n"
+        "  return <span>{children}</span>;\n"
+        "}\n"
+        "export function NullishChild({ children }: { children?: unknown }) {\n"
+        "  return <span>{children ?? 'Save'}</span>;\n"
+        "}\n"
+        "export function OrChild({ children }: { children?: unknown }) {\n"
+        "  return <span>{children || 'Save'}</span>;\n"
+        "}\n",
+    )
+    put(
+        tmp_path,
+        "app/page.tsx",
+        "import { Label as ImportedLabel } from '../components/ExportAliases';\n"
+        "import { Aliased } from '../components/barrel';\n"
+        "import { DefaultChild, NullishChild, OrChild } from '../components/ChildrenDefaults';\n"
+        "function Label() { return <svg />; }\n"
+        "export function Page() {\n"
+        "  return (\n"
+        "    <div>\n"
+        "      <button><Label /></button>\n"
+        "      <button><ImportedLabel /></button>\n"
+        "      <button><Aliased /></button>\n"
+        "      <button><DefaultChild /></button>\n"
+        "      <button><DefaultChild>{undefined}</DefaultChild></button>\n"
+        "      <button><DefaultChild>{null}</DefaultChild></button>\n"
+        "      <button><DefaultChild>{false}</DefaultChild></button>\n"
+        "      <button><DefaultChild>{''}</DefaultChild></button>\n"
+        "      <button><DefaultChild><span /></DefaultChild></button>\n"
+        "      <button><NullishChild /></button>\n"
+        "      <button><NullishChild>{null}</NullishChild></button>\n"
+        "      <button><NullishChild>{false}</NullishChild></button>\n"
+        "      <button><NullishChild>{''}</NullishChild></button>\n"
+        "      <button><NullishChild><span /></NullishChild></button>\n"
+        "      <button><OrChild /></button>\n"
+        "      <button><OrChild>{null}</OrChild></button>\n"
+        "      <button><OrChild>{false}</OrChild></button>\n"
+        "      <button><OrChild>{''}</OrChild></button>\n"
+        "      <button><OrChild><span /></OrChild></button>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    res = TypeScriptNextJsAdapter().extract(tmp_path, ".")
+    disp_lines = sorted(f.line for f in res.findings if f.rule_code == "DISP-005")
+    assert disp_lines == [8, 13, 14, 15, 16, 19, 20, 21, 26], res.findings
+
+
