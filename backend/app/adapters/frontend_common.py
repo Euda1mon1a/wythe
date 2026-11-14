@@ -224,7 +224,9 @@ def build_a11y_component_resolver(
     extensions: tuple[str, ...],
 ) -> Callable[[Path, str], Callable[[str, str, str], str]]:
     """Build a per-scan factory returning depth-bounded component text-semantics resolvers."""
-    shared_cache: dict[tuple[Path, str], tuple[dict[str, str], str, dict[str, tuple[str, str]], Path]] = {}
+    shared_cache: dict[
+        tuple[Path, str], tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path]
+    ] = {}
 
     def _resolve_imp(spec: str, current_file: Path) -> Path | None:
         return resolve_frontend_import(spec, current_file, src_root, extensions)

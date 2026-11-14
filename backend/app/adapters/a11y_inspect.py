@@ -478,9 +478,76 @@ def _eval_attr_value(expr: str) -> str:
     return "dynamic"
 
 
-def _extract_prop_attrs(attrs: str) -> dict[str, str]:
-    """Parse JSX/Svelte component prop attributes into `{name: 'named' | 'dynamic' | 'empty'}`."""
+def _split_top_level_js(src: str, sep: str = ",") -> list[str]:
+    """Split JS argument/object/pattern list on `sep` at bracket depth 0 outside strings."""
+    parts: list[str] = []
+    depth = 0
+    quote: str | None = None
+    start = 0
+    i = 0
+    n = len(src)
+    while i < n:
+        ch = src[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+        elif ch == sep and depth == 0:
+            parts.append(src[start:i])
+            start = i + 1
+        i += 1
+    parts.append(src[start:])
+    return parts
+
+
+def _split_first_top_level_js(src: str, sep: str) -> tuple[str, str | None]:
+    """Split on first top-level `sep`, returning `(left, right_or_none)`."""
+    depth = 0
+    quote: str | None = None
+    i = 0
+    n = len(src)
+    while i < n:
+        ch = src[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+        elif ch == sep and depth == 0:
+            return src[:i], src[i + 1 :]
+        i += 1
+    return src, None
+
+
+def _extract_prop_attrs(attrs: str) -> tuple[dict[str, str], bool, set[str]]:
+    """Parse JSX/Svelte component attrs into `(props, has_opaque_spread, explicit_after_spread)`."""
     props: dict[str, str] = {}
+    has_opaque_spread = False
+    explicit_after_spread: set[str] = set()
+
+    def mark_opaque_spread() -> None:
+        nonlocal has_opaque_spread
+        has_opaque_spread = True
+        explicit_after_spread.clear()
+        for existing_k, existing_v in list(props.items()):
+            if existing_v == "empty":
+                props[existing_k] = "opaque"
+
     i = 0
     n = len(attrs)
     while i < n:
@@ -492,8 +559,33 @@ def _extract_prop_attrs(attrs: str) -> dict[str, str]:
             bend = _scan_brace_end(attrs, i)
             if bend is not None:
                 inner = attrs[i + 1 : bend - 1].strip()
-                if re.fullmatch(r"[A-Za-z_$][\w$]*", inner):
+                if inner.startswith("..."):
+                    spread_expr = inner[3:].strip()
+                    if spread_expr.startswith("{") and spread_expr.endswith("}"):
+                        for entry in _split_top_level_js(spread_expr[1:-1], ","):
+                            entry = entry.strip()
+                            if not entry:
+                                continue
+                            if entry.startswith("..."):
+                                mark_opaque_spread()
+                                continue
+                            raw_k, raw_v = _split_first_top_level_js(entry, ":")
+                            if raw_v is not None:
+                                skey = raw_k.strip().strip("'\"")
+                                if re.fullmatch(r"[A-Za-z_$][\w$.-]*", skey):
+                                    props[skey] = _eval_attr_value(raw_v)
+                                    if has_opaque_spread:
+                                        explicit_after_spread.add(skey)
+                            elif re.fullmatch(r"[A-Za-z_$][\w$]*", entry):
+                                props[entry] = "dynamic"
+                                if has_opaque_spread:
+                                    explicit_after_spread.add(entry)
+                    else:
+                        mark_opaque_spread()
+                elif re.fullmatch(r"[A-Za-z_$][\w$]*", inner):
                     props[inner] = "dynamic"
+                    if has_opaque_spread:
+                        explicit_after_spread.add(inner)
                 i = bend
                 continue
             i += 1
@@ -520,14 +612,18 @@ def _extract_prop_attrs(attrs: str) -> dict[str, str]:
                 j += 2 if attrs[j] == "\\" else 1
             val = attrs[i + 1 : j]
             props[key] = "named" if val.strip() else "empty"
+            if has_opaque_spread:
+                explicit_after_spread.add(key)
             i = min(j + 1, n)
         elif attrs[i] == "{":
             bend = _scan_brace_end(attrs, i)
             if bend is None:
                 break
             props[key] = _eval_attr_value(attrs[i + 1 : bend - 1])
+            if has_opaque_spread:
+                explicit_after_spread.add(key)
             i = bend
-    return props
+    return props, has_opaque_spread, explicit_after_spread
 
 
 _SCRIPT_BLOCK_RE = re.compile(r"<script\b[^>]*>(?P<body>[\s\S]*?)</script>", re.IGNORECASE)
@@ -537,26 +633,24 @@ _HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
 _IDENT_TOKEN_RE = re.compile(r"\b[A-Za-z_$][\w$]*\b")
 
 
-def _parse_default_params(raw_params: str) -> dict[str, str]:
-    """Extract parameter names and default states (`named`, `empty`, `unknown`)."""
+def _parse_default_params(raw_params: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Extract `(local_defaults, local_to_source_prop)` respecting destructuring aliases."""
     defaults: dict[str, str] = {}
-    cleaned = re.sub(r":[^=,}\)]+(?=[=,}\)])", "", raw_params)
-    for part in cleaned.split(","):
-        item = part.strip().lstrip(".")
-        if not item:
+    aliases: dict[str, str] = {}
+    for raw_part in _split_top_level_js(raw_params, ","):
+        item = raw_part.strip()
+        if not item or item.startswith("..."):
             continue
-        if "=" in item:
-            lhs, rhs = item.split("=", 1)
-            name = lhs.split(":", 1)[0].strip()
-            if re.fullmatch(r"[A-Za-z_$][\w$]*", name):
-                defaults[name] = _eval_attr_value(rhs)
-        elif ":" in item:
-            alias = item.split(":", 1)[1].strip()
-            if re.fullmatch(r"[A-Za-z_$][\w$]*", alias):
-                defaults[alias] = "unknown"
-        elif re.fullmatch(r"[A-Za-z_$][\w$]*", item):
-            defaults[item] = "unknown"
-    return defaults
+        lhs_raw, rhs_raw = _split_first_top_level_js(item, "=")
+        lhs = lhs_raw.strip()
+        src_part, alias_part = _split_first_top_level_js(lhs, ":")
+        src_name = src_part.strip()
+        local_name = alias_part.strip() if alias_part is not None else src_name
+        if not (re.fullmatch(r"[A-Za-z_$][\w$]*", src_name) and re.fullmatch(r"[A-Za-z_$][\w$]*", local_name)):
+            continue
+        defaults[local_name] = _eval_attr_value(rhs_raw) if rhs_raw is not None else "unknown"
+        aliases[local_name] = src_name
+    return defaults, aliases
 
 
 def _scan_paren_end(src: str, pos: int, mask: list[bool]) -> int | None:
@@ -789,9 +883,10 @@ def _extract_component_props_and_markup(
     raw_source: str,
     suffix: str,
     exported_name: str = "default",
-) -> tuple[dict[str, str], str]:
-    """Return `(prop_defaults, template_markup)` for a local Svelte, Vue, or JSX/TSX component."""
+) -> tuple[dict[str, str], dict[str, str], str]:
+    """Return `(prop_defaults, local_to_source, template_markup)` for a local component."""
     prop_defaults: dict[str, str] = {}
+    prop_aliases: dict[str, str] = {}
     if suffix == ".svelte":
         for sm in _SCRIPT_BLOCK_RE.finditer(raw_source):
             script_body = sm.group("body")
@@ -800,12 +895,21 @@ def _extract_component_props_and_markup(
                 script_body,
             ):
                 dval = pm.group("def")
-                prop_defaults[pm.group("name")] = _eval_attr_value(dval) if dval is not None else "unknown"
-            for pm in re.finditer(r"\blet\s*\{(?P<inner>[^}]+)\}[^=]*=\s*\$props\b", script_body):
-                prop_defaults.update(_parse_default_params(pm.group("inner")))
+                pname = pm.group("name")
+                prop_defaults[pname] = _eval_attr_value(dval) if dval is not None else "unknown"
+                prop_aliases.setdefault(pname, pname)
+            for pm in re.finditer(r"\blet\s*\{", script_body):
+                bend = _scan_brace_end(script_body, pm.end() - 1)
+                if bend is None:
+                    continue
+                tail = script_body[bend:]
+                if re.match(r"^(?:\s*:[^=;\n]+)?\s*=\s*\$props\b", tail):
+                    defs, als = _parse_default_params(script_body[pm.end() : bend - 1])
+                    prop_defaults.update(defs)
+                    prop_aliases.update(als)
         markup = _SCRIPT_BLOCK_RE.sub("", raw_source)
         markup = _STYLE_BLOCK_RE.sub("", markup)
-        return prop_defaults, markup
+        return prop_defaults, prop_aliases, markup
 
     if suffix == ".vue":
         for sm in _SCRIPT_BLOCK_RE.finditer(raw_source):
@@ -817,40 +921,47 @@ def _extract_component_props_and_markup(
                         k = k.strip().strip("'\"")
                         if re.fullmatch(r"[A-Za-z_$][\w$]*", k):
                             prop_defaults[k] = _eval_attr_value(v)
+                            prop_aliases.setdefault(k, k)
             for pm in re.finditer(r"defineProps\s*<\s*\{(?P<inner>[^}]+)\}\s*>", sb):
                 for k in re.findall(r"([A-Za-z_$][\w$]*)\s*\??:", pm.group("inner")):
                     prop_defaults.setdefault(k, "unknown")
+                    prop_aliases.setdefault(k, k)
             for pm in re.finditer(r"defineProps\s*\(\s*\[(?P<inner>[^\]]+)\]\s*\)", sb):
                 for k in re.findall(r"['\"]([A-Za-z_$][\w$]*)['\"]", pm.group("inner")):
                     prop_defaults.setdefault(k, "unknown")
+                    prop_aliases.setdefault(k, k)
         tm = _VUE_TPL_RE.search(raw_source)
-        return prop_defaults, tm.group("body") if tm else ""
+        return prop_defaults, prop_aliases, tm.group("body") if tm else ""
 
     # .tsx / .jsx: locate the target exported component declaration
     target_src = _locate_tsx_export_source(raw_source, exported_name)
-    m_props = re.search(r"\(\s*\{(?P<inner>[^})]{0,300})\}", target_src)
-    if m_props:
-        prop_defaults.update(_parse_default_params(m_props.group("inner")))
+    m_open = re.search(r"\(\s*\{", target_src)
+    if m_open:
+        bend = _scan_brace_end(target_src, m_open.end() - 1)
+        if bend is not None:
+            defs, als = _parse_default_params(target_src[m_open.end() : bend - 1])
+            prop_defaults.update(defs)
+            prop_aliases.update(als)
     m_ret = re.search(r"(?:\breturn\s*\(?|=>\s*\(?)\s*(?=<(?:[A-Za-z]|>))", target_src)
     if not m_ret:
-        return prop_defaults, ""
+        return prop_defaults, prop_aliases, ""
     jsx_start = m_ret.end()
     if target_src.startswith("<>", jsx_start):
         close = target_src.find("</>", jsx_start + 2)
-        return prop_defaults, target_src[jsx_start : close + 3] if close >= 0 else ""
+        return prop_defaults, prop_aliases, target_src[jsx_start : close + 3] if close >= 0 else ""
     tm = re.match(r"<([A-Za-z][\w.]*)", target_src[jsx_start:])
     if not tm:
-        return prop_defaults, ""
+        return prop_defaults, prop_aliases, ""
     tname = tm.group(1)
     open_end = scan_open_tag_end(target_src, jsx_start + tm.end())
     if open_end is None:
-        return prop_defaults, ""
+        return prop_defaults, prop_aliases, ""
     if target_src[jsx_start + tm.end() : open_end - 1].rstrip().endswith("/"):
-        return prop_defaults, target_src[jsx_start:open_end]
+        return prop_defaults, prop_aliases, target_src[jsx_start:open_end]
     close_span = _find_matching_close_tag(target_src, open_end, tname)
     if close_span is None:
-        return prop_defaults, ""
-    return prop_defaults, target_src[jsx_start : close_span[1]]
+        return prop_defaults, prop_aliases, ""
+    return prop_defaults, prop_aliases, target_src[jsx_start : close_span[1]]
 
 
 def _classify_expr_semantics(
@@ -885,6 +996,8 @@ def _classify_expr_semantics(
             return "named"
         if re.search(r"""['"][^'"\s][^'"]*['"]""", expr):
             return "named"
+        if any(st == "opaque" for st in states):
+            return "opaque"
         return "empty"
     if re.search(r"""['"][^'"\s][^'"]*['"]""", expr):
         return "named"
@@ -1067,7 +1180,9 @@ def make_local_component_resolver(
     resolve_import_fn: Callable[[str, Path], Path | None],
     *,
     _caller_imports: dict[str, tuple[str, str]] | None = None,
-    _cache: dict[tuple[Path, str], tuple[dict[str, str], str, dict[str, tuple[str, str]], Path]] | None = None,
+    _cache: dict[
+        tuple[Path, str], tuple[dict[str, str], dict[str, str], str, dict[str, tuple[str, str]], Path]
+    ] | None = None,
     _visiting: frozenset[Path] = frozenset(),
     _depth: int = 0,
     _parent_props: dict[str, str] | None = None,
@@ -1110,31 +1225,46 @@ def make_local_component_resolver(
                 raw_target = caller_source if same_file else target.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 return "opaque"
-            defaults, markup = _extract_component_props_and_markup(
+            defaults, aliases, markup = _extract_component_props_and_markup(
                 raw_target, target.suffix, exported_name=exported
             )
             target_imports = imports if same_file else parse_component_imports(raw_target)
-            cache[ckey] = (defaults, markup, target_imports, target)
-        defaults, markup, target_imports, resolved_path = cache[ckey]
+            cache[ckey] = (defaults, aliases, markup, target_imports, target)
+        defaults, aliases, markup, target_imports, resolved_path = cache[ckey]
         if not markup.strip():
             return "opaque"
 
-        passed = _extract_prop_attrs(attrs)
+        passed, has_opaque_spread, explicit_after_spread = _extract_prop_attrs(attrs)
         merged_props: dict[str, str] = {}
-        for pname, dstate in defaults.items():
-            if pname in passed:
-                merged_props[pname] = passed[pname]
+        for local_name, dstate in defaults.items():
+            src_name = aliases.get(local_name, local_name)
+            if src_name in passed:
+                merged_props[local_name] = passed[src_name]
+            elif has_opaque_spread and src_name not in explicit_after_spread:
+                merged_props[local_name] = "opaque"
             elif dstate in ("named", "dynamic"):
-                merged_props[pname] = "named"
+                merged_props[local_name] = "named"
             else:
-                merged_props[pname] = "empty"
-        for pname, pstate in passed.items():
-            merged_props.setdefault(pname, pstate)
+                merged_props[local_name] = "empty"
+        for src_name, pstate in passed.items():
+            merged_props.setdefault(src_name, pstate)
+
+        effective_inner = inner_status
+        if effective_inner == "empty":
+            if passed.get("children") in ("named", "dynamic"):
+                effective_inner = "named"
+            elif passed.get("children") == "opaque" or (
+                has_opaque_spread and "children" not in explicit_after_spread
+            ):
+                effective_inner = "opaque"
 
         if _parent_props is not None:
             raw_prop_exprs = _extract_prop_raw_exprs(attrs)
+            for local_name, src_name in aliases.items():
+                if src_name in raw_prop_exprs and raw_prop_exprs[src_name] in _parent_props:
+                    merged_props[local_name] = _parent_props[raw_prop_exprs[src_name]]
             for pname, raw_e in raw_prop_exprs.items():
-                if raw_e in _parent_props:
+                if pname not in aliases.values() and raw_e in _parent_props:
                     merged_props[pname] = _parent_props[raw_e]
 
         nested_resolver = make_local_component_resolver(
@@ -1152,7 +1282,7 @@ def make_local_component_resolver(
             imported_components=target_imports,
             component_resolver=nested_resolver,
             prop_values=merged_props,
-            inner_status=inner_status,
+            inner_status=effective_inner,
         )
         return status
 

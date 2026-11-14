@@ -255,3 +255,58 @@ def test_tsx_default_export_and_expression_arrow_a11y_resolution(tmp_path: Path)
     res = TypeScriptReactSpaAdapter().extract(tmp_path, ".")
     disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
     assert [(f.source_file, f.line) for f in disp_005] == [("src/App.tsx", 7)], disp_005
+
+
+def test_tsx_spread_props_and_destructured_aliases_a11y(tmp_path: Path) -> None:
+    """Resolve static spread objects/destructured aliases and keep dynamic spreads unobserved."""
+    from app.adapters.typescript_react import TypeScriptReactSpaAdapter
+
+    (tmp_path / "src" / "components").mkdir(parents=True)
+    (tmp_path / "package.json").write_text('{"dependencies":{"react":"^18.0.0"}}', encoding="utf-8")
+
+    (tmp_path / "src" / "components" / "Label.tsx").write_text(
+        "export function Label({ text }: { text?: string }) {\n  return <span>{text}</span>;\n}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "AliasedLabel.tsx").write_text(
+        "export default function AliasedLabel({ text: caption, fallback: altTxt = '' }: { text?: string; fallback?: string }) {\n"
+        "  return <span>{caption || altTxt}</span>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "components" / "IconOnly.tsx").write_text(
+        "export default function IconOnly({ className }: { className?: string }) {\n"
+        "  return <svg className={className} aria-hidden='true' />;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "App.tsx").write_text(
+        "import { Label } from './components/Label';\n"
+        "import AliasedLabel from './components/AliasedLabel';\n"
+        "import IconOnly from './components/IconOnly';\n"
+        "export function App(extra: Record<string, string>) {\n"
+        "  return (\n"
+        "    <main>\n"
+        "      <button type='button'><Label {...{ text: 'Save' }} /></button>\n"
+        "      <button type='button'><Label {...extra} /></button>\n"
+        "      <button type='button'><Label {...extra} text='' /></button>\n"
+        "      <button type='button'><AliasedLabel text='Save' /></button>\n"
+        "      <button type='button'><AliasedLabel caption='WrongProp' /></button>\n"
+        "      <button type='button'><IconOnly {...extra} /></button>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = TypeScriptReactSpaAdapter().extract(tmp_path, ".")
+    disp_005 = [f for f in res.findings if f.rule_code == "DISP-005"]
+    # Line 7: static spread {text: 'Save'} -> clean; Line 8: dynamic spread -> unobserved
+    # Line 9: explicit text='' after spread -> flagged; Line 10: aliased text='Save' -> clean
+    # Line 11: passing local alias caption= instead of source text= -> flagged; Line 12: pure icon -> flagged
+    assert [(f.source_file, f.line) for f in disp_005] == [
+        ("src/App.tsx", 9),
+        ("src/App.tsx", 11),
+        ("src/App.tsx", 12),
+    ], disp_005
+    assert any("unobserved" in n.lower() for n in res.notes), res.notes
