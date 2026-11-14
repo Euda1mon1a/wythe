@@ -17,6 +17,7 @@ from app.adapters.rust_http import RustHttpAdapter
 from app.adapters.rust_sql_truth import RustSqlTruthAdapter
 from app.adapters.rust_wasm_display import RustWasmDisplayAdapter
 from app.adapters.sql_ddl_truth import SqlDdlTruthAdapter
+from app.adapters.sql_tools_truth import SqlToolsSchemaAdapter
 from app.adapters.sveltekit_display import SvelteKitDisplayAdapter
 from app.adapters.typescript_nextjs import TypeScriptNextJsAdapter
 from app.adapters.typescript_node import TypeScriptNodeAdapter
@@ -33,6 +34,7 @@ def build_default_registry() -> AdapterRegistry:
     registry.register_truth(PrismaSchemaAdapter())
     registry.register_truth(DrizzleOrmAdapter())
     registry.register_truth(KyselySchemaAdapter())
+    registry.register_truth(SqlToolsSchemaAdapter())
     registry.register_truth(DjangoOrmAdapter())
     registry.register_truth(SqlDdlTruthAdapter())
     registry.register_truth(RustSqlTruthAdapter())

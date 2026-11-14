@@ -30,6 +30,7 @@ from app.adapters.ts_reachability import (
     ReachabilityIndex,
     build_nextjs_reachability,
 )
+from app.adapters.ts_sdk import WorkspaceSdkIndex
 from app.adapters.ts_trpc import extract_trpc_client_calls
 from app.adapters.ts_workspace import WorkspaceResolver, extract_ts_import_bindings
 from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
@@ -1417,6 +1418,7 @@ class TypeScriptNextJsAdapter:
         url_const_resolver = build_frontend_url_const_resolver(src_root, _next_exts)
         comp_resolver_for = build_a11y_component_resolver(src_root, _next_exts)
         ws_resolver = WorkspaceResolver.build(repo_root.resolve(), extra_roots=(fe_dir, src_root))
+        sdk_index = WorkspaceSdkIndex.build(repo_root, ws_resolver)
         has_gen_cfg = has_frontend_generator_config(fe_dir)
         unobserved_a11y: list[str] = []
 
@@ -1567,12 +1569,17 @@ class TypeScriptNextJsAdapter:
 
             # 1. Resolve intra-tier imports (including barrel index.ts files)
             imported_Specs = [m.group("spec") for m in _IMPORT_RE.finditer(txt)]
+            sdk_calls, uses_typed_sdk = sdk_index.extract_caller_sdk_calls(
+                fpath,
+                txt,
+                is_tsx=fpath.suffix in (".tsx", ".jsx"),
+            )
             uses_generated_types = has_generated_contract_provenance(
                 imported_Specs,
                 raw_source=raw_texts.get(fpath),
                 source_file=rel_repo,
                 has_generator_config=has_gen_cfg,
-            )
+            ) or uses_typed_sdk
 
             for binding in extract_ts_import_bindings(txt, is_tsx=True):
                 target_path = _resolve_ts_import(binding.spec, fpath, src_root, ws_resolver=ws_resolver)
@@ -1592,9 +1599,16 @@ class TypeScriptNextJsAdapter:
             file_calls = 0
             methods_seen: list[str] = []
             paths_seen: list[str] = []
-            for verb, raw_u, lineno in _extract_ts_http_calls(
-                txt, imported_consts=url_const_resolver(fpath, txt)
-            ):
+            extracted_calls = list(
+                _extract_ts_http_calls(txt, imported_consts=url_const_resolver(fpath, txt))
+            )
+            if sdk_calls:
+                seen_calls = set(extracted_calls)
+                for item in sdk_calls:
+                    if item not in seen_calls:
+                        seen_calls.add(item)
+                        extracted_calls.append(item)
+            for verb, raw_u, lineno in extracted_calls:
                 norm_u = _normalize_ts_url(raw_u)
                 file_calls += 1
                 if verb not in methods_seen:

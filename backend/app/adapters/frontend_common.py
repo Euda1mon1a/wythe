@@ -92,9 +92,9 @@ def resolve_frontend_import(
 ) -> Path | None:
     if spec.startswith(("@/", "~/")):
         base = src_root / spec[2:]
-    elif spec.startswith("$lib/"):
+    elif spec.startswith(("$lib/", "#lib/")):
         lib_dir = src_root / "lib" if (src_root / "lib").is_dir() else src_root
-        base = lib_dir / spec[len("$lib/") :]
+        base = lib_dir / spec[5:]
     elif spec.startswith("."):
         base = (current_file.parent / spec).resolve()
     else:
@@ -339,6 +339,8 @@ def scan_display_module_semantics(
     component_resolver: Callable[[str, str, str], str] | None = None,
     unobserved_a11y_out: list[str] | None = None,
     has_generator_config: bool = False,
+    sdk_calls: tuple[tuple[str, str, int], ...] | list[tuple[str, str, int]] = (),
+    uses_typed_sdk: bool = False,
 ) -> tuple[list[str], list[FrontendHttpCall], list[RawCandidateFinding]]:
     """Extract imports, HTTP calls, and DISP-001..005 findings for a single display node."""
     imported_specs = [m.group("spec") for m in _IMPORT_RE.finditer(cleaned_txt)]
@@ -347,9 +349,15 @@ def scan_display_module_semantics(
         raw_source=raw_source,
         source_file=rel_repo,
         has_generator_config=has_generator_config,
-    )
+    ) or uses_typed_sdk
 
     raw_calls = list(_extract_ts_http_calls(cleaned_txt, imported_consts=imported_url_consts))
+    if sdk_calls:
+        seen_calls = set(raw_calls)
+        for item in sdk_calls:
+            if item not in seen_calls:
+                seen_calls.add(item)
+                raw_calls.append(item)
     for vm in _VUE_SFC_FETCH_RE.finditer(cleaned_txt):
         raw_tail = vm.group("tail")
         pdepth = 1

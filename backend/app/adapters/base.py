@@ -256,6 +256,17 @@ class AdapterRegistry:
                 ],
             ),
             AdapterSlotSchema(
+                name="sql-tools",
+                tier="truth",
+                language="TypeScript / SQL",
+                frameworks=["PostgreSQL", "@immich/sql-tools", "Kysely"],
+                implementation_status="experimental",
+                capabilities=[
+                    "@immich/sql-tools @Table, column, ForeignKeyColumn, and registered SQL function extraction",
+                    "Trigger/FK guard attribution, partial-evidence constraint notes, and live catalog probe",
+                ],
+            ),
+            AdapterSlotSchema(
                 name="django-orm",
                 tier="truth",
                 language="Python / SQL",
