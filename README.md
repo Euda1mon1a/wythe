@@ -152,7 +152,9 @@ and writes, owner comparisons, line evidence and unknowns. It always leaves
 runtime enforcement **unknown**. The demonstration checks two identities, HTTP
 responses and database contents in fresh in-memory applications: the same
 regression fails before the example repair and passes afterward. Neither command
-tests a live target. See the [scope, limitations and exit codes](docs/architecture/record-ownership.md).
+tests a live target. See the [scope, limitations and exit codes](docs/architecture/record-ownership.md)
+and [SECURITY.md](SECURITY.md) for non-certification bounds, isolated
+`wythe_examples` packaging, and local-bind rules.
 
 ---
 
