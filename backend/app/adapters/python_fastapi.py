@@ -143,6 +143,37 @@ def _classify_manipulator(rel_inside_app: str) -> tuple[str, str]:
     return "service", head or "services"
 
 
+def _is_passive_imported_symbol(
+    imported_sym: str,
+    pm: ParsedPythonModule,
+    pm_parent: ParsedPythonModule | None,
+) -> bool:
+    """Return True when `imported_sym` is a constant or exception class in a callable service module."""
+    if pm_parent is None or not pm_parent.defined:
+        return False
+    has_attr_call = any(c.startswith(f"{imported_sym}.") for c in pm.called)
+    if imported_sym not in pm.called and not has_attr_call:
+        stripped = imported_sym.lstrip("_")
+        if stripped and stripped.isupper():
+            return True
+        if (
+            pm_parent is not None
+            and imported_sym not in pm_parent.defined
+            and imported_sym not in pm_parent.import_targets
+            and not any(m.endswith(".*") for m in pm_parent.imported_modules)
+        ):
+            return True
+    if pm_parent is not None and imported_sym in pm_parent.class_bases and not has_attr_call:
+        bases = pm_parent.class_bases.get(imported_sym, ())
+        pub_methods = pm_parent.class_attrs.get(imported_sym, frozenset()) & pm_parent.method_defs
+        if not pub_methods and (
+            imported_sym.endswith(("Error", "Exception", "Refusal", "Warning"))
+            or any(b.endswith(("Error", "Exception", "BaseException", "Warning")) for b in bases)
+        ):
+            return True
+    return False
+
+
 class _ImportResolver:
     """Maps an imported name to manipulator nodes.
 
@@ -237,11 +268,20 @@ class _ImportResolver:
     def targets(self, imp: str, pm: ParsedPythonModule) -> list[tuple[str, str]]:
         """(node id, evidence) pairs that the import entry `imp` of module `pm` reaches."""
         target_nid = self.mod_to_node.get(imp)
+        if target_nid is not None and any(m.startswith(f"{imp}.") for m in pm.imported_modules):
+            mod_leaf = imp.rpartition(".")[2] or imp
+            if (
+                mod_leaf not in pm.called
+                and not any(c.startswith((f"{mod_leaf}.", f"{imp}.")) for c in pm.called)
+            ):
+                target_nid = None
         if target_nid is None and "." in imp:
             parent_mod, _, imported_sym = imp.rpartition(".")
             cand_nid = self.mod_to_node.get(parent_mod)
             if cand_nid and imported_sym in pm.called | pm.reads:
-                target_nid = cand_nid
+                pm_parent = self.parsed_by_mod.get(parent_mod)
+                if not _is_passive_imported_symbol(imported_sym, pm, pm_parent):
+                    target_nid = cand_nid
         if target_nid:
             return [(target_nid, f"Imports and invokes `{imp}`.")]
         pkg, _, sym = (imp, "", "") if imp in self.exports else imp.rpartition(".")
@@ -420,28 +460,66 @@ class PythonFastApiAdapter:
                 for mname, def_nid in raw_class_methods[(nid, cname)].items():
                     method_to_class_profiles.setdefault(mname, []).append((def_nid, nid, full_attrs))
         edges: list[AtlasEdge] = []
-        seen_edges: set[tuple[str, str, str]] = set()
+        edge_idx_by_key: dict[tuple[str, str, str], int] = {}
         routes: list[RouteDescriptor] = []
         findings: list[RawCandidateFinding] = []
         table_readers: dict[str, set[str]] = {}
         table_writers: dict[str, set[str]] = {}
         precise = bool(truth.class_modules)
         model_modules = frozenset(truth.model_modules) | frozenset().union(*truth.class_modules.values())
+        parsed_by_nid: dict[str, ParsedPythonModule] = {
+            nodes_by_rel[rel_a].id: pm_a for rel_a, pm_a in parsed_modules.items()
+        }
+        all_other_modules: list[ParsedPythonModule] = [
+            *parsed_modules.values(),
+            *caller_only,
+            *packages.values(),
+        ]
+        global_ref_counts: dict[str, int] = {}
+        own_ref_tokens: dict[int, set[str]] = {}
+        for m_item in all_other_modules:
+            toks = set(m_item.called) | set(m_item.reads)
+            for imp_m in m_item.imported_modules:
+                if "." in imp_m:
+                    toks.add(imp_m.rpartition(".")[2])
+            own_ref_tokens[id(m_item)] = toks
+            for tok in toks:
+                global_ref_counts[tok] = global_ref_counts.get(tok, 0) + 1
 
-        def add_edge(src: str, dst: str, kind: str, path: str, note: str) -> None:
+        def add_edge(
+            src: str,
+            dst: str,
+            kind: str,
+            path: str,
+            note: str,
+            *,
+            verification: str = "verified",
+            symbol_links: list[str] | None = None,
+        ) -> None:
             key = (src, dst, kind)
-            if src == dst or key in seen_edges:
+            if src == dst:
                 return
-            seen_edges.add(key)
+            links = list(dict.fromkeys(symbol_links or ()))
+            if key in edge_idx_by_key:
+                existing = edges[edge_idx_by_key[key]]
+                if links:
+                    merged = list(dict.fromkeys([*existing.symbol_links, *links]))
+                    existing.symbol_links = merged
+                if existing.verification != "verified" and verification == "verified":
+                    existing.verification = "verified"  # type: ignore[assignment]
+                    existing.evidence_note = note
+                return
+            edge_idx_by_key[key] = len(edges)
             edges.append(
                 AtlasEdge(
                     id=f"e:{src}->{dst}:{kind}",
                     source_id=src,
                     target_id=dst,
                     kind=kind,  # type: ignore[arg-type]
-                    verification="verified",
+                    verification=verification,  # type: ignore[arg-type]
                     evidence_path=path,
                     evidence_note=note,
+                    symbol_links=links,
                 )
             )
 
@@ -449,84 +527,8 @@ class PythonFastApiAdapter:
             node = nodes_by_rel[rel_app]
             nid = node.id
 
-            # 1. Manipulate -> Truth (ORM + SQL reads & writes)
-            matched_reads: set[str] = set()
-            write_line: dict[str, int] = {}
-            for sym in pm.sql_reads:
-                tid = _sql_table_id(truth, sym)
-                if tid:
-                    matched_reads.add(tid)
-            for sym in pm.reads:
-                tid = _ast_table_id(truth, pm, sym, model_modules)
-                if tid:
-                    matched_reads.add(tid)
-            ast_writes = (
-                pm.persisted | (pm.constructed if pm.has_session_writes else frozenset())
-                if precise
-                else pm.writes
-            )
-            for sym, resolver in (
-                *((s, _sql_table_id) for s in pm.sql_writes),
-                *((s, None) for s in ast_writes),
-            ):
-                tid = resolver(truth, sym) if resolver else _ast_table_id(truth, pm, sym, model_modules)
-                if tid:
-                    line = pm.write_lines.get(sym, 1)
-                    write_line[tid] = min(write_line.get(tid, line), line)
-            matched_writes = set(write_line)
-
-            for tid in sorted(matched_reads):
-                table_readers.setdefault(tid, set()).add(nid)
-                add_edge(nid, tid, "reads_truth", pm.rel_path, f"AST verified read of `{tid.removeprefix('t:')}`.")
-            for tid in sorted(matched_writes):
-                table_writers.setdefault(tid, set()).add(nid)
-                add_edge(nid, tid, "writes_truth", pm.rel_path, f"AST verified write to `{tid.removeprefix('t:')}`.")
-                if node.subkind == "route":
-                    findings.append(
-                        RawCandidateFinding(
-                            rule_code="TRUTH-003",
-                            node_id=nid,
-                            source_file=pm.rel_path,
-                            line=write_line[tid],
-                            title=f"HTTP route `{node.label}` writes `{tid.removeprefix('t:')}` directly",
-                            detail=f"{pm.rel_path} mutates `{tid.removeprefix('t:')}` inside the route layer rather than delegating to a transactional service door.",
-                            remediation="Move persistence mutations into an audited domain service or SQL write-lane function.",
-                        )
-                    )
-
-            for fn_call in pm.sql_calls | pm.called:
-                fn_id = truth.function_symbol_map.get(fn_call.lower())
-                if fn_id:
-                    add_edge(nid, fn_id, "guards_truth", pm.rel_path, f"Calls PostgreSQL function `{fn_call}`.")
-
-            # 2. Manipulate -> Manipulate (module imports + called symbols)
-            for imp in pm.imported_modules:
-                for target_nid, note in import_resolver.targets(imp, pm):
-                    add_edge(nid, target_nid, "calls_helper", pm.rel_path, note)
-
-            for called_sym in pm.symbol_calls:
-                defs = symbol_to_defining_nodes.get(called_sym, [])
-                if len(defs) == 1:
-                    add_edge(nid, defs[0], "calls_helper", pm.rel_path, f"Calls `{called_sym}()` across manipulation tier.")
-            for called_sym, req_attrs in pm.param_method_calls:
-                matches = [
-                    (def_nid, own_nid)
-                    for def_nid, own_nid, cattrs in method_to_class_profiles.get(called_sym, ())
-                    if req_attrs <= cattrs
-                ]
-                definers = {def_nid for def_nid, _ in matches}
-                owners = {own_nid for _, own_nid in matches}
-                targets = (*(definers if len(definers) == 1 else ()), *(owners if len(owners) == 1 else ()))
-                for target_cand in dict.fromkeys(targets):
-                    add_edge(
-                        nid,
-                        target_cand,
-                        "calls_helper",
-                        pm.rel_path,
-                        f"Calls `{called_sym}()` across manipulation tier.",
-                    )
-
-            # 3. Route descriptors
+            # 0. Route descriptors (computed first so route HTTP keys are available for symbol_links)
+            handler_route_keys: dict[str, list[str]] = {}
             if pm.route_handlers:
                 stem = Path(rel_app).stem
                 mounts = router_mounts.get(stem) or [""]
@@ -535,6 +537,10 @@ class PythonFastApiAdapter:
                 for mount_prefix in mounts:
                     for h in pm.route_handlers:
                         full_p = _join_http_path(mount_prefix, pm.router_prefix, h.subpath)
+                        rk = f"{h.http_method} {full_p}"
+                        rkeys = handler_route_keys.setdefault(h.func_name, [])
+                        if rk not in rkeys:
+                            rkeys.append(rk)
                         if h.http_method not in methods_seen:
                             methods_seen.append(h.http_method)
                         if full_p not in paths_seen:
@@ -553,6 +559,217 @@ class PythonFastApiAdapter:
                         )
                 node.http_methods = methods_seen
                 node.http_paths = paths_seen[:25]
+
+            def _expand_scopes(
+                raw_scopes: set[str],
+                _rkeys: dict[str, list[str]] = handler_route_keys,
+            ) -> list[str]:
+                out: list[str] = []
+                for sc in sorted(raw_scopes):
+                    out.append(sc)
+                    out.extend(_rkeys.get(sc, ()))
+                return out
+
+            pm_own_toks = own_ref_tokens.get(id(pm), set())
+            ext_refs = {
+                fn
+                for fn in pm.top_level_defs
+                if global_ref_counts.get(fn, 0) > (1 if fn in pm_own_toks else 0)
+            }
+
+            seed_live_scopes: set[str] = (
+                {"*"}
+                | set(pm.decorated_funcs)
+                | set(pm.class_attrs)
+                | set(pm.method_defs)
+                | {
+                    fn
+                    for fn in pm.top_level_defs
+                    if fn in ext_refs
+                    or fn in pm.func_calls.get("*", ())
+                    or any(
+                        fn in pm.func_calls.get(m, ())
+                        for m in (set(pm.class_attrs) | set(pm.method_defs) | set(pm.decorated_funcs))
+                    )
+                }
+            )
+            live_scopes = set(seed_live_scopes) | {
+                cal
+                for sc in seed_live_scopes
+                for cal in pm.func_calls.get(sc, ())
+                if cal in pm.top_level_defs
+            }
+            top_funcs = pm.top_level_defs - set(pm.class_attrs)
+            has_selective_liveness = bool(
+                node.subkind in ("service", "solver")
+                and (top_funcs & live_scopes)
+                and (top_funcs - live_scopes)
+            )
+
+            # 1. Manipulate -> Truth (ORM + SQL reads & writes)
+            matched_reads: set[str] = set()
+            verified_read_scopes: dict[str, set[str]] = {}
+            declared_read_scopes: dict[str, set[str]] = {}
+            write_line: dict[str, int] = {}
+            write_scopes_by_tid: dict[str, set[str]] = {}
+            for sym, is_sql in (
+                *((s, True) for s in pm.sql_reads),
+                *((s, False) for s in pm.reads),
+            ):
+                tid = _sql_table_id(truth, sym) if is_sql else _ast_table_id(truth, pm, sym, model_modules)
+                if not tid:
+                    continue
+                r_scopes = {sc for sc, rsyms in pm.func_reads.items() if sym in rsyms} or {"*"}
+                if has_selective_liveness and r_scopes.isdisjoint(live_scopes):
+                    declared_read_scopes.setdefault(tid, set()).update(r_scopes)
+                else:
+                    matched_reads.add(tid)
+                    active_r = (r_scopes & live_scopes) if has_selective_liveness else r_scopes
+                    verified_read_scopes.setdefault(tid, set()).update(active_r or {"*"})
+
+            ast_writes = (
+                pm.persisted | (pm.constructed if pm.has_session_writes else frozenset())
+                if precise
+                else pm.writes
+            )
+            for sym, resolver in (
+                *((s, _sql_table_id) for s in pm.sql_writes),
+                *((s, None) for s in ast_writes),
+            ):
+                tid = resolver(truth, sym) if resolver else _ast_table_id(truth, pm, sym, model_modules)
+                if tid:
+                    line = pm.write_lines.get(sym, 1)
+                    write_line[tid] = min(write_line.get(tid, line), line)
+                    w_scopes = {sc for sc, wsyms in pm.func_writes.items() if sym in wsyms} or {"*"}
+                    write_scopes_by_tid.setdefault(tid, set()).update(w_scopes)
+            matched_writes = set(write_line)
+
+            for tid in sorted(matched_reads):
+                table_readers.setdefault(tid, set()).add(nid)
+                slinks = [f"{sc}->*" for sc in _expand_scopes(verified_read_scopes.get(tid, {"*"}))]
+                add_edge(
+                    nid,
+                    tid,
+                    "reads_truth",
+                    pm.rel_path,
+                    f"AST verified read of `{tid.removeprefix('t:')}`.",
+                    symbol_links=slinks,
+                )
+            for tid in sorted(set(declared_read_scopes) - matched_reads):
+                u_funcs = sorted(declared_read_scopes[tid])
+                slinks = [f"{sc}->*" for sc in _expand_scopes(set(u_funcs))]
+                add_edge(
+                    nid,
+                    tid,
+                    "reads_truth",
+                    pm.rel_path,
+                    f"Uncalled function `{u_funcs[0]}()` declares read of `{tid.removeprefix('t:')}` (0 callers).",
+                    verification="declared",
+                    symbol_links=slinks,
+                )
+            for tid in sorted(matched_writes):
+                table_writers.setdefault(tid, set()).add(nid)
+                slinks = [f"{sc}->*" for sc in _expand_scopes(write_scopes_by_tid.get(tid, {"*"}))]
+                add_edge(
+                    nid,
+                    tid,
+                    "writes_truth",
+                    pm.rel_path,
+                    f"AST verified write to `{tid.removeprefix('t:')}`.",
+                    symbol_links=slinks,
+                )
+                if node.subkind == "route":
+                    findings.append(
+                        RawCandidateFinding(
+                            rule_code="TRUTH-003",
+                            node_id=nid,
+                            source_file=pm.rel_path,
+                            line=write_line[tid],
+                            title=f"HTTP route `{node.label}` writes `{tid.removeprefix('t:')}` directly",
+                            detail=f"{pm.rel_path} mutates `{tid.removeprefix('t:')}` inside the route layer rather than delegating to a transactional service door.",
+                            remediation="Move persistence mutations into an audited domain service or SQL write-lane function.",
+                        )
+                    )
+
+            for fn_call in pm.sql_calls | pm.called:
+                fn_id = truth.function_symbol_map.get(fn_call.lower())
+                if fn_id:
+                    g_scopes = {sc for sc, csyms in pm.func_calls.items() if fn_call in csyms} or {"*"}
+                    slinks = [f"{sc}->*" for sc in _expand_scopes(g_scopes)]
+                    add_edge(
+                        nid,
+                        fn_id,
+                        "guards_truth",
+                        pm.rel_path,
+                        f"Calls PostgreSQL function `{fn_call}`.",
+                        symbol_links=slinks,
+                    )
+
+            def _helper_links(
+                target_cand: str,
+                explicit_sym: str | None = None,
+                _pm: ParsedPythonModule = pm,
+                _expand: object = _expand_scopes,
+            ) -> list[str]:
+                t_pm = parsed_by_nid.get(target_cand)
+                if t_pm is None:
+                    return []
+                t_defs = (t_pm.defined | set(t_pm.class_attrs)) - {
+                    s for s in t_pm.defined if _is_passive_imported_symbol(s, _pm, t_pm)
+                }
+                pairs: list[str] = []
+                for sc, c_syms in sorted(_pm.func_calls.items()):
+                    matched_callees = set(c_syms & t_defs)
+                    if explicit_sym and explicit_sym in c_syms:
+                        matched_callees.add(explicit_sym)
+                    if not matched_callees:
+                        continue
+                    for caller_k in _expand({sc}):  # type: ignore[operator]
+                        for cal in sorted(matched_callees):
+                            pairs.append(f"{caller_k}->{cal}")
+                return pairs
+
+            # 2. Manipulate -> Manipulate (module imports + called symbols)
+            for imp in pm.imported_modules:
+                for target_nid, note in import_resolver.targets(imp, pm):
+                    add_edge(
+                        nid,
+                        target_nid,
+                        "calls_helper",
+                        pm.rel_path,
+                        note,
+                        symbol_links=_helper_links(target_nid),
+                    )
+
+            for called_sym in pm.symbol_calls:
+                defs = symbol_to_defining_nodes.get(called_sym, [])
+                if len(defs) == 1:
+                    add_edge(
+                        nid,
+                        defs[0],
+                        "calls_helper",
+                        pm.rel_path,
+                        f"Calls `{called_sym}()` across manipulation tier.",
+                        symbol_links=_helper_links(defs[0], called_sym),
+                    )
+            for called_sym, req_attrs in pm.param_method_calls:
+                matches = [
+                    (def_nid, own_nid)
+                    for def_nid, own_nid, cattrs in method_to_class_profiles.get(called_sym, ())
+                    if req_attrs <= cattrs
+                ]
+                definers = {def_nid for def_nid, _ in matches}
+                owners = {own_nid for _, own_nid in matches}
+                targets = (*(definers if len(definers) == 1 else ()), *(owners if len(owners) == 1 else ()))
+                for target_cand in dict.fromkeys(targets):
+                    add_edge(
+                        nid,
+                        target_cand,
+                        "calls_helper",
+                        pm.rel_path,
+                        f"Calls `{called_sym}()` across manipulation tier.",
+                        symbol_links=_helper_links(target_cand, called_sym),
+                    )
 
             # 4. MANIP-001 & MANIP-002 checks
             if not rel_app.startswith("adapters/"):
@@ -632,28 +849,71 @@ class PythonFastApiAdapter:
             for imp in cpm.imported_modules:
                 for target_nid, _ in import_resolver.targets(imp, cpm):
                     inbound_callers[target_nid] = inbound_callers.get(target_nid, 0) + 1
-        for rel_app, node in nodes_by_rel.items():
-            if (
-                node.subkind in ("service", "solver")
-                and not rel_app.endswith("main.py")
-                and inbound_callers.get(node.id, 0) == 0
-                and not rel_app.startswith("adapters/")
-            ):
-                if node.status == "clean":
-                    node.status = "unwired"
-                findings.append(
-                    RawCandidateFinding(
-                        rule_code="MANIP-003",
-                        node_id=node.id,
-                        source_file=node.source_file,
-                        line=node.line,
-                        title=f"Manipulator `{node.label}` has no discovered inbound callers",
-                        detail=(f"No static route, CLI, task, or peer service reference to `{node.source_file}` "
-                                "was resolved. Dynamic registration and external entry points may be unobserved; "
-                                "this is not proof that the module is unused or safe to delete."),
-                        remediation="Check dynamic and external callers before wiring, refactoring, or removing the module.",
-                    )
+        unwired_rels = [
+            rel_app
+            for rel_app, node in nodes_by_rel.items()
+            if node.subkind in ("service", "solver")
+            and not rel_app.endswith("main.py")
+            and inbound_callers.get(node.id, 0) == 0
+            and not rel_app.startswith("adapters/")
+        ]
+        mod_to_test_files: dict[str, list[str]] = {}
+        if unwired_rels:
+            pkg_rx = re.compile(rf"\b{re.escape(package_name)}(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+            seen_tpaths: set[Path] = set()
+            for tdir in (repo_root / backend_subdir / "tests", repo_root / "tests"):
+                if not tdir.is_dir():
+                    continue
+                for tf in sorted(tdir.rglob("*.py")):
+                    if tf.is_symlink() or tf in seen_tpaths:
+                        continue
+                    seen_tpaths.add(tf)
+                    try:
+                        t_txt = tf.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        continue
+                    if package_name not in t_txt:
+                        continue
+                    t_rel = tf.relative_to(repo_root).as_posix()
+                    for m_tok in set(pkg_rx.findall(t_txt)):
+                        parts_t = m_tok.split(".")
+                        for k in range(2, len(parts_t) + 1):
+                            prefix_m = ".".join(parts_t[:k])
+                            mod_to_test_files.setdefault(prefix_m, []).append(t_rel)
+
+        for rel_app in unwired_rels:
+            node = nodes_by_rel[rel_app]
+            pm_u = parsed_modules.get(rel_app)
+            if node.status == "clean":
+                node.status = "unwired"
+            dotted_rel = rel_app.removesuffix(".py").replace("/", ".")
+            mod_full = pm_u.module_name if pm_u else f"{package_name}.{dotted_rel}"
+            test_hits = mod_to_test_files.get(mod_full, [])
+            title_suffix = (
+                f" (referenced in {len(test_hits)} test file(s): `{test_hits[0]}`)"
+                if test_hits
+                else ""
+            )
+            test_note = (
+                f" Referenced in {len(test_hits)} test file(s) (e.g. `{test_hits[0]}`) with 0 non-test callers."
+                if test_hits
+                else ""
+            )
+            findings.append(
+                RawCandidateFinding(
+                    rule_code="MANIP-003",
+                    node_id=node.id,
+                    source_file=node.source_file,
+                    line=node.line,
+                    title=f"Manipulator `{node.label}` has no discovered inbound callers{title_suffix}",
+                    detail=(
+                        f"No static route, CLI, task, or peer service reference to `{node.source_file}` "
+                        f"was resolved.{test_note} Dynamic registration and external entry points may be unobserved; "
+                        "this is not proof that the module is unused or safe to delete."
+                    ),
+                    remediation="Check dynamic and external callers before wiring, refactoring, or removing the module.",
                 )
+            )
 
         return ManipulatorExtractionResult(
             nodes=list(nodes_by_rel.values()),

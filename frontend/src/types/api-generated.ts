@@ -609,6 +609,8 @@ export interface components {
             evidence_path?: string | null;
             /** Evidence Note */
             evidence_note: string;
+            /** Symbol Links */
+            symbol_links?: string[];
         };
         /** AtlasNode */
         AtlasNode: {

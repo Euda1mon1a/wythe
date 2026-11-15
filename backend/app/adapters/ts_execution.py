@@ -34,6 +34,68 @@ class ModuleExecution:
     exports: dict[str, str]
 
 
+def _is_inert_initializer(raw: bytes, node: Any) -> bool:
+    unwrapped = _unwrap_cst_expr(node)
+    if unwrapped.type in (
+        "arrow_function",
+        "function_expression",
+        "generator_function",
+        "identifier",
+        "number",
+        "string",
+        "template_string",
+        "true",
+        "false",
+        "null",
+        "undefined",
+        "regex",
+    ):
+        if unwrapped.type == "template_string":
+            return all(
+                c.type == "string_fragment" or _is_inert_initializer(raw, c)
+                for c in unwrapped.named_children
+            )
+        return True
+    if unwrapped.type in ("binary_expression", "unary_expression", "SpreadElement", "spread_element"):
+        return all(
+            _is_inert_initializer(raw, c)
+            for c in unwrapped.named_children
+            if c.type != "comment"
+        )
+    if unwrapped.type == "new_expression":
+        ctor = unwrapped.child_by_field_name("constructor")
+        args = unwrapped.child_by_field_name("arguments")
+        if ctor is not None and ctor.type == "identifier" and _text(raw, ctor) in ("Set", "Map", "RegExp", "Error"):
+            if args is None:
+                return True
+            return all(
+                _is_inert_initializer(raw, c)
+                for c in args.named_children
+                if c.type != "comment"
+            )
+        return False
+    if unwrapped.type == "array":
+        return all(
+            _is_inert_initializer(raw, c)
+            for c in unwrapped.named_children
+            if c.type != "comment"
+        )
+    if unwrapped.type == "object":
+        for c in unwrapped.named_children:
+            if c.type == "comment":
+                continue
+            if c.type != "pair":
+                return False
+            k = c.child_by_field_name("key")
+            v = c.child_by_field_name("value")
+            if k is None or k.type not in ("property_identifier", "string", "number") or v is None:
+                return False
+            if not _is_inert_initializer(raw, v):
+                return False
+        return True
+    return False
+
+
 def module_execution(source: str) -> ModuleExecution | None:
     """Return eager declaration names and top-level statements, excluding lazy functions."""
     parsed = _parse(source)
@@ -84,7 +146,7 @@ def module_execution(source: str) -> ModuleExecution | None:
                 if value is None:
                     continue
                 value = _unwrap_cst_expr(value)
-                if value.type in ("arrow_function", "function_expression", "generator_function"):
+                if _is_inert_initializer(raw, value):
                     continue
                 if name is not None and name.type == "identifier":
                     eager.add(_text(raw, name))
@@ -124,8 +186,12 @@ def module_execution(source: str) -> ModuleExecution | None:
         elif node.type not in (
             "import_statement", "comment", "function_declaration",
             "generator_function_declaration", "interface_declaration",
-            "type_alias_declaration", "ambient_declaration",
+            "type_alias_declaration", "ambient_declaration", "enum_declaration",
         ):
+            if node.type == "expression_statement":
+                expr_children = [c for c in node.named_children if c.type != "comment"]
+                if len(expr_children) == 1 and expr_children[0].type == "string":
+                    continue
             statements.append(_text(raw, node))
     return ModuleExecution(eager, "\n".join(statements), ranges, bodies, exports)
 

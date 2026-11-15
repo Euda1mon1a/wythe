@@ -56,18 +56,67 @@ def _count_section(included: int, eligible: int) -> ConeSectionCount:
     )
 
 
-def _bfs_ordered_list(seeds: list[str], adj: dict[str, list[str]], valid_ids: set[str]) -> list[str]:
+def _parse_symbol_pairs(links: list[str]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for item in links:
+        caller, sep, callee = item.partition("->")
+        if sep and caller and callee:
+            pairs.append((caller, callee))
+    return pairs
+
+
+def _bfs_cone_direction(
+    seeds: list[str],
+    edges_by_node: dict[str, list[tuple[AtlasEdge, str]]],
+    valid_ids: set[str],
+    *,
+    reverse: bool,
+) -> tuple[list[str], set[str]]:
+    active_syms: dict[str, set[str]] = {sid: {"*"} for sid in seeds}
     visited: set[str] = set(seeds)
     ordered: list[str] = []
+    traversed_edge_ids: set[str] = set()
     q: deque[str] = deque(seeds)
     while q:
         cur = q.popleft()
-        for nxt in adj.get(cur, ()):
-            if nxt in valid_ids and nxt not in visited:
-                visited.add(nxt)
-                ordered.append(nxt)
+        cur_syms = active_syms.get(cur, {"*"})
+        for edge, nxt in edges_by_node.get(cur, ()):
+            if nxt not in valid_ids:
+                continue
+            pairs = _parse_symbol_pairs(edge.symbol_links)
+            if pairs:
+                if reverse:
+                    next_syms = {
+                        caller
+                        for caller, callee in pairs
+                        if "*" in cur_syms or callee == "*" or callee in cur_syms
+                    }
+                else:
+                    next_syms = {
+                        callee
+                        for caller, callee in pairs
+                        if "*" in cur_syms or caller == "*" or caller in cur_syms
+                    }
+                if not next_syms:
+                    continue
+            else:
+                if "*" not in cur_syms:
+                    continue
+                next_syms = {"*"}
+            traversed_edge_ids.add(edge.id)
+            prev_nxt = active_syms.get(nxt)
+            if prev_nxt is None:
+                active_syms[nxt] = set(next_syms)
+                if nxt not in visited:
+                    visited.add(nxt)
+                    ordered.append(nxt)
                 q.append(nxt)
-    return ordered
+            else:
+                added = next_syms - prev_nxt
+                if added:
+                    prev_nxt.update(added)
+                    q.append(nxt)
+    return ordered, traversed_edge_ids
 
 
 def _interleave_cone_nodes(
@@ -355,24 +404,28 @@ def build_lineage_cone_slice(
 
     nodes_by_id = {n.id: n for n in report.nodes}
     valid_ids = set(nodes_by_id)
-    fwd_raw: dict[str, list[tuple[tuple[int, str, str, str], str]]] = {}
-    rev_raw: dict[str, list[tuple[tuple[int, str, str, str], str]]] = {}
+    seed_ids = [n.id for n in seeds]
+    seed_set = set(seed_ids)
+    fwd_raw: dict[str, list[tuple[tuple[int, str, str, str], AtlasEdge, str]]] = {}
+    rev_raw: dict[str, list[tuple[tuple[int, str, str, str], AtlasEdge, str]]] = {}
     for e in report.edges:
-        fwd_raw.setdefault(e.source_id, []).append((_edge_sort_key(e, e.target_id), e.target_id))
-        rev_raw.setdefault(e.target_id, []).append((_edge_sort_key(e, e.source_id), e.source_id))
-    fwd_adj = {
-        k: list(dict.fromkeys(nid for _, nid in sorted(v, key=lambda item: item[0])))
+        is_seed_edge = e.source_id in seed_set or e.target_id in seed_set
+        if not is_seed_edge and e.verification != "verified":
+            continue
+        fwd_raw.setdefault(e.source_id, []).append((_edge_sort_key(e, e.target_id), e, e.target_id))
+        rev_raw.setdefault(e.target_id, []).append((_edge_sort_key(e, e.source_id), e, e.source_id))
+    fwd_edges_by_node = {
+        k: [(edge, nid) for _, edge, nid in sorted(v, key=lambda item: item[0])]
         for k, v in fwd_raw.items()
     }
-    rev_adj = {
-        k: list(dict.fromkeys(nid for _, nid in sorted(v, key=lambda item: item[0])))
+    rev_edges_by_node = {
+        k: [(edge, nid) for _, edge, nid in sorted(v, key=lambda item: item[0])]
         for k, v in rev_raw.items()
     }
 
-    seed_ids = [n.id for n in seeds]
-    seed_set = set(seed_ids)
-    down_order = _bfs_ordered_list(seed_ids, fwd_adj, valid_ids)
-    up_order = _bfs_ordered_list(seed_ids, rev_adj, valid_ids)
+    down_order, down_edge_ids = _bfs_cone_direction(seed_ids, fwd_edges_by_node, valid_ids, reverse=False)
+    up_order, up_edge_ids = _bfs_cone_direction(seed_ids, rev_edges_by_node, valid_ids, reverse=True)
+    traversed_edge_ids = down_edge_ids | up_edge_ids
     full_cone_ids = seed_set | set(down_order) | set(up_order)
     budget = None if full else max(max_nodes, len(seed_ids))
     cone_ids = _interleave_cone_nodes(seed_ids, down_order, up_order, budget=budget)
@@ -383,7 +436,11 @@ def build_lineage_cone_slice(
     truth_ptrs = [_to_llm_pointer(n) for n in cone_nodes if n.tier == "truth"]
 
     eligible_edges = [
-        e for e in report.edges if e.source_id in full_cone_ids and e.target_id in full_cone_ids
+        e
+        for e in report.edges
+        if e.source_id in full_cone_ids
+        and e.target_id in full_cone_ids
+        and (e.id in traversed_edge_ids or e.source_id in seed_set or e.target_id in seed_set)
     ]
     in_cone_edges = sorted(
         (e for e in eligible_edges if e.source_id in cone_ids and e.target_id in cone_ids),

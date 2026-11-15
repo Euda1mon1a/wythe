@@ -3,7 +3,7 @@
   "info": {
     "title": "Wythe API",
     "description": "Why -> Therefore: 3-tier architecture & lineage verifier. PostgreSQL holds truth, Backend manipulates truth, UI displays truth.",
-    "version": "0.2.0"
+    "version": "0.2.1"
   },
   "paths": {
     "/api/v1/adapters/slots": {
@@ -1871,6 +1871,13 @@
           "evidence_note": {
             "type": "string",
             "title": "Evidence Note"
+          },
+          "symbol_links": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Symbol Links"
           }
         },
         "additionalProperties": false,

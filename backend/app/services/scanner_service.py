@@ -439,6 +439,7 @@ def _solve_cross_tier_lineage(
             candidate_pages = upstream_pages(call.caller_node_id)
         for rdesc in matched_routes:
             ekey = (call.caller_node_id, rdesc.node_id, kind)
+            route_link = f"*->{rdesc.http_method} {rdesc.full_path}"
             new_edge = AtlasEdge(
                 id=f"e:{call.caller_node_id}->{rdesc.node_id}:{kind}",
                 source_id=call.caller_node_id,
@@ -447,6 +448,7 @@ def _solve_cross_tier_lineage(
                 verification=edge_verification,
                 evidence_path=call.source_file,
                 evidence_note=f"`{call.http_method} {call.normalized_path}` -> `{rdesc.full_path}`",
+                symbol_links=[route_link],
             )
             existing_idx = seen_edges.get(ekey)
             if existing_idx is None:
@@ -455,6 +457,11 @@ def _solve_cross_tier_lineage(
             elif not is_inactive and cross_edges[existing_idx].verification == "declared":
                 # Active usage supersedes an earlier inactive/declared call to the same endpoint node.
                 cross_edges[existing_idx] = new_edge
+            elif (
+                is_inactive == (cross_edges[existing_idx].verification == "declared")
+                and route_link not in cross_edges[existing_idx].symbol_links
+            ):
+                cross_edges[existing_idx].symbol_links.append(route_link)
             if is_inactive:
                 continue
 
