@@ -13,12 +13,17 @@ from pathlib import Path
 import uvicorn
 
 from app.adapters.autodetect import detect_repository_stack
+from app.adapters.plugin_registry import ENTRY_POINT_GROUP, list_registered_plugins
 from app.core.config import load_settings
 from app.db.session import get_session_factory
 from app.main import create_app, initialize_database
 from app.models import TargetProject
 from app.schemas.atlas import TargetProjectCreate
 from app.security_cli import add_security_parser, run_security_command
+from app.services.companion_export_service import (
+    build_openlineage_static_bundle,
+    summarize_companion_security_artifacts,
+)
 from app.services.diff_and_sarif_service import (
     build_sarif_log,
     run_target_diff,
@@ -215,7 +220,42 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--strict", action="store_true", help="Ignore ratchet baselines")
     p_scan.add_argument("--json", dest="json_out", default=None, help="Write full JSON report to file")
     p_scan.add_argument("--sarif", dest="sarif_out", default=None, help="Write SARIF 2.1.0 report to file")
+    p_scan.add_argument("--trivy-report", default=None, help="Optional read-only Trivy JSON/SARIF report")
+    p_scan.add_argument("--syft-sbom", default=None, help="Optional read-only Syft CycloneDX/SPDX JSON SBOM")
+    p_scan.add_argument(
+        "--companion-out",
+        default=None,
+        help="Write combined blueprint + crate security handoff JSON (non-certifying)",
+    )
     _add_probe_args(p_scan)
+
+    p_plugins = sub.add_parser(
+        "plugins",
+        help="List built-in and installed wythe.plugins entry points (never imports target repo code)",
+    )
+    p_plugins.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON metadata")
+    p_plugins.add_argument(
+        "--allow-local-plugins",
+        action="store_true",
+        help="Explicit opt-in permitting --plugin local modules/files",
+    )
+    p_plugins.add_argument(
+        "--plugin",
+        dest="local_plugins",
+        action="append",
+        default=None,
+        help="Explicit local plugin module or .py file (requires --allow-local-plugins)",
+    )
+
+    p_ol = sub.add_parser(
+        "export-openlineage",
+        help="Export deterministic OpenLineage Static Lineage JSON (datasets + jobs)",
+    )
+    p_ol.add_argument("target", help="Registered target slug or filesystem path")
+    p_ol.add_argument("--profile", default="auto", help="Stack profile slug or 'auto' (default)")
+    p_ol.add_argument("--dsn", default=None, help="Optional read-only SQL DB DSN")
+    p_ol.add_argument("--redis-dsn", default=None, help="Optional read-only Redis DSN")
+    p_ol.add_argument("--out", default=None, help="Optional output file path (e.g. openlineage.json)")
 
     p_gate = sub.add_parser("gate", help="Fail-closed 3-tier boundary check (exit 0 pass, 1 violation, 2 incomplete or error)")
     p_gate.add_argument("target", help="Registered target slug or filesystem path")
@@ -311,6 +351,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "security":
         return run_security_command(args)
 
+    if args.cmd == "plugins":
+        try:
+            items = list_registered_plugins(
+                allow_local_plugins=bool(args.allow_local_plugins),
+                local_plugin_modules=args.local_plugins,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"wythe plugins error: {exc}", file=sys.stderr)
+            return 2
+        if args.as_json:
+            print(
+                json.dumps(
+                    {
+                        "entry_point_group": ENTRY_POINT_GROUP,
+                        "allow_local_plugins": bool(args.allow_local_plugins),
+                        "count": len(items),
+                        "plugins": items,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+        print(f"Wythe Registered Plugins (group={ENTRY_POINT_GROUP}, count={len(items)})")
+        for item in items:
+            default_state = "on" if item.get("enabled_by_default") else "off"
+            print(
+                f"  - {item['name']} [{item['origin']}, {item['kind']}, "
+                f"v{item['version']}, default={default_state}] :: {item['description']}"
+            )
+        return 0
+
     if args.cmd == "export-openapi":
         application = create_app()
         out_p = _write_json_file(args.out, json.dumps(application.openapi(), indent=2))
@@ -402,6 +473,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
 
+            if args.cmd == "export-openlineage":
+                rep = run_target_scan(
+                    session,
+                    target,
+                    pg_dsn=args.dsn,
+                    redis_dsn=args.redis_dsn,
+                    strict_gate=True,
+                    persist_snapshot=False,
+                )
+                bundle = build_openlineage_static_bundle(rep)
+                payload = json.dumps(bundle, indent=2)
+                if args.out:
+                    out_p = _write_json_file(args.out, payload)
+                    ds_n = len(bundle.get("datasets") or [])  # type: ignore[arg-type]
+                    job_n = len(bundle.get("jobs") or [])  # type: ignore[arg-type]
+                    print(
+                        f"Wrote OpenLineage static lineage bundle "
+                        f"(datasets={ds_n}, jobs={job_n}) -> {out_p}"
+                    )
+                else:
+                    print(payload)
+                return 0
+
             if args.cmd == "llms":
                 rep = run_target_scan(session, target, strict_gate=True, persist_snapshot=False)
                 brief = build_llms_txt_brief(rep, max_tokens=args.max_tokens)
@@ -483,6 +577,27 @@ def main(argv: list[str] | None = None) -> int:
             if args.cmd == "scan" and args.json_out:
                 out_p = _write_json_file(args.json_out, report.model_dump_json(indent=2))
                 print(f"  JSON written             : {out_p}")
+            if args.cmd == "scan" and (
+                args.trivy_report or args.syft_sbom or args.companion_out
+            ):
+                comp = summarize_companion_security_artifacts(
+                    report,
+                    trivy_path=args.trivy_report,
+                    syft_path=args.syft_sbom,
+                )
+                crate = comp["crate_stage"]  # type: ignore[index]
+                syft_s = crate["syft_sbom"]  # type: ignore[index]
+                trivy_s = crate["trivy_report"]  # type: ignore[index]
+                print(
+                    f"  Companion Crate Summary  : Syft packages={syft_s['package_count']}, "
+                    f"Trivy vulns={trivy_s['vulnerability_count']}, "
+                    f"misconfigs={trivy_s['misconfiguration_count']}, "
+                    f"secrets={trivy_s['secret_count']}"
+                )
+                print(f"  Companion Disclaimer     : {comp['non_certification_disclaimer']}")
+                if args.companion_out:
+                    out_c = _write_json_file(args.companion_out, json.dumps(comp, indent=2))
+                    print(f"  Companion JSON written   : {out_c}")
             if getattr(args, "sarif_out", None):
                 sarif = build_sarif_log(report)
                 out_s = _write_json_file(args.sarif_out, json.dumps(sarif, indent=2))

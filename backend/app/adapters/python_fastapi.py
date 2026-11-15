@@ -13,7 +13,13 @@ from app.adapters.base import (
 )
 from app.adapters.python_ast_inspect import ParsedPythonModule, parse_python_module
 from app.adapters.python_layout import discover_python_app
-from app.schemas.atlas import AtlasEdge, AtlasNode
+from app.adapters.python_policy_consumption import (
+    analyze_module_policy_table_read,
+    classify_table_policy_columns,
+    merge_policy_consumptions,
+    summarize_edge_policy_consumption,
+)
+from app.schemas.atlas import AtlasEdge, AtlasNode, PolicyFieldConsumption
 
 _CLOCK_ALLOW_MODULES = ("clock.py", "program_time.py", "sql_clock.py")
 _INFRA_SKIP_PARTS = ("__pycache__", "tests", "test", "alembic")
@@ -151,6 +157,10 @@ def _is_passive_imported_symbol(
     """Return True when `imported_sym` is a constant or exception class in a callable service module."""
     if pm_parent is None or not pm_parent.defined:
         return False
+    if pm_parent.route_handlers or pm_parent.router_includes:
+        parent_stem = Path(pm_parent.rel_path).stem
+        if any(child == parent_stem for child, _ in pm.router_includes):
+            return False
     has_attr_call = any(c.startswith(f"{imported_sym}.") for c in pm.called)
     if imported_sym not in pm.called and not has_attr_call:
         stripped = imported_sym.lstrip("_")
@@ -333,6 +343,7 @@ class PythonFastApiAdapter:
         packages: dict[str, ParsedPythonModule] = {}
         caller_only: list[ParsedPythonModule] = []
         parsed_modules: dict[str, ParsedPythonModule] = {}
+        source_by_rel: dict[str, str] = {}
         all_parsed: list[tuple[str, ParsedPythonModule]] = []
 
         for py_file in sorted(app_dir.rglob("*.py")):
@@ -372,6 +383,7 @@ class PythonFastApiAdapter:
                 caller_only.append(parsed)
                 continue
             parsed_modules[rel_app] = parsed
+            source_by_rel[rel_app] = text
 
         router_mounts = _resolve_router_mounts(all_parsed)
 
@@ -465,6 +477,17 @@ class PythonFastApiAdapter:
         findings: list[RawCandidateFinding] = []
         table_readers: dict[str, set[str]] = {}
         table_writers: dict[str, set[str]] = {}
+        tnode_by_id: dict[str, AtlasNode] = {}
+        model_syms_by_tid: dict[str, set[str]] = {}
+        edge_consumptions_by_tid: dict[str, list[PolicyFieldConsumption]] = {}
+        for sym_k, mapped_tid in truth.table_symbol_map.items():
+            model_syms_by_tid.setdefault(mapped_tid, set()).add(sym_k)
+        for tnode in truth.nodes:
+            if tnode.subkind == "table":
+                tnode_by_id[tnode.id] = tnode
+                tnode.policy_columns = classify_table_policy_columns(
+                    tnode.label, tnode.columns
+                )
         precise = bool(truth.class_modules)
         model_modules = frozenset(truth.model_modules) | frozenset().union(*truth.class_modules.values())
         parsed_by_nid: dict[str, ParsedPythonModule] = {
@@ -495,6 +518,7 @@ class PythonFastApiAdapter:
             *,
             verification: str = "verified",
             symbol_links: list[str] | None = None,
+            policy_field_consumption: PolicyFieldConsumption | None = None,
         ) -> None:
             key = (src, dst, kind)
             if src == dst:
@@ -505,6 +529,14 @@ class PythonFastApiAdapter:
                 if links:
                     merged = list(dict.fromkeys([*existing.symbol_links, *links]))
                     existing.symbol_links = merged
+                if policy_field_consumption is not None:
+                    existing.policy_field_consumption = (
+                        merge_policy_consumptions(
+                            [existing.policy_field_consumption, policy_field_consumption]
+                        )
+                        if existing.policy_field_consumption is not None
+                        else policy_field_consumption
+                    )
                 if existing.verification != "verified" and verification == "verified":
                     existing.verification = "verified"  # type: ignore[assignment]
                     existing.evidence_note = note
@@ -520,6 +552,7 @@ class PythonFastApiAdapter:
                     evidence_path=path,
                     evidence_note=note,
                     symbol_links=links,
+                    policy_field_consumption=policy_field_consumption,
                 )
             )
 
@@ -644,16 +677,107 @@ class PythonFastApiAdapter:
                     write_scopes_by_tid.setdefault(tid, set()).update(w_scopes)
             matched_writes = set(write_line)
 
+            edge_consumptions_for_node: list[PolicyFieldConsumption] = []
+            subst_consts_in_mod: dict[str, list[str]] = {}
+            fb_consts_in_mod: dict[str, list[str]] = {}
+
             for tid in sorted(matched_reads):
                 table_readers.setdefault(tid, set()).add(nid)
                 slinks = [f"{sc}->*" for sc in _expand_scopes(verified_read_scopes.get(tid, {"*"}))]
+                t_label = tid.removeprefix("t:")
+                ev_note = f"AST verified read of `{t_label}`."
+                edge_pfc: PolicyFieldConsumption | None = None
+                tnode_ref = tnode_by_id.get(tid)
+                if tnode_ref is not None and tnode_ref.policy_columns:
+                    ast_syms = {
+                        s for s in pm.reads if _ast_table_id(truth, pm, s, model_modules) == tid
+                    }
+                    sql_syms = {s for s in pm.sql_reads if _sql_table_id(truth, s) == tid}
+                    scope_analyses = analyze_module_policy_table_read(
+                        source_by_rel.get(rel_app, ""),
+                        table_label=tnode_ref.label,
+                        table_columns=tnode_ref.columns,
+                        policy_columns=tnode_ref.policy_columns,
+                        active_scopes=sorted(verified_read_scopes.get(tid, {"*"})),
+                        write_scopes=write_scopes_by_tid.get(tid, set()),
+                        func_calls=pm.func_calls,
+                        model_symbols=ast_syms | (model_syms_by_tid.get(tid, set()) & set(pm.reads)),
+                        sql_table_names=sql_syms,
+                        declared_policy_consts=[c for c, _, _ in pm.policy_literals],
+                    )
+                    summarized = summarize_edge_policy_consumption(
+                        tnode_ref.label, tnode_ref.policy_columns, scope_analyses
+                    )
+                    if summarized is not None:
+                        edge_pfc, ev_note = summarized
+                        edge_consumptions_for_node.append(edge_pfc)
+                        edge_consumptions_by_tid.setdefault(tid, []).append(edge_pfc)
+                    for sa in scope_analyses:
+                        if sa.state == "bypassed":
+                            for sc_const in sa.substituted_constants:
+                                subst_consts_in_mod.setdefault(sc_const, []).append(
+                                    tnode_ref.label
+                                )
+                        for fb_const in sa.fallback_constants:
+                            fb_consts_in_mod.setdefault(fb_const, []).append(tnode_ref.label)
+                        if sa.state == "bypassed" and not rel_app.startswith("adapters/"):
+                            node.status = "policy_in_code"
+                            uncons_str = ", ".join(f"`{c}`" for c in sa.unconsumed_policy_columns)
+                            cons_str = (
+                                ", ".join(f"`{c}`" for c in sa.consumed_columns)
+                                if sa.consumed_columns
+                                else "none"
+                            )
+                            subst_str = (
+                                " and substitutes "
+                                + ", ".join(f"`{k}`" for k in sa.substituted_constants)
+                                if sa.substituted_constants
+                                else ""
+                            )
+                            dead_str = (
+                                " Policy column access occurs only in dead/unreachable flow."
+                                if sa.had_dead_policy_access
+                                else ""
+                            )
+                            sc_label = (
+                                f"`{sa.scope_name}()`" if sa.scope_name != "*" else "module scope"
+                            )
+                            findings.append(
+                                RawCandidateFinding(
+                                    rule_code="MANIP-001",
+                                    node_id=nid,
+                                    target_node_id=tid,
+                                    source_file=pm.rel_path,
+                                    line=sa.lineno,
+                                    title=(
+                                        f"Policy read of `{tnode_ref.label}` in {sc_label} "
+                                        f"bypasses policy column(s) {uncons_str}{subst_str}"
+                                    ),
+                                    detail=(
+                                        f"{pm.rel_path}:{sa.lineno} queries `{tnode_ref.label}` "
+                                        f"in {sc_label} (consumed columns: {cons_str}; "
+                                        f"unconsumed policy columns: {uncons_str})"
+                                        f"{subst_str}.{dead_str}"
+                                    ),
+                                    remediation=(
+                                        f"Project and flow `{tnode_ref.label}` policy column(s) "
+                                        f"{uncons_str} into live returned/controlling values "
+                                        "instead of hardcoded constants."
+                                    ),
+                                )
+                            )
                 add_edge(
                     nid,
                     tid,
                     "reads_truth",
                     pm.rel_path,
-                    f"AST verified read of `{tid.removeprefix('t:')}`.",
+                    ev_note,
                     symbol_links=slinks,
+                    policy_field_consumption=edge_pfc,
+                )
+            if edge_consumptions_for_node:
+                node.policy_field_consumption = merge_policy_consumptions(
+                    edge_consumptions_for_node
                 )
             for tid in sorted(set(declared_read_scopes) - matched_reads):
                 u_funcs = sorted(declared_read_scopes[tid])
@@ -775,6 +899,19 @@ class PythonFastApiAdapter:
             if not rel_app.startswith("adapters/"):
                 for const_name, lineno, sample in pm.policy_literals:
                     node.status = "policy_in_code"
+                    subst_tbls = list(dict.fromkeys(subst_consts_in_mod.get(const_name, ())))
+                    fb_tbls = list(dict.fromkeys(fb_consts_in_mod.get(const_name, ())))
+                    usage_suffix = ""
+                    if subst_tbls:
+                        tbl_list = ", ".join(f"`{t}`" for t in subst_tbls)
+                        usage_suffix = (
+                            f" Overrides database policy column(s) on {tbl_list} in reader output."
+                        )
+                    elif fb_tbls:
+                        tbl_list = ", ".join(f"`{t}`" for t in fb_tbls)
+                        usage_suffix = (
+                            f" Used as null/falsy fallback alongside {tbl_list} policy read."
+                        )
                     findings.append(
                         RawCandidateFinding(
                             rule_code="MANIP-001",
@@ -782,8 +919,14 @@ class PythonFastApiAdapter:
                             source_file=pm.rel_path,
                             line=lineno,
                             title=f"Hardcoded policy constant `{const_name}` ({sample})",
-                            detail=f"{pm.rel_path}:{lineno} defines mutable domain policy `{const_name}` in Python code.",
-                            remediation="Move policy threshold/vocabulary into PostgreSQL catalog truth and read via snapshot.",
+                            detail=(
+                                f"{pm.rel_path}:{lineno} defines mutable domain policy "
+                                f"`{const_name}` in Python code.{usage_suffix}"
+                            ),
+                            remediation=(
+                                "Move policy threshold/vocabulary into PostgreSQL catalog truth "
+                                "and read via snapshot."
+                            ),
                         )
                     )
             if PurePosixPath(pm.rel_path).name not in _CLOCK_ALLOW_MODULES:
@@ -826,6 +969,20 @@ class PythonFastApiAdapter:
             wcount = len(table_writers.get(tnode.id, set()))
             tnode.read_by_count = rcount
             tnode.written_by_count = wcount
+            if tid_pfcs := edge_consumptions_by_tid.get(tnode.id):
+                merged_tpfc = merge_policy_consumptions(tid_pfcs)
+                tnode.policy_field_consumption = merged_tpfc
+                if merged_tpfc is not None:
+                    pfc_tag = (
+                        f"policy_field_consumption={merged_tpfc.state} "
+                        f"(consumed={merged_tpfc.consumed_columns}, "
+                        f"unconsumed_policy={merged_tpfc.unconsumed_policy_columns})"
+                    )
+                    tnode.verification_note = (
+                        f"{tnode.verification_note} | {pfc_tag}"
+                        if tnode.verification_note
+                        else pfc_tag
+                    )
             if rcount == 0 and tnode.role == "input":
                 tnode.status = "orphaned"
                 findings.append(

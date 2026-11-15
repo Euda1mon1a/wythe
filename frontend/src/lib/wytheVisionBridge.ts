@@ -5,6 +5,7 @@
 
 import type { AtlasEdge, AtlasNode, BoundaryFinding } from '@/api/atlas';
 import {
+  collectContainerEntrypointIds,
   deriveDomainCluster,
   evaluateNodeVisual,
   getLensLegendItems,
@@ -331,6 +332,7 @@ export function buildLiveViewportDigest(params: {
 
   const frustumEntries: FrustumEntry[] = [];
   const colorBuckets = new Map<string, AtlasNode[]>();
+  const containerEntrypointIds = collectContainerEntrypointIds(visibleNodes, edges);
 
   for (const n of visibleNodes) {
     const pos = positions.get(n.id);
@@ -356,6 +358,7 @@ export function buildLiveViewportDigest(params: {
       guardedTableIds,
       mutatorNodeIds,
       diffOverlay,
+      containerEntrypointIds,
     });
     const isDimmed =
       vis.forceDim || (traceIds?.size

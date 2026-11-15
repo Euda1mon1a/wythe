@@ -19,7 +19,7 @@ from app.schemas.atlas import (
 
 _confirmed_ast_rules = frozenset({"MANIP-001", "MANIP-002", "DISP-001", "DISP-002", "DISP-005"})
 _confirmed_structural_rules = frozenset(
-    {"TRUTH-002", "TRUTH-003", "DISP-003", "DISP-004", "MANIP-004", "MANIP-005"}
+    {"TRUTH-002", "TRUTH-003", "DISP-003", "DISP-004", "MANIP-004", "MANIP-005", "MANIP-006"}
 )
 _candidate_structural_rules = frozenset({"TRUTH-005", "DISP-007"})
 _valid_confidences: tuple[FindingConfidence, ...] = ("confirmed", "candidate")

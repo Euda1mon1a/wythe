@@ -21,10 +21,43 @@ def add_security_parser(subparsers) -> None:
     source.add_argument("--json", dest="json_out", help="Write a new JSON file; existing files are refused")
     demo = actions.add_parser("ownership-demo", help="Execute only the shipped synthetic before/after examples")
     demo.add_argument("--json", dest="json_out", help="Write a new JSON file; existing files are refused")
+    companion = actions.add_parser(
+        "companion",
+        help="Correlate static blueprint findings with optional Syft SBOM & Trivy reports (non-certifying)",
+    )
+    companion.add_argument("target", help="Registered target slug or repository path")
+    companion.add_argument("--profile", default="auto", help="Stack profile slug or 'auto' (default)")
+    companion.add_argument("--trivy-report", default=None, help="Optional read-only Trivy JSON or SARIF report")
+    companion.add_argument("--syft-sbom", default=None, help="Optional read-only Syft CycloneDX/SPDX JSON SBOM")
+    companion.add_argument("--json", dest="json_out", help="Write JSON handoff receipt to file")
 
 
 def run_security_command(args: argparse.Namespace) -> int:
     try:
+        if args.security_action == "companion":
+            import json
+
+            from app.cli import _resolve_cli_target, _write_json_file
+            from app.db.session import get_session_factory
+            from app.main import initialize_database
+            from app.services.companion_export_service import summarize_companion_security_artifacts
+            from app.services.scanner_service import run_target_scan
+
+            initialize_database()
+            factory = get_session_factory()
+            with factory() as session:
+                target, _ = _resolve_cli_target(session, args.target, args.profile, ensure_persisted=False)
+                scan_report = run_target_scan(session, target, strict_gate=True, persist_snapshot=False)
+            summary = summarize_companion_security_artifacts(
+                scan_report,
+                trivy_path=args.trivy_report,
+                syft_path=args.syft_sbom,
+            )
+            payload = json.dumps(summary, indent=2)
+            if args.json_out:
+                _write_json_file(args.json_out, payload)
+            print(payload)
+            return 0
         if args.security_action == "ownership":
             report = inspect_record_ownership(
                 Path(args.target), handler=args.handler, record=args.record,

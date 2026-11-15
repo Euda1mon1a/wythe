@@ -9,7 +9,7 @@ own use; it is not a supported product (see [SUPPORT.md](SUPPORT.md)).
   no security SLA, and no promised fix, patch, release, compatibility, or
   response timeline.
 - **Pin and fork:** Downstream users who depend on Wythe should pin an exact
-  version (`wythe==0.2.1`, or `Euda1mon1a/wythe@v0.2.1` in GitHub Actions) and
+  version (`wythe==0.2.2`, or `Euda1mon1a/wythe@v0.2.2` in GitHub Actions) and
   fork the repository whenever immediate fixes or changes are needed.
 - **Vulnerability reporting:** Per [SUPPORT.md](SUPPORT.md), there is no formal
   security response process. If GitHub Private Vulnerability Reporting or
@@ -21,10 +21,12 @@ own use; it is not a supported product (see [SUPPORT.md](SUPPORT.md)).
 ## 2. Defensive / Blue-Team Component (`wythe security`)
 
 Wythe's experimental `wythe security` commands provide bounded evidence
-collection and self-contained regression examples—never an automated security
-audit or certification. See
+collection, read-only companion artifact correlation, and self-contained
+regression examples—never an automated security audit or certification. See
 [docs/architecture/record-ownership.md](docs/architecture/record-ownership.md)
-for the complete specification and exit codes.
+and
+[docs/architecture/containers-security-and-plugins.md](docs/architecture/containers-security-and-plugins.md)
+for complete specifications and exit codes.
 
 ### Static ownership evidence (`wythe security ownership`)
 
@@ -70,7 +72,34 @@ for the complete specification and exit codes.
   so SAST scanners and Wythe's self-dogfooding gate do not flag the
   intentionally vulnerable fixture as a flaw in Wythe's production server.
 
+### Companion artifact correlation (`wythe security companion`)
+
+- **Read-only post-build artifact join:** `wythe security companion` (and
+  `wythe scan --trivy-report ... --syft-sbom ... --companion-out ...`) joins
+  Wythe's static blueprint findings with optional caller-supplied Trivy
+  JSON/SARIF reports and Syft CycloneDX/SPDX/JSON SBOMs, redacting Trivy secret
+  `Match` values.
+- **Non-certification and zero external execution:** Every companion summary
+  records `target_code_executed: false` and `automated_security_audit: false`.
+  Wythe never invokes `docker`, `trivy`, or `syft`, never queries vulnerability
+  feeds, and never certifies CVE reachability, exploitability, or production
+  security posture.
+
 ## 3. Safe Deployment & Data-Handling Boundaries
+
+### Untrusted-repository plugin boundary (`wythe.plugins`)
+
+- **No automatic target-repository code execution:** Scanning an unfamiliar or
+  untrusted repository never imports or executes `.py` files from the target
+  checkout by default (`allow_local_plugins: false`).
+- **Trusted discovery lanes only:** Default discovery loads only built-in
+  first-party plugins (`tach-boundaries`, `container-sources`) and packages
+  installed into Wythe's own Python environment via
+  `importlib.metadata.entry_points(group="wythe.plugins")`.
+- **CLI-only explicit opt-in:** Loading an arbitrary local module requires
+  passing `--allow-local-plugins` alongside `--plugin MODULE` on the CLI; it is
+  never enabled over HTTP (`/api/v1/adapters/plugins`) or MCP
+  (`wythe_plugins`).
 
 ### Unauthenticated local workstation server (`wythe serve`)
 
@@ -78,10 +107,11 @@ for the complete specification and exit codes.
   WebGL UI defaulting to `127.0.0.1` port `8780` (`WYTHE_HOST` / `WYTHE_PORT`)
   with loopback CORS defaults (`http://127.0.0.1:3780,http://localhost:3780`).
 - **Local path & source access by design:** Endpoints including
-  `/api/v1/targets`, `/api/v1/scans`, and `/api/v1/scans/{slug}/source`
-  register local repository paths, execute scans, and read bounded local
-  source excerpts (blocking `.git`, `secrets`/`.secrets`, `node_modules`,
-  `.env*`, and key/DB extensions).
+  `/api/v1/targets`, `/api/v1/scans`, `/api/v1/scans/{slug}/source`,
+  `/api/v1/scans/{slug}/openlineage`, and `/api/v1/adapters/plugins` register
+  local repository paths, execute scans, export static lineage metadata, and
+  read bounded local source excerpts (blocking `.git`, `secrets`/`.secrets`,
+  `node_modules`, `.env*`, and key/DB extensions).
 - **Bind boundary:** Bind `wythe serve` only to `127.0.0.1` or an
   ACL-restricted single-owner Tailnet. Never bind `0.0.0.0` on untrusted LANs or
   expose the server to the public internet.
@@ -89,11 +119,12 @@ for the complete specification and exit codes.
 ### Read-only live probes (`--dsn`, `--redis-dsn`, `--probe-url`)
 
 - **Read-only catalog credentials:** When passing `--dsn` to `wythe scan`,
-  `wythe gate`, or `wythe diff` (distinct from `WYTHE_DATABASE_URL`, which
-  holds Wythe's own metadata database), use strictly least-privilege, read-only
-  catalog credentials. Wythe reads table metadata only via `pg_catalog` in a
-  `READ ONLY` PostgreSQL session, `information_schema` in `READ ONLY` mode on
-  MySQL/MariaDB, or read-only SQLite (`?mode=ro`), with zero row or PII reads.
+  `wythe gate`, `wythe diff`, or `wythe export-openlineage` (distinct from
+  `WYTHE_DATABASE_URL`, which holds Wythe's own metadata database), use strictly
+  least-privilege, read-only catalog credentials. Wythe reads table metadata
+  only via `pg_catalog` in a `READ ONLY` PostgreSQL session,
+  `information_schema` in `READ ONLY` mode on MySQL/MariaDB, or read-only SQLite
+  (`?mode=ro`), with zero row or PII reads.
 - **Metadata-only Redis & GET probes:** `--redis-dsn` executes metadata-only
   `INFO keyspace` and `SCAN` key-prefix checks without reading values.
   `--probe-url` is opt-in, sends unauthenticated `GET` requests only (dropping
@@ -103,10 +134,11 @@ for the complete specification and exit codes.
 ### Output and LLM confidentiality
 
 - **Confidential source artifacts:** JSON receipts, `/api/v1/scans/{slug}/source`
-  responses, `wythe context`, `wythe llms`, `wythe mcp`, and `What's This?`
-  viewport briefs/snapshots contain local repository paths, `file:line`
-  pointers, schema/route inventories, findings, and AST or verbatim source
-  excerpts.
+  and `/api/v1/scans/{slug}/openlineage` responses, `wythe export-openlineage`,
+  `wythe security companion`, `wythe context`, `wythe llms`, `wythe mcp`
+  (`wythe_plugins`, `wythe_openlineage`), and `What's This?` viewport
+  briefs/snapshots contain local repository paths, `file:line` pointers,
+  schema/route inventories, findings, and AST or verbatim source excerpts.
 - **Share and LLM boundary:** Treat these outputs as confidential source
   artifacts and review or redact them before external sharing or submission to
   hosted/cloud LLMs (`Ask AI` defaults to local on-device Apple Intelligence,

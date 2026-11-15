@@ -1,13 +1,15 @@
 'use client';
 
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { Download, FileJson, GitCompare, History, Plus, Tag, Upload } from 'lucide-react';
+import { Boxes, Download, FileJson, GitCompare, History, Plus, Tag, Upload } from 'lucide-react';
 import type { PolicyVocabularyRead } from '@/api/atlas';
 import {
   useCompareSnapshots,
   useCreateVocabulary,
+  useDownloadOpenLineage,
   useDownloadSarif,
   useGovernanceBundle,
+  usePlugins,
   useScanDiff,
   useScanHistory,
   useSyncGovernanceBundle,
@@ -62,8 +64,10 @@ export function GovernanceAndDiffPanel({
     refetch: refetchDiff,
   } = useScanDiff(activeSlug, committedBaseRef);
   const { data: bundle } = useGovernanceBundle(activeSlug);
+  const { data: pluginManifest } = usePlugins();
   const syncBundle = useSyncGovernanceBundle(activeSlug);
   const downloadSarif = useDownloadSarif(activeSlug);
+  const downloadOpenLineage = useDownloadOpenLineage(activeSlug);
   const createVocab = useCreateVocabulary(activeSlug);
   const updateVocab = useUpdateVocabulary(activeSlug);
 
@@ -87,6 +91,22 @@ export function GovernanceAndDiffPanel({
         const a = document.createElement('a');
         a.href = url;
         a.download = `${activeSlug}.wythe.sarif.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      },
+    });
+  };
+
+  const handleExportOpenLineage = () => {
+    downloadOpenLineage.mutate(undefined, {
+      onSuccess: (olBundle) => {
+        const blob = new Blob([JSON.stringify(olBundle, null, 2)], {
+          type: 'application/json',
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${activeSlug}.openlineage.json`;
         a.click();
         URL.revokeObjectURL(url);
       },
@@ -136,15 +156,28 @@ export function GovernanceAndDiffPanel({
             <GitCompare className="h-4 w-4 text-sky-400" />
             PR Diff Gate &amp; 3-Tier Blast Radius
           </div>
-          <button
-            type="button"
-            disabled={downloadSarif.isPending}
-            onClick={handleExportSarif}
-            className="flex items-center gap-1 border border-slate-700 bg-slate-900 px-2 py-1 font-mono text-[11px] text-slate-200 hover:border-teal-400 hover:text-teal-300"
-          >
-            <Download className="h-3 w-3" />
-            {downloadSarif.isPending ? 'Building…' : 'SARIF 2.1.0'}
-          </button>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              aria-label="Export OpenLineage static lineage JSON"
+              disabled={downloadOpenLineage.isPending || !activeSlug}
+              onClick={handleExportOpenLineage}
+              className="flex items-center gap-1 border border-slate-700 bg-slate-900 px-2 py-1 font-mono text-[11px] text-slate-200 hover:border-sky-400 hover:text-sky-300 disabled:opacity-50"
+            >
+              <Download className="h-3 w-3" />
+              {downloadOpenLineage.isPending ? 'Exporting…' : 'Export OpenLineage'}
+            </button>
+            <button
+              type="button"
+              aria-label="Export SARIF 2.1.0 findings log"
+              disabled={downloadSarif.isPending || !activeSlug}
+              onClick={handleExportSarif}
+              className="flex items-center gap-1 border border-slate-700 bg-slate-900 px-2 py-1 font-mono text-[11px] text-slate-200 hover:border-teal-400 hover:text-teal-300 disabled:opacity-50"
+            >
+              <Download className="h-3 w-3" />
+              {downloadSarif.isPending ? 'Building…' : 'SARIF 2.1.0'}
+            </button>
+          </div>
         </div>
 
         <div className="flex items-center gap-2 font-mono">
@@ -429,6 +462,38 @@ export function GovernanceAndDiffPanel({
               <span>{v.token}</span>
             </label>
           ))}
+        </div>
+
+        {/* Registered Companion Plugins Status */}
+        <div className="space-y-2 border-t border-slate-800/80 pt-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[11px]">
+            <span className="flex items-center gap-1.5 font-semibold text-slate-200">
+              <Boxes className="h-3.5 w-3.5 text-sky-400" />
+              Companion Plugins ({pluginManifest?.plugins?.length ?? 0} registered)
+            </span>
+            <span className="border border-teal-500/30 bg-teal-500/10 px-1.5 py-0.5 text-[10px] text-teal-300">
+              local_plugins_allowed: {String(pluginManifest?.local_plugins_allowed ?? false)}
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-1.5 font-mono text-[11px]">
+            {(pluginManifest?.plugins ?? []).map((plug) => (
+              <div
+                key={plug.name}
+                title={plug.description || plug.source}
+                className="flex items-center gap-1.5 border border-slate-800 bg-slate-950 px-2 py-1 text-slate-200"
+              >
+                <span className="font-semibold text-sky-300">{plug.name}</span>
+                <span className="text-[10px] text-slate-400">
+                  [{plug.origin} · {plug.tier} · v{plug.version ?? 'unknown'}]
+                </span>
+              </div>
+            ))}
+          </div>
+          {(pluginManifest?.load_errors?.length ?? 0) > 0 && (
+            <div className="border border-amber-500/35 bg-amber-950/20 p-2 font-mono text-[11px] text-amber-200">
+              Isolated plugin load errors: {(pluginManifest?.load_errors ?? []).join('; ')}
+            </div>
+          )}
         </div>
       </div>
     </div>

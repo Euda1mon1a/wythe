@@ -21,8 +21,8 @@ def test_security_policy_exists_and_covers_posture_blue_team_and_boundaries() ->
     required_terms = (
         "SUPPORT.md",
         "MIT License",
-        "wythe==0.2.1",
-        "Euda1mon1a/wythe@v0.2.1",
+        "wythe==0.2.2",
+        "Euda1mon1a/wythe@v0.2.2",
         "Private Vulnerability Reporting",
         "Security Advisories",
         "wythe security ownership",
@@ -35,12 +35,19 @@ def test_security_policy_exists_and_covers_posture_blue_team_and_boundaries() ->
         "wythe_examples",
         "backend/wythe_examples/ownership_lab.py",
         "network_requests_sent: false",
+        "wythe security companion",
+        "automated_security_audit: false",
+        "wythe.plugins",
+        "--allow-local-plugins",
         "docs/architecture/record-ownership.md",
+        "docs/architecture/containers-security-and-plugins.md",
         "127.0.0.1",
         "0.0.0.0",
         "/api/v1/targets",
         "/api/v1/scans",
         "/api/v1/scans/{slug}/source",
+        "/api/v1/scans/{slug}/openlineage",
+        "/api/v1/adapters/plugins",
         "--dsn",
         "pg_catalog",
         "information_schema",
@@ -56,8 +63,11 @@ def test_security_policy_exists_and_covers_posture_blue_team_and_boundaries() ->
 
 def test_security_policy_pointer_links_in_readme_and_user_guide() -> None:
     readme = _normalized_text(REPO_ROOT / "README.md")
+    support = _normalized_text(REPO_ROOT / "SUPPORT.md")
     user_guide = _normalized_text(REPO_ROOT / "docs" / "user-guide.md")
 
     assert "### Record ownership (experimental)" in readme
     assert "[SECURITY.md](SECURITY.md)" in readme
+    assert "Euda1mon1a/wythe@v0.2.2" in readme
+    assert "wythe==0.2.2" in support
     assert "[SECURITY.md](../SECURITY.md)" in user_guide

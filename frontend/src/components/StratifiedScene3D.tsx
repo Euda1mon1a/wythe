@@ -8,6 +8,7 @@ import type { AtlasEdge, AtlasNode, BoundaryFinding, EndToEndChain } from '@/api
 import { selectSceneGraph, type NeighborhoodHops } from '@/lib/wytheSceneGraph';
 import { createBatchedNodes, createBatchedEdges, fitGraphCamera, type SceneRenderNode, type SceneRenderEdge, type SceneRenderStats } from '@/lib/wytheSceneBatches';
 import {
+  collectContainerEntrypointIds,
   computeScenePositions,
   deriveDomainCluster,
   evaluateEdgeVisual,
@@ -287,6 +288,11 @@ export function StratifiedScene3D({
       mutatorNodeIds: mutators,
     };
   }, [edges]);
+
+  const containerEntrypointIds = useMemo(
+    () => collectContainerEntrypointIds(nodes, edges),
+    [nodes, edges],
+  );
 
   const coneNodeIds = useMemo(() => {
     const cone = new Set<string>();
@@ -760,7 +766,7 @@ export function StratifiedScene3D({
       const inCone = (selectedNodeId !== null && coneNodeIds.has(n.id)) || inTrace;
       const vis = evaluateNodeVisual({
         node: n, lens, palette: activePalette, degree: degreeByNode.get(n.id) ?? 0,
-        guardedTableIds, mutatorNodeIds, diffOverlay,
+        guardedTableIds, mutatorNodeIds, diffOverlay, containerEntrypointIds,
       });
       const dimmed = vis.forceDim ||
         (traceHopIds.length > 0 && !inTrace && !isSelected) ||

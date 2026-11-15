@@ -8,6 +8,7 @@ import type { components } from '@/types/api-generated';
 export type TruthAtlasReport = components['schemas']['TruthAtlasReport'];
 export type AtlasNode = components['schemas']['AtlasNode'];
 export type StorePurposeDeclaration = components['schemas']['StorePurposeDeclaration'];
+export type PolicyFieldConsumption = components['schemas']['PolicyFieldConsumption'];
 export type AtlasEdge = components['schemas']['AtlasEdge'];
 export type EndToEndChain = components['schemas']['EndToEndChain'];
 export type BoundaryFinding = components['schemas']['BoundaryFinding'];
@@ -47,6 +48,13 @@ export type AskEnginesRead = components['schemas']['AskEnginesRead'];
 export type AskChatTurn = components['schemas']['AskChatTurn'];
 export type AskWytheRequest = components['schemas']['AskWytheRequest'];
 export type AskWytheResponse = components['schemas']['AskWytheResponse'];
+export type PluginSpecItem = components['schemas']['PluginSpecItem'];
+export type PluginListResponse = components['schemas']['PluginListResponse'];
+export type OpenLineageTargetInfo = components['schemas']['OpenLineageTargetInfo'];
+export type OpenLineageDatasetRef = components['schemas']['OpenLineageDatasetRef'];
+export type OpenLineageDatasetItem = components['schemas']['OpenLineageDatasetItem'];
+export type OpenLineageJobItem = components['schemas']['OpenLineageJobItem'];
+export type OpenLineageBundleResponse = components['schemas']['OpenLineageBundleResponse'];
 
 export const atlasApi = {
   listTargets: () => get<TargetProjectRead[]>('/targets'),
@@ -76,6 +84,8 @@ export const atlasApi = {
     ),
   getScanSarif: (targetSlug: string) =>
     get<Record<string, unknown>>(`/scans/${targetSlug}/sarif`),
+  getScanOpenLineage: (targetSlug: string) =>
+    get<OpenLineageBundleResponse>(`/scans/${targetSlug}/openlineage`),
   getScanLlmsBrief: (targetSlug: string) =>
     get<LlmBriefRead>(`/scans/${targetSlug}/llms`),
   getScanContextCone: (
@@ -112,6 +122,7 @@ export const atlasApi = {
     post<AuditRulingRead>(`/rulings/${targetSlug}`, payload),
 
   listAdapterSlots: () => get<AdapterSlotSchema[]>('/adapters/slots'),
+  listPlugins: () => get<PluginListResponse>('/adapters/plugins'),
   listStackProfiles: () => get<StackProfileRead[]>('/adapters/profiles'),
   detectStack: (repoPath: string) =>
     get<StackDetectionResult>(`/adapters/detect?repo_path=${encodeURIComponent(repoPath)}`),

@@ -547,7 +547,14 @@ export default function WytheWorkspacePage() {
   }, [wytheTheme, flashToast]);
 
   const cycleSceneLens = useCallback(() => {
-    const order: SceneLens[] = ['status', 'contention', 'gravity', 'subkind', 'cluster'];
+    const order: SceneLens[] = [
+      'status',
+      'contention',
+      'gravity',
+      'subkind',
+      'cluster',
+      'containers',
+    ];
     setSceneLens((cur) => {
       const next = order[(order.indexOf(cur) + 1) % order.length];
       flashToast(`3D Lens: ${SCENE_LENS_LABELS[next]}`);
@@ -1765,7 +1772,16 @@ export default function WytheWorkspacePage() {
                       <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5 text-[11px]">
                         <div className="flex flex-wrap items-center gap-1.5">
                           <span className="text-slate-300">Lens [V]:</span>
-                          {(['status', 'contention', 'gravity', 'subkind', 'cluster'] as const).map(
+                          {(
+                            [
+                              'status',
+                              'contention',
+                              'gravity',
+                              'subkind',
+                              'cluster',
+                              'containers',
+                            ] as const
+                          ).map(
                             (lKey) => (
                               <button
                                 key={lKey}
