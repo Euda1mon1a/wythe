@@ -105,6 +105,7 @@ class AtlasEdge(StrictSchema):
     verification: VerificationState
     evidence_path: str | None = None
     evidence_note: str
+    symbol_links: list[str] = Field(default_factory=list)
 
 
 class EndToEndChain(StrictSchema):

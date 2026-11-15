@@ -21,8 +21,8 @@ def test_security_policy_exists_and_covers_posture_blue_team_and_boundaries() ->
     required_terms = (
         "SUPPORT.md",
         "MIT License",
-        "wythe==0.2.0",
-        "Euda1mon1a/wythe@v0.2.0",
+        "wythe==0.2.1",
+        "Euda1mon1a/wythe@v0.2.1",
         "Private Vulnerability Reporting",
         "Security Advisories",
         "wythe security ownership",

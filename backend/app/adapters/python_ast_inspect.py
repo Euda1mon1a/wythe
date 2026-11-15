@@ -252,6 +252,10 @@ class ParsedPythonModule:
     # Includes made into this module's own `APIRouter` (`router.include_router(sub)`): the
     # included routes live under wherever this module's router is mounted.
     nested_router_includes: tuple[tuple[str, str], ...] = ()
+    func_reads: dict[str, frozenset[str]] = field(default_factory=dict)
+    func_writes: dict[str, frozenset[str]] = field(default_factory=dict)
+    func_calls: dict[str, frozenset[str]] = field(default_factory=dict)
+    decorated_funcs: frozenset[str] = frozenset()
 
 
 def _dotted(node: ast.AST) -> str | None:
@@ -2571,9 +2575,63 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     param_profiles = _injected_param_profiles(tree, excluded)
     write_only: set[int] = set()
 
+    node_scopes: dict[int, tuple[str, ...]] = {}
+    scope_line_ranges: list[tuple[int, int, tuple[str, ...]]] = []
+    decorated_funcs: set[str] = set()
+
+    def _tag_scope_stmts(stmts: list[ast.stmt]) -> None:
+        for st in stmts:
+            if id(st) in excluded:
+                continue
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if st.decorator_list:
+                    decorated_funcs.add(st.name)
+                sc = (st.name,)
+                scope_line_ranges.append((st.lineno, getattr(st, "end_lineno", st.lineno), sc))
+                for ch in ast.walk(st):
+                    node_scopes[id(ch)] = sc
+            elif isinstance(st, ast.ClassDef):
+                cls_sc = (st.name,)
+                for ch in ast.walk(st):
+                    node_scopes[id(ch)] = cls_sc
+                for member in st.body:
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if member.decorator_list:
+                            decorated_funcs.add(member.name)
+                        msc = (st.name, member.name) if member.name in ("__init__", "__new__", "__call__") else (member.name,)
+                        scope_line_ranges.append((member.lineno, getattr(member, "end_lineno", member.lineno), msc))
+                        for ch in ast.walk(member):
+                            node_scopes[id(ch)] = msc
+            elif isinstance(st, (ast.If, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)):
+                _tag_scope_stmts(st.body)
+                if hasattr(st, "orelse"):
+                    _tag_scope_stmts(st.orelse)
+            elif isinstance(st, (ast.Try, ast.TryStar)):
+                _tag_scope_stmts(st.body)
+                for h in st.handlers:
+                    _tag_scope_stmts(h.body)
+                _tag_scope_stmts(st.orelse)
+                _tag_scope_stmts(st.finalbody)
+
+    _tag_scope_stmts(tree.body)
+    raw_func_reads: dict[str, set[str]] = {}
+    raw_func_writes: dict[str, set[str]] = {}
+    raw_func_calls: dict[str, set[str]] = {}
+
+    def _scopes_for_node(nd: ast.AST) -> tuple[str, ...]:
+        return node_scopes.get(id(nd), ("*",))
+
+    def _scopes_for_line(lineno: int) -> tuple[str, ...]:
+        for s_line, e_line, sc in reversed(scope_line_ranges):
+            if s_line <= lineno <= e_line:
+                return sc
+        return ("*",)
+
     def note_write(sym: str, lineno: int) -> None:
         if sym not in write_lines or lineno < write_lines[sym]:
             write_lines[sym] = lineno
+        for sc in _scopes_for_line(lineno):
+            raw_func_writes.setdefault(sc, set()).add(sym)
 
     raw_clocks = _collect_raw_clocks(tree, excluded)
     router_prefix = ""
@@ -2615,6 +2673,8 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         if short:
             resolved_short = resolve(short)
             called.add(resolved_short)
+            for sc in _scopes_for_node(n):
+                raw_func_calls.setdefault(sc, set()).add(resolved_short)
             if isinstance(target, ast.Name):
                 # Imported names resolve through their import edge; builtins never cross modules.
                 if target.id not in external_roots and target.id not in aliases and target.id not in _BUILTIN_NAMES:
@@ -2629,6 +2689,8 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             if dotted:
                 qual = resolve_qual(dotted)
                 called.add(qual)
+                for sc in _scopes_for_node(n):
+                    raw_func_calls.setdefault(sc, set()).add(qual)
                 writes.add(qual)
                 constructed.add(qual)
                 note_write(qual, n.lineno)
@@ -2670,18 +2732,33 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         if id(n) in excluded:
             continue
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and id(n) not in write_only:
-            reads.add(resolve(n.id))
+            rsym = resolve(n.id)
+            reads.add(rsym)
+            for sc in _scopes_for_node(n):
+                raw_func_reads.setdefault(sc, set()).add(rsym)
         elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) and id(n) not in write_only:
             reads.add(n.attr)
+            for sc in _scopes_for_node(n):
+                raw_func_reads.setdefault(sc, set()).add(n.attr)
             d = _dotted(n)
             if d:
                 h, _, t = d.partition(".")
-                reads.add(f"{resolve(h)}.{t}" if t else resolve(h))
+                qsym = f"{resolve(h)}.{t}" if t else resolve(h)
+                reads.add(qsym)
+                for sc in _scopes_for_node(n):
+                    raw_func_reads.setdefault(sc, set()).add(qsym)
         elif isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstring_ids:
             sr, sw, sc = _sql_targets(n.value)
             sql_reads |= sr
             sql_writes |= sw
             sql_calls |= sc
+            n_scopes = _scopes_for_node(n)
+            for sym in sr:
+                for sc_name in n_scopes:
+                    raw_func_reads.setdefault(sc_name, set()).add(sym)
+            for sym in sc:
+                for sc_name in n_scopes:
+                    raw_func_calls.setdefault(sc_name, set()).add(sym)
             for sym in sw:
                 note_write(sym, n.lineno)
 
@@ -2922,6 +2999,36 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             if size >= 3 and name_has_policy_token(target_name, _POLICY_COLLECTION_TOKENS):
                 policy_literals.append((target_name, stmt.lineno, f"collection[{size}]"))
 
+    all_scopes = set(raw_func_calls) | set(raw_func_reads) | set(raw_func_writes) | set(top_level_defs) | set(method_defs)
+    internal_scopes = all_scopes - {"*"}
+    for _ in range(6):
+        changed = False
+        for sc_name in list(all_scopes):
+            callees = (raw_func_calls.get(sc_name, set()) & internal_scopes) - {sc_name}
+            for cal in list(callees):
+                c_set = raw_func_calls.setdefault(sc_name, set())
+                r_set = raw_func_reads.setdefault(sc_name, set())
+                w_set = raw_func_writes.setdefault(sc_name, set())
+                before = (len(c_set), len(r_set), len(w_set))
+                c_set.update(raw_func_calls.get(cal, ()))
+                r_set.update(raw_func_reads.get(cal, ()))
+                w_set.update(raw_func_writes.get(cal, ()))
+                if (len(c_set), len(r_set), len(w_set)) != before:
+                    changed = True
+        if not changed:
+            break
+
+    handlers = [
+        ParsedRouteHandler(
+            func_name=h.func_name,
+            http_method=h.http_method,
+            subpath=h.subpath,
+            lineno=h.lineno,
+            called_symbols=frozenset(h.called_symbols | raw_func_calls.get(h.func_name, set())),
+        )
+        for h in handlers
+    ]
+
     is_package = rel_path.endswith("__init__.py")
     package_exports = _package_exports(tree, [b[:2] for b in bindings], excluded, local_pkg) if is_package else ()
 
@@ -2960,6 +3067,10 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         imported_names={k: frozenset(v) for k, v in imported_names.items()},
         import_targets=import_targets,
         write_lines=write_lines,
+        func_reads={k: frozenset(v) for k, v in raw_func_reads.items()},
+        func_writes={k: frozenset(v) for k, v in raw_func_writes.items()},
+        func_calls={k: frozenset(v) for k, v in raw_func_calls.items()},
+        decorated_funcs=frozenset(decorated_funcs),
     )
 
 

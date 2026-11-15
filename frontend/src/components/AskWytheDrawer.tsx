@@ -102,6 +102,34 @@ function renderFormattedAnswer(md: string) {
   });
 }
 
+function matchReferencedNodeIds(
+  answerMarkdown: string,
+  focusedNodeId: string | null,
+  nodesById: Map<string, AtlasNode>,
+): string[] {
+  const matched: string[] = [];
+  if (focusedNodeId) {
+    matched.push(focusedNodeId);
+  }
+  const lowAns = answerMarkdown.toLowerCase();
+  for (const node of nodesById.values()) {
+    if (matched.length >= 6) break;
+    if (matched.includes(node.id)) continue;
+    const idLow = node.id.toLowerCase();
+    const lblLow = node.label.toLowerCase();
+    const isCodeIdentifier =
+      lblLow.includes('_') || lblLow.includes('/') || lblLow.includes(':');
+    if (
+      lowAns.includes(idLow) ||
+      lowAns.includes(`\`${lblLow}\``) ||
+      (isCodeIdentifier && lblLow.length >= 5 && lowAns.includes(lblLow))
+    ) {
+      matched.push(node.id);
+    }
+  }
+  return matched;
+}
+
 export function AskWytheDrawer({
   open,
   activeSlug,
@@ -195,12 +223,11 @@ export function AskWytheDrawer({
     const liveBrief = liveDigest
       ? `${liveDigest.markdownBrief}\n\n${explanation?.markdown_brief ?? ''}`.trim()
       : (explanation?.markdown_brief ?? `Target: ${activeSlug}`);
-    const refNodes =
-      liveDigest?.referencedNodeIds && liveDigest.referencedNodeIds.length > 0
-        ? liveDigest.referencedNodeIds
-        : explanation?.focused_node
-          ? [explanation.focused_node.id]
-          : [];
+    const focusedNodeId =
+      explanation?.focused_node?.id ??
+      (liveDigest?.referencedNodeIds && liveDigest.referencedNodeIds.length > 0
+        ? liveDigest.referencedNodeIds[0]
+        : null);
     const sessionHistory: AskChatTurn[] = keepSession
       ? [...turns]
           .reverse()
@@ -231,7 +258,7 @@ export function AskWytheDrawer({
             answerMarkdown: out.answerMarkdown,
             engineBadge: 'chrome · gemini-nano-in-browser',
             usedVision: out.usedVision,
-            referencedNodeIds: refNodes,
+            referencedNodeIds: matchReferencedNodeIds(out.answerMarkdown, focusedNodeId, nodesById),
           },
           ...prev,
         ]);
@@ -269,7 +296,7 @@ export function AskWytheDrawer({
             answerMarkdown: out.answerMarkdown,
             engineBadge: `local (this Mac) · ${browserLocalProbe.displayModel ?? 'default_model'}`,
             usedVision: out.usedVision,
-            referencedNodeIds: refNodes,
+            referencedNodeIds: matchReferencedNodeIds(out.answerMarkdown, focusedNodeId, nodesById),
           },
           ...prev,
         ]);

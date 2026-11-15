@@ -179,7 +179,7 @@ def parse_module(path: Path, text: str) -> _ModuleInfo:
     if execution is not None:
         info.execution_known = True
         info.eager_symbols = execution.eager_symbols
-        info.module_body += "\n" + execution.statements
+        info.module_body = execution.statements
         ranges = execution.ranges
         exact_names = {name for name, _, _ in ranges}
         info.decl_ranges = ranges + [r for r in info.decl_ranges if r[0] not in exact_names]

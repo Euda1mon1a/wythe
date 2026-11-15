@@ -1,4 +1,4 @@
-# Wythe User Guide (`v0.2.0`)
+# Wythe User Guide (`v0.2.1`)
 
 **Wythe** (**Why `?` → Therefore `∴`**) audits full-stack repositories around three architectural invariants:
 

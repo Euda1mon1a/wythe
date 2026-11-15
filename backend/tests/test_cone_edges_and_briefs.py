@@ -343,3 +343,148 @@ def test_cli_context_full_and_ui_focus_edge_labels(
         http_data = http_resp.json()
         assert http_data["completeness"]["full_export"] is True
         assert http_data["completeness"]["is_complete"] is True
+
+
+def test_surgical_cone_symbol_scoping_uncalled_reader_and_barrel_inertness(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "surgical-cone-repo"
+    (repo / "backend/app/models").mkdir(parents=True)
+    (repo / "backend/app/resilience").mkdir(parents=True)
+    (repo / "backend/app/scheduling").mkdir(parents=True)
+    (repo / "backend/app/api/routes").mkdir(parents=True)
+    (repo / "backend/tests/mesh").mkdir(parents=True)
+    (repo / "frontend/src/hooks").mkdir(parents=True)
+    (repo / "frontend/src/app/dashboard").mkdir(parents=True)
+
+    (repo / "backend/schema.sql").write_text(
+        "CREATE TABLE cross_training_recommendations (id INT PRIMARY KEY);\n"
+        "CREATE TABLE health_snapshots (id INT PRIMARY KEY);\n",
+        encoding="utf-8",
+    )
+    (repo / "backend/app/models/resilience.py").write_text(
+        "class CrossTrainingRecommendationRecord:\n"
+        "    __tablename__ = 'cross_training_recommendations'\n"
+        "class HealthSnapshotRecord:\n"
+        "    __tablename__ = 'health_snapshots'\n",
+        encoding="utf-8",
+    )
+    (repo / "backend/app/resilience/tier3_persistence.py").write_text(
+        "from app.models.resilience import CrossTrainingRecommendationRecord\n"
+        "def persist_cross_training_recommendation(db):\n"
+        "    rec = CrossTrainingRecommendationRecord()\n"
+        "    db.add(rec)\n"
+        "    return rec\n"
+        "def get_pending_cross_training(db):\n"
+        "    return db.query(CrossTrainingRecommendationRecord).all()\n",
+        encoding="utf-8",
+    )
+    (repo / "backend/app/resilience/service.py").write_text(
+        "from app.models.resilience import HealthSnapshotRecord\n"
+        "from app.resilience.tier3_persistence import persist_cross_training_recommendation\n"
+        "DEFAULT_CONFIG_TAG = 'v1'\n"
+        "class ResilienceError(RuntimeError):\n"
+        "    pass\n"
+        "class ResilienceService:\n"
+        "    def check_health(self, db):\n"
+        "        return db.query(HealthSnapshotRecord).all()\n"
+        "    def generate_cross_training_recommendations(self, db):\n"
+        "        return persist_cross_training_recommendation(db)\n",
+        encoding="utf-8",
+    )
+    (repo / "backend/app/scheduling/engine.py").write_text(
+        "from app.resilience.service import DEFAULT_CONFIG_TAG, ResilienceError, ResilienceService\n"
+        "class SchedulingEngine:\n"
+        "    def run(self, db):\n"
+        "        _ = DEFAULT_CONFIG_TAG\n"
+        "        try:\n"
+        "            return ResilienceService().check_health(db)\n"
+        "        except ResilienceError:\n"
+        "            return []\n",
+        encoding="utf-8",
+    )
+    (repo / "backend/app/scheduling/mesh_orphan.py").write_text(
+        "class ServiceMesh:\n"
+        "    def route(self):\n"
+        "        return True\n",
+        encoding="utf-8",
+    )
+    (repo / "backend/tests/mesh/test_mesh_orphan.py").write_text(
+        "from app.scheduling.mesh_orphan import ServiceMesh\n"
+        "def test_mesh():\n"
+        "    assert ServiceMesh().route() is True\n",
+        encoding="utf-8",
+    )
+    (repo / "backend/app/api/routes/resilience.py").write_text(
+        "from fastapi import APIRouter\n"
+        "from app.resilience.service import ResilienceService\n"
+        "router = APIRouter(prefix='/resilience')\n"
+        "@router.get('/health')\n"
+        "def health_endpoint(db):\n"
+        "    return ResilienceService().check_health(db)\n"
+        "@router.get('/tier3/hubs/cross-training')\n"
+        "def cross_training_endpoint(db):\n"
+        "    return ResilienceService().generate_cross_training_recommendations(db)\n",
+        encoding="utf-8",
+    )
+    (repo / "frontend/src/hooks/index.ts").write_text(
+        "export * from './useResilience';\n"
+        "export * from './useOther';\n",
+        encoding="utf-8",
+    )
+    (repo / "frontend/src/hooks/useResilience.ts").write_text(
+        "/** JSDoc header comment */\n"
+        "'use client';\n"
+        "export enum HealthState { OK = 'ok' }\n"
+        "export const resilienceQueryKeys = { all: ['resilience'] as const, health: () => ['resilience', 'health'] as const };\n"
+        "export function useSystemHealth() { return fetch('/resilience/health'); }\n",
+        encoding="utf-8",
+    )
+    (repo / "frontend/src/hooks/useOther.ts").write_text(
+        "export function useOther() { return 42; }\n",
+        encoding="utf-8",
+    )
+    (repo / "frontend/src/app/dashboard/page.tsx").write_text(
+        "import { useOther } from '@/hooks';\n"
+        "export default function DashboardPage() { return <div>{useOther()}</div>; }\n",
+        encoding="utf-8",
+    )
+
+    target = register_target(
+        db_session,
+        TargetProjectCreate(
+            slug="surgical-cone",
+            name="Surgical Cone",
+            repo_path=str(repo),
+            stack_profile_slug="fastapi-sqlalchemy-nextjs",
+        ),
+    )
+    rep = run_target_scan(db_session, target, strict_gate=True, persist_snapshot=False)
+
+    # 1. P3: Uncalled reader function `get_pending_cross_training` does not mask TRUTH-001.
+    ct_node = next(n for n in rep.nodes if n.id == "t:cross_training_recommendations")
+    assert ct_node.read_by_count == 0
+    assert ct_node.written_by_count == 1
+    assert ct_node.status == "orphaned"
+    assert any(f.rule_code == "TRUTH-001" and f.node_id == "t:cross_training_recommendations" for f in rep.findings)
+
+    # 2. P1 + P2: Lineage cone for `t:cross_training_recommendations` excludes `scheduling.engine` and frontend `/resilience/health` hooks.
+    cone = build_lineage_cone_slice(rep, "t:cross_training_recommendations", full=True)
+    manip_ids = {n.id for n in cone.manipulator_nodes}
+    assert manip_ids == {
+        "m:solver:resilience.tier3_persistence",
+        "m:solver:resilience.service",
+        "m:route:api.routes.resilience",
+    }
+    assert cone.upstream_display_nodes == []
+
+    # 3. P1: DashboardPage importing `useOther` from barrel `@/hooks` does not acquire a declared edge to `useResilience`.
+    disp_edges = [
+        e for e in rep.edges if e.source_id.endswith("dashboard.page") and e.target_id.endswith("useResilience")
+    ]
+    assert disp_edges == []
+
+    # 4. P4: MANIP-003 on `mesh_orphan` cites its test file reference.
+    m3 = next(f for f in rep.findings if f.rule_code == "MANIP-003" and "mesh_orphan" in (f.node_id or ""))
+    assert "test_mesh_orphan.py" in m3.detail
