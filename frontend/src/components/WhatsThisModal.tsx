@@ -1,7 +1,9 @@
 'use client';
 
+import { useRef } from 'react';
 import { Bot, CheckCircle2, Download, Eye, Sparkles, X } from 'lucide-react';
 import type { UiFocusExplainRead } from '@/api/atlas';
+import { useDialogFocusTrap } from '@/lib/wytheDialogFocus';
 
 interface WhatsThisModalProps {
   open: boolean;
@@ -22,6 +24,16 @@ export function WhatsThisModal({
   onAskAi,
   onClose,
 }: WhatsThisModalProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+
+  useDialogFocusTrap({
+    open,
+    containerRef,
+    initialFocusRef: closeButtonRef,
+    onClose,
+  });
+
   if (!open) return null;
 
   return (
@@ -31,7 +43,10 @@ export function WhatsThisModal({
       aria-label="Wythe What's This Human-to-LLM X-Ray Bridge"
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm"
     >
-      <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto border border-teal-500/50 bg-slate-950 p-5 text-xs text-slate-200 shadow-2xl">
+      <div
+        ref={containerRef}
+        className="max-h-[90vh] w-full max-w-3xl overflow-y-auto border border-teal-500/50 bg-slate-950 p-5 text-xs text-slate-200 shadow-2xl"
+      >
         <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-teal-300">
@@ -56,10 +71,11 @@ export function WhatsThisModal({
             </h2>
           </div>
           <button
+            ref={closeButtonRef}
             type="button"
             onClick={onClose}
             aria-label="Close What's This X-Ray card"
-            className="border border-slate-700 bg-slate-900 p-1 text-slate-300 hover:border-teal-400 hover:text-slate-100"
+            className="inline-flex min-h-6 min-w-6 items-center justify-center border border-slate-700 bg-slate-900 p-1 text-slate-300 hover:border-teal-400 hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
           >
             <X className="h-4 w-4" />
           </button>
@@ -82,7 +98,7 @@ export function WhatsThisModal({
               <button
                 type="button"
                 onClick={() => onAskAi('What is this cluster and why is it colored like this?')}
-                className="flex items-center gap-1.5 border border-teal-400/60 bg-teal-500/20 px-3 py-1 font-mono text-xs font-semibold text-teal-100 hover:bg-teal-500/30"
+                className="flex min-h-6 min-w-6 items-center gap-1.5 border border-teal-400/60 bg-teal-500/20 px-3 py-1 font-mono text-xs font-semibold text-teal-100 hover:bg-teal-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 <Bot className="h-3.5 w-3.5" />
                 Ask On-Device AI Now [A]
@@ -138,7 +154,7 @@ export function WhatsThisModal({
               <a
                 href={snapshotDataUrl}
                 download={`wythe-xray-${explanation?.active_slug ?? 'view'}.png`}
-                className="flex items-center gap-1 border border-teal-500/40 bg-teal-500/15 px-2 py-0.5 text-teal-200 hover:bg-teal-500/25"
+                className="flex min-h-6 min-w-6 items-center gap-1 border border-teal-500/40 bg-teal-500/15 px-2 py-0.5 text-teal-200 hover:bg-teal-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 <Download className="h-3 w-3" />
                 Download PNG
