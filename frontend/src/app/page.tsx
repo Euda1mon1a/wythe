@@ -1292,7 +1292,7 @@ export default function WytheWorkspacePage() {
                   setActiveSlug(e.target.value);
                   setSelectedNodeId(null);
                 }}
-                className="border border-slate-700 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-100 focus:border-teal-400 focus:outline-none"
+                className="min-h-6 border border-slate-700 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-100 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 {loadingTargets && <option value="">Loading targets…</option>}
                 {targets.map((t) => (
@@ -1306,7 +1306,7 @@ export default function WytheWorkspacePage() {
                 onClick={() => setShowAddTarget((v) => !v)}
                 aria-label="Register repository path"
                 title="Register repository path"
-                className="border border-slate-800 bg-slate-900 p-1.5 text-slate-300 hover:border-teal-400 hover:text-teal-300"
+                className="inline-flex min-h-6 min-w-6 items-center justify-center border border-slate-800 bg-slate-900 p-1.5 text-slate-300 hover:border-teal-400 hover:text-teal-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 <Plus className="h-3.5 w-3.5" />
               </button>
@@ -1318,7 +1318,7 @@ export default function WytheWorkspacePage() {
                 }}
                 aria-label="Open command palette and quick jump"
                 title="Search commands, 3-tier nodes, findings & targets (⌘K or /)"
-                className="flex items-center gap-1.5 border border-slate-700 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-200 hover:border-teal-400 hover:text-teal-300"
+                className="flex min-h-6 min-w-6 items-center gap-1.5 border border-slate-700 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-200 hover:border-teal-400 hover:text-teal-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 <Command className="h-3.5 w-3.5 text-teal-300" />
                 <span>Commands</span>
@@ -1331,7 +1331,7 @@ export default function WytheWorkspacePage() {
                 onClick={() => openAskWytheDrawer()}
                 aria-label="Open Ask Wythe On-Device AI drawer"
                 title="Ask Apple Intelligence, Chrome Gemini Nano, or Local OpenAI /v1 directly about this view (A or ⌘J)"
-                className="flex items-center gap-1.5 border border-sky-500/50 bg-sky-500/15 px-2.5 py-1 font-mono text-xs text-sky-200 hover:border-sky-400 hover:bg-sky-500/25"
+                className="flex min-h-6 min-w-6 items-center gap-1.5 border border-sky-500/50 bg-sky-500/15 px-2.5 py-1 font-mono text-xs text-sky-200 hover:border-sky-400 hover:bg-sky-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 <Bot className="h-3.5 w-3.5 text-sky-300" />
                 <span>Ask AI</span>
@@ -1410,7 +1410,7 @@ export default function WytheWorkspacePage() {
                   }}
                   aria-label="Copy token-budgeted llms.txt architectural map"
                   title="Copy token-budgeted llms.txt pointer map (~2k tokens) for LLMs & coding agents"
-                  className="flex items-center gap-1.5 border border-sky-500/40 bg-sky-500/15 px-2.5 py-1 text-sky-200 hover:bg-sky-500/25 disabled:opacity-50"
+                  className="flex min-h-6 min-w-6 items-center gap-1.5 border border-sky-500/40 bg-sky-500/15 px-2.5 py-1 text-sky-200 hover:bg-sky-500/25 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                 >
                   <Copy className="h-3.5 w-3.5" />
                   {copiedBriefLabel ?? 'Copy llms.txt'}
@@ -1419,7 +1419,7 @@ export default function WytheWorkspacePage() {
                   type="button"
                   disabled={triggerScan.isPending}
                   onClick={() => triggerScan.mutate()}
-                  className="flex items-center gap-1.5 border border-slate-700 bg-slate-900 px-2.5 py-1 text-slate-200 hover:border-teal-400 hover:text-teal-300 disabled:opacity-50"
+                  className="flex min-h-6 min-w-6 items-center gap-1.5 border border-slate-700 bg-slate-900 px-2.5 py-1 text-slate-200 hover:border-teal-400 hover:text-teal-300 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                 >
                   <RefreshCw
                     className={`h-3.5 w-3.5 ${triggerScan.isPending ? 'animate-spin' : ''}`}
@@ -1445,13 +1445,13 @@ export default function WytheWorkspacePage() {
                 placeholder="/absolute/path/to/repo"
                 value={newPath}
                 onChange={(e) => setNewPath(e.target.value)}
-                className="w-72 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400"
+                className="min-h-6 w-72 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               />
               <button
                 type="button"
                 disabled={detectStack.isPending || !newPath.trim()}
                 onClick={handleAutoDetect}
-                className="border border-sky-500/40 bg-sky-500/15 px-2.5 py-1 text-sky-300 hover:bg-sky-500/25 disabled:opacity-50"
+                className="min-h-6 min-w-6 border border-sky-500/40 bg-sky-500/15 px-2.5 py-1 text-sky-300 hover:bg-sky-500/25 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 {detectStack.isPending ? 'Detecting…' : 'Auto-Detect Stack'}
               </button>
@@ -1459,7 +1459,7 @@ export default function WytheWorkspacePage() {
                 aria-label="Stack profile"
                 value={newProfileSlug}
                 onChange={(e) => setNewProfileSlug(e.target.value)}
-                className="border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100"
+                className="min-h-6 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 {enabledProfiles.map((p) => (
                   <option key={p.slug} value={p.slug}>
@@ -1476,7 +1476,7 @@ export default function WytheWorkspacePage() {
                 placeholder="slug (e.g. my-app)"
                 value={newSlug}
                 onChange={(e) => setNewSlug(e.target.value)}
-                className="w-40 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400"
+                className="min-h-6 w-40 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               />
               <input
                 type="text"
@@ -1484,7 +1484,7 @@ export default function WytheWorkspacePage() {
                 placeholder="Display name"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                className="w-44 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400"
+                className="min-h-6 w-44 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               />
               <input
                 type="text"
@@ -1493,7 +1493,7 @@ export default function WytheWorkspacePage() {
                 title="Backend subdirectory relative to repo root (use . for full-stack root)"
                 value={newBackendSubdir}
                 onChange={(e) => setNewBackendSubdir(e.target.value)}
-                className="w-36 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400"
+                className="min-h-6 w-36 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               />
               <input
                 type="text"
@@ -1502,11 +1502,11 @@ export default function WytheWorkspacePage() {
                 title="Frontend subdirectory relative to repo root (use . for full-stack root)"
                 value={newFrontendSubdir}
                 onChange={(e) => setNewFrontendSubdir(e.target.value)}
-                className="w-36 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400"
+                className="min-h-6 w-36 border border-slate-800 bg-slate-900 px-2.5 py-1 text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               />
               <button
                 type="submit"
-                className="border border-teal-500/40 bg-teal-500/15 px-3 py-1 text-teal-300 hover:bg-teal-500/25"
+                className="min-h-6 min-w-6 border border-teal-500/40 bg-teal-500/15 px-3 py-1 text-teal-300 hover:bg-teal-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 Register Target
               </button>
@@ -1574,7 +1574,7 @@ export default function WytheWorkspacePage() {
                 tabIndex={activeTab === key ? 0 : -1}
                 onClick={() => setActiveTab(key)}
                 onKeyDown={(e) => handleTabKeyDown(e, key)}
-                className={`px-3 py-1 transition-colors focus:outline-none focus:ring-2 focus:ring-teal-400 ${
+                className={`min-h-6 px-3 py-1 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                   activeTab === key
                     ? 'bg-teal-500/20 font-semibold text-teal-300'
                     : 'text-slate-300 hover:text-slate-100'
@@ -1643,7 +1643,7 @@ export default function WytheWorkspacePage() {
                               key={t}
                               type="button"
                               onClick={() => setTierFilter(t)}
-                              className={`border px-2 py-0.5 uppercase ${
+                              className={`min-h-6 min-w-6 border px-2 py-0.5 uppercase focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                                 tierFilter === t
                                   ? 'border-teal-400/60 bg-teal-500/15 text-teal-300'
                                   : 'border-slate-800 bg-slate-950 text-slate-300 hover:text-slate-100'
@@ -1658,7 +1658,7 @@ export default function WytheWorkspacePage() {
                             onChange={(e) =>
                               setSubkindFilter(e.target.value as 'all' | AtlasNode['subkind'])
                             }
-                            className="border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200"
+                            className="min-h-6 border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                           >
                             <option value="all">Subkind: All (11)</option>
                             {ALL_NODE_SUBKINDS.map((sk) => (
@@ -1671,7 +1671,7 @@ export default function WytheWorkspacePage() {
                             aria-label="Filter 3D edges by kind and verification"
                             value={edgeFilter}
                             onChange={(e) => setEdgeFilter(e.target.value as EdgeFilterMode)}
-                            className="border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200"
+                            className="min-h-6 border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                           >
                             <option value="all">Edges: All</option>
                             <option value="writes">Edges: Writes &amp; Mutations</option>
@@ -1689,40 +1689,40 @@ export default function WytheWorkspacePage() {
                             value={searchQuery}
                             onChange={(e) => setSearchQuery(e.target.value)}
                             placeholder="Search node, column, /route…"
-                            className="w-48 border border-slate-800 bg-slate-950 px-2.5 py-0.5 text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus:outline-none"
+                            className="min-h-6 w-48 border border-slate-800 bg-slate-950 px-2.5 py-0.5 text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                           />
                         </div>
                         <div className="flex flex-wrap items-center gap-3">
-                          <label className="flex cursor-pointer items-center gap-1.5 text-slate-300" title="Hide nodes without a connection in this filtered view. Missing connections do not prove code is unused.">
+                          <label className="flex min-h-6 cursor-pointer items-center gap-1.5 text-slate-300" title="Hide nodes without a connection in this filtered view. Missing connections do not prove code is unused.">
                             <input type="checkbox" checked={connectedOnly}
-                              onChange={(e) => setConnectedOnly(e.target.checked)} className="accent-teal-400" />
+                              onChange={(e) => setConnectedOnly(e.target.checked)} className="accent-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400" />
                             Connected only
                           </label>
                           <select aria-label="Selected node neighborhood" disabled={!selectedNodeId}
                             value={neighborhoodHops}
                             onChange={(e) => { setNeighborhoodHops(Number(e.target.value) as 0 | 1 | 2); setIsolateCone(false); }}
                             title={selectedNodeId ? 'Follow connections in either direction using the active edge filter' : 'Select a node to focus its neighborhood'}
-                            className="border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200 disabled:opacity-40">
+                            className="min-h-6 border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200 disabled:opacity-40 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400">
                             <option value={0}>Neighborhood: All</option>
                             <option value={1}>Neighborhood: 1 hop</option>
                             <option value={2}>Neighborhood: 2 hops</option>
                           </select>
-                          <label className="flex cursor-pointer items-center gap-1.5 text-slate-300">
+                          <label className="flex min-h-6 cursor-pointer items-center gap-1.5 text-slate-300">
                             <input
                               type="checkbox"
                               checked={isolateCone}
                               disabled={!selectedNodeId}
                               onChange={(e) => { setIsolateCone(e.target.checked); setNeighborhoodHops(0); }}
-                              className="accent-sky-400 disabled:opacity-40"
+                              className="accent-sky-400 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             />
                             Cone [C]
                           </label>
-                          <label className="flex cursor-pointer items-center gap-1.5 text-slate-300">
+                          <label className="flex min-h-6 cursor-pointer items-center gap-1.5 text-slate-300">
                             <input
                               type="checkbox"
                               checked={onlyFlagged}
                               onChange={(e) => setOnlyFlagged(e.target.checked)}
-                              className="accent-amber-400"
+                              className="accent-amber-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             />
                             Flagged [G]
                           </label>
@@ -1734,7 +1734,7 @@ export default function WytheWorkspacePage() {
                                 setPaletteOpen(true);
                               }}
                               aria-label="Open command palette in fullscreen"
-                              className="flex items-center gap-1 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 hover:text-teal-300"
+                              className="flex min-h-6 min-w-6 items-center gap-1 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 hover:text-teal-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             >
                               <Command className="h-3 w-3 text-teal-300" />
                               ⌘K
@@ -1744,7 +1744,7 @@ export default function WytheWorkspacePage() {
                             type="button"
                             onClick={toggleFullscreen3D}
                             aria-label={isFullscreen3D ? 'Exit fullscreen 3D view' : 'Expand 3D view to fullscreen'}
-                            className="flex items-center gap-1 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 hover:text-teal-300"
+                            className="flex min-h-6 min-w-6 items-center gap-1 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 hover:text-teal-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                           >
                             {isFullscreen3D ? (
                               <>
@@ -1771,7 +1771,7 @@ export default function WytheWorkspacePage() {
                                 key={lKey}
                                 type="button"
                                 onClick={() => setSceneLens(lKey)}
-                                className={`border px-2 py-0.5 ${
+                                className={`min-h-6 min-w-6 border px-2 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                                   sceneLens === lKey
                                     ? 'border-sky-400/60 bg-sky-500/20 text-sky-200'
                                     : 'border-slate-800 bg-slate-950 text-slate-300 hover:text-slate-100'
@@ -1790,7 +1790,7 @@ export default function WytheWorkspacePage() {
                               aria-label="3D spatial layout arrangement"
                               value={sceneLayout}
                               onChange={(e) => setSceneLayout(e.target.value as SceneLayoutMode)}
-                              className="ml-1 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                              className="ml-1 min-h-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             >
                               <option value="cluster">Layout [L]: Domain Districts</option>
                               <option value="grid">Layout [L]: Uniform Grid</option>
@@ -1802,7 +1802,7 @@ export default function WytheWorkspacePage() {
                               onClick={() => setFlatten2D((v) => !v)}
                               aria-pressed={flatten2D}
                               aria-label="Toggle 2D flat working plane versus 3D stratified tiers"
-                              className={`border px-2 py-0.5 ${
+                              className={`min-h-6 min-w-6 border px-2 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                                 flatten2D
                                   ? 'border-teal-400/60 bg-teal-950/80 text-teal-200'
                                   : 'border-slate-700 bg-slate-900 text-slate-200 hover:border-teal-400'
@@ -1815,7 +1815,7 @@ export default function WytheWorkspacePage() {
                               onClick={() => setCompactVisible((v) => !v)}
                               aria-pressed={compactVisible}
                               aria-label="Toggle compact layout around currently visible working set"
-                              className={`border px-2 py-0.5 ${
+                              className={`min-h-6 min-w-6 border px-2 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                                 compactVisible
                                   ? 'border-teal-400/60 bg-teal-950/80 text-teal-200'
                                   : 'border-slate-700 bg-slate-900 text-slate-200 hover:border-teal-400'
@@ -1834,7 +1834,7 @@ export default function WytheWorkspacePage() {
                                 setGroupBy(e.target.value as 'none' | 'cluster' | 'subkind');
                                 setCollapsedGroups(new Set());
                               }}
-                              className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                              className="min-h-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             >
                               <option value="none">Group: Off</option>
                               <option value="cluster">Group: Domain</option>
@@ -1844,7 +1844,7 @@ export default function WytheWorkspacePage() {
                               type="button"
                               onClick={() => handleCollectVisibleToWorkingSet(true)}
                               aria-label="Isolate visible nodes into a focused working set"
-                              className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                              className="min-h-6 min-w-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             >
                               Isolate visible ({visibleSceneNodeIds.length})
                             </button>
@@ -1852,7 +1852,7 @@ export default function WytheWorkspacePage() {
                               type="button"
                               onClick={() => handleCollectVisibleToWorkingSet(false)}
                               aria-label="Add visible nodes into the working set"
-                              className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                              className="min-h-6 min-w-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             >
                               + Add visible
                             </button>
@@ -1861,7 +1861,7 @@ export default function WytheWorkspacePage() {
                                 type="button"
                                 onClick={() => setWorkingSetActive(false)}
                                 aria-label="Show full graph without leaving working set items cleared"
-                                className="border border-amber-500/50 bg-amber-950/70 px-2 py-0.5 text-amber-200 hover:border-amber-300"
+                                className="min-h-6 min-w-6 border border-amber-500/50 bg-amber-950/70 px-2 py-0.5 text-amber-200 hover:border-amber-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                               >
                                 Exit set ({workingSetIds.size})
                               </button>
@@ -1870,7 +1870,7 @@ export default function WytheWorkspacePage() {
                               type="button"
                               onClick={handleSaveWorkingView}
                               aria-label="Save current working set and layout view locally"
-                              className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                              className="min-h-6 min-w-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             >
                               Save view
                             </button>
@@ -1886,7 +1886,7 @@ export default function WytheWorkspacePage() {
                                   onChange={(e) => {
                                     if (e.target.value) handleLoadSavedView(e.target.value);
                                   }}
-                                  className="border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                                  className="min-h-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                                 >
                                   <option value="">Saved views ({savedViews.filter((v) => v.targetSlug === activeSlug).length})...</option>
                                   {savedViews
@@ -1904,7 +1904,7 @@ export default function WytheWorkspacePage() {
                                 type="button"
                                 onClick={handleResetOverview}
                                 aria-label="Reset working set and layout overrides to overview"
-                                className="border border-slate-600 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400"
+                                className="min-h-6 min-w-6 border border-slate-600 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                               >
                                 Reset overview
                               </button>
@@ -1919,7 +1919,7 @@ export default function WytheWorkspacePage() {
                             onChange={(e) =>
                               setBlastMode(e.target.value as 'off' | 'git' | 'snapshot')
                             }
-                            className="border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200"
+                            className="min-h-6 border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                           >
                             <option value="off">3D Blast [B]: Off</option>
                             <option value="git">3D Blast: Git Diff ({diffBaseRef})</option>
@@ -1933,7 +1933,7 @@ export default function WytheWorkspacePage() {
                               aria-label="Git base reference for 3D blast overlay"
                               value={diffBaseRef}
                               onChange={(e) => setDiffBaseRef(e.target.value)}
-                              className="w-24 border border-amber-500/40 bg-slate-950 px-1.5 py-0.5 text-amber-200"
+                              className="min-h-6 w-24 border border-amber-500/40 bg-slate-950 px-1.5 py-0.5 text-amber-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             />
                           )}
                           {blastMode === 'snapshot' && scanHistory.length >= 2 && (
@@ -1941,7 +1941,7 @@ export default function WytheWorkspacePage() {
                               aria-label="Base snapshot for 3D time scrubber"
                               value={effectiveBaseSnapId ?? ''}
                               onChange={(e) => setSnapBaseId(Number(e.target.value))}
-                              className="border border-amber-500/40 bg-slate-950 px-1.5 py-0.5 text-amber-200"
+                              className="min-h-6 border border-amber-500/40 bg-slate-950 px-1.5 py-0.5 text-amber-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                             >
                               {scanHistory.slice(1).map((s) => (
                                 <option key={s.id} value={s.id}>
@@ -1958,7 +1958,7 @@ export default function WytheWorkspacePage() {
                                 report.chains.find((c) => c.id === e.target.value) ?? null;
                               setActiveTraceChain(found);
                             }}
-                            className="max-w-[14rem] border border-amber-400/40 bg-slate-950 px-2 py-0.5 text-amber-200"
+                            className="min-h-6 max-w-[14rem] border border-amber-400/40 bg-slate-950 px-2 py-0.5 text-amber-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                           >
                             <option value="">Trace Request in 3D…</option>
                             {report.chains.slice(0, 50).map((c) => (
@@ -1985,7 +1985,7 @@ export default function WytheWorkspacePage() {
                             type="button"
                             onClick={() => setSavedViewNotice(null)}
                             aria-label="Dismiss saved view reconciliation warning"
-                            className="border border-amber-500/40 px-2 py-0.5 text-amber-100 hover:border-amber-300"
+                            className="min-h-6 min-w-6 border border-amber-500/40 px-2 py-0.5 text-amber-100 hover:border-amber-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                           >
                             Dismiss
                           </button>

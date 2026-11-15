@@ -22,6 +22,7 @@ import {
 import { createBatchedNodes, createBatchedEdges, fitGraphCamera, type SceneRenderNode } from '../src/lib/wytheSceneBatches';
 import { buildLiveViewportDigest } from '../src/lib/wytheVisionBridge';
 import { buildDiagnosticBrief, selectReferenceExemplar } from '../src/lib/wytheBriefBuilder';
+import { computeWrappedFocusIndex } from '../src/lib/wytheDialogFocus';
 import { WYTHE_PRESETS } from '../src/lib/wytheTheme';
 
 const node = (id: string, overrides: Partial<AtlasNode> = {}): AtlasNode => ({
@@ -493,4 +494,29 @@ test('group summaries collapse and saved-view reconciliation flags commit drift 
   assert.deepEqual(reconciled.missingNodeIds, ['deleted-node']);
   assert.equal(reconciled.commitChanged, true);
   assert.equal(reconciled.digestChanged, true);
+});
+
+test('computeWrappedFocusIndex wraps Tab and Shift+Tab focus cleanly across dialog controls', () => {
+  assert.equal(computeWrappedFocusIndex(0, 0, false), -1);
+  assert.equal(computeWrappedFocusIndex(0, -1, true), -1);
+  assert.equal(computeWrappedFocusIndex(-2, 0, false), -1);
+
+  assert.equal(computeWrappedFocusIndex(1, 0, false), 0);
+  assert.equal(computeWrappedFocusIndex(1, 0, true), 0);
+
+  // Forward stepping and forward wrap from last control to first
+  assert.equal(computeWrappedFocusIndex(4, 0, false), 1);
+  assert.equal(computeWrappedFocusIndex(4, 2, false), 3);
+  assert.equal(computeWrappedFocusIndex(4, 3, false), 0);
+
+  // Backward stepping and backward wrap from first control to last
+  assert.equal(computeWrappedFocusIndex(4, 3, true), 2);
+  assert.equal(computeWrappedFocusIndex(4, 1, true), 0);
+  assert.equal(computeWrappedFocusIndex(4, 0, true), 3);
+
+  // Out-of-range currentIndex enters at start on Tab or end on Shift+Tab
+  assert.equal(computeWrappedFocusIndex(4, -1, false), 0);
+  assert.equal(computeWrappedFocusIndex(4, -1, true), 3);
+  assert.equal(computeWrappedFocusIndex(4, 4, false), 0);
+  assert.equal(computeWrappedFocusIndex(4, 99, true), 3);
 });

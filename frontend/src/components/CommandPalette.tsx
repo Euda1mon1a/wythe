@@ -10,6 +10,7 @@ import {
   type PaletteMode,
   type QuickActionDef,
 } from '@/lib/wytheCommands';
+import { useDialogFocusTrap } from '@/lib/wytheDialogFocus';
 
 interface CommandPaletteProps {
   open: boolean;
@@ -49,16 +50,22 @@ export function CommandPalette({
   const [query, setQuery] = useState(initialQuery);
   const [filterOverride, setFilterOverride] = useState<PaletteMode | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
+  const panelRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const rowRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
+  useDialogFocusTrap({
+    open,
+    containerRef: panelRef,
+    initialFocusRef: inputRef,
+    onClose,
+  });
 
   useEffect(() => {
     if (!open) return;
     setQuery(initialQuery);
     setFilterOverride(null);
     setActiveIndex(0);
-    const id = window.requestAnimationFrame(() => inputRef.current?.focus());
-    return () => window.cancelAnimationFrame(id);
   }, [open, initialQuery]);
 
   const items = useMemo(
@@ -101,12 +108,6 @@ export function CommandPalette({
   const effectiveMode = filterOverride ?? parsePaletteQuery(query).mode;
 
   const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopPropagation();
-      onClose();
-      return;
-    }
     if (items.length === 0) return;
     if (e.key === 'ArrowDown' || (e.ctrlKey && e.key.toLowerCase() === 'n')) {
       e.preventDefault();
@@ -120,7 +121,7 @@ export function CommandPalette({
     } else if (e.key === 'End') {
       e.preventDefault();
       setActiveIndex(items.length - 1);
-    } else if (e.key === 'Enter') {
+    } else if (e.key === 'Enter' && (e.target as HTMLElement | null)?.tagName !== 'BUTTON') {
       e.preventDefault();
       const target = items[activeIndex];
       if (target) target.onSelect();
@@ -142,7 +143,10 @@ export function CommandPalette({
         onClick={onClose}
         className="fixed inset-0 h-full w-full cursor-default bg-transparent"
       />
-      <div className="relative z-10 w-full max-w-2xl border border-slate-700 bg-slate-950 font-mono shadow-2xl">
+      <div
+        ref={panelRef}
+        className="relative z-10 w-full max-w-2xl border border-slate-700 bg-slate-950 font-mono shadow-2xl"
+      >
         {/* Search Input Row */}
         <div className="flex items-center gap-2.5 border-b border-slate-800 px-3.5 py-2.5">
           <Search className="h-4 w-4 shrink-0 text-teal-400" />
@@ -153,14 +157,14 @@ export function CommandPalette({
             onChange={(e) => setQuery(e.target.value)}
             aria-label="Search commands, 3-tier nodes, findings, or targets"
             placeholder="Type command or node… (> actions, @ nodes, @col:, @http:, @sub:, ! flagged, # targets)"
-            className="w-full bg-transparent text-xs text-slate-100 placeholder-slate-400 focus:outline-none"
+            className="w-full bg-transparent text-xs text-slate-100 placeholder-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
           />
           {query && (
             <button
               type="button"
               aria-label="Clear palette query"
               onClick={() => setQuery('')}
-              className="text-slate-300 hover:text-slate-100"
+              className="inline-flex min-h-6 min-w-6 items-center justify-center text-slate-300 hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
             >
               <X className="h-3.5 w-3.5" />
             </button>
@@ -169,7 +173,7 @@ export function CommandPalette({
             type="button"
             aria-label="Close command palette"
             onClick={onClose}
-            className="border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] text-slate-300 hover:text-slate-100"
+            className="inline-flex min-h-6 min-w-6 items-center justify-center border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] text-slate-300 hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
           >
             ESC
           </button>
@@ -191,7 +195,7 @@ export function CommandPalette({
                 key={m}
                 type="button"
                 onClick={() => setFilterOverride(filterOverride === m ? null : m)}
-                className={`border px-2 py-0.5 ${
+                className={`inline-flex min-h-6 min-w-6 items-center border px-2 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                   effectiveMode === m
                     ? 'border-teal-500/50 bg-teal-500/15 text-teal-300'
                     : 'border-slate-800 bg-slate-950 text-slate-300 hover:text-slate-100'
@@ -230,7 +234,7 @@ export function CommandPalette({
                     aria-selected={active}
                     onMouseEnter={() => setActiveIndex(idx)}
                     onClick={item.onSelect}
-                    className={`flex w-full items-center justify-between gap-3 px-2.5 py-2 text-left text-xs ${
+                    className={`flex min-h-6 min-w-6 w-full items-center justify-between gap-3 px-2.5 py-2 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                       active
                         ? 'border-l-2 border-teal-400 bg-teal-500/15 text-slate-100'
                         : 'border-l-2 border-transparent text-slate-200 hover:bg-slate-900'

@@ -1,10 +1,11 @@
 'use client';
 
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Bot, Copy, Cpu, Download, Eye, RefreshCw, Send, Sparkles, Trash2, X } from 'lucide-react';
 import type { AskChatTurn, AtlasNode, UiFocusExplainRead } from '@/api/atlas';
 import { useAskEngines, useAskWythe } from '@/hooks/useAtlas';
 import { copyTextToClipboard } from '@/lib/clipboard';
+import { useDialogFocusTrap } from '@/lib/wytheDialogFocus';
 import type { LiveViewportDigest } from '@/lib/wytheVisionBridge';
 import {
   probeBrowserLocalOpenAi,
@@ -137,6 +138,13 @@ export function AskWytheDrawer({
   const [activeError, setActiveError] = useState<string | null>(null);
   const [isRunningClientModel, setIsRunningClientModel] = useState(false);
   const [copiedEndpoint, setCopiedEndpoint] = useState<string | null>(null);
+  const containerRef = useRef<HTMLElement>(null);
+
+  useDialogFocusTrap({
+    open,
+    containerRef,
+    onClose,
+  });
 
   const { data: backendEngines, refetch: refetchEngines } = useAskEngines(
     customLocalUrl.trim() || undefined,
@@ -315,7 +323,9 @@ export function AskWytheDrawer({
 
   return (
     <aside
+      ref={containerRef}
       role="dialog"
+      aria-modal="true"
       aria-label="Ask Wythe On-Device Architecture Assistant"
       className="fixed inset-y-0 right-0 z-50 flex w-full max-w-lg flex-col border-l border-teal-500/50 bg-slate-950/95 text-xs text-slate-200 shadow-2xl backdrop-blur-md"
     >
@@ -333,7 +343,7 @@ export function AskWytheDrawer({
           type="button"
           onClick={onClose}
           aria-label="Close Ask Wythe drawer"
-          className="border border-slate-700 bg-slate-900 p-1 text-slate-300 hover:border-teal-400 hover:text-slate-100"
+          className="inline-flex min-h-6 min-w-6 items-center justify-center border border-slate-700 bg-slate-900 p-1 text-slate-300 hover:border-teal-400 hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
         >
           <X className="h-4 w-4" />
         </button>
@@ -349,7 +359,7 @@ export function AskWytheDrawer({
             <button
               type="button"
               onClick={() => setShowLocalConfig((v) => !v)}
-              className="font-mono text-[10px] text-teal-300 underline hover:text-teal-200"
+              className="inline-flex min-h-6 min-w-6 items-center font-mono text-[10px] text-teal-300 underline hover:text-teal-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
             >
               {showLocalConfig ? 'Hide /v1 URL' : 'Configure /v1 URL'}
             </button>
@@ -367,7 +377,7 @@ export function AskWytheDrawer({
                 key={key}
                 type="button"
                 onClick={() => setEngineChoice(key)}
-                className={`flex items-center justify-between border px-2 py-1 text-left ${
+                className={`flex min-h-6 min-w-6 items-center justify-between border px-2 py-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                   engineChoice === key
                     ? 'border-teal-400 bg-teal-500/20 text-teal-100'
                     : 'border-slate-800 bg-slate-950 text-slate-300 hover:border-slate-700'
@@ -403,7 +413,7 @@ export function AskWytheDrawer({
                     setChromeDownloadPct(null);
                   });
               }}
-              className="flex w-full items-center justify-center gap-1.5 border border-sky-500/40 bg-sky-500/15 px-2.5 py-1 font-mono text-[11px] text-sky-200 hover:bg-sky-500/25"
+              className="flex min-h-6 min-w-6 w-full items-center justify-center gap-1.5 border border-sky-500/40 bg-sky-500/15 px-2.5 py-1 font-mono text-[11px] text-sky-200 hover:bg-sky-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
             >
               <Download className="h-3 w-3" />
               {chromeDownloadPct !== null
@@ -420,7 +430,7 @@ export function AskWytheDrawer({
                 value={customLocalUrl}
                 onChange={(e) => setCustomLocalUrl(e.target.value)}
                 placeholder="http://127.0.0.1:8084/v1 or :8080/v1"
-                className="flex-1 border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px] text-slate-100 focus:border-teal-400 focus:outline-none"
+                className="min-h-6 flex-1 border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px] text-slate-100 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               />
               <button
                 type="button"
@@ -428,7 +438,7 @@ export function AskWytheDrawer({
                   void refetchEngines();
                   void probeBrowserLocalOpenAi(customLocalUrl.trim() || undefined).then(setBrowserLocalProbe);
                 }}
-                className="border border-teal-500/40 bg-teal-500/15 px-2 py-1 font-mono text-[11px] text-teal-200"
+                className="inline-flex min-h-6 min-w-6 items-center justify-center border border-teal-500/40 bg-teal-500/15 px-2 py-1 font-mono text-[11px] text-teal-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 Probe
               </button>
@@ -439,7 +449,7 @@ export function AskWytheDrawer({
             <button
               type="button"
               onClick={() => copyEndpoint('mcp')}
-              className="flex items-center gap-1 border border-slate-700 bg-slate-950 px-2 py-0.5 hover:border-teal-400 hover:text-teal-200"
+              className="flex min-h-6 min-w-6 items-center gap-1 border border-slate-700 bg-slate-950 px-2 py-0.5 hover:border-teal-400 hover:text-teal-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
             >
               <Copy className="h-2.5 w-2.5" />
               {copiedEndpoint === 'mcp' ? 'Copied /api/v1/mcp!' : 'Copy HTTP MCP URL'}
@@ -447,7 +457,7 @@ export function AskWytheDrawer({
             <button
               type="button"
               onClick={() => copyEndpoint('openapi')}
-              className="flex items-center gap-1 border border-slate-700 bg-slate-950 px-2 py-0.5 hover:border-teal-400 hover:text-teal-200"
+              className="flex min-h-6 min-w-6 items-center gap-1 border border-slate-700 bg-slate-950 px-2 py-0.5 hover:border-teal-400 hover:text-teal-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
             >
               <Copy className="h-2.5 w-2.5" />
               {copiedEndpoint === 'openapi' ? 'Copied /openapi.json!' : 'Copy OpenAPI URL'}
@@ -467,7 +477,7 @@ export function AskWytheDrawer({
               <button
                 type="button"
                 onClick={() => setKeepSession((v) => !v)}
-                className={`border px-1.5 py-0.5 text-[10px] ${
+                className={`inline-flex min-h-6 min-w-6 items-center border px-1.5 py-0.5 text-[10px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                   keepSession
                     ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
                     : 'border-slate-700 bg-slate-900 text-slate-300'
@@ -480,7 +490,7 @@ export function AskWytheDrawer({
                   type="button"
                   onClick={() => setTurns([])}
                   aria-label="Clear conversation history"
-                  className="flex items-center gap-1 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] text-slate-300 hover:border-rose-400 hover:text-rose-200"
+                  className="flex min-h-6 min-w-6 items-center gap-1 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] text-slate-300 hover:border-rose-400 hover:text-rose-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                 >
                   <Trash2 className="h-2.5 w-2.5" />
                   Clear
@@ -489,7 +499,7 @@ export function AskWytheDrawer({
               <button
                 type="button"
                 onClick={onRefreshFocus}
-                className="flex items-center gap-1 border border-teal-500/40 bg-teal-500/15 px-1.5 py-0.5 text-[10px] text-teal-200 hover:bg-teal-500/25"
+                className="flex min-h-6 min-w-6 items-center gap-1 border border-teal-500/40 bg-teal-500/15 px-1.5 py-0.5 text-[10px] text-teal-200 hover:bg-teal-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 <RefreshCw className="h-2.5 w-2.5" />
                 Snap PNG
@@ -511,7 +521,7 @@ export function AskWytheDrawer({
               type="button"
               disabled={isBusy}
               onClick={() => void runQuestion(pq)}
-              className="border border-slate-800 bg-slate-900 px-2 py-1 text-left font-mono text-[10px] text-slate-200 hover:border-teal-400 hover:text-teal-200 disabled:opacity-50"
+              className="min-h-6 min-w-6 border border-slate-800 bg-slate-900 px-2 py-1 text-left font-mono text-[10px] text-slate-200 hover:border-teal-400 hover:text-teal-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 disabled:opacity-50"
             >
               <Sparkles className="mr-1 inline h-2.5 w-2.5 text-teal-300" />
               {pq}
@@ -546,7 +556,7 @@ export function AskWytheDrawer({
                         key={nid}
                         type="button"
                         onClick={() => onSelectNode(nid)}
-                        className="border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 font-mono text-[10px] text-sky-200 hover:bg-sky-500/25"
+                        className="inline-flex min-h-6 min-w-6 items-center border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 font-mono text-[10px] text-sky-200 hover:bg-sky-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                       >
                         {n ? `${n.tier}:${n.label}` : nid}
                       </button>
@@ -568,13 +578,13 @@ export function AskWytheDrawer({
             onChange={(e) => setQuestion(e.target.value)}
             placeholder={isBusy ? 'Synthesizing grounded 3-tier answer…' : 'Ask "what is this?" or anything about this view…'}
             disabled={isBusy}
-            className="flex-1 border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus:outline-none"
+            className="min-h-6 flex-1 border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
           />
           <button
             type="submit"
             disabled={isBusy || !question.trim()}
             aria-label="Send architectural question"
-            className="flex items-center gap-1.5 border border-teal-500/60 bg-teal-500/20 px-3 py-2 font-mono text-xs font-semibold text-teal-100 hover:bg-teal-500/30 disabled:opacity-50"
+            className="flex min-h-6 min-w-6 items-center gap-1.5 border border-teal-500/60 bg-teal-500/20 px-3 py-2 font-mono text-xs font-semibold text-teal-100 hover:bg-teal-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 disabled:opacity-50"
           >
             <Send className="h-3.5 w-3.5" />
             {isBusy ? 'Asking…' : 'Ask'}

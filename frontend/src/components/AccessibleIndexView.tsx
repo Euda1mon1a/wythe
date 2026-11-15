@@ -33,6 +33,7 @@ export function AccessibleIndexView({
   const [search, setSearch] = useState('');
   const [tier, setTier] = useState<'all' | 'truth' | 'manipulate' | 'display'>('all');
   const [subkind, setSubkind] = useState<'all' | AtlasNode['subkind']>('all');
+  const [pageLimit, setPageLimit] = useState(150);
 
   const exemplars = useMemo(() => {
     const pick = (t: AtlasNode['tier'], preferredSubkind: AtlasNode['subkind']) =>
@@ -100,7 +101,7 @@ export function AccessibleIndexView({
               <button
                 type="button"
                 onClick={() => onSelectNode(exemplars.truth!.id)}
-                className="mt-2 truncate font-mono text-[11px] text-teal-300 hover:underline"
+                className="mt-2 truncate font-mono text-[11px] text-teal-300 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 Sample clean node (unvalidated): {exemplars.truth.label} →
               </button>
@@ -117,7 +118,7 @@ export function AccessibleIndexView({
               <button
                 type="button"
                 onClick={() => onSelectNode(exemplars.manipulate!.id)}
-                className="mt-2 truncate font-mono text-[11px] text-sky-300 hover:underline"
+                className="mt-2 truncate font-mono text-[11px] text-sky-300 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 Sample clean node (unvalidated): {exemplars.manipulate.label} →
               </button>
@@ -134,7 +135,7 @@ export function AccessibleIndexView({
               <button
                 type="button"
                 onClick={() => onSelectNode(exemplars.display!.id)}
-                className="mt-2 truncate font-mono text-[11px] text-blue-300 hover:underline"
+                className="mt-2 truncate font-mono text-[11px] text-blue-300 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 Sample clean node (unvalidated): {exemplars.display.label} →
               </button>
@@ -266,7 +267,7 @@ export function AccessibleIndexView({
                   <button
                     type="button"
                     onClick={() => onSelectNode(r.node_id)}
-                    className="font-mono font-medium text-teal-300 hover:underline"
+                    className="font-mono font-medium text-teal-300 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                   >
                     {r.node_id}
                   </button>
@@ -295,15 +296,21 @@ export function AccessibleIndexView({
               type="search"
               aria-label="Search 3-tier node index"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                setPageLimit(150);
+              }}
               placeholder="Search node, column, or file…"
-              className="w-56 border border-slate-800 bg-slate-950 px-2.5 py-1 font-mono text-xs text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus:outline-none"
+              className="min-h-6 w-56 border border-slate-800 bg-slate-950 px-2.5 py-1 font-mono text-xs text-slate-100 placeholder:text-slate-400 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
             />
             <select
               aria-label="Filter index by subkind"
               value={subkind}
-              onChange={(e) => setSubkind(e.target.value as 'all' | AtlasNode['subkind'])}
-              className="border border-slate-800 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200"
+              onChange={(e) => {
+                setSubkind(e.target.value as 'all' | AtlasNode['subkind']);
+                setPageLimit(150);
+              }}
+              className="min-h-6 border border-slate-800 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
             >
               <option value="all">All 11 subkinds</option>
               {ALL_NODE_SUBKINDS.map((sk) => (
@@ -312,13 +319,21 @@ export function AccessibleIndexView({
                 </option>
               ))}
             </select>
-            <div className="flex border border-slate-800 bg-slate-950 p-0.5 font-mono text-xs">
+            <div
+              role="group"
+              aria-label="Filter index by tier"
+              className="flex border border-slate-800 bg-slate-950 p-0.5 font-mono text-xs"
+            >
               {(['all', 'truth', 'manipulate', 'display'] as const).map((t) => (
                 <button
                   key={t}
                   type="button"
-                  onClick={() => setTier(t)}
-                  className={`px-2 py-0.5 uppercase ${
+                  aria-pressed={tier === t}
+                  onClick={() => {
+                    setTier(t);
+                    setPageLimit(150);
+                  }}
+                  className={`min-h-6 px-2 py-0.5 uppercase focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
                     tier === t ? 'bg-teal-500/20 text-teal-300' : 'text-slate-300'
                   }`}
                 >
@@ -331,23 +346,26 @@ export function AccessibleIndexView({
 
         <div className="overflow-x-auto border border-slate-800 bg-slate-950/40">
           <table className="w-full text-left text-xs">
+            <caption className="sr-only">
+              3-tier architectural nodes filtered by tier, subkind, and search query
+            </caption>
             <thead className="border-b border-slate-800 bg-slate-950 font-mono text-[11px] uppercase text-slate-300">
               <tr>
-                <th className="px-3 py-2">Node</th>
-                <th className="px-3 py-2">Tier · Subkind · District</th>
-                <th className="px-3 py-2">Coupling</th>
-                <th className="px-3 py-2">Status</th>
-                <th className="px-3 py-2">Source Coordinate</th>
+                <th scope="col" className="px-3 py-2">Node</th>
+                <th scope="col" className="px-3 py-2">Tier · Subkind · District</th>
+                <th scope="col" className="px-3 py-2">Coupling</th>
+                <th scope="col" className="px-3 py-2">Status</th>
+                <th scope="col" className="px-3 py-2">Source Coordinate</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/70">
-              {filtered.slice(0, 150).map((n) => (
+              {filtered.slice(0, pageLimit).map((n) => (
                 <tr key={n.id} className="hover:bg-slate-900/50">
                   <td className="px-3 py-2 font-mono font-medium">
                     <button
                       type="button"
                       onClick={() => onSelectNode(n.id)}
-                      className="text-left text-teal-300 hover:underline"
+                      className="min-h-6 text-left text-teal-300 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                     >
                       {n.label}
                     </button>
@@ -395,6 +413,46 @@ export function AccessibleIndexView({
             </tbody>
           </table>
         </div>
+        {(filtered.length > 150 || filtered.length > pageLimit) && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex flex-wrap items-center justify-between gap-2 border border-slate-800 bg-slate-950/60 px-3 py-2 font-mono text-xs text-slate-300"
+          >
+            <span>
+              Showing {Math.min(pageLimit, filtered.length)} of {filtered.length} matching nodes.
+            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              {pageLimit < filtered.length && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setPageLimit((prev) => prev + 150)}
+                    className="min-h-6 border border-slate-700 bg-slate-900 px-2.5 py-0.5 text-slate-200 hover:border-teal-400 hover:text-teal-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    Show 150 more
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPageLimit(filtered.length)}
+                    className="min-h-6 border border-teal-500/40 bg-teal-500/15 px-2.5 py-0.5 text-teal-300 hover:bg-teal-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    Show all ({filtered.length})
+                  </button>
+                </>
+              )}
+              {pageLimit > 150 && (
+                <button
+                  type="button"
+                  onClick={() => setPageLimit(150)}
+                  className="min-h-6 border border-slate-700 bg-slate-900 px-2.5 py-0.5 text-slate-200 hover:border-teal-400 hover:text-teal-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                >
+                  Reset to 150
+                </button>
+              )}
+            </div>
+          </div>
+        )}
       </section>
     </div>
   );
