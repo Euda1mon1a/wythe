@@ -175,3 +175,5 @@ wythe security ownership /path/to/repo \
   - **MCP:** Connect coding agents directly to `http://127.0.0.1:8780/api/v1/mcp` (Streamable HTTP) or `wythe mcp` (stdio).
 
 > **Epistemic Guardrail:** Static reachability (`DISP-004` vs. `DISP-007`), zero discovered callers (`MANIP-003`, `TRUTH-001`), declared dependency edges (`dashed`), and 3D proximity (`Linked Components`) are investigation leads—never proof of runtime dead code, safe deletion, or production health. Always verify dynamic imports, external webhooks/workers, and test/build suites before removing code.
+
+> **Security & Data-Handling Boundary:** `wythe serve` is an unauthenticated local workstation server (`127.0.0.1` default), and JSON receipts, `wythe context`/`llms`/`mcp`, and `What's This?` briefs contain local paths and source/AST excerpts—see [SECURITY.md](../SECURITY.md) for bind-host limits, read-only catalog `--dsn` credentials, and `wythe security` non-certification bounds.
