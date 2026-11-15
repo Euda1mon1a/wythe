@@ -119,7 +119,7 @@ def test_http_api_surface_end_to_end(isolated_db_url: str) -> None:
 
         rules = client.get("/api/v1/rules")
         assert rules.status_code == 200
-        assert len(rules.json()) == 18
+        assert len(rules.json()) == 19
 
         patch_rule = client.patch(
             "/api/v1/rules/TRUTH-001",

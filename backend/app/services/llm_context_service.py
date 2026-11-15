@@ -465,6 +465,7 @@ def build_lineage_cone_slice(
             verification=e.verification,
             evidence_path=e.evidence_path,
             evidence_note=e.evidence_note,
+            policy_field_consumption=e.policy_field_consumption,
         )
         for e in selected_edges
     ]
@@ -638,8 +639,9 @@ def build_lineage_cone_slice(
         )
         md.append(f"## Findings in Cone (requires evidence review; {f_heading})")
         for cf in selected_findings:
+            actor_key = "reader" if cf.rule_code == "MANIP-001" else "writer"
             writer_tag = (
-                f" [writer=`{cf.node_id}` -> target=`{cf.target_node_id}`]"
+                f" [{actor_key}=`{cf.node_id}` -> target=`{cf.target_node_id}`]"
                 if cf.target_node_id and cf.target_node_id != cf.node_id
                 else ""
             )

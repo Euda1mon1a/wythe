@@ -14,6 +14,7 @@ from app.schemas.atlas import (
     DiffBlastRadiusReport,
     LlmBriefRead,
     LlmContextConeReport,
+    OpenLineageBundleResponse,
     RatchetBaselineRead,
     RatchetCaptureRequest,
     ScanSnapshotSummary,
@@ -21,6 +22,7 @@ from app.schemas.atlas import (
     SourceSnippetRead,
     TruthAtlasReport,
 )
+from app.services.companion_export_service import build_openlineage_static_bundle
 from app.services.diff_and_sarif_service import (
     build_sarif_log,
     compare_recorded_snapshots,
@@ -163,6 +165,19 @@ def export_target_sarif(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return build_sarif_log(report, findings_override=diff_report.new_findings, diff=diff_report)
     return build_sarif_log(report)
+
+
+@router.get("/{target_slug}/openlineage", response_model=OpenLineageBundleResponse)
+def export_target_openlineage(
+    target_slug: str,
+    db: DbSession,
+) -> OpenLineageBundleResponse:
+    target = get_target_by_slug(db, target_slug)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"Target '{target_slug}' not found")
+    report = run_target_scan(db, target, strict_gate=True, persist_snapshot=False)
+    bundle = build_openlineage_static_bundle(report)
+    return OpenLineageBundleResponse.model_validate(bundle)
 
 
 @router.get("/{target_slug}/llms", response_model=LlmBriefRead)

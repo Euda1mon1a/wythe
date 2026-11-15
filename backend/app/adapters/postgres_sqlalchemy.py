@@ -215,7 +215,9 @@ def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
                         (uses_sqlmodel or fn_name == "Field") and fn_name != "Relationship"
                     ):
                         columns.append(col_name)
-                elif uses_sqlmodel:
+                elif uses_sqlmodel or (
+                    stmt.value is None and _expr_name(stmt.annotation) == "Mapped"
+                ):
                     columns.append(col_name)
 
         scan.class_columns[node.name] = columns

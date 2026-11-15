@@ -3,7 +3,7 @@
   "info": {
     "title": "Wythe API",
     "description": "Why -> Therefore: 3-tier architecture & lineage verifier. PostgreSQL holds truth, Backend manipulates truth, UI displays truth.",
-    "version": "0.2.1"
+    "version": "0.2.2"
   },
   "paths": {
     "/api/v1/adapters/slots": {
@@ -24,6 +24,27 @@
                   },
                   "type": "array",
                   "title": "Response Get Adapter Slots Api V1 Adapters Slots Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/adapters/plugins": {
+      "get": {
+        "tags": [
+          "adapters"
+        ],
+        "summary": "Get Registered Plugins",
+        "operationId": "get_registered_plugins_api_v1_adapters_plugins_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginListResponse"
                 }
               }
             }
@@ -681,6 +702,48 @@
                   "type": "object",
                   "additionalProperties": true,
                   "title": "Response Export Target Sarif Api V1 Scans  Target Slug  Sarif Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/scans/{target_slug}/openlineage": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Export Target Openlineage",
+        "operationId": "export_target_openlineage_api_v1_scans__target_slug__openlineage_get",
+        "parameters": [
+          {
+            "name": "target_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Target Slug"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenLineageBundleResponse"
                 }
               }
             }
@@ -1878,6 +1941,16 @@
             },
             "type": "array",
             "title": "Symbol Links"
+          },
+          "policy_field_consumption": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyFieldConsumption"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -1972,6 +2045,13 @@
             "type": "array",
             "title": "Columns"
           },
+          "policy_columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Policy Columns"
+          },
           "http_methods": {
             "items": {
               "type": "string"
@@ -2050,6 +2130,16 @@
               }
             ],
             "title": "Verification Note"
+          },
+          "policy_field_consumption": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyFieldConsumption"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -2519,6 +2609,16 @@
           "evidence_note": {
             "type": "string",
             "title": "Evidence Note"
+          },
+          "policy_field_consumption": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyFieldConsumption"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -3393,6 +3493,344 @@
           "state"
         ],
         "title": "OnDeviceEngineStatus"
+      },
+      "OpenLineageBundleResponse": {
+        "properties": {
+          "producer": {
+            "type": "string",
+            "title": "Producer"
+          },
+          "schemaURL": {
+            "type": "string",
+            "title": "Schemaurl"
+          },
+          "bundleType": {
+            "type": "string",
+            "title": "Bundletype"
+          },
+          "eventTime": {
+            "type": "string",
+            "title": "Eventtime"
+          },
+          "target": {
+            "$ref": "#/components/schemas/OpenLineageTargetInfo"
+          },
+          "datasets": {
+            "items": {
+              "$ref": "#/components/schemas/OpenLineageDatasetItem"
+            },
+            "type": "array",
+            "title": "Datasets"
+          },
+          "jobs": {
+            "items": {
+              "$ref": "#/components/schemas/OpenLineageJobItem"
+            },
+            "type": "array",
+            "title": "Jobs"
+          },
+          "nonCertificationNotice": {
+            "type": "string",
+            "title": "Noncertificationnotice"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "producer",
+          "schemaURL",
+          "bundleType",
+          "eventTime",
+          "target",
+          "nonCertificationNotice"
+        ],
+        "title": "OpenLineageBundleResponse"
+      },
+      "OpenLineageDatasetItem": {
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "title": "Namespace"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "facets": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Facets"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "namespace",
+          "name"
+        ],
+        "title": "OpenLineageDatasetItem"
+      },
+      "OpenLineageDatasetRef": {
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "title": "Namespace"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "namespace",
+          "name"
+        ],
+        "title": "OpenLineageDatasetRef"
+      },
+      "OpenLineageJobItem": {
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "title": "Namespace"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "inputs": {
+            "items": {
+              "$ref": "#/components/schemas/OpenLineageDatasetRef"
+            },
+            "type": "array",
+            "title": "Inputs"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/components/schemas/OpenLineageDatasetRef"
+            },
+            "type": "array",
+            "title": "Outputs"
+          },
+          "facets": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Facets"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "namespace",
+          "name"
+        ],
+        "title": "OpenLineageJobItem"
+      },
+      "OpenLineageTargetInfo": {
+        "properties": {
+          "slug": {
+            "type": "string",
+            "title": "Slug"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "stackProfile": {
+            "type": "string",
+            "title": "Stackprofile"
+          },
+          "sourceCommit": {
+            "type": "string",
+            "title": "Sourcecommit"
+          },
+          "contentDigest": {
+            "type": "string",
+            "title": "Contentdigest"
+          },
+          "observationSource": {
+            "type": "string",
+            "title": "Observationsource"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "slug",
+          "name",
+          "stackProfile",
+          "sourceCommit",
+          "contentDigest",
+          "observationSource"
+        ],
+        "title": "OpenLineageTargetInfo"
+      },
+      "PluginListResponse": {
+        "properties": {
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/PluginSpecItem"
+            },
+            "type": "array",
+            "title": "Plugins"
+          },
+          "local_plugins_allowed": {
+            "type": "boolean",
+            "title": "Local Plugins Allowed",
+            "default": false
+          },
+          "load_errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Load Errors"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "PluginListResponse"
+      },
+      "PluginSpecItem": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "manipulator_augmenter",
+              "post_scan_check"
+            ],
+            "title": "Kind"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "builtin",
+              "entry_point",
+              "local_opt_in"
+            ],
+            "title": "Origin"
+          },
+          "tier": {
+            "type": "string",
+            "title": "Tier",
+            "default": "manipulate"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version",
+            "default": "unknown"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "enabled_by_default": {
+            "type": "boolean",
+            "title": "Enabled By Default",
+            "default": true
+          },
+          "trusted": {
+            "type": "boolean",
+            "title": "Trusted",
+            "default": true
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "source",
+          "origin"
+        ],
+        "title": "PluginSpecItem"
+      },
+      "PolicyFieldConsumption": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "consumed",
+              "bypassed",
+              "unresolved"
+            ],
+            "title": "State"
+          },
+          "mechanism": {
+            "type": "string",
+            "enum": [
+              "field_controls_result",
+              "constant_or_fallback_wins",
+              "dynamic_or_opaque_flow"
+            ],
+            "title": "Mechanism"
+          },
+          "reader_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reader Scopes"
+          },
+          "policy_columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Policy Columns"
+          },
+          "consumed_columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Consumed Columns"
+          },
+          "unconsumed_policy_columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Unconsumed Policy Columns"
+          },
+          "substituted_constants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Substituted Constants"
+          },
+          "fallback_constants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Fallback Constants"
+          },
+          "note": {
+            "type": "string",
+            "title": "Note",
+            "default": ""
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state",
+          "mechanism"
+        ],
+        "title": "PolicyFieldConsumption",
+        "description": "Per-edge or per-node static policy column consumption lineage."
       },
       "PolicyVocabularyCreate": {
         "properties": {

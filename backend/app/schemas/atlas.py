@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -41,6 +41,12 @@ EdgeKind = Literal[
     "uses_client",
 ]
 VerificationState = Literal["verified", "declared", "unverified", "broken"]
+PolicyConsumptionState = Literal["consumed", "bypassed", "unresolved"]
+PolicyConsumptionMechanism = Literal[
+    "field_controls_result",
+    "constant_or_fallback_wins",
+    "dynamic_or_opaque_flow",
+]
 FindingConfidence = Literal["confirmed", "candidate"]
 EvidenceStrength = Literal["ast_exact", "structural_match", "heuristic"]
 GateVerdict = Literal["PASS", "RATCHET_PASS", "INCOMPLETE", "FAIL"]
@@ -74,6 +80,20 @@ class StorePurposeDeclaration(StrictSchema):
     verification_summary: str | None = None
 
 
+class PolicyFieldConsumption(StrictSchema):
+    """Per-edge or per-node static policy column consumption lineage."""
+
+    state: PolicyConsumptionState
+    mechanism: PolicyConsumptionMechanism
+    reader_scopes: list[str] = Field(default_factory=list)
+    policy_columns: list[str] = Field(default_factory=list)
+    consumed_columns: list[str] = Field(default_factory=list)
+    unconsumed_policy_columns: list[str] = Field(default_factory=list)
+    substituted_constants: list[str] = Field(default_factory=list)
+    fallback_constants: list[str] = Field(default_factory=list)
+    note: str = ""
+
+
 class AtlasNode(StrictSchema):
     id: str
     tier: TierKind
@@ -86,6 +106,7 @@ class AtlasNode(StrictSchema):
     cluster: str = "core"
     summary: str
     columns: list[str] = Field(default_factory=list)
+    policy_columns: list[str] = Field(default_factory=list)
     http_methods: list[str] = Field(default_factory=list)
     http_paths: list[str] = Field(default_factory=list)
     read_by_count: int = 0
@@ -95,6 +116,7 @@ class AtlasNode(StrictSchema):
     ruling_audited_at: date | None = None
     store_purpose: StorePurposeDeclaration | None = None
     verification_note: str | None = None
+    policy_field_consumption: PolicyFieldConsumption | None = None
 
 
 class AtlasEdge(StrictSchema):
@@ -106,6 +128,7 @@ class AtlasEdge(StrictSchema):
     evidence_path: str | None = None
     evidence_note: str
     symbol_links: list[str] = Field(default_factory=list)
+    policy_field_consumption: PolicyFieldConsumption | None = None
 
 
 class EndToEndChain(StrictSchema):
@@ -521,6 +544,7 @@ class ConeEdgeSummary(StrictSchema):
     verification: VerificationState
     evidence_path: str | None = None
     evidence_note: str
+    policy_field_consumption: PolicyFieldConsumption | None = None
 
 
 class ConeSectionCount(StrictSchema):
@@ -694,3 +718,60 @@ class AskWytheResponse(StrictSchema):
     answer_markdown: str
     referenced_node_ids: list[str] = Field(default_factory=list)
     observed_at: datetime
+
+
+class PluginSpecItem(StrictSchema):
+    name: str
+    kind: Literal["manipulator_augmenter", "post_scan_check"]
+    source: str
+    origin: Literal["builtin", "entry_point", "local_opt_in"]
+    tier: str = "manipulate"
+    version: str = "unknown"
+    description: str = ""
+    enabled_by_default: bool = True
+    trusted: bool = True
+
+
+class PluginListResponse(StrictSchema):
+    plugins: list[PluginSpecItem] = Field(default_factory=list)
+    local_plugins_allowed: bool = False
+    load_errors: list[str] = Field(default_factory=list)
+
+
+class OpenLineageTargetInfo(StrictSchema):
+    slug: str
+    name: str
+    stackProfile: str
+    sourceCommit: str
+    contentDigest: str
+    observationSource: str
+
+
+class OpenLineageDatasetRef(StrictSchema):
+    namespace: str
+    name: str
+
+
+class OpenLineageDatasetItem(StrictSchema):
+    namespace: str
+    name: str
+    facets: dict[str, Any] = Field(default_factory=dict)
+
+
+class OpenLineageJobItem(StrictSchema):
+    namespace: str
+    name: str
+    inputs: list[OpenLineageDatasetRef] = Field(default_factory=list)
+    outputs: list[OpenLineageDatasetRef] = Field(default_factory=list)
+    facets: dict[str, Any] = Field(default_factory=dict)
+
+
+class OpenLineageBundleResponse(StrictSchema):
+    producer: str
+    schemaURL: str
+    bundleType: str
+    eventTime: str
+    target: OpenLineageTargetInfo
+    datasets: list[OpenLineageDatasetItem] = Field(default_factory=list)
+    jobs: list[OpenLineageJobItem] = Field(default_factory=list)
+    nonCertificationNotice: str

@@ -1,4 +1,4 @@
-# Wythe User Guide (`v0.2.1`)
+# Wythe User Guide (`v0.2.2`)
 
 **Wythe** (**Why `?` → Therefore `∴`**) audits full-stack repositories around three architectural invariants:
 
@@ -32,7 +32,7 @@ Switch tabs with the top-right tab bar or keys `1`–`4`:
 
 1. **3D Stratified Atlas `[1]`** — Interactive WebGL topology (with 3D tiers and 2D flat plane modes), filters, layout compaction, working sets, blast overlays, packet trace animation, and the right-hand **Node Inspector**.
 2. **3-Tier Lineage `[2]`** — Searchable table of end-to-end `Display → Route/Procedure → Service → Database Table/Guard` request chains (`Trace` animates a glowing packet across all hops in 3D).
-3. **Gate & Rules `[3]`** — Policy table backed by `atlas_rule_policies`, **Capture Ratchet Ceiling** button, **Git Diff / Snapshot Comparison**, **SARIF 2.1.0** export, `.wythe/governance.json` export/sync, and dynamic **Domain Policy Vocabularies**.
+3. **Gate & Rules `[3]`** — Policy table backed by `atlas_rule_policies`, **Capture Ratchet Ceiling** button, **Git Diff / Snapshot Comparison**, **SARIF 2.1.0** export, **Export OpenLineage** JSON download, registered `wythe.plugins` status, `.wythe/governance.json` export/sync, and dynamic **Domain Policy Vocabularies**.
 4. **Index & Adapters `[4]`** — Keyboard-navigable sortable node index, screen-reader summary, and stack adapter coverage status.
 
 ---
@@ -75,7 +75,7 @@ Filters alone preserve overview coordinates so nodes do not jump unexpectedly wh
 ### Visual Modes & Lenses
 - **`Mode: Atomic [P]` ↔ `Mode: Simple [P]`:** Switch between faceted polyhedra (`Hex-12`, `Octa-8`, `Solver-20`, `Icosa-20`, `Guard-8`) and geometric primitives (`Boxes`, `Octahedra`, `Cylinders`).
 - **`Appearance [D]`:** Cycle `System`, `Dark`, and `Light` polarity plus built-in themes and custom tier color pickers.
-- **`Lens [V]`:** Color nodes independently of layout by `Boundary Status`, `Write Contention`, `Fan-Out Gravity`, `11-Subkind Taxonomy`, or `Domain Clusters`.
+- **Lens `[V]` & Scene Diagnostic Lenses:** Color nodes independently of layout by `Boundary Status`, `Write Contention`, `Fan-Out Gravity`, `11-Subkind Taxonomy`, or `Domain Clusters`, and toggle scene lenses including **`Containers`** (`cluster="containers"` highlighting `m:dockerfile:*`, `m:compose:*`, and `m:k8s:*` nodes alongside their connected entrypoints).
 
 ---
 
@@ -115,6 +115,20 @@ Clicking any node opens the right-hand **Node Inspector** (`frontend/src/compone
 - **Bounded vs. `--full` Lineage Cone Export:**
   - `Copy LLM Cone` copies a ~300-token 3-tier slice and displays an explicit completeness banner showing included vs. eligible upstream/downstream nodes, edges, and findings whenever a cap omits items.
   - `Full Cone` requests `?full=true` (`wythe context --full`) with zero truncation.
+- **3-State Policy Field Consumption (`PolicyFieldConsumption`):**
+  - On Python `reads_truth` edges, Tier-1 policy tables, Tier-2
+    readers, and `wythe context` cones, `NodeInspector` renders
+    `policy:<state>` badges and per-column consumption cards:
+    - `consumed` (`field_controls_result`): `consumed_columns` reach
+      a live return, guard, solver/helper call, or write sink
+      (`fallback_constants` note `policy.cap or FALLBACK_CAP`).
+    - `bypassed` (`constant_or_fallback_wins`): an active reader
+      queries the policy row while leaving `unconsumed_policy_columns`
+      unused or substituting `substituted_constants`, emitting a
+      causal `MANIP-001` policy-bypass finding targeting `t:<table>`.
+    - `unresolved` (`dynamic_or_opaque_flow`): dynamic `getattr`,
+      dynamic subscripts, or opaque whole-row handoffs are surfaced
+      honestly without false certainty or false `MANIP-001` findings.
 - **Intent-Scoped Diagnostic Briefs (`NodeSourceAndPromptPanel`):** Choose one of three explicit task intents before copying an AI prompt:
   - `Investigate evidence (read-only)` (`investigate`)
   - `Prepare issue / triage report (no edits)` (`prepare_issue`)
@@ -172,7 +186,14 @@ wythe security ownership /path/to/repo \
   - `wythe llms /path/to/repo --max-tokens 2200` emits a compact `llms.txt` architecture pointer map.
   - `wythe context /path/to/repo <query> [--full]` extracts a focused 3-tier slice around any table, route, queue, file, or node ID.
   - `wythe focus [--remote http://<tailnet-host>:8780]` pulls the active browser viewport brief over LAN/Tailnet.
+  - `wythe plugins [--json]` (plus `GET /api/v1/adapters/plugins` and MCP `wythe_plugins`) lists built-in (`tach-boundaries`, `container-sources`) and `wythe.plugins` entry-point extensions without executing target repository code (`--allow-local-plugins` is CLI-only).
+  - `wythe export-openlineage /path/to/repo [--profile auto] [--out openlineage.json]` (plus `GET /api/v1/scans/{slug}/openlineage`, MCP `wythe_openlineage`, and the Governance **Export OpenLineage** button) exports Tier-1 datasets and Tier-2 jobs as OpenLineage static JSON.
+  - `wythe security companion /path/to/repo [--trivy-report FILE] [--syft-sbom FILE] [--json FILE]` (or `wythe scan ... --companion-out FILE`) correlates static blueprint findings with read-only `Syft` SBOM and `Trivy` CVE/SARIF artifacts.
   - **MCP:** Connect coding agents directly to `http://127.0.0.1:8780/api/v1/mcp` (Streamable HTTP) or `wythe mcp` (stdio).
+- **Architecture & Security References:**
+  - [Containers, Security Workflows & Plugin Architecture](architecture/containers-security-and-plugins.md) — `Dockerfile`/`.dockerignore`/`.docker/`, Compose, and Kubernetes manifest lineage (`$(VAR_NAME)` vs. `$VAR`), `Syft`+`Trivy` Blue/Red/Purple CI handoffs, `wythe.plugins`, and `tach.toml` (`MANIP-006`) + OpenLineage bridges.
+  - [Ecosystem Reference & Positioning](architecture/ecosystem-and-positioning.md) — Comparison across layer linters, schema engines, SAST/runtime tracers, container scanners, and enterprise catalogs.
+  - [Multi-Language & Multi-Database Extensibility](architecture/multi-language-extensibility.md) and [Experimental Record-Ownership Workflow](architecture/record-ownership.md).
 
 > **Epistemic Guardrail:** Static reachability (`DISP-004` vs. `DISP-007`), zero discovered callers (`MANIP-003`, `TRUTH-001`), declared dependency edges (`dashed`), and 3D proximity (`Linked Components`) are investigation leads—never proof of runtime dead code, safe deletion, or production health. Always verify dynamic imports, external webhooks/workers, and test/build suites before removing code.
 

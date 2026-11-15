@@ -1,7 +1,13 @@
 import type { AtlasEdge, AtlasNode } from '@/api/atlas';
 import type { WythePaletteColors } from '@/lib/wytheTheme';
 
-export type SceneLens = 'status' | 'contention' | 'gravity' | 'subkind' | 'cluster';
+export type SceneLens =
+  | 'status'
+  | 'contention'
+  | 'gravity'
+  | 'subkind'
+  | 'cluster'
+  | 'containers';
 export type SceneLayoutMode = 'cluster' | 'grid' | 'subkind' | 'connected';
 
 export const SCENE_LAYOUT_LABELS: Record<SceneLayoutMode, string> = {
@@ -44,7 +50,35 @@ export const SCENE_LENS_LABELS: Record<SceneLens, string> = {
   gravity: 'Fan-Out Gravity',
   subkind: '11-Subkind Taxonomy',
   cluster: 'Domain Clusters',
+  containers: 'Containers',
 };
+
+const CONTAINER_ID_PREFIXES = ['m:dockerfile:', 'm:compose:', 'm:k8s:'] as const;
+
+export function isContainerNode(node: Pick<AtlasNode, 'id' | 'cluster'>): boolean {
+  if (node.cluster === 'containers') return true;
+  return CONTAINER_ID_PREFIXES.some((prefix) => node.id.startsWith(prefix));
+}
+
+export function collectContainerEntrypointIds(
+  nodes: ReadonlyArray<Pick<AtlasNode, 'id' | 'cluster'>>,
+  edges: ReadonlyArray<Pick<AtlasEdge, 'source_id' | 'target_id'>>,
+): Set<string> {
+  const containerIds = new Set<string>();
+  for (const n of nodes) {
+    if (isContainerNode(n)) containerIds.add(n.id);
+  }
+  const linked = new Set<string>();
+  if (containerIds.size === 0) return linked;
+  for (const e of edges) {
+    if (containerIds.has(e.source_id) && !containerIds.has(e.target_id)) {
+      linked.add(e.target_id);
+    } else if (containerIds.has(e.target_id) && !containerIds.has(e.source_id)) {
+      linked.add(e.source_id);
+    }
+  }
+  return linked;
+}
 
 export const ALL_NODE_SUBKINDS: Array<AtlasNode['subkind']> = [
   'table',
@@ -548,8 +582,18 @@ export function evaluateNodeVisual(opts: {
   guardedTableIds: Set<string>;
   mutatorNodeIds: Set<string>;
   diffOverlay: DiffOverlaySet | null;
+  containerEntrypointIds?: ReadonlySet<string>;
 }): EvaluatedNodeVisual {
-  const { node: n, lens, palette, degree, guardedTableIds, mutatorNodeIds, diffOverlay } = opts;
+  const {
+    node: n,
+    lens,
+    palette,
+    degree,
+    guardedTableIds,
+    mutatorNodeIds,
+    diffOverlay,
+    containerEntrypointIds,
+  } = opts;
   const hollow = n.status === 'in_flight' || n.status === 'unwired' || n.status === 'orphaned';
   const baseFlagged =
     n.status === 'policy_in_code' || n.status === 'duplicated_truth' || n.status === 'gray_zone';
@@ -564,6 +608,7 @@ export function evaluateNodeVisual(opts: {
   let inquiryHex = baseFlagged ? palette.warn : palette.inquiry;
   let scale = 1.0;
   let flagged = baseFlagged;
+  let forceDim = false;
 
   if (lens === 'status') {
     barHex =
@@ -636,10 +681,23 @@ export function evaluateNodeVisual(opts: {
   } else if (lens === 'cluster') {
     barHex = clusterColorHex(deriveDomainCluster(n));
     inquiryHex = palette.inquiry;
+  } else if (lens === 'containers') {
+    if (isContainerNode(n)) {
+      barHex = baseFlagged ? '#f59e0b' : '#22d3ee';
+      inquiryHex = baseFlagged ? '#fef08a' : '#cffafe';
+      scale = 1.28;
+    } else if (containerEntrypointIds?.has(n.id)) {
+      barHex = '#38bdf8';
+      inquiryHex = '#e0f2fe';
+      scale = 1.15;
+    } else {
+      barHex = '#334155';
+      forceDim = true;
+    }
   }
 
-  let forceDim = false;
   if (diffOverlay) {
+    forceDim = false;
     const isTouched = diffOverlay.touchedIds.has(n.id) || diffOverlay.addedIds.has(n.id);
     const isImpacted = diffOverlay.impactedIds.has(n.id);
     const hasNewFinding = diffOverlay.newFindingNodeIds.has(n.id);
@@ -837,6 +895,13 @@ export function getLensLegendItems(
   if (lens === 'cluster') {
     return [
       { color: '#2dd4bf', label: 'vertical domain districts aligned across Display · Manipulate · Truth' },
+    ];
+  }
+  if (lens === 'containers') {
+    return [
+      { color: '#22d3ee', label: 'Dockerfile / Compose / K8s' },
+      { color: '#38bdf8', label: 'linked entrypoint' },
+      { color: '#f59e0b', label: 'container drift / finding' },
     ];
   }
   return [

@@ -10,14 +10,14 @@
 **Why (`?`) → Therefore (`∴`)** — Generalizable 3-tier architecture verifier, cross-boundary lineage solver, interactive 3D WebGL latticework visualizer, and fail-closed CI gate built around three masonry wythe invariants:
 
 1. **Database holds truth** — Relational schemas (`PostgreSQL`, `MySQL`, `SQLite` via `SQLAlchemy 2.0`/`SQLModel` + `Alembic`, `Prisma`, `Drizzle ORM`, `Kysely` migrations, `@immich/sql-tools` decorators, `Django ORM`, Rust `sqlx`/`Diesel`/`SeaORM`, or raw SQL DDL/`sqlc` + optional read-only catalog probes) own domain policy, thresholds, temporal validity, and write-lane guards, while `Redis` keyspaces and worker queues are modeled explicitly as ephemeral stores/lanes with independently verified purpose declarations rather than durable shadow truth.
-2. **Backend manipulates truth** — Services, background workers, solvers, and routers (`Python/FastAPI`, `TypeScript/Node/Express/Hono/Fastify/NestJS/Next.js/SvelteKit/tRPC`, `Python/Django/DRF/Ninja`, `Go net/http/chi/gin/echo`, `Rust axum/actix-web/rocket/Tauri`) execute mechanisms over database rows behind explicit transactional service/SQL doors across single or multi-root workspaces without embedding shadow policy literals or host-clock drift.
+2. **Backend manipulates truth** — Services, background workers, solvers, routers, and static container/orchestration declarations (`Python/FastAPI`, `TypeScript/Node/Express/Hono/Fastify/NestJS/Next.js/SvelteKit/tRPC`, `Python/Django/DRF/Ninja`, `Go net/http/chi/gin/echo`, `Rust axum/actix-web/rocket/Tauri`, plus `Dockerfile`/`.dockerignore`/`.docker/`, `compose.yaml`/`docker-compose.*.yml`, Kubernetes manifests, and `tach.toml` domain walls) execute mechanisms over database rows behind explicit transactional service/SQL doors across single or multi-root workspaces without embedding shadow policy literals or host-clock drift.
 3. **Frontend displays truth** — UI surfaces (`Next.js`, `React/Vite/TanStack Router/Remix`, `Vue 3/Nuxt`, `Svelte 5/SvelteKit`, `Rust WASM Leptos/Dioxus/Yew` + Tauri `invoke()`) bind to typed OpenAPI SDK (`Hey API`, `oazapfts`), `tRPC`, and REST contracts, centralized clock utilities, and WCAG-accessible markup without inventing client-side policy maps or unbacked HTTP/IPC calls.
 
-Wythe supports **38 stack profiles** via `--profile auto` (**1 production-dogfooded Tier-1 profile** + **36 `experimental` profiles**, including partial-coverage `INCOMPLETE` profiles + **1 `planned` slot**), pairs Python's native `ast` with an optional **Tree-sitter CST grammar engine** (`wythe[treesitter]` for TypeScript/TSX, JavaScript, Rust, and Go), traces background worker & scheduled beat queues (`Celery` / `Beat`, `BullMQ` / NestJS `@Processor`/`@InjectQueue`, `Asynq`), enforces **WCAG accessibility semantics** (`DISP-005`), renders both **Simple Solids** and **120 fps Breathing Atomic Wythe Polyhedra** (with adaptive `System | Dark | Light` polarity and custom user palettes), and **self-dogfoods** its own 3-tier codebase (`wythe gate --strict wythe` passes with zero blocking and zero warning findings).
+Wythe supports **38 stack profiles** via `--profile auto` (**1 production-dogfooded Tier-1 profile** + **36 `experimental` profiles**, including partial-coverage `INCOMPLETE` profiles + **1 `planned` slot**), pairs Python's native `ast` with an optional **Tree-sitter CST grammar engine** (`wythe[treesitter]` for TypeScript/TSX, JavaScript, Rust, and Go), traces background worker & scheduled beat queues (`Celery` / `Beat`, `BullMQ` / NestJS `@Processor`/`@InjectQueue`, `Asynq`), augments any profile via **`wythe.plugins`** (`container-sources` + `tach-boundaries` `MANIP-006`) and **OpenLineage** static export, enforces **WCAG accessibility semantics** (`DISP-005`), renders both **Simple Solids** and **120 fps Breathing Atomic Wythe Polyhedra** (with adaptive `System | Dark | Light` polarity and custom user palettes), and **self-dogfoods** its own 3-tier codebase (`wythe gate --strict wythe` passes with zero blocking and zero warning findings).
 
 > [!IMPORTANT]
 > **Status, Maturity & Zero-Maintenance Notice (`"AS IS"`)**
-> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.2.1` or `wythe==0.2.1`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
+> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.2.2` or `wythe==0.2.2`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
 > - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **36 experimental profiles** (`nextjs-prisma`, `node-kysely-react`, `node-sql-tools-sveltekit`, `django-nextjs`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, partial-coverage profiles, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
 
 ---
@@ -48,8 +48,8 @@ The 3D/2D view represents every scanned node matching the current filters with n
 - **`Compact visible`** repacks only the currently visible/filtered/working-set nodes to remove empty space and re-fits the camera; ordinary filters keep global coordinates stable until you opt in.
 - **`3D Tiers` ↔ `2D Flat`** flattens the three strata onto a single `y = 0` plane; **`Pin` (`Pinned ★`)** locks individual node coordinates across layout changes.
 - **Working sets & collapsible groups:** Use **`Isolate visible`**, **`+ Add visible`**, and **`Group: Domain | Subkind`** to build focused views with boundary-crossing `+Expand (+K)` links, and persist layouts as **`Saved views`** (reconciled across commit/digest changes).
-- **4-state edge styling & filters:** **Connected only** hides isolated nodes in the active view; **Neighborhood: 1 hop / 2 hops** and **Cone `[C]`** follow connections in either direction; edge styles distinguish **Solid** (`verified`), **Dashed** (`declared`), **Dotted** (`unverified`), and **Gap** (`broken`).
-- **Fit view** frames the active selection or visible set while zooming toward the pointer.
+- **4-state edge styling, diagnostic lenses & filters:** **Connected only** hides isolated nodes in the active view; **Neighborhood: 1 hop / 2 hops** and symbol-scoped **Cone `[C]`** (`AtlasEdge.symbol_links`) follow connections in either direction; diagnostic lenses include **`Containers`** (`cluster="containers"` highlighting `m:dockerfile:*`, `m:compose:*`, and `m:k8s:*` nodes and their linked entrypoints); edge styles distinguish **Solid** (`verified`), **Dashed** (`declared`), **Dotted** (`unverified`), and **Gap** (`broken`).
+- **Fit view & Governance exports:** **Fit view** frames the active selection or visible set while zooming toward the pointer; **Gate & Rules** surfaces registered `wythe.plugins` status alongside **`Export OpenLineage`** JSON downloads.
 
 Selected and traced nodes remain pinned outside ordinary filters (with the extra count shown explicitly; `Connected-only` has no pin exception). Hidden or disconnected nodes remain in the scan and index; missing static connections are never proof of dead code or safe deletion. Rendering the entire scan does not extend the scanner's coverage.
 
@@ -61,7 +61,7 @@ Pin an explicit release tag (do not track unpinned branches if you want zero-sur
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0
-- uses: Euda1mon1a/wythe@v0.2.1
+- uses: Euda1mon1a/wythe@v0.2.2
   with:
     mode: diff
     base-ref: origin/main
@@ -81,11 +81,12 @@ Rule severity, enablement, gate-blocking behavior, and effective-date windows li
 | `TRUTH-003` | `truth` | Blocking | Table or Redis store mutated directly inside HTTP route without service/DB door |
 | `TRUTH-004` | `truth` | Warning | Unbounded Redis `SET`/`HSET` write without TTL risks volatile shadow truth |
 | `TRUTH-005` | `truth` | Warning | A model's table exists in the live DB (`--dsn`) but no `schema.sql`/migration creates it |
-| `MANIP-001` | `manipulate` | Blocking | Mutable domain policy/threshold constant hardcoded in code (`atlas_policy_vocabularies`) |
+| `MANIP-001` | `manipulate` | Blocking | Mutable domain policy/threshold constant hardcoded in code or container/service config, or active policy-table read bypassing policy columns (`atlas_policy_vocabularies`) |
 | `MANIP-002` | `manipulate` | Blocking | Direct host `date.today()` or naive `datetime.now()` / `datetime.utcnow()` call |
-| `MANIP-003` | `manipulate` | Warning | Service/solver module has zero verified inbound route, CLI, or worker callers |
-| `MANIP-004` | `manipulate` | Warning | Launchd declaration has an invalid command or literal unexpanded path |
-| `MANIP-005` | `manipulate` | Warning | Deployment declaration references an absent source file |
+| `MANIP-003` | `manipulate` | Warning | Service/solver module has zero verified inbound route, CLI, container, or worker callers |
+| `MANIP-004` | `manipulate` | Warning | Service, launchd, Dockerfile, Compose, or Kubernetes launch declaration has an invalid command or unexpanded `$VAR`/`~` path (allowing K8s `$(VAR_NAME)`) |
+| `MANIP-005` | `manipulate` | Warning | Deployment or Dockerfile `COPY`/`ADD` references an absent/`.dockerignore`-excluded source or omits a transitive runtime import |
+| `MANIP-006` | `manipulate` | Blocking | Cross-domain Python import violates `tach.toml` horizontal module or public `[[interfaces]]` boundary |
 | `DISP-001` | `display` | Blocking | Display tier defines domain policy threshold shadows in frontend code |
 | `DISP-002` | `display` | Blocking | Raw `new Date()` or UTC `.toISOString().slice(0, 10)` date slicing |
 | `DISP-003` | `display` | Warning | Frontend API client omits `api-generated` OpenAPI/schema types |
@@ -93,6 +94,7 @@ Rule severity, enablement, gate-blocking behavior, and effective-date windows li
 | `DISP-005` | `display` | Warning | Display markup violates core WCAG semantics (missing `alt`, unlabeled form input, nameless icon button, non-keyboard `<div onClick>`) |
 | `DISP-006` | `display` | Warning | Call path is built at runtime (`/${kind}/items`) and could match real routes: reported for review, not called broken |
 | `DISP-007` | `display` | Warning | Call to a missing route with no discovered entry path; retained for removal or reconnection review |
+| `DISP-008` | `display` | Warning | Display API call cannot be verified because backend route coverage is incomplete |
 
 **How a frontend call with no matching route is classified.** A call served by the frontend's own Next.js `route.ts` / `pages/api` handler is not a backend call and is not reported. A path built at runtime that could match real routes is `DISP-006`. On the `typescript-nextjs` and `typescript-react` display adapters, Wythe follows imports per exported symbol from entry pages/layouts/roots (honoring `tsconfig` path aliases, barrels, re-exports, and dynamic imports); a call in a symbol nothing reaches is `DISP-007`. Everything else is `DISP-004`, and its detail names the page/entry trail that reaches it. When the analysis cannot tell, it treats the call as reachable, so a real defect is never demoted to a warning by a parsing gap. Other display profiles keep `DISP-004` for every unmatched call.
 
@@ -103,6 +105,24 @@ Rule severity, enablement, gate-blocking behavior, and effective-date windows li
 **Reachability and removal decisions.** With the Tree-sitter extra, a lazy import such as `import('./widgets').then(m => m.Chart)` reaches the selected export while retaining barrel dependencies and import-time initializers. Unknown export selectors conservatively retain all exports; runtime-selected module paths are explicitly unresolved. Scan notes record these distinctions, and additional import dependencies appear as `declared` edges in the existing blast-radius graph. `DISP-007` keeps inactive broken calls visible. A small blast radius or a missing caller is evidence for review, not proof that deletion is safe: check external entry points, registration side effects and the relevant build/tests before removing code or reconnecting its useful behavior. Without a usable CST, import execution stays conservative.
 
 **Python services and operational declarations (experimental).** The `python-services` profile maps Python imports, literal importlib targets and package initializers outside an `app/` layout, shell script references, launchd commands, and JSON command fields under `config/` or `configs/`. It also recognizes literal deployment constructors whose first fields are `repo_path` and `live_path`, including source-to-installed-path renames. These are **declared** edges, not proof of admission, installation or execution. Module summaries distinguish source references, deployment-only references, and no discovered references; none certifies safe deletion. Missing deployment source files and invalid launchd commands are review warnings. Coverage notes name exclusions, parse failures and unresolved dynamic imports. This profile does not analyze UI/custom HTTP routes, evaluate job eligibility, execute installers, or query running services. Use `wythe scan /path/to/services --profile python-services` and inspect the coverage notes before interpreting a passing gate.
+
+**Policy field-to-result consumption (`PolicyFieldConsumption`).**
+On Python `reads_truth` edges, Tier-1 policy tables, Tier-2 readers,
+`wythe context` cones, and `NodeInspector`, Wythe classifies policy
+columns (`policy_columns`, matched via `atlas_policy_vocabularies`
+and cap/limit/quota/threshold stems) into three epistemic states:
+`consumed` (`field_controls_result`, where `>=1` policy column
+reaches a live return, branch guard, solver/helper call, or write
+sink; `policy.cap or FALLBACK_CAP` records `fallback_constants`
+without false alarm), `bypassed` (`constant_or_fallback_wins`, where
+an active reader touches non-policy fields, dead branches, or
+overwritten locals while leaving `unconsumed_policy_columns` unused
+or substituting `substituted_constants`, emitting a causal
+`MANIP-001` policy-bypass finding targeting `t:<table>`), and
+`unresolved` (`dynamic_or_opaque_flow`, for `getattr(row, dyn_name)`,
+dynamic subscripts, or opaque whole-row handoffs).
+
+**Containers, Kubernetes, `tach.toml` & `wythe.plugins` (`cluster="containers"`).** Across every stack profile, built-in `wythe.plugins` augmenters statically inspect `Dockerfile`/`Containerfile` (including `.docker/` subdirectories) and `.dockerignore`, `compose.yaml`/`docker-compose.*.yml`, Kubernetes manifests (`Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Pod`, `ConfigMap` in root or `k8s/`, `kubernetes/`, `manifests/`, `deploy/`, `deployments/`, `.k8s/`, safely skipping Helm/Mustache `{{` templates with a coverage note), and `tach.toml` modular-monolith walls (`MANIP-006`). Container and K8s edges populate `AtlasEdge.symbol_links` (`*->sym` on callable entrypoints like `dramatiq app.tasks:process_queue`, falling back to whole-module `[]` on framework variable/router hubs like `uvicorn app.main:app` or `celery -A app.worker.celery_app`) so Lineage Cones stay surgical without severing mounted routers or tasks; K8s `$(VAR_NAME)` parenthesized interpolation is honored while bare `$VAR`/`~` in exec arrays triggers `MANIP-004`, and literal policy tokens in Compose `environment:` or K8s `env:`/`ConfigMap.data` trigger `MANIP-001`. Scanning never imports or executes `.py` files from a target repository unless `--allow-local-plugins` is explicitly passed on the CLI.
 
 **Deletion and rename diffs.** `wythe diff` resolves the requested base to an exact commit and scans its committed files in a temporary directory, without checking out or executing target code. It traverses the base and current graphs separately, retaining removed nodes, their old callers and import-time dependencies. Renames include both paths. New violation counts still use current-side changed lines. `PASS` means the diff gate found no blocking findings on those lines; it does not certify safe deletion. Invalid bases exit with code 2. If the base cannot be reconstructed (including unresolved symlinks or submodules), JSON and SARIF explicitly report incomplete evidence and the CLI exits 2.
 
@@ -129,6 +149,16 @@ wythe diff /path/to/repo --base origin/main --sarif diff.sarif.json
 # Git-portable governance bundle (.wythe/governance.json) for CI runners
 wythe export-config /path/to/repo
 wythe gate --sync-config /path/to/repo
+
+# Inspect trusted built-in / entry-point plugins & export OpenLineage static JSON
+wythe plugins --json
+wythe export-openlineage /path/to/repo --profile auto --out openlineage.json
+
+# Correlate blueprint findings with read-only post-build Syft SBOM & Trivy JSON/SARIF artifacts
+wythe security companion /path/to/repo \
+  --syft-sbom sbom.cdx.json \
+  --trivy-report trivy.sarif \
+  --json companion-handoff.json
 
 # Single-port API + 3D WebGL UI (auto-registers target directory on startup)
 wythe serve /path/to/repo --host 127.0.0.1 --port 8780
@@ -167,7 +197,7 @@ Full JSON scans on large repositories span megabytes; Wythe exposes five zero-co
    - **Chrome Built-In (`chrome`)**: Client-side browser `LanguageModel` (Gemini Nano via Prompt API, including 1-click download and multimodal WebGL `<canvas>` vision when enabled).
    - **Local OpenAI `/v1` (`local`)**: Auto-probes browser-host & server loopback `/v1/models` & `/v1/chat/completions` (`:8080`/`:8084`/`:8083` MLX, `:11434` Ollama, `:1234` LM Studio) without triggering weight reloads.
 2. **Streamable HTTP MCP (`POST /api/v1/mcp` & `GET /api/v1/mcp`) + Stdio MCP (`wythe mcp`)** — Connect local or remote Tailnet coding agents (`http://<host>:8780/api/v1/mcp`) with zero local install.
-3. **OpenAPI 3.1 (`/openapi.json`) + Remote CLI (`wythe focus --remote <url>`)** — Universal HTTP tool/Actions compatibility plus cross-host CLI X-Ray inspection.
+3. **OpenAPI 3.1 (`/openapi.json`, `/api/v1/adapters/plugins`, `/api/v1/scans/{slug}/openlineage`) + Remote CLI (`wythe focus --remote <url>`)** — Universal HTTP tool/Actions compatibility, read-only plugin and OpenLineage JSON endpoints, plus cross-host CLI X-Ray inspection.
 4. **In-Tab WebMCP (`navigator.modelContext` & `window.wythe`)** — Exposes `whatIsThis()`, `getLineageCone(query)`, `selectNode(nodeId)`, and `ask(question)` directly to browser agents and extensions.
 5. **Token-Budgeted `llms.txt` & Lineage Cone Slicer** — Deterministic ~2,000-token repo maps and ~300-token 3-tier cones.
 
@@ -187,7 +217,7 @@ wythe focus --remote http://100.64.0.10:8780
 wythe mcp
 ```
 
-MCP client configuration (Stdio or Streamable HTTP — exposes `wythe_what_is_this`, `wythe_list_targets`, `wythe_overview`, `wythe_lineage_cone`, `wythe_blast_radius`, `wythe_findings`):
+MCP client configuration (Stdio or Streamable HTTP — exposes `wythe_what_is_this`, `wythe_list_targets`, `wythe_overview`, `wythe_lineage_cone`, `wythe_blast_radius`, `wythe_findings`, `wythe_plugins`, `wythe_openlineage`):
 
 ```json
 {
@@ -241,11 +271,11 @@ Only the dogfooded Python/SQLAlchemy/Next.js trio is classified **`Implemented`*
 
 The [Open WebUI source audit](docs/audits/open-webui.md) records the 0.1.7 repairs, measured coverage and remaining gaps. Its FastAPI/Svelte profile remains experimental.
 
-Every stack family has been scanned against synthetic regression suites and pinned open-source repositories (`wythe[treesitter]==0.2.1`):
+Every stack family has been scanned against synthetic regression suites and pinned open-source repositories (`wythe[treesitter]==0.2.2`):
 
 | Repository | Profile (`--profile auto`) | Maturity | Tier 1 (Truth) | Tier 2 (Manipulate) | Tier 3 (Display) | Verified Edges / E2E Chains | Notes & Observed Boundaries |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`Euda1mon1a/wythe`** (`v0.2.1`) | `fastapi-sqlalchemy-nextjs` | **Implemented** | 7 tables, 1 SQL fn | 9 routes, 65 services | 1 page, 26 hooks/clients | **322 / 29** | Self-dogfooded (`PASS --strict`, 0 blocking, 0 warnings) |
+| **`Euda1mon1a/wythe`** (`v0.2.2`) | `fastapi-sqlalchemy-nextjs` | **Implemented** | 7 tables, 1 SQL fn | 9 routes, 71 services | 1 page, 27 hooks/clients | **346 / 31** | Self-dogfooded (`PASS --strict`, 0 blocking, 0 warnings) |
 | **`fastapi/full-stack-fastapi-template`** (`aabb90126964`) | `fastapi-react-spa` | Experimental | 2 tables | 6 routes, 7 services | 10 pages, 58 hooks/clients | **229 / 39** | SQLModel + nested Alembic + Hey API OpenAPI SDK (`0` `DISP-004`/`007`) |
 | **`makeplane/plane`** (`9cefae892c4c`) | `django-nextjs` | Experimental | 112 tables, 34 Redis | 109 routes, 238 services | 58 pages, 1,590 UI nodes | **5,095 / 300** | Imported Django URL packages & CBVs; Next.js `pages`+`app` (`300` report cap) |
 | **`docmost/docmost`** (`3a3e812f25e8`) | `node-kysely-react` | Experimental | 49 tables, 16 fn, 14 Redis/BullMQ | 70 routes, 486 services | 26 pages, 817 UI nodes | **3,854 / 300** | Kysely `CamelCasePlugin` replay + NestJS BullMQ `@Processor`/`@InjectQueue` |
@@ -272,9 +302,10 @@ So `uvx "wythe[treesitter]" serve /path/to/repo` works in one command on any mac
 **No.** Wythe is shared openly as a free community give-back from internal R&D, provided strictly **"AS IS"** under MIT with **zero commitment to maintain, patch, review PRs, triage issues, or preserve backward compatibility**. Pin exact versions in CI and fork freely.
 
 ### User Guide, Architecture & Ecosystem Docs
-- [`docs/user-guide.md`](docs/user-guide.md) — Interactive 3D/2D WebGL usage, working-set compaction (`Compact visible`, `Linked Components`, `2D Flat`, Saved Views), keyboard shortcuts, scoped rulings/store purposes, CLI flags, and epistemic guardrails.
-- [`docs/architecture/ecosystem-and-positioning.md`](docs/architecture/ecosystem-and-positioning.md) — Ecosystem comparison (`tach`, `import-linter`, `dependency-cruiser`, `sqllineage`, `OpenLineage`, `CodeCharta`, `Semgrep`) and pairing `tach` + Wythe in CI.
-- [`docs/architecture/multi-language-extensibility.md`](docs/architecture/multi-language-extensibility.md) — Language-neutral intermediate contract, adapter maturity matrix, pinned corpus benchmarks, and non-REST transport boundaries.
+- [`docs/user-guide.md`](docs/user-guide.md) — Interactive 3D/2D WebGL usage, working-set compaction (`Compact visible`, `Linked Components`, `2D Flat`, Saved Views), `Containers` lens, keyboard shortcuts, scoped rulings/store purposes, CLI flags, and epistemic guardrails.
+- [`docs/architecture/containers-security-and-plugins.md`](docs/architecture/containers-security-and-plugins.md) — `Dockerfile`/`.dockerignore`/`.docker/`, Compose, and Kubernetes manifest lineage (`$(VAR_NAME)` vs. `$VAR`), two-stage `Syft` + `Trivy` Blue/Red/Purple CI handoffs, `wythe.plugins`, `tach.toml` (`MANIP-006`), and OpenLineage export.
+- [`docs/architecture/ecosystem-and-positioning.md`](docs/architecture/ecosystem-and-positioning.md) — Ecosystem comparison (`tach`, `import-linter`, `dependency-cruiser`, `Ariga Atlas`, `SQLGlot`/`SQLLineage`, `OpenLineage`, `Syft`, `Trivy`, `Semgrep`) and pairing `tach` + Wythe in CI.
+- [`docs/architecture/multi-language-extensibility.md`](docs/architecture/multi-language-extensibility.md) — Language-neutral intermediate contract, `AtlasEdge.symbol_links`, adapter maturity matrix, pinned corpus benchmarks, and non-REST transport boundaries.
 
 ---
 

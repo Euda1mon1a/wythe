@@ -13,8 +13,10 @@ from sqlalchemy.orm import Session
 
 from app import __version__
 from app.adapters.autodetect import detect_repository_stack
+from app.adapters.plugin_registry import discover_plugins
 from app.db.session import get_session_factory
 from app.models import TargetProject
+from app.services.companion_export_service import build_openlineage_static_bundle
 from app.services.diff_and_sarif_service import compute_diff_and_blast_radius
 from app.services.governance_service import (
     get_target_by_slug,
@@ -133,6 +135,35 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "wythe_plugins",
+        "description": (
+            "List registered built-in and installed `wythe.plugins` entry-point companion plugins "
+            "(local untrusted repository plugins are never executed over MCP)."
+        ),
+        "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False},
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "wythe_openlineage",
+        "description": (
+            "Export a concise static OpenLineage 2.0.2 summary (SQL/cache datasets and Tier-2/E2E "
+            "job read `inputs` vs write `outputs`) for a registered target or directory."
+        ),
+        "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Registered target slug or repository path.",
+                },
+                "profile": {"type": "string", "default": "auto"},
+            },
+            "required": ["target"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -244,6 +275,31 @@ def _execute_tool(session: Session, tool_name: str, args: dict[str, Any]) -> str
             lines.append(f"- `{p.slug}`: {p.truth_adapter} + {p.manipulator_adapter} + {p.display_adapter}")
         return "\n".join(lines)
 
+    if canonical == "wythe_plugins":
+        load_errors: list[str] = []
+        specs = discover_plugins(
+            include_builtins=True,
+            include_entry_points=True,
+            allow_local_plugins=False,
+            strict_plugins=False,
+            notes_out=load_errors,
+        )
+        lines = [
+            f"# Registered Wythe Plugins ({len(specs)})",
+            "> Security boundary: `local_plugins_allowed=false` (untrusted repo code is never imported).",
+        ]
+        for spec in specs:
+            state = "enabled" if spec.enabled_by_default else "disabled"
+            ver = spec.version or "unknown"
+            lines.append(
+                f"- `{spec.name}` [{spec.kind} | {spec.origin} | v{ver} | {state}] — {spec.description}"
+            )
+        if load_errors:
+            lines.append(f"\n## Isolated Load Errors ({len(load_errors)})")
+            for err in load_errors:
+                lines.append(f"- {err}")
+        return "\n".join(lines)
+
     raw_target = str(args.get("target") or "").strip()
     if not raw_target:
         raise ValueError("Missing required parameter `target` (slug or directory path).")
@@ -304,6 +360,27 @@ def _execute_tool(session: Session, tool_name: str, args: dict[str, Any]) -> str
             lines.append(
                 f"- **{f.rule_code}** [{f.severity}/{f.tier}] `{f.source_file}:{f.line}` (`{f.node_id}`) — {f.title}\n  Remediation: {f.remediation}"
             )
+        return "\n".join(lines)
+
+    if canonical == "wythe_openlineage":
+        bundle = build_openlineage_static_bundle(report)
+        datasets: list[dict[str, Any]] = bundle["datasets"]  # type: ignore[assignment]
+        jobs: list[dict[str, Any]] = bundle["jobs"]  # type: ignore[assignment]
+        active_jobs = [j for j in jobs if j.get("inputs") or j.get("outputs")]
+        lines = [
+            f"# Static OpenLineage Bundle :: `{report.target_slug}` (`{report.source_commit[:10]}`)",
+            f"> Schema: `{bundle['schemaURL']}` | Datasets: {len(datasets)} | Jobs: {len(jobs)} ({len(active_jobs)} with dataset lineage)",
+            f"> Notice: {bundle['nonCertificationNotice']}",
+            f"\n## Datasets ({len(datasets)})",
+        ]
+        for ds in datasets[:40]:
+            fields = ds.get("facets", {}).get("schema", {}).get("fields", [])
+            lines.append(f"- `{ds['namespace']}/{ds['name']}` ({len(fields)} column(s))")
+        lines.append(f"\n## Jobs with Inputs/Outputs (showing {min(len(active_jobs), 40)} of {len(active_jobs)})")
+        for job in active_jobs[:40]:
+            ins = ", ".join(r["name"] for r in job.get("inputs", ())) or "none"
+            outs = ", ".join(r["name"] for r in job.get("outputs", ())) or "none"
+            lines.append(f"- `{job['name']}` ({job['namespace']}) :: inputs=[{ins}] -> outputs=[{outs}]")
         return "\n".join(lines)
 
     raise ValueError(f"Unknown tool '{tool_name}'.")

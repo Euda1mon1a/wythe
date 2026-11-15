@@ -21,6 +21,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/adapters/plugins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Registered Plugins */
+        get: operations["get_registered_plugins_api_v1_adapters_plugins_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/adapters/profiles": {
         parameters: {
             query?: never;
@@ -203,6 +220,23 @@ export interface paths {
         };
         /** Export Target Sarif */
         get: operations["export_target_sarif_api_v1_scans__target_slug__sarif_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/scans/{target_slug}/openlineage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Export Target Openlineage */
+        get: operations["export_target_openlineage_api_v1_scans__target_slug__openlineage_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -611,6 +645,7 @@ export interface components {
             evidence_note: string;
             /** Symbol Links */
             symbol_links?: string[];
+            policy_field_consumption?: components["schemas"]["PolicyFieldConsumption"] | null;
         };
         /** AtlasNode */
         AtlasNode: {
@@ -655,6 +690,8 @@ export interface components {
             summary: string;
             /** Columns */
             columns?: string[];
+            /** Policy Columns */
+            policy_columns?: string[];
             /** Http Methods */
             http_methods?: string[];
             /** Http Paths */
@@ -678,6 +715,7 @@ export interface components {
             store_purpose?: components["schemas"]["StorePurposeDeclaration"] | null;
             /** Verification Note */
             verification_note?: string | null;
+            policy_field_consumption?: components["schemas"]["PolicyFieldConsumption"] | null;
         };
         /** AtlasSummaryStats */
         AtlasSummaryStats: {
@@ -866,6 +904,7 @@ export interface components {
             evidence_path?: string | null;
             /** Evidence Note */
             evidence_note: string;
+            policy_field_consumption?: components["schemas"]["PolicyFieldConsumption"] | null;
         };
         /** ConeSectionCount */
         ConeSectionCount: {
@@ -1216,6 +1255,159 @@ export interface components {
              * @default false
              */
             supports_vision: boolean;
+            /**
+             * Note
+             * @default
+             */
+            note: string;
+        };
+        /** OpenLineageBundleResponse */
+        OpenLineageBundleResponse: {
+            /** Producer */
+            producer: string;
+            /** Schemaurl */
+            schemaURL: string;
+            /** Bundletype */
+            bundleType: string;
+            /** Eventtime */
+            eventTime: string;
+            target: components["schemas"]["OpenLineageTargetInfo"];
+            /** Datasets */
+            datasets?: components["schemas"]["OpenLineageDatasetItem"][];
+            /** Jobs */
+            jobs?: components["schemas"]["OpenLineageJobItem"][];
+            /** Noncertificationnotice */
+            nonCertificationNotice: string;
+        };
+        /** OpenLineageDatasetItem */
+        OpenLineageDatasetItem: {
+            /** Namespace */
+            namespace: string;
+            /** Name */
+            name: string;
+            /** Facets */
+            facets?: {
+                [key: string]: unknown;
+            };
+        };
+        /** OpenLineageDatasetRef */
+        OpenLineageDatasetRef: {
+            /** Namespace */
+            namespace: string;
+            /** Name */
+            name: string;
+        };
+        /** OpenLineageJobItem */
+        OpenLineageJobItem: {
+            /** Namespace */
+            namespace: string;
+            /** Name */
+            name: string;
+            /** Inputs */
+            inputs?: components["schemas"]["OpenLineageDatasetRef"][];
+            /** Outputs */
+            outputs?: components["schemas"]["OpenLineageDatasetRef"][];
+            /** Facets */
+            facets?: {
+                [key: string]: unknown;
+            };
+        };
+        /** OpenLineageTargetInfo */
+        OpenLineageTargetInfo: {
+            /** Slug */
+            slug: string;
+            /** Name */
+            name: string;
+            /** Stackprofile */
+            stackProfile: string;
+            /** Sourcecommit */
+            sourceCommit: string;
+            /** Contentdigest */
+            contentDigest: string;
+            /** Observationsource */
+            observationSource: string;
+        };
+        /** PluginListResponse */
+        PluginListResponse: {
+            /** Plugins */
+            plugins?: components["schemas"]["PluginSpecItem"][];
+            /**
+             * Local Plugins Allowed
+             * @default false
+             */
+            local_plugins_allowed: boolean;
+            /** Load Errors */
+            load_errors?: string[];
+        };
+        /** PluginSpecItem */
+        PluginSpecItem: {
+            /** Name */
+            name: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "manipulator_augmenter" | "post_scan_check";
+            /** Source */
+            source: string;
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "builtin" | "entry_point" | "local_opt_in";
+            /**
+             * Tier
+             * @default manipulate
+             */
+            tier: string;
+            /**
+             * Version
+             * @default unknown
+             */
+            version: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Enabled By Default
+             * @default true
+             */
+            enabled_by_default: boolean;
+            /**
+             * Trusted
+             * @default true
+             */
+            trusted: boolean;
+        };
+        /**
+         * PolicyFieldConsumption
+         * @description Per-edge or per-node static policy column consumption lineage.
+         */
+        PolicyFieldConsumption: {
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "consumed" | "bypassed" | "unresolved";
+            /**
+             * Mechanism
+             * @enum {string}
+             */
+            mechanism: "field_controls_result" | "constant_or_fallback_wins" | "dynamic_or_opaque_flow";
+            /** Reader Scopes */
+            reader_scopes?: string[];
+            /** Policy Columns */
+            policy_columns?: string[];
+            /** Consumed Columns */
+            consumed_columns?: string[];
+            /** Unconsumed Policy Columns */
+            unconsumed_policy_columns?: string[];
+            /** Substituted Constants */
+            substituted_constants?: string[];
+            /** Fallback Constants */
+            fallback_constants?: string[];
             /**
              * Note
              * @default
@@ -1971,6 +2163,26 @@ export interface operations {
             };
         };
     };
+    get_registered_plugins_api_v1_adapters_plugins_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginListResponse"];
+                };
+            };
+        };
+    };
     get_stack_profiles_api_v1_adapters_profiles_get: {
         parameters: {
             query?: never;
@@ -2393,6 +2605,37 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    export_target_openlineage_api_v1_scans__target_slug__openlineage_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                target_slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OpenLineageBundleResponse"];
                 };
             };
             /** @description Validation Error */

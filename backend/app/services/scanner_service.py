@@ -24,6 +24,7 @@ from app.adapters.base import (
     TruthExtractionResult,
 )
 from app.adapters.legacy_snapshot_bridge import apply_legacy_snapshot_bridge
+from app.adapters.plugin_registry import run_manipulator_plugins, run_post_scan_plugins
 from app.adapters.redis_ephemeral import augment_redis_ephemeral_lineage
 from app.adapters.typescript_nextjs import _skip_template_expr
 from app.core.clock import utc_now, valid_until_from
@@ -497,6 +498,53 @@ def _solve_cross_tier_lineage(
     return cross_edges, chains, extra_findings
 
 
+def _reconcile_post_plugin_node_states(manip: ManipulatorExtractionResult) -> None:
+    """Reconcile inert-module findings, summaries, and node statuses after manipulator plugins run."""
+    manip.edges[:] = list({e.id: e for e in manip.edges}.values())
+    inbound_targets = {
+        e.target_id
+        for e in manip.edges
+        if e.kind == "calls_helper"
+        and e.source_id != e.target_id
+        and (
+            e.verification == "verified"
+            or e.source_id.startswith(("m:dockerfile:", "m:compose:", "m:k8s:", "m:launchd:"))
+            or e.id.startswith(("e:script:", "e:shell:"))
+        )
+    }
+    if inbound_targets:
+        manip.findings[:] = [
+            f
+            for f in manip.findings
+            if not (f.rule_code == "MANIP-003" and f.node_id in inbound_targets)
+        ]
+
+    rules_by_nid: dict[str, set[str]] = {}
+    for f in manip.findings:
+        if f.node_id:
+            rules_by_nid.setdefault(f.node_id, set()).add(f.rule_code)
+
+    for node in manip.nodes:
+        if node.id.startswith("m:script:") and node.id in inbound_targets:
+            for stale_suffix in (
+                " No source caller/reference discovered; external entry points remain unknown.",
+                " Deployment references only; no execution caller discovered.",
+            ):
+                if node.summary.endswith(stale_suffix):
+                    node.summary = (
+                        node.summary[: -len(stale_suffix)]
+                        + " Declared source caller/reference found."
+                    )
+                    break
+        n_rules = rules_by_nid.get(node.id, set())
+        if node.status == "unwired" and "MANIP-003" not in n_rules:
+            node.status = "clean"
+        if "MANIP-001" in n_rules and node.status == "clean":
+            node.status = "policy_in_code"
+        elif n_rules & {"MANIP-004", "MANIP-005", "MANIP-006"} and node.status == "clean":
+            node.status = "gray_zone"
+
+
 def run_target_scan(
     session: Session,
     target: TargetProject,
@@ -573,6 +621,8 @@ def run_target_scan(
         with policy_tokens_scope(enabled_tokens):
             truth_res = t_adapter.extract(repo_root, target.backend_subdir, pg_dsn=pg_dsn)
             manip_res = m_adapter.extract(repo_root, target.backend_subdir, truth_res)
+            run_manipulator_plugins(repo_root, target.backend_subdir, manip_res)
+            _reconcile_post_plugin_node_states(manip_res)
             disp_res = d_adapter.extract(repo_root, target.frontend_subdir)
 
         obs_source = augment_redis_ephemeral_lineage(
@@ -704,6 +754,32 @@ def run_target_scan(
         legacy_bridge=legacy_summary,
         rulings=rulings,
     )
+
+    post_exec = run_post_scan_plugins(repo_root, report)
+    if post_exec.findings:
+        raw_findings = [*raw_findings, *post_exec.findings]
+        findings, gate = evaluate_findings_and_gate(
+            session,
+            raw_findings,
+            target_id=target.id or None,
+            strict=strict_gate,
+            coverage_complete=coverage_complete,
+        )
+        stats.blocking_findings = sum(1 for f in findings if f.blocks_gate)
+        stats.warning_findings = sum(1 for f in findings if not f.blocks_gate)
+        digest_src = json.dumps(
+            {
+                "commit": commit_sha,
+                "nodes": [n.id for n in all_nodes],
+                "edges": [e.id for e in all_edges],
+                "findings": sorted(f.id for f in findings),
+            },
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
+        report.findings = findings
+        report.gate = gate
+        report.content_digest = digest
 
     if persist_snapshot and target.id:
         snap = ScanSnapshot(

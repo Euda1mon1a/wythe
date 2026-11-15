@@ -7,6 +7,7 @@ import type {
   AtlasNode,
   BoundaryFinding,
   ConeCompleteness,
+  PolicyFieldConsumption,
   PortableReferenceExemplar,
   StorePurposeDeclaration,
 } from '@/api/atlas';
@@ -47,6 +48,32 @@ function edgeStateBadge(verification: AtlasEdge['verification']): {
     return { tone: 'text-amber-300', text: 'unverified · dotted' };
   }
   return { tone: 'text-rose-300', text: 'broken · gap' };
+}
+
+function policyConsumptionBadge(state: PolicyFieldConsumption['state']): {
+  tone: string;
+  card: string;
+  label: string;
+} {
+  if (state === 'consumed') {
+    return {
+      tone: 'text-teal-300',
+      card: 'border-teal-500/30 bg-teal-950/20',
+      label: 'consumed · field controls result',
+    };
+  }
+  if (state === 'bypassed') {
+    return {
+      tone: 'text-rose-300',
+      card: 'border-rose-500/40 bg-rose-950/25',
+      label: 'bypassed · constant/fallback wins',
+    };
+  }
+  return {
+    tone: 'text-amber-300',
+    card: 'border-amber-500/35 bg-amber-950/20',
+    label: 'unresolved · dynamic/opaque flow',
+  };
 }
 
 export function NodeInspector({
@@ -283,7 +310,7 @@ export function NodeInspector({
                 <div className="mt-0.5">{f.title}</div>
                 <div className="mt-0.5 font-mono text-[10px] text-amber-200/90">
                   {isCausalWriter
-                    ? `Causal writer: ${f.node_id} @ ${f.source_file}:${f.line}`
+                    ? `${f.rule_code === 'MANIP-001' ? 'Causal reader' : 'Causal writer'}: ${f.node_id} @ ${f.source_file}:${f.line}`
                     : `${f.source_file}:${f.line}`}
                 </div>
                 <div className="mt-0.5 text-[10px] text-slate-300">{f.remediation}</div>
@@ -370,6 +397,46 @@ export function NodeInspector({
         </div>
       )}
 
+      {node.policy_field_consumption && (() => {
+        const pfc = node.policy_field_consumption;
+        const pBadge = policyConsumptionBadge(pfc.state);
+        return (
+          <div className={`space-y-1.5 border p-3 ${pBadge.card}`}>
+            <div className="flex flex-wrap items-center justify-between gap-1 font-mono text-[10px] uppercase tracking-wider">
+              <span className={pBadge.tone}>Policy Field Consumption</span>
+              <span className={pBadge.tone}>{pBadge.label}</span>
+            </div>
+            <div className="space-y-1 font-mono text-[10px] text-slate-200">
+              {pfc.consumed_columns && pfc.consumed_columns.length > 0 && (
+                <div>
+                  <span className="text-slate-400">Consumed columns: </span>
+                  <span className="text-teal-200">{pfc.consumed_columns.join(', ')}</span>
+                </div>
+              )}
+              {pfc.unconsumed_policy_columns && pfc.unconsumed_policy_columns.length > 0 && (
+                <div>
+                  <span className="text-slate-400">Unconsumed policy columns: </span>
+                  <span className="text-rose-200">{pfc.unconsumed_policy_columns.join(', ')}</span>
+                </div>
+              )}
+              {pfc.substituted_constants && pfc.substituted_constants.length > 0 && (
+                <div>
+                  <span className="text-slate-400">Substituted constants: </span>
+                  <span className="text-rose-300">{pfc.substituted_constants.join(', ')}</span>
+                </div>
+              )}
+              {pfc.fallback_constants && pfc.fallback_constants.length > 0 && (
+                <div>
+                  <span className="text-slate-400">Null/falsy fallbacks: </span>
+                  <span className="text-sky-200">{pfc.fallback_constants.join(', ')}</span>
+                </div>
+              )}
+            </div>
+            {pfc.note && <p className="text-[11px] text-slate-300">{pfc.note}</p>}
+          </div>
+        );
+      })()}
+
       {node.columns && node.columns.length > 0 && (
         <div>
           <div className="flex items-center justify-between font-mono text-[10px] uppercase text-slate-400">
@@ -388,14 +455,22 @@ export function NodeInspector({
             )}
           </div>
           <div className="mt-1.5 flex flex-wrap gap-1">
-            {(showAllColumns ? node.columns : node.columns.slice(0, 18)).map((c) => (
-              <span
-                key={c}
-                className="border border-slate-800 bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-slate-200"
-              >
-                {c}
-              </span>
-            ))}
+            {(showAllColumns ? node.columns : node.columns.slice(0, 18)).map((c) => {
+              const isPolCol = node.policy_columns?.includes(c) ?? false;
+              return (
+                <span
+                  key={c}
+                  title={isPolCol ? 'Domain policy column' : undefined}
+                  className={`border px-1.5 py-0.5 font-mono text-[10px] ${
+                    isPolCol
+                      ? 'border-teal-500/40 bg-teal-950/30 text-teal-200'
+                      : 'border-slate-800 bg-slate-900 text-slate-200'
+                  }`}
+                >
+                  {c}
+                </span>
+              );
+            })}
           </div>
         </div>
       )}
@@ -464,6 +539,11 @@ export function NodeInspector({
                 </button>
                 <div className="flex items-center gap-1.5 truncate font-mono text-[10px] text-slate-400">
                   <span className={badge.tone}>{badge.text}</span>
+                  {e.policy_field_consumption && (
+                    <span className={policyConsumptionBadge(e.policy_field_consumption.state).tone}>
+                      · policy:{e.policy_field_consumption.state}
+                    </span>
+                  )}
                   {e.evidence_path && <span title={e.evidence_path}>· {e.evidence_path}</span>}
                   {e.evidence_note && <span title={e.evidence_note}>· {e.evidence_note}</span>}
                 </div>
@@ -490,6 +570,11 @@ export function NodeInspector({
                 </button>
                 <div className="flex items-center gap-1.5 truncate font-mono text-[10px] text-slate-400">
                   <span className={badge.tone}>{badge.text}</span>
+                  {e.policy_field_consumption && (
+                    <span className={policyConsumptionBadge(e.policy_field_consumption.state).tone}>
+                      · policy:{e.policy_field_consumption.state}
+                    </span>
+                  )}
                   {e.evidence_path && <span title={e.evidence_path}>· {e.evidence_path}</span>}
                   {e.evidence_note && <span title={e.evidence_note}>· {e.evidence_note}</span>}
                 </div>

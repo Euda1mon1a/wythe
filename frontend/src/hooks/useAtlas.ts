@@ -30,6 +30,7 @@ export const atlasKeys = {
   source: (slug: string, relPath: string, line: number) =>
     ['source', slug, relPath, line] as const,
   slots: ['adapter-slots'] as const,
+  plugins: ['adapter-plugins'] as const,
   profiles: ['stack-profiles'] as const,
 };
 
@@ -67,6 +68,13 @@ export function useAdapterSlots() {
   return useQuery({
     queryKey: atlasKeys.slots,
     queryFn: () => atlasApi.listAdapterSlots(),
+  });
+}
+
+export function usePlugins() {
+  return useQuery({
+    queryKey: atlasKeys.plugins,
+    queryFn: () => atlasApi.listPlugins(),
   });
 }
 
@@ -220,6 +228,12 @@ export function useSyncGovernanceBundle(slug: string) {
 export function useDownloadSarif(slug: string) {
   return useMutation({
     mutationFn: () => atlasApi.getScanSarif(slug),
+  });
+}
+
+export function useDownloadOpenLineage(slug: string) {
+  return useMutation({
+    mutationFn: () => atlasApi.getScanOpenLineage(slug),
   });
 }
 
