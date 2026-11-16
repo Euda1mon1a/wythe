@@ -28,6 +28,32 @@ INITIAL_STACK_PROFILES: tuple[dict[str, object], ...] = (
         ),
     },
     {
+        "slug": "python-services-react",
+        "label": "SQL DDL/SQLite/Postgres + Python Services/Daemons + React/TypeScript",
+        "truth_adapter": "sql-ddl",
+        "manipulator_adapter": "python-services",
+        "display_adapter": "typescript-react",
+        "implementation_status": "experimental",
+        "is_enabled": True,
+        "description": (
+            "SQL DDL and inline SQLite/PostgreSQL/JSONL stores, Python services/daemons/registries, "
+            "and React/Vite/TypeScript SPA display."
+        ),
+    },
+    {
+        "slug": "python-services-nextjs",
+        "label": "SQL DDL/SQLite/Postgres + Python Services/Daemons + Next.js/TypeScript",
+        "truth_adapter": "sql-ddl",
+        "manipulator_adapter": "python-services",
+        "display_adapter": "typescript-nextjs",
+        "implementation_status": "experimental",
+        "is_enabled": True,
+        "description": (
+            "SQL DDL and inline SQLite/PostgreSQL/JSONL stores, Python services/daemons/registries, "
+            "and Next.js App/Pages Router display."
+        ),
+    },
+    {
         "slug": "fastapi-sqlalchemy-nextjs",
         "label": "PostgreSQL/SQLite + FastAPI/SQLAlchemy + Next.js/TypeScript",
         "truth_adapter": "postgres-sqlalchemy",

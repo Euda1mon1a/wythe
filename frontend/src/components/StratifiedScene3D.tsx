@@ -89,7 +89,7 @@ interface StratifiedScene3DProps {
     visualHeadline: string | null;
   }) => void;
   onLiveViewportDigest?: (digest: LiveViewportDigest) => void;
-  onRegisterLiveCapture?: (fn: () => string | null) => void;
+  onRegisterLiveCapture?: (fn: (() => string | null) | null) => void;
   onOpenAskAi?: () => void;
   onSelectNode: (nodeId: string | null) => void;
   onToggleWorkingSetNode?: (nodeId: string) => void;
@@ -933,6 +933,9 @@ export function StratifiedScene3D({
   useEffect(() => {
     if (!onRegisterLiveCapture) return;
     onRegisterLiveCapture(() => captureCompactViewportWebp(canvasRef.current, 1024, 0.82));
+    return () => {
+      onRegisterLiveCapture(null);
+    };
   }, [onRegisterLiveCapture]);
 
   useEffect(() => {

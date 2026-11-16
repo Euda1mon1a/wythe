@@ -44,8 +44,10 @@ def test_http_api_surface_end_to_end(isolated_db_url: str) -> None:
         exp_count = sum(
             1 for p in profiles.json() if p["implementation_status"] == "experimental"
         )
-        assert exp_count == 36
+        assert exp_count == 38
         assert profiles_by_slug["python-services"]["implementation_status"] == "experimental"
+        assert profiles_by_slug["python-services-react"]["implementation_status"] == "experimental"
+        assert profiles_by_slug["python-services-nextjs"]["implementation_status"] == "experimental"
 
         targets = client.get("/api/v1/targets")
         assert targets.status_code == 200

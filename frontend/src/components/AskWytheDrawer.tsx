@@ -2,12 +2,20 @@
 
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Bot, Copy, Cpu, Download, Eye, RefreshCw, Send, Sparkles, Trash2, X } from 'lucide-react';
-import type { AskChatTurn, AtlasNode, UiFocusExplainRead } from '@/api/atlas';
+import type {
+  AskChatTurn,
+  AtlasNode,
+  UiFocusExplainRead,
+  UiFocusStatePayload,
+  UiFocusSyncAck,
+} from '@/api/atlas';
 import { useAskEngines, useAskWythe } from '@/hooks/useAtlas';
+import { post } from '@/lib/api';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { useDialogFocusTrap } from '@/lib/wytheDialogFocus';
 import type { LiveViewportDigest } from '@/lib/wytheVisionBridge';
 import {
+  bumpViewportCameraRevision,
   probeBrowserLocalOpenAi,
   probeChromeBuiltInModel,
   runBrowserLocalOpenAiAsk,
@@ -16,6 +24,8 @@ import {
   type BrowserLocalOpenAiProbe,
   type ChromeEngineProbe,
 } from '@/lib/wytheBrowserAi';
+
+let monotonicDrawerCameraRevision = 0;
 
 export type SelectedEngineChoice = 'auto' | 'apple' | 'chrome' | 'local';
 
@@ -174,8 +184,15 @@ export function AskWytheDrawer({
     onClose,
   });
 
+  const [debouncedCustomUrl, setDebouncedCustomUrl] = useState('');
+  useEffect(() => {
+    const trimmed = customLocalUrl.trim();
+    const t = window.setTimeout(() => setDebouncedCustomUrl(trimmed), 280);
+    return () => window.clearTimeout(t);
+  }, [customLocalUrl]);
+
   const { data: backendEngines, refetch: refetchEngines } = useAskEngines(
-    customLocalUrl.trim() || undefined,
+    debouncedCustomUrl || undefined,
     open,
   );
   const askBackend = useAskWythe();
@@ -184,11 +201,49 @@ export function AskWytheDrawer({
     if (initialQuestion) setQuestion(initialQuestion);
   }, [initialQuestion]);
 
+  const syncCapturedWebpToUiFocus = async (webpDataUrl: string | null): Promise<void> => {
+    if (!activeSlug || !webpDataUrl || !webpDataUrl.startsWith('data:image/')) return;
+    const knownServerRev =
+      Number((explanation as { camera_revision?: number | null } | null)?.camera_revision ?? 0) || 0;
+    monotonicDrawerCameraRevision = bumpViewportCameraRevision(knownServerRev);
+    const syncPayload: Partial<UiFocusStatePayload> & {
+      active_slug: string;
+      camera_revision: number;
+      snapshot_data_url: string;
+    } = {
+      active_slug: activeSlug,
+      camera_revision: monotonicDrawerCameraRevision,
+      snapshot_data_url: webpDataUrl,
+      ...(liveDigest?.selectedNodeId !== undefined ? { selected_node_id: liveDigest.selectedNodeId } : {}),
+      ...(liveDigest?.hoveredNodeId !== undefined ? { hovered_node_id: liveDigest.hoveredNodeId } : {}),
+      ...(liveDigest?.lens ? { lens: liveDigest.lens } : {}),
+      ...(liveDigest?.layoutMode ? { layout_mode: liveDigest.layoutMode } : {}),
+      ...(liveDigest?.visibleNodeCount !== undefined ? { visible_node_count: liveDigest.visibleNodeCount } : {}),
+      ...(liveDigest?.inFrustumCount !== undefined ? { in_frustum_count: liveDigest.inFrustumCount } : {}),
+      ...(liveDigest?.summaryPill ? { visual_headline: liveDigest.summaryPill } : {}),
+      ...(liveDigest?.markdownBrief ? { live_viewport_brief: liveDigest.markdownBrief } : {}),
+    };
+    try {
+      await post<UiFocusSyncAck>('/ui-focus', syncPayload);
+    } catch {
+      // Keep zero-backend Chrome mode working when server is offline
+    }
+  };
+
   useEffect(() => {
     if (!open) return;
     void probeChromeBuiltInModel().then(setChromeProbe);
-    void probeBrowserLocalOpenAi(customLocalUrl.trim() || undefined).then(setBrowserLocalProbe);
-  }, [open, customLocalUrl]);
+    const initialWebp = captureLiveWebp?.() ?? null;
+    if (initialWebp) {
+      void syncCapturedWebpToUiFocus(initialWebp).then(() => onRefreshFocus());
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    void probeBrowserLocalOpenAi(debouncedCustomUrl || undefined, true).then(setBrowserLocalProbe);
+  }, [open, debouncedCustomUrl]);
 
   if (!open) return null;
 
@@ -219,7 +274,12 @@ export function AskWytheDrawer({
     if (!trimmed || isBusy) return;
     setActiveError(null);
 
-    const liveFrameUrl = captureLiveWebp?.() ?? snapshotDataUrl;
+    const capturedWebp = captureLiveWebp?.() ?? null;
+    if (capturedWebp) {
+      await syncCapturedWebpToUiFocus(capturedWebp);
+    }
+    const liveFrameUrl = capturedWebp ?? snapshotDataUrl;
+    const hasAttachedFrame = Boolean(liveFrameUrl);
     const liveBrief = liveDigest
       ? `${liveDigest.markdownBrief}\n\n${explanation?.markdown_brief ?? ''}`.trim()
       : (explanation?.markdown_brief ?? `Target: ${activeSlug}`);
@@ -238,9 +298,17 @@ export function AskWytheDrawer({
           ])
       : [];
 
+    const anyVlmReady =
+      (chromeProbe.state === 'ready' && chromeProbe.supportsVision) ||
+      (browserLocalProbe.state === 'ready' && browserLocalProbe.supportsVision) ||
+      Boolean(localSt?.state === 'ready' && localSt.supports_vision);
+
     const useChrome =
       engineChoice === 'chrome' ||
-      (engineChoice === 'auto' && appleSt?.state !== 'ready' && chromeProbe.state === 'ready');
+      (engineChoice === 'auto' &&
+        chromeProbe.state === 'ready' &&
+        ((hasAttachedFrame && chromeProbe.supportsVision) ||
+          (!anyVlmReady && appleSt?.state !== 'ready')));
 
     if (useChrome) {
       setIsRunningClientModel(true);
@@ -275,9 +343,11 @@ export function AskWytheDrawer({
     }
 
     const useBrowserLocal =
+      browserLocalProbe.state === 'ready' &&
       (engineChoice === 'local' ||
-        (engineChoice === 'auto' && appleSt?.state !== 'ready' && chromeProbe.state !== 'ready')) &&
-      browserLocalProbe.state === 'ready';
+        (engineChoice === 'auto' &&
+          ((hasAttachedFrame && browserLocalProbe.supportsVision) ||
+            (!anyVlmReady && appleSt?.state !== 'ready' && chromeProbe.state !== 'ready'))));
 
     if (useBrowserLocal) {
       setIsRunningClientModel(true);
@@ -525,11 +595,18 @@ export function AskWytheDrawer({
               )}
               <button
                 type="button"
-                onClick={onRefreshFocus}
+                onClick={() => {
+                  const snappedWebp = captureLiveWebp?.() ?? null;
+                  if (snappedWebp) {
+                    void syncCapturedWebpToUiFocus(snappedWebp).then(() => onRefreshFocus());
+                  } else {
+                    onRefreshFocus();
+                  }
+                }}
                 className="flex min-h-6 min-w-6 items-center gap-1 border border-teal-500/40 bg-teal-500/15 px-1.5 py-0.5 text-[10px] text-teal-200 hover:bg-teal-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 <RefreshCw className="h-2.5 w-2.5" />
-                Snap PNG
+                Snap WebP
               </button>
             </div>
           </div>

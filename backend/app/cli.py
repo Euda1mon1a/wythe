@@ -314,7 +314,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_ctx.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON instead of Markdown")
 
-    sub.add_parser("mcp", help="Run read-only Model Context Protocol (MCP) server over stdio")
+    p_mcp = sub.add_parser("mcp", help="Run read-only Model Context Protocol (MCP) server over stdio")
+    p_mcp.add_argument(
+        "--slice",
+        dest="slice_mode",
+        choices=("full", "slm"),
+        default="full",
+        help="MCP tool surface slice: 'full' (all 8 tools, default) or 'slm' (compact <=2KB 4-tool slice)",
+    )
 
     p_focus = sub.add_parser(
         "focus",
@@ -389,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "mcp":
-        return run_mcp_stdio_server()
+        return run_mcp_stdio_server(slice_mode=args.slice_mode)
 
     if args.cmd == "focus":
         if args.remote:

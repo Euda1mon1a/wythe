@@ -200,6 +200,18 @@ export interface BrowserLocalOpenAiProbe {
   note: string;
 }
 
+let sharedViewportCameraRevision = 0;
+
+export function bumpViewportCameraRevision(knownServerRev = 0): number {
+  const floor = Number.isFinite(knownServerRev) && knownServerRev > 0 ? Math.floor(knownServerRev) : 0;
+  sharedViewportCameraRevision = Math.max(sharedViewportCameraRevision, floor) + 1;
+  return sharedViewportCameraRevision;
+}
+
+export function currentViewportCameraRevision(): number {
+  return sharedViewportCameraRevision;
+}
+
 const CLIENT_LOCAL_SEATS = [
   'http://127.0.0.1:8080/v1',
   'http://127.0.0.1:8084/v1',
@@ -227,13 +239,17 @@ function normalizeClientV1Url(raw: string): string {
   return trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
 }
 
-export async function probeBrowserLocalOpenAi(customUrl?: string): Promise<BrowserLocalOpenAiProbe> {
+export async function probeBrowserLocalOpenAi(
+  customUrl?: string,
+  preferVision = false,
+): Promise<BrowserLocalOpenAiProbe> {
   if (typeof window === 'undefined') {
     return { state: 'unavailable', baseUrl: null, requestModelId: null, displayModel: null, supportsVision: false, note: 'SSR' };
   }
   const candidates = customUrl?.trim()
     ? [normalizeClientV1Url(customUrl), ...CLIENT_LOCAL_SEATS]
     : CLIENT_LOCAL_SEATS;
+  let firstReadyTextFallback: BrowserLocalOpenAiProbe | null = null;
 
   for (const base of candidates) {
     try {
@@ -248,11 +264,11 @@ export async function probeBrowserLocalOpenAi(customUrl?: string): Promise<Brows
         .filter((id) => !NON_CHAT_MODEL_TOKENS.some((bad) => id.toLowerCase().includes(bad)));
       if (chatIds.length === 0) continue;
 
-      let reqModel = chatIds[0];
-      let dispModel = extractSnapshotSlug(reqModel) ?? reqModel;
       const isPinnedProxy =
         items.length === 1 || (items[0]?.owned_by ?? '').toLowerCase().includes('pinned');
       const isMlxMulti = items.some((m) => (m.id ?? '').startsWith('mlx-community/') || (m.id ?? '').includes('/models--'));
+      let reqModel = chatIds[0];
+      let dispModel = extractSnapshotSlug(reqModel) ?? reqModel;
       if (!isPinnedProxy && isMlxMulti) {
         const srvHdr = (res.headers.get('server') ?? '').toLowerCase();
         const createdSet = new Set(items.map((m) => m.created).filter((c) => typeof c === 'number'));
@@ -265,7 +281,7 @@ export async function probeBrowserLocalOpenAi(customUrl?: string): Promise<Brows
         dispModel = snap ?? 'default_model (mlx_lm)';
       }
       const supportsVision = VISION_MODEL_TOKENS.some((tok) => dispModel.toLowerCase().includes(tok));
-      return {
+      const candidateProbe: BrowserLocalOpenAiProbe = {
         state: 'ready',
         baseUrl: base,
         requestModelId: reqModel,
@@ -273,9 +289,16 @@ export async function probeBrowserLocalOpenAi(customUrl?: string): Promise<Brows
         supportsVision,
         note: `${dispModel} ready on this browser host (${base})`,
       };
+      if (!preferVision || supportsVision) {
+        return candidateProbe;
+      }
+      firstReadyTextFallback ??= candidateProbe;
     } catch {
       // Try next loopback port on viewer workstation
     }
+  }
+  if (firstReadyTextFallback) {
+    return firstReadyTextFallback;
   }
   return {
     state: 'unavailable',
@@ -360,6 +383,13 @@ export interface WythePageBridgeHandlers {
   openAskDrawer: (prefill?: string) => void;
 }
 
+export const WYTHE_WEBMCP_TOOL_NAMES = [
+  'wythe_what_is_this',
+  'wythe_lineage_cone',
+  'wythe_select_node',
+  'wythe_ask',
+] as const;
+
 export function registerWytheWebMcpBridge(handlers: WythePageBridgeHandlers): () => void {
   if (typeof window === 'undefined') return () => {};
   const win = window as unknown as Record<string, unknown>;
@@ -384,8 +414,31 @@ export function registerWytheWebMcpBridge(handlers: WythePageBridgeHandlers): ()
       nav.modelContext.registerTool({
         name: 'wythe_what_is_this',
         description: 'Inspect live 3D Wythe focus node, vertical district, and blast-radius X-ray.',
-        inputSchema: { type: 'object', properties: {} },
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         execute: async () => handlers.getWhatIsThis(),
+      });
+      nav.modelContext.registerTool({
+        name: 'wythe_lineage_cone',
+        description:
+          'Slice the surgical 3-tier upstream/downstream lineage cone around a table, route, file, queue, or node ID.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Table name, HTTP route, file path, queue lane, or node ID.',
+            },
+          },
+          required: ['query'],
+          additionalProperties: false,
+        },
+        execute: async (args?: { query?: string }) => {
+          const query = (args?.query ?? '').trim();
+          if (!query) {
+            throw new Error('Missing required parameter `query`.');
+          }
+          return handlers.getLineageCone(query);
+        },
       });
       nav.modelContext.registerTool({
         name: 'wythe_select_node',
@@ -394,10 +447,30 @@ export function registerWytheWebMcpBridge(handlers: WythePageBridgeHandlers): ()
           type: 'object',
           properties: { nodeId: { type: 'string' } },
           required: ['nodeId'],
+          additionalProperties: false,
         },
-        execute: async (args: { nodeId?: string }) => {
+        execute: async (args?: { nodeId?: string }) => {
           if (args?.nodeId) handlers.selectNode(args.nodeId);
           return { ok: true, selectedNodeId: args?.nodeId ?? null };
+        },
+      });
+      nav.modelContext.registerTool({
+        name: 'wythe_ask',
+        description:
+          'Open the Ask Wythe on-device architecture assistant drawer with an optional prefilled question.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            question: {
+              type: 'string',
+              description: 'Optional architectural question to prefill in Ask Wythe.',
+            },
+          },
+          additionalProperties: false,
+        },
+        execute: async (args?: { question?: string }) => {
+          handlers.openAskDrawer(args?.question);
+          return { ok: true, question: args?.question ?? null };
         },
       });
     } catch {
@@ -408,8 +481,9 @@ export function registerWytheWebMcpBridge(handlers: WythePageBridgeHandlers): ()
   return () => {
     delete win.wythe;
     try {
-      nav.modelContext?.unregisterTool?.('wythe_what_is_this');
-      nav.modelContext?.unregisterTool?.('wythe_select_node');
+      for (const toolName of WYTHE_WEBMCP_TOOL_NAMES) {
+        nav.modelContext?.unregisterTool?.(toolName);
+      }
     } catch {
       // Ignore cleanup if browser lacks unregisterTool
     }

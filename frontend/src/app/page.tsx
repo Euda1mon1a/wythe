@@ -78,7 +78,7 @@ import {
   type SavedWorkingView,
 } from '@/lib/wytheWorkingSet';
 import { tryCopyDataUrlPngToClipboard, type LiveViewportDigest } from '@/lib/wytheVisionBridge';
-import { registerWytheWebMcpBridge } from '@/lib/wytheBrowserAi';
+import { bumpViewportCameraRevision, registerWytheWebMcpBridge } from '@/lib/wytheBrowserAi';
 import { WYTHE_PRESETS, useWytheAppearance, type AppearanceMode } from '@/lib/wytheTheme';
 
 const StratifiedScene3D = dynamic(
@@ -297,6 +297,9 @@ export default function WytheWorkspacePage() {
       (selectedNode ? deriveDomainCluster(selectedNode) : null) ??
       hoverFocusMeta.district;
     const timer = window.setTimeout(() => {
+      const knownRev =
+        Number((whatsThisExplanation as { camera_revision?: number | null } | null)?.camera_revision ?? 0) || 0;
+      const nextRev = bumpViewportCameraRevision(knownRev);
       syncUiFocus.mutate(
         {
           active_slug: activeSlug,
@@ -325,6 +328,7 @@ export default function WytheWorkspacePage() {
           in_frustum_count: liveViewportDigest?.inFrustumCount ?? 0,
           visual_headline: hoverFocusMeta.visualHeadline,
           live_viewport_brief: liveViewportDigest?.markdownBrief ?? null,
+          camera_revision: nextRev,
         },
         {
           onSuccess: () => {
@@ -345,6 +349,8 @@ export default function WytheWorkspacePage() {
     selectedNodeId,
     hoverFocusMeta.hoveredNodeId,
     hoverFocusMeta.district,
+    hoverFocusMeta.cameraPosition,
+    hoverFocusMeta.cameraTarget,
     tierFilter,
     subkindFilter,
     edgeFilter,
@@ -366,7 +372,7 @@ export default function WytheWorkspacePage() {
       if (typeof prefill === 'string') setAskPrefillQuestion(prefill);
       setWhatsThisOpen(false);
       setAskDrawerOpen(true);
-      if (activeTab === '3d') {
+      if (activeTab === '3d' && !liveCaptureFnRef.current) {
         focusCaptureTargetRef.current = 'drawer';
         setWhatsThisRequest((n) => n + 1);
       } else if (activeSlug) {
@@ -408,6 +414,8 @@ export default function WytheWorkspacePage() {
           });
         }
       }
+      const knownRev =
+        Number((whatsThisExplanation as { camera_revision?: number | null } | null)?.camera_revision ?? 0) || 0;
       syncUiFocus.mutate(
         {
           active_slug: activeSlug,
@@ -437,6 +445,7 @@ export default function WytheWorkspacePage() {
           in_frustum_count: liveViewportDigest?.inFrustumCount ?? 0,
           visual_headline: payload.visualHeadline,
           live_viewport_brief: liveViewportDigest?.markdownBrief ?? null,
+          camera_revision: bumpViewportCameraRevision(knownRev),
           snapshot_data_url: payload.snapshotDataUrl,
         },
         {
@@ -2158,9 +2167,15 @@ export default function WytheWorkspacePage() {
         nodesById={nodesById}
         initialQuestion={askPrefillQuestion}
         onRefreshFocus={() => {
-          focusCaptureTargetRef.current = 'silent';
           setActiveTab('3d');
-          setWhatsThisRequest((n) => n + 1);
+          if (liveCaptureFnRef.current && activeSlug) {
+            fetchUiFocus.mutate(activeSlug, {
+              onSuccess: (exp) => setWhatsThisExplanation(exp),
+            });
+          } else {
+            focusCaptureTargetRef.current = 'silent';
+            setWhatsThisRequest((n) => n + 1);
+          }
         }}
         onSelectNode={(nid) => setSelectedNodeId(nid)}
         onClose={() => setAskDrawerOpen(false)}

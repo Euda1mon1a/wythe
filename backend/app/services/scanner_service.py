@@ -508,8 +508,10 @@ def _reconcile_post_plugin_node_states(manip: ManipulatorExtractionResult) -> No
         and e.source_id != e.target_id
         and (
             e.verification == "verified"
-            or e.source_id.startswith(("m:dockerfile:", "m:compose:", "m:k8s:", "m:launchd:"))
-            or e.id.startswith(("e:script:", "e:shell:"))
+            or e.source_id.startswith(
+                ("m:dockerfile:", "m:compose:", "m:k8s:", "m:launchd:", "m:systemd:", "m:registry:")
+            )
+            or e.id.startswith(("e:script:", "e:shell:", "e:subprocess:"))
         )
     }
     if inbound_targets:
