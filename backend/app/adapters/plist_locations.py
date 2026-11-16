@@ -63,3 +63,59 @@ def command_locations(raw: bytes) -> tuple[dict[str, int], list[int]]:
     except ExpatError:
         return {}, []
     return fields, arguments
+
+
+def env_locations(raw: bytes) -> dict[str, int]:
+    """Return per-key line numbers inside top-level `EnvironmentVariables` XML dict."""
+    parser = ParserCreate()
+    stack: list[_Element] = []
+    env_lines: dict[str, int] = {}
+    top_key = ""
+    env_key = ""
+
+    def start(tag, attrs):
+        element = _Element(tag, parser.CurrentLineNumber)
+        stack.append(element)
+        if len(stack) == 3 and tag == "dict" and top_key == "EnvironmentVariables":
+            env_lines.clear()
+        elif (
+            len(stack) == 4
+            and stack[-2].tag == "dict"
+            and top_key == "EnvironmentVariables"
+            and tag != "key"
+            and env_key
+        ):
+            env_lines[env_key] = element.line
+
+    def text(value):
+        if not stack:
+            return
+        element = stack[-1]
+        element.text.append(value)
+        if element.value_line is None and value.strip():
+            leading = value[: len(value) - len(value.lstrip())]
+            element.value_line = parser.CurrentLineNumber + leading.count("\n")
+
+    def end(tag):
+        nonlocal top_key, env_key
+        element = stack[-1]
+        if len(stack) == 3 and tag == "key":
+            top_key = "".join(element.text)
+            env_key = ""
+        elif len(stack) == 4 and stack[-2].tag == "dict" and top_key == "EnvironmentVariables":
+            if tag == "key":
+                env_key = "".join(element.text).strip()
+                if env_key:
+                    env_lines[env_key] = element.value_line or element.line
+            elif env_key and element.value_line is not None:
+                env_lines[env_key] = element.value_line
+        stack.pop()
+
+    parser.StartElementHandler = start
+    parser.CharacterDataHandler = text
+    parser.EndElementHandler = end
+    try:
+        parser.Parse(raw, True)
+    except ExpatError:
+        return {}
+    return env_lines

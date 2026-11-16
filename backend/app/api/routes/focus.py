@@ -18,6 +18,7 @@ from app.services.ui_focus_service import (
     explain_ui_focus,
     load_latest_snapshot_png,
     record_ui_focus,
+    sniff_snapshot_mime,
 )
 
 router = APIRouter()
@@ -45,4 +46,4 @@ def get_ui_focus_snapshot_route() -> FileResponse:
     png_path = load_latest_snapshot_png()
     if png_path is None:
         raise HTTPException(status_code=404, detail="No UI focus snapshot captured yet.")
-    return FileResponse(png_path, media_type="image/png")
+    return FileResponse(png_path, media_type=sniff_snapshot_mime(png_path))

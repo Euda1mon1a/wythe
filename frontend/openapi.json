@@ -1515,17 +1515,43 @@
           "mcp"
         ],
         "summary": "Get Mcp Http Manifest Route",
-        "description": "Return Streamable HTTP MCP discovery manifest & read-only tool schemas.",
+        "description": "Return Streamable HTTP MCP discovery manifest & read-only tool/resource schemas.",
         "operationId": "get_mcp_http_manifest_route_api_v1_mcp_get",
+        "parameters": [
+          {
+            "name": "slice",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "full",
+                "slm"
+              ],
+              "type": "string",
+              "default": "full",
+              "title": "Slice"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "type": "object",
+                  "additionalProperties": true,
                   "title": "Response Get Mcp Http Manifest Route Api V1 Mcp Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -1539,28 +1565,44 @@
         "summary": "Post Mcp Http Rpc Route",
         "description": "Handle single or batched JSON-RPC 2.0 MCP requests over Streamable HTTP.",
         "operationId": "post_mcp_http_rpc_route_api_v1_mcp_post",
+        "parameters": [
+          {
+            "name": "slice",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "full",
+                "slm"
+              ],
+              "type": "string",
+              "default": "full",
+              "title": "Slice"
+            }
+          }
+        ],
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "anyOf": [
                   {
-                    "additionalProperties": true,
-                    "type": "object"
+                    "type": "object",
+                    "additionalProperties": true
                   },
                   {
+                    "type": "array",
                     "items": {
-                      "additionalProperties": true,
-                      "type": "object"
-                    },
-                    "type": "array"
+                      "type": "object",
+                      "additionalProperties": true
+                    }
                   }
                 ],
                 "title": "Payload"
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "200": {
@@ -5345,6 +5387,33 @@
             ],
             "title": "Snapshot Path"
           },
+          "snapshot_mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Mime Type"
+          },
+          "camera_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Camera Revision"
+          },
+          "snapshot_stale": {
+            "type": "boolean",
+            "title": "Snapshot Stale",
+            "default": false
+          },
           "markdown_brief": {
             "type": "string",
             "title": "Markdown Brief"
@@ -5565,6 +5634,18 @@
             ],
             "title": "Live Viewport Brief"
           },
+          "camera_revision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Camera Revision"
+          },
           "snapshot_data_url": {
             "anyOf": [
               {
@@ -5610,6 +5691,33 @@
               }
             ],
             "title": "Snapshot Path"
+          },
+          "snapshot_mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Mime Type"
+          },
+          "camera_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Camera Revision"
+          },
+          "snapshot_stale": {
+            "type": "boolean",
+            "title": "Snapshot Stale",
+            "default": false
           }
         },
         "additionalProperties": false,

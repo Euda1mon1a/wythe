@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
@@ -115,12 +115,16 @@ def _looks_vision_capable(model_id: str) -> bool:
 def probe_local_openai_engine(
     custom_base_url: str | None = None,
     preferred_model: str | None = None,
+    *,
+    prefer_vision: bool = False,
 ) -> OnDeviceEngineStatus:
     """Probe loopback/Tailnet OpenAI-compatible `/v1/models` seats bypassing `HTTP_PROXY`."""
     candidates: list[str] = []
+    explicit_custom_base: str | None = None
     if custom_base_url and custom_base_url.strip():
         try:
-            candidates.append(_normalize_private_v1_url(custom_base_url))
+            explicit_custom_base = _normalize_private_v1_url(custom_base_url)
+            candidates.append(explicit_custom_base)
         except ValueError as exc:
             return OnDeviceEngineStatus(
                 engine="local",
@@ -133,6 +137,7 @@ def probe_local_openai_engine(
             candidates.append(seat)
 
     last_note = "No loopback OpenAI-compatible /v1 seat detected (:8080, :8084, :8083, :8085, :8093, :8081, :1234, :11434)."
+    fallback_text_seat: OnDeviceEngineStatus | None = None
     for base in candidates:
         req = urllib.request.Request(f"{base}/models", method="GET")
         try:
@@ -154,8 +159,8 @@ def probe_local_openai_engine(
             last_note = f"{base} has no chat-capable `/v1/models` entries."
             continue
         req_model, display_model = selected
-        has_vision = _looks_vision_capable(display_model)
-        return OnDeviceEngineStatus(
+        has_vision = _looks_vision_capable(display_model) or _looks_vision_capable(req_model)
+        seat_status = OnDeviceEngineStatus(
             engine="local",
             label="Local OpenAI /v1 Server",
             state="ready",
@@ -164,6 +169,18 @@ def probe_local_openai_engine(
             supports_vision=has_vision,
             note=f"{display_model} ready at {base}",
         )
+        explicit_model_match = bool(
+            preferred_model
+            and preferred_model.strip()
+            and preferred_model.strip() in {str(item.get("id")) for item in raw_items}
+        )
+        if explicit_custom_base == base or explicit_model_match or has_vision or not prefer_vision:
+            return seat_status
+        if fallback_text_seat is None:
+            fallback_text_seat = seat_status
+
+    if fallback_text_seat is not None:
+        return fallback_text_seat
 
     return OnDeviceEngineStatus(
         engine="local",
@@ -171,6 +188,44 @@ def probe_local_openai_engine(
         state="unavailable",
         note=last_note,
     )
+
+
+def resolve_auto_backend_cascade(
+    *,
+    backend: str = "auto",
+    apple_status: OnDeviceEngineStatus | None,
+    local_status: OnDeviceEngineStatus | None,
+    image_data_url: str | None = None,
+    has_screenshot: bool = False,
+) -> list[Literal["apple", "local"]]:
+    """Select backend engine priority; prefer ready local `/v1` VLMs when a viewport image is attached."""
+    if backend == "apple":
+        return ["apple"]
+    if backend == "local":
+        return ["local"]
+
+    apple_ready = bool(apple_status and apple_status.state == "ready")
+    local_ready = bool(
+        local_status
+        and local_status.state == "ready"
+        and local_status.base_url
+        and local_status.model_id
+    )
+    local_vlm_ready = bool(local_ready and local_status and local_status.supports_vision)
+    multimodal_attached = bool((image_data_url and image_data_url.strip()) or has_screenshot)
+
+    order: list[Literal["apple", "local"]] = []
+    if multimodal_attached and local_vlm_ready:
+        order.append("local")
+        if apple_ready:
+            order.append("apple")
+        return order
+
+    if apple_ready:
+        order.append("apple")
+    if local_ready:
+        order.append("local")
+    return order
 
 
 def list_ask_engines(custom_base_url: str | None = None) -> AskEnginesRead:
@@ -193,11 +248,20 @@ def list_ask_engines(custom_base_url: str | None = None) -> AskEnginesRead:
 
 
 def _sniff_image_data_url(snap_path: Path | None, inline_data_url: str | None) -> str | None:
-    if inline_data_url and inline_data_url.startswith(("data:image/webp;base64,", "data:image/png;base64,", "data:image/jpeg;base64,")):
-        return inline_data_url
+    if inline_data_url:
+        low_inline = inline_data_url[:32].lower()
+        if low_inline.startswith(("data:image/webp;base64,", "data:image/png;base64,", "data:image/jpeg;base64,")):
+            return inline_data_url
+        if low_inline.startswith("data:image/jpg;base64,"):
+            return "data:image/jpeg;base64," + inline_data_url[len("data:image/jpg;base64,") :]
     if snap_path is not None and snap_path.is_file():
         raw = snap_path.read_bytes()
-        mime = "image/webp" if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP" else "image/png"
+        if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            mime = "image/webp"
+        elif raw[:3] == b"\xff\xd8\xff":
+            mime = "image/jpeg"
+        else:
+            mime = "image/png"
         b64 = base64.b64encode(raw).decode("ascii")
         return f"data:{mime};base64,{b64}"
     return None
@@ -262,10 +326,19 @@ def _run_local_chat_completion(
         return _post_chat(user_content), used_vision
     except urllib.error.HTTPError as exc:
         if used_vision and exc.code in (400, 415, 422):
-            return _post_chat(user_text), False
+            try:
+                return _post_chat(user_text), False
+            except (TimeoutError, OSError, ValueError) as inner_exc:
+                raise RuntimeError(
+                    f"Local model text fallback at {base_url} failed ({type(inner_exc).__name__}: {inner_exc})."
+                ) from inner_exc
         raise RuntimeError(f"Local model server at {base_url} answered HTTP {exc.code}.") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach local model server at {base_url} ({exc.reason}).") from exc
+    except (TimeoutError, OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Local model server at {base_url} failed during completion ({type(exc).__name__}: {exc})."
+        ) from exc
 
 
 def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> AskWytheResponse:
@@ -295,8 +368,16 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
     compact_context = f"{focus.markdown_brief[:2300]}{vp_section}{cone_md}"
     full_prompt = f"## Live 3D Wythe Viewport & X-Ray\n{compact_context}\n\n## User Question\n{payload.question.strip()}"
 
-    snap_path = Path(focus.snapshot_path) if (payload.include_vision_snapshot and focus.snapshot_path) else None
+    snap_path = (
+        Path(focus.snapshot_path)
+        if (payload.include_vision_snapshot and focus.snapshot_path and not focus.snapshot_stale)
+        else None
+    )
     inline_snap = payload.snapshot_data_url if payload.include_vision_snapshot else None
+    attached_img_url = (
+        _sniff_image_data_url(snap_path, inline_snap) if payload.include_vision_snapshot else None
+    )
+    has_multimodal_image = attached_img_url is not None
     engine_choice = payload.engine
     answer_md = ""
     engine_used: str = "local"
@@ -305,47 +386,80 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
     hinted_refs: list[str] = []
 
     apple_status = check_apple_engine_status() if engine_choice in ("auto", "apple") else None
-    local_status = probe_local_openai_engine(payload.local_base_url, payload.local_model_id)
+    local_status = probe_local_openai_engine(
+        payload.local_base_url,
+        payload.local_model_id,
+        prefer_vision=has_multimodal_image,
+    )
 
-    if engine_choice == "apple" or (engine_choice == "auto" and apple_status and apple_status.state == "ready"):
-        try:
-            hist_tail = "\n".join(
-                f"{'User' if t.role == 'user' else 'Assistant'}: {t.content[:360]}"
-                for t in payload.history[-4:]
-            )
-            hist_block = f"\n\n## Recent Session Turns\n{hist_tail}" if hist_tail else ""
-            apple_prompt = (
-                f"## Live Wythe Viewport\n{focus.markdown_brief[:1600]}{vp_section[:900]}"
-                f"{hist_block}\n\n## Question\n{payload.question.strip()}"
-            )
-            answer_md, hinted_refs = run_apple_engine_ask(instructions, apple_prompt)
-            engine_used = "apple"
-            model_used = "apple-foundation-models-on-device"
-        except RuntimeError:
-            if engine_choice == "apple" or local_status.state != "ready":
-                raise
+    cascade = resolve_auto_backend_cascade(
+        backend=engine_choice,
+        apple_status=apple_status,
+        local_status=local_status,
+        image_data_url=inline_snap,
+        has_screenshot=has_multimodal_image,
+    )
+
+    for idx, candidate_engine in enumerate(cascade):
+        has_fallback = idx + 1 < len(cascade)
+        if candidate_engine == "apple":
+            try:
+                hist_tail = "\n".join(
+                    f"{'User' if t.role == 'user' else 'Assistant'}: {t.content[:360]}"
+                    for t in payload.history[-4:]
+                )
+                hist_block = f"\n\n## Recent Session Turns\n{hist_tail}" if hist_tail else ""
+                apple_prompt = (
+                    f"## Live Wythe Viewport\n{focus.markdown_brief[:1600]}{vp_section[:900]}"
+                    f"{hist_block}\n\n## Question\n{payload.question.strip()}"
+                )
+                answer_md, hinted_refs = run_apple_engine_ask(instructions, apple_prompt)
+                engine_used = "apple"
+                model_used = "apple-foundation-models-on-device"
+                used_vision = False
+                break
+            except (RuntimeError, TimeoutError, OSError, ValueError) as exc:
+                if not has_fallback:
+                    if isinstance(exc, RuntimeError):
+                        raise
+                    raise RuntimeError(f"Local model completion failed ({type(exc).__name__}: {exc}).") from exc
+        else:
+            if local_status.state != "ready" or not local_status.base_url or not local_status.model_id:
+                if has_fallback:
+                    continue
+                break
+            try:
+                answer_md, used_vision = _run_local_chat_completion(
+                    local_status.base_url,
+                    local_status.model_id,
+                    instructions,
+                    full_prompt,
+                    snap_path,
+                    inline_data_url=inline_snap,
+                    history=payload.history,
+                    supports_vision=local_status.supports_vision,
+                )
+                engine_used = "local"
+                if (
+                    local_status.model_id == "default_model"
+                    and local_status.note
+                    and " ready at " in local_status.note
+                ):
+                    model_used = local_status.note.split(" ready at ", 1)[0]
+                else:
+                    model_used = local_status.model_id
+                break
+            except (RuntimeError, TimeoutError, OSError, ValueError) as exc:
+                if not has_fallback:
+                    if isinstance(exc, RuntimeError):
+                        raise
+                    raise RuntimeError(f"Local model completion failed ({type(exc).__name__}: {exc}).") from exc
 
     if not answer_md:
-        if local_status.state != "ready" or not local_status.base_url or not local_status.model_id:
-            raise ValueError(
-                f"No ready backend LLM engine (Apple: {apple_status.note if apple_status else 'skipped'}; "
-                f"Local: {local_status.note}). Try Chrome Built-In in the browser or start a local `/v1` model."
-            )
-        answer_md, used_vision = _run_local_chat_completion(
-            local_status.base_url,
-            local_status.model_id,
-            instructions,
-            full_prompt,
-            snap_path,
-            inline_data_url=inline_snap,
-            history=payload.history,
-            supports_vision=local_status.supports_vision,
+        raise ValueError(
+            f"No ready backend LLM engine (Apple: {apple_status.note if apple_status else 'skipped'}; "
+            f"Local: {local_status.note}). Try Chrome Built-In in the browser or start a local `/v1` model."
         )
-        engine_used = "local"
-        if local_status.model_id == "default_model" and local_status.note and " ready at " in local_status.note:
-            model_used = local_status.note.split(" ready at ", 1)[0]
-        else:
-            model_used = local_status.model_id
 
     matched_ids: list[str] = []
     if focus.focused_node is not None:

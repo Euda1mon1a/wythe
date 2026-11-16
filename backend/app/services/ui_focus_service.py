@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import json
+import os
 import re
 import tempfile
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.core.clock import utc_now
 from app.core.config import load_settings
+from app.models import TargetProject
 from app.schemas.atlas import (
     AtlasNode,
     BoundaryFinding,
@@ -23,7 +27,7 @@ from app.schemas.atlas import (
     UiFocusStatePayload,
     UiFocusSyncAck,
 )
-from app.services.diff_and_sarif_service import compute_diff_and_blast_radius
+from app.services.diff_and_sarif_service import compute_diff_and_blast_radius, run_target_diff
 from app.services.governance_service import get_target_by_slug, list_targets
 from app.services.scanner_service import run_target_scan
 
@@ -47,18 +51,122 @@ _GENERIC_PATH_SEGMENTS = {
     "alembic",
     "versions",
 }
-_DATA_IMAGE_RE = re.compile(r"^data:image/(png|webp|jpeg);base64,", re.IGNORECASE)
+_DATA_IMAGE_RE = re.compile(r"^data:image/(png|webp|jpeg|jpg);base64,", re.IGNORECASE)
+_MIME_TO_EXT: dict[str, str] = {
+    "image/webp": ".webp",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+}
+_EXT_TO_MIME: dict[str, str] = {
+    ".webp": "image/webp",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
 
 
-def _resolve_focus_paths() -> tuple[Path, Path]:
+_ALLOWED_SNAPSHOT_NAMES = frozenset(
+    {"ui_focus_latest.webp", "ui_focus_latest.png", "ui_focus_latest.jpg"}
+)
+
+
+def _resolve_focus_dir() -> Path:
     db_url = load_settings().database_url
     if db_url.startswith("sqlite:///") and ":memory:" not in db_url:
         db_file = Path(db_url.removeprefix("sqlite:///")).resolve()
         base_dir = db_file.parent
-    else:
-        base_dir = Path(tempfile.gettempdir()) / "wythe-ephemeral-focus"
-    base_dir.mkdir(parents=True, exist_ok=True)
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir
+
+    uid_suffix = str(os.getuid()) if hasattr(os, "getuid") else "local"
+    base_dir = Path(tempfile.gettempdir()) / f"wythe-ephemeral-focus-{uid_suffix}"
+    if base_dir.is_symlink():
+        raise RuntimeError(f"Refusing symlinked ephemeral focus directory: {base_dir}")
+    base_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        base_dir.chmod(0o700)
+    except OSError:
+        pass
+    if hasattr(os, "getuid"):
+        st = base_dir.lstat()
+        if st.st_uid != os.getuid():
+            raise RuntimeError(f"Refusing foreign-owned ephemeral focus directory: {base_dir}")
+    return base_dir
+
+
+def _resolve_focus_paths() -> tuple[Path, Path]:
+    base_dir = _resolve_focus_dir()
     return base_dir / "ui_focus_state.json", base_dir / "ui_focus_latest.png"
+
+
+def sniff_snapshot_mime(snap_file: Path) -> str:
+    try:
+        head = snap_file.read_bytes()[:16]
+        if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "image/webp"
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if head.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+    except OSError:
+        pass
+    return _EXT_TO_MIME.get(snap_file.suffix.lower(), "image/png")
+
+
+_sniff_snapshot_mime = sniff_snapshot_mime
+
+
+def read_saved_ui_focus_state() -> dict[str, Any]:
+    """Read persisted `ui_focus_state.json` safely without raising on missing/corrupt files."""
+    state_file, _ = _resolve_focus_paths()
+    if state_file.is_symlink() or not state_file.is_file():
+        return {}
+    try:
+        parsed = json.loads(state_file.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _is_contained_snapshot_file(cand: Path, real_base: Path) -> bool:
+    if cand.name not in _ALLOWED_SNAPSHOT_NAMES or cand.is_symlink():
+        return False
+    try:
+        resolved = cand.resolve()
+    except OSError:
+        return False
+    return resolved.parent == real_base and resolved.is_relative_to(real_base) and resolved.is_file()
+
+
+def _find_existing_snapshot(base_dir: Path, saved: dict[str, Any]) -> tuple[Path | None, str | None]:
+    if base_dir.is_symlink():
+        return None, None
+    real_base = base_dir.resolve()
+    raw_saved_path = saved.get("snapshot_path")
+    if isinstance(raw_saved_path, str) and raw_saved_path.strip():
+        raw_cand = Path(raw_saved_path)
+        if (
+            not raw_cand.is_symlink()
+            and raw_cand.name in _ALLOWED_SNAPSHOT_NAMES
+            and raw_cand.exists()
+            and _is_contained_snapshot_file(base_dir / raw_cand.name, real_base)
+        ):
+            try:
+                if raw_cand.resolve() == (base_dir / raw_cand.name).resolve():
+                    safe_cand = base_dir / raw_cand.name
+                    return safe_cand, sniff_snapshot_mime(safe_cand)
+            except OSError:
+                pass
+
+    existing = [
+        p
+        for ext in (".webp", ".png", ".jpg")
+        if _is_contained_snapshot_file((p := base_dir / f"ui_focus_latest{ext}"), real_base)
+    ]
+    if not existing:
+        return None, None
+    newest = max(existing, key=lambda p: p.stat().st_mtime_ns)
+    return newest, sniff_snapshot_mime(newest)
 
 
 def derive_node_district(node: AtlasNode) -> str:
@@ -77,40 +185,111 @@ def derive_node_district(node: AtlasNode) -> str:
 
 
 def record_ui_focus(payload: UiFocusStatePayload) -> UiFocusSyncAck:
-    """Persist the live browser viewport state + optional annotated WebGL PNG atomically."""
-    state_file, png_file = _resolve_focus_paths()
+    """Persist live browser viewport state + optional WebP/PNG/JPEG snapshot with staleness tracking."""
+    base_dir = _resolve_focus_dir()
+    state_file = base_dir / "ui_focus_state.json"
+    prev = read_saved_ui_focus_state()
     now = utc_now()
-    saved_png: str | None = None
+    explicit_fields = set(payload.model_fields_set)
+    same_slug_prev = prev if (prev and prev.get("active_slug") == payload.active_slug) else {}
+
+    def _eff_field(name: str) -> Any:
+        val = getattr(payload, name)
+        if name in explicit_fields or name not in same_slug_prev:
+            return val
+        return same_slug_prev[name]
+
+    prev_cam_rev = prev.get("camera_revision")
+    effective_cam_rev: int | None = (
+        payload.camera_revision
+        if payload.camera_revision is not None
+        else (int(prev_cam_rev) if isinstance(prev_cam_rev, int) else None)
+    )
+    saved_snap: str | None = None
+    saved_mime: str | None = None
+    snap_stale = False
+    snap_cam_rev: int | None = (
+        int(prev["snapshot_camera_revision"])
+        if isinstance(prev.get("snapshot_camera_revision"), int)
+        else (int(prev_cam_rev) if isinstance(prev_cam_rev, int) else None)
+    )
+
+    wrote_fresh_image = False
     if payload.snapshot_data_url:
         m = _DATA_IMAGE_RE.match(payload.snapshot_data_url)
         if m:
+            raw_fmt = m.group(1).lower()
+            saved_mime = "image/jpeg" if raw_fmt in ("jpeg", "jpg") else f"image/{raw_fmt}"
+            ext = _MIME_TO_EXT[saved_mime]
+            snap_file = base_dir / f"ui_focus_latest{ext}"
             raw_b64 = payload.snapshot_data_url[m.end() :]
             img_bytes = base64.b64decode(raw_b64, validate=False)
-            tmp_png = png_file.with_suffix(".img.tmp")
-            tmp_png.write_bytes(img_bytes)
-            tmp_png.replace(png_file)
-            saved_png = str(png_file)
-    elif png_file.is_file():
-        saved_png = str(png_file)
+            tmp_img = base_dir / f"ui_focus_latest{ext}.img.tmp"
+            tmp_img.write_bytes(img_bytes)
+            tmp_img.replace(snap_file)
+            for other_ext in _MIME_TO_EXT.values():
+                if other_ext != ext:
+                    (base_dir / f"ui_focus_latest{other_ext}").unlink(missing_ok=True)
+            saved_snap = str(snap_file)
+            snap_stale = False
+            snap_cam_rev = effective_cam_rev
+            wrote_fresh_image = True
 
-    serialized = payload.model_dump(exclude={"snapshot_data_url"})
+    if not wrote_fresh_image:
+        existing_file, existing_mime = _find_existing_snapshot(base_dir, prev)
+        if existing_file is not None:
+            saved_snap = str(existing_file)
+            saved_mime = existing_mime
+            already_stale = bool(prev.get("snapshot_stale", False))
+            newer_cam = payload.camera_revision is not None and (
+                snap_cam_rev is None or payload.camera_revision > snap_cam_rev
+            )
+            scene_changed = bool(prev) and (
+                payload.active_slug != prev.get("active_slug")
+                or _eff_field("selected_node_id") != prev.get("selected_node_id")
+                or _eff_field("lens") != prev.get("lens", "status")
+                or _eff_field("layout_mode") != prev.get("layout_mode", "cluster")
+                or _eff_field("in_frustum_count") != prev.get("in_frustum_count", 0)
+                or _eff_field("camera_position") != prev.get("camera_position")
+                or _eff_field("camera_target") != prev.get("camera_target")
+                or _eff_field("tier_filter") != prev.get("tier_filter", "all")
+                or _eff_field("only_flagged") != prev.get("only_flagged", False)
+                or _eff_field("isolate_cone") != prev.get("isolate_cone", False)
+                or _eff_field("connected_only") != prev.get("connected_only", False)
+                or _eff_field("neighborhood_hops") != prev.get("neighborhood_hops", 0)
+            )
+            snap_stale = already_stale or newer_cam or scene_changed
+
+    serialized = {
+        k: _eff_field(k)
+        for k in UiFocusStatePayload.model_fields
+        if k != "snapshot_data_url"
+    }
+    serialized["camera_revision"] = effective_cam_rev
+    serialized["snapshot_camera_revision"] = snap_cam_rev
     serialized["observed_at"] = now.isoformat()
-    serialized["snapshot_path"] = saved_png
+    serialized["snapshot_path"] = saved_snap
+    serialized["snapshot_mime_type"] = saved_mime
+    serialized["snapshot_stale"] = snap_stale
     tmp_json = state_file.with_suffix(".json.tmp")
     tmp_json.write_text(json.dumps(serialized, indent=2), encoding="utf-8")
     tmp_json.replace(state_file)
     return UiFocusSyncAck(
         active_slug=payload.active_slug,
         observed_at=now,
-        has_snapshot=saved_png is not None,
-        snapshot_path=saved_png,
+        has_snapshot=saved_snap is not None,
+        snapshot_path=saved_snap,
+        snapshot_mime_type=saved_mime,
+        camera_revision=effective_cam_rev,
+        snapshot_stale=snap_stale,
     )
 
 
 def load_latest_snapshot_png() -> Path | None:
-    """Return path to latest annotated 3D viewport PNG if captured."""
-    _, png_file = _resolve_focus_paths()
-    return png_file if png_file.is_file() else None
+    """Return path to latest annotated 3D viewport snapshot if captured."""
+    base_dir = _resolve_focus_dir()
+    snap_file, _ = _find_existing_snapshot(base_dir, read_saved_ui_focus_state())
+    return snap_file
 
 
 def _summarize_district(
@@ -144,26 +323,38 @@ def explain_ui_focus(
     session: Session,
     *,
     target_override: str | None = None,
+    target_project: TargetProject | None = None,
+    precomputed_report: TruthAtlasReport | None = None,
 ) -> UiFocusExplainRead:
     """Join live GUI viewport state against AST/diff truth to answer 'what is this?'."""
-    state_file, png_file = _resolve_focus_paths()
-    saved: dict = {}
-    if state_file.is_file():
-        try:
-            saved = json.loads(state_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            saved = {}
+    base_dir = _resolve_focus_dir()
+    saved = read_saved_ui_focus_state()
 
-    slug = target_override or str(saved.get("active_slug") or "")
-    target = get_target_by_slug(session, slug) if slug else None
-    if target is None:
-        all_targets = list_targets(session)
-        if not all_targets:
-            raise ValueError("No registered Wythe targets available.")
-        target = all_targets[0]
-        slug = target.slug
+    if target_project is not None:
+        target = target_project
+    elif target_override is not None and target_override.strip():
+        ovr = target_override.strip()
+        target = get_target_by_slug(session, ovr)
+        if target is None:
+            registered = [t.slug for t in list_targets(session)]
+            close = difflib.get_close_matches(ovr.lower(), registered, n=4, cutoff=0.4)
+            known_str = ", ".join(f"`{s}`" for s in registered) if registered else "none"
+            close_str = f" Closest match(es): {', '.join(f'`{c}`' for c in close)}." if close else ""
+            raise ValueError(
+                f"Unknown target `{ovr}`.{close_str} Registered target slugs: {known_str}."
+            )
+    else:
+        slug = str(saved.get("active_slug") or "")
+        target = get_target_by_slug(session, slug) if slug else None
+        if target is None:
+            all_targets = list_targets(session)
+            if not all_targets:
+                raise ValueError("No registered Wythe targets available.")
+            target = all_targets[0]
 
-    report = run_target_scan(session, target, strict_gate=True, persist_snapshot=False)
+    report = precomputed_report or run_target_scan(
+        session, target, strict_gate=True, persist_snapshot=False
+    )
     blast_mode = str(saved.get("blast_mode") or "off")
     diff_base_ref = str(saved.get("diff_base_ref") or "HEAD~1")
     lens = str(saved.get("lens") or "status")
@@ -174,9 +365,12 @@ def explain_ui_focus(
     touched_ids: set[str] = set()
     impacted_ids: set[str] = set()
     if blast_mode == "git":
-        diff_rep = compute_diff_and_blast_radius(
-            Path(target.repo_path).resolve(), report, base_ref=diff_base_ref
-        )
+        try:
+            diff_rep = run_target_diff(session, target, report, diff_base_ref)
+        except ValueError:
+            diff_rep = compute_diff_and_blast_radius(
+                Path(target.repo_path).resolve(), report, base_ref=diff_base_ref
+            )
         crimson_ids = {f.node_id for f in diff_rep.new_findings if f.node_id}
         touched_ids = set(diff_rep.touched_node_ids)
         impacted_ids = (
@@ -282,8 +476,16 @@ def explain_ui_focus(
         if focus_node
         else f"District `{district}` in `{target.slug}`" if district else f"Overview of `{target.slug}`"
     )
-    has_snap = png_file.is_file()
-    snap_path = str(png_file) if has_snap else None
+    snap_file, detected_mime = _find_existing_snapshot(base_dir, saved)
+    has_snap = snap_file is not None and snap_file.is_file()
+    snap_path = str(snap_file) if has_snap else None
+    snap_mime = detected_mime if has_snap else None
+    raw_cam_rev = saved.get("camera_revision")
+    camera_rev = int(raw_cam_rev) if isinstance(raw_cam_rev, int) else None
+    saved_slug = str(saved.get("active_slug") or "")
+    snap_stale = (
+        bool(saved.get("snapshot_stale", False)) or (bool(saved_slug) and saved_slug != target.slug)
+    ) if has_snap else False
 
     md_lines = [
         f"# Wythe Live Focus X-Ray :: `{target.slug}` @ `{report.source_commit[:10]}`",
@@ -354,7 +556,15 @@ def explain_ui_focus(
         for ce in cone_edges[:10]:
             md_lines.append(f"- `{ce}`")
     if snap_path:
-        md_lines.append(f"\n> Annotated Viewport PNG: `{snap_path}`")
+        freshness = (
+            "stale — newer camera/focus telemetry arrived without a frame"
+            if snap_stale
+            else "fresh"
+        )
+        rev_tag = f" · camera_revision={camera_rev}" if camera_rev is not None else ""
+        md_lines.append(
+            f"\n> Annotated Viewport Snapshot ({snap_mime or 'image/png'} · {freshness}{rev_tag}): `{snap_path}`"
+        )
 
     return UiFocusExplainRead(
         active_slug=target.slug,
@@ -374,5 +584,8 @@ def explain_ui_focus(
         cone_edges=cone_edges,
         has_snapshot=has_snap,
         snapshot_path=snap_path,
+        snapshot_mime_type=snap_mime,
+        camera_revision=camera_rev,
+        snapshot_stale=snap_stale,
         markdown_brief="\n".join(md_lines),
     )

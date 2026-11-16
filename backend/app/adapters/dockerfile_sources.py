@@ -28,8 +28,15 @@ _IGNORED_DOCKERFILE_SUFFIXES = (".dockerignore", ".bak", ".orig", ".swp", ".tmp"
 _COMPOSE_FILENAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
 _COMPOSE_VARIANT_RE = re.compile(r"^(?:docker-)?compose(?:\.[A-Za-z0-9_.-]+)?\.(?:ya?ml)$")
 ALLOWED_CONTAINER_DOT_DIRS = frozenset({".docker"})
-CONTAINER_NODE_PREFIXES = ("m:dockerfile:", "m:compose:", "m:k8s:", "m:launchd:")
-CONTAINER_EDGE_PREFIXES = ("e:deployment:", "e:launchd:", "e:dockerfile:", "e:compose:", "e:k8s:")
+CONTAINER_NODE_PREFIXES = ("m:dockerfile:", "m:compose:", "m:k8s:", "m:launchd:", "m:systemd:")
+CONTAINER_EDGE_PREFIXES = (
+    "e:deployment:",
+    "e:launchd:",
+    "e:systemd:",
+    "e:dockerfile:",
+    "e:compose:",
+    "e:k8s:",
+)
 _SHELL_BINARIES = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 _VAR_TOKEN_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})")
 _ESCAPE_DIRECTIVE_RE = re.compile(r"^\s*#\s*escape\s*=\s*([\\`])\s*$", re.IGNORECASE)
@@ -2083,8 +2090,11 @@ def augment_dockerfile_sources(
     result: ManipulatorExtractionResult,
 ) -> dict[str, object]:
     """Discover Dockerfiles, add `m:dockerfile:*` nodes/edges, and check build/runtime drift."""
+    from app.adapters.container_launchers import augment_container_launchers
+
     df_paths, _ = discover_dockerfiles(repo_root)
     if not df_paths:
+        augment_container_launchers(repo_root, backend_subdir, result, dockerfiles={})
         return {}
 
     real_root = repo_root.resolve()
@@ -2199,4 +2209,5 @@ def augment_dockerfile_sources(
             f"{unresolved_count} with external or unresolved commands. "
             "Build args passed at CI time, external base image contents, and container runtime state are not observed."
         )
+    augment_container_launchers(repo_root, backend_subdir, result, dockerfiles=parsed_map)
     return parsed_map

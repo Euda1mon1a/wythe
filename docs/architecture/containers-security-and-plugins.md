@@ -34,9 +34,9 @@ In a hardened multi-stage build (`FROM node:22 AS ui-build`, `FROM python:3.12 A
 +----------------------------------+---------------------------------+
 ```
 
-### How Wythe Analyzes `Dockerfile`, `.dockerignore`, Compose & Kubernetes
+### How Wythe Analyzes `Dockerfile`, `.dockerignore`, Compose, Kubernetes & Host CLI Launchers
 
-Instead of unpacking built layer tarballs, Wythe's built-in `container-sources` plugin (`dockerfile_sources.py`, `compose_sources.py`, and `k8s_sources.py`) statically inspects container and orchestration blueprints across **any** active stack profile whenever container files exist—without invoking `docker`/`kubectl` or following symlinks outside the repository root:
+Instead of unpacking built layer tarballs, Wythe's built-in `container-sources` plugin (`dockerfile_sources.py`, `container_launchers.py`, `compose_sources.py`, and `k8s_sources.py`) statically inspects container, orchestration, and host-unit blueprints across **any** active stack profile whenever container or service unit files exist—without invoking `container`, `docker`, `podman`, `kubectl`, `launchctl`, or `systemctl`, and without following symlinks outside the repository root:
 
 1. **Multi-Stage `Dockerfile` & `.dockerignore` Lineage (`m:dockerfile:<rel>`)**
    - Discovers `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, and `Containerfile` (including inside `.docker/` hidden directories such as `.docker/backend.Dockerfile`), parsing multi-stage `FROM <image> [AS <stage>]`, `WORKDIR`, literal `ARG`/`ENV` bindings, `COPY`/`ADD` (`--chown`, `--chmod`, `--link`, `--from=<stage|index>`, JSON-array and whitespace forms), and `ENTRYPOINT`/`CMD`.
@@ -55,8 +55,12 @@ Instead of unpacking built layer tarballs, Wythe's built-in `container-sources` 
    - Connects workload `image`, `command`, and `args` declarations to matching repository `Dockerfile`s and entrypoint modules via `declared` `calls_helper` edges (`cluster="containers"`), clearing false `MANIP-003` inert-module warnings on Kubernetes `CronJob`s and queue consumers.
    - **`$(VAR_NAME)` vs. bare `$VAR` (`MANIP-004`)**: Kubernetes natively interpolates parenthesized `$(VAR_NAME)` references in container `command` and `args` arrays without a shell, whereas bare POSIX `$VAR`, `${VAR}`, or `~` tokens remain unexpanded literals unless wrapped in `sh -c` / `bash -c`. Wythe honors `$(VAR_NAME)` cleanly and flags bare `$VAR`/`${VAR}`/`~` under `MANIP-004`.
    - Audits literal `PolicyVocabulary` tokens in container `env:` `value:` literals and `ConfigMap.data` via **`MANIP-001`** (ignoring `valueFrom` `secretKeyRef`/`configMapKeyRef` references).
-5. **Surgical `AtlasEdge.symbol_links` Cones & WebGL `Containers` Lens**
-   - Whenever concrete `module:symbol` entrypoints (`uvicorn app.main:app` -> `*->app`, `celery -A pkg.tasks:celery_app` -> `*->celery_app`) are parsed in `Dockerfile`, Compose, or Kubernetes manifests, Wythe populates `AtlasEdge.symbol_links` so function-scoped Lineage Cones stay narrow rather than fanning out across unrelated functions in the file (leaving `[]` wildcard flow when invoking a whole script such as `python worker.py`).
+5. **Imperative Host CLI Launchers & Service Units (`m:systemd:<rel>`, `m:launchd:<rel>`, `m:script:<rel>`)**
+   - Statically parses `container run` (`apple/container` `ContainerRun.swift` grammar), `docker run`, and `podman run` across `launchd` `.plist` `Program`/`ProgramArguments` (reusing existing `m:launchd:<rel>` nodes or emitting them on non-`python-services` profiles), `systemd` `.service` units (`ExecStart=`, `ExecStartPre=`, `Environment=`, `EnvironmentFile=`, `WorkingDirectory=`), and repository POSIX `.sh` wrappers—ignoring non-run subcommands (`build`, `pull`, `inspect`, `ps`, `login`).
+   - Recovers `-e`/`--env` literals vs. bare pass-through keys, containment-checked in-repo `--env-file` and `EnvironmentFile=` targets (rejecting symlinks and `..` traversal outside `repo_root`), `--mount` (`type=bind,source=...,target=...,readonly`) and `-v`/`--volume` (`:ro` vs. writable) specs, `-w`/`--workdir`, `--entrypoint`, `--rm`, image tags, and trailing commands—linking host units both to matching `m:dockerfile:*` nodes and to repository Python/shell entrypoints (including direct non-container `systemd` `ExecStart=` scripts).
+   - Audits hardcoded `-e KEY=VALUE`, `systemd` `Environment=KEY=VALUE`, and committed static env-file policy thresholds under **`MANIP-001`** (skipping `${VAR}` pass-throughs, bare keys, booleans, and `.example`/`.sample`/`.template` files), flags unexpanded `$VAR`/`~` tokens in non-shell `launchd` and `systemd` exec declarations under **`MANIP-004`**, and records external/digest-pinned images without an in-repo `Dockerfile` plus dynamic `$IMAGE_TAG` references as explicit `unresolved` scan coverage notes rather than broken edges.
+6. **Surgical `AtlasEdge.symbol_links` Cones & WebGL `Containers` Lens**
+   - Whenever concrete callable `module:symbol` entrypoints (`uvicorn app.main:create_app --factory` -> `*->create_app`, `dramatiq app.worker:process_queue` -> `*->process_queue`) are parsed across `Dockerfile`, Compose, Kubernetes manifests, or host CLI launchers (subject to Wythe's AST callable/router-hub guard so router-mounting `app = FastAPI()` modules preserve full downstream route cones), Wythe populates `AtlasEdge.symbol_links` so function-scoped Lineage Cones stay narrow rather than fanning out across unrelated functions in the file.
    - In the 3D/2D WebGL explorer, the **`Containers`** diagnostic lens isolates `cluster="containers"` (`m:dockerfile:*`, `m:compose:*`, `m:k8s:*`) alongside their connected backend entrypoints.
 
 ---
@@ -135,6 +139,57 @@ Every security-related surface in Wythe preserves strict epistemic honesty:
 - **Inconclusive static ownership contract**: `wythe security ownership` reads at most one caller-selected regular `.py` file (`<= 1 MiB`) using descriptor-relative no-symlink opens and **always** emits `invariant_result: "unknown"`, `target_code_executed: false`, and `target_database_contacted: false`.
 - **Read-only companion correlation**: `--trivy-report` (Trivy JSON or SARIF 2.1.0) and `--syft-sbom` (CycloneDX or SPDX JSON) are parsed **read-only** from local files generated by your pipeline. Wythe does not execute `docker`, `trivy`, or `syft`, fetch CVE feeds, or claim whether a package CVE is reachable or exploitable at runtime.
 - **Confidential source artifacts**: Scan JSON, companion handoff receipts, `wythe context`, `wythe llms`, and OpenLineage exports contain repository paths, `file:line` pointers, and schema/route inventories—review or redact them before external sharing per [SECURITY.md](../../SECURITY.md).
+
+### Hardware-Isolated Read-Only Micro-VM & Rootless Container Scanning
+
+Although Wythe never imports or executes target-repository Python code by default (`allow_local_plugins: false`), teams auditing unfamiliar or untrusted third-party repositories can enclose the scanner itself inside an ephemeral hardware micro-VM (`apple/container` on macOS Apple Silicon) or a rootless `--read-only --network=none` OCI container (`podman` / `docker` on Linux):
+
+```text
++----------------------------------+----------------------------------+
+| ISOLATION LANE                   | BOUNDARY & MOUNT CONTRACT        |
++----------------------------------+----------------------------------+
+| apple/container (macOS arm64)    | Dedicated Linux micro-VM kernel  |
+|   container run --rm             | --mount type=bind,source=<repo>, |
+|     --network none ...           |   target=/workspace/target,      |
+|                                  |   readonly                       |
++----------------------------------+----------------------------------+
+| Rootless podman / docker (Linux) | Userns + seccomp + cap-drop=ALL  |
+|   podman run --rm --read-only    | -v <repo>:/workspace/target:ro   |
+|     --network=none ...           | --tmpfs /tmp:rw,noexec,nosuid    |
++----------------------------------+----------------------------------+
+```
+
+```bash
+# Build the minimal rootless scanner image from the repository Containerfile
+docker build -t wythe:local -f Containerfile .   # or `podman build` / `container build`
+
+# macOS Apple Silicon: dedicated Virtualization.framework micro-VM (apple/container)
+container run --rm --network none \
+  -e WYTHE_STATE_DIR=/tmp/wythe-state \
+  --mount type=bind,source=/path/to/untrusted-repo,target=/workspace/target,readonly \
+  wythe:local \
+  wythe scan /workspace/target --profile auto
+
+# Linux rootless Podman: read-only rootfs, no network, dropped capabilities, :ro target
+podman run --rm --read-only --network=none \
+  --cap-drop=ALL --security-opt=no-new-privileges \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  -e WYTHE_STATE_DIR=/tmp/wythe-state \
+  -v /path/to/untrusted-repo:/workspace/target:ro \
+  wythe:local \
+  wythe scan /workspace/target --profile auto
+
+# Docker Engine equivalent (prefer rootless mode)
+docker run --rm --read-only --network=none \
+  --cap-drop=ALL --security-opt=no-new-privileges \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  -e WYTHE_STATE_DIR=/tmp/wythe-state \
+  -v /path/to/untrusted-repo:/workspace/target:ro \
+  wythe:local \
+  wythe scan /workspace/target --profile auto
+```
+
+Keep `--allow-local-plugins` omitted so Wythe loads only built-in and image-installed plugins. Per [SECURITY.md](../../SECURITY.md), micro-VM and container isolation protect the *scanning host* only—a clean `wythe scan` or `wythe gate` result (`target_code_executed: false`, `automated_security_audit: false`) never certifies that the untrusted repository is safe to build, execute, or deploy.
 
 ---
 

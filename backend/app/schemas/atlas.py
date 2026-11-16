@@ -633,6 +633,7 @@ class UiFocusStatePayload(StrictSchema):
     in_frustum_count: int = Field(default=0, ge=0, le=50000)
     visual_headline: str | None = Field(default=None, max_length=320)
     live_viewport_brief: str | None = Field(default=None, max_length=16000)
+    camera_revision: int | None = Field(default=None, ge=0)
     snapshot_data_url: str | None = Field(default=None, max_length=8_500_000)
 
 
@@ -641,6 +642,9 @@ class UiFocusSyncAck(StrictSchema):
     observed_at: datetime
     has_snapshot: bool
     snapshot_path: str | None = None
+    snapshot_mime_type: str | None = None
+    camera_revision: int | None = None
+    snapshot_stale: bool = False
 
 
 class DistrictXraySummary(StrictSchema):
@@ -672,7 +676,13 @@ class UiFocusExplainRead(StrictSchema):
     cone_edges: list[str] = Field(default_factory=list)
     has_snapshot: bool = False
     snapshot_path: str | None = None
+    snapshot_mime_type: str | None = None
+    camera_revision: int | None = None
+    snapshot_stale: bool = False
     markdown_brief: str
+
+
+UiFocusExplainResponse = UiFocusExplainRead
 
 
 class OnDeviceEngineStatus(StrictSchema):

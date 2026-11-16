@@ -101,6 +101,59 @@ for complete specifications and exit codes.
   never enabled over HTTP (`/api/v1/adapters/plugins`) or MCP
   (`wythe_plugins`).
 
+### Hardware-isolated read-only scanning of untrusted repositories
+
+- **Defense-in-depth host isolation:** Although Wythe is a static analyzer that
+  keeps `allow_local_plugins: false` by default and never executes target
+  repository code, operators auditing unfamiliar or untrusted third-party
+  checkouts can enclose the scanner itself inside an ephemeral micro-VM or
+  rootless read-only container with host networking disabled and the target
+  repository mounted strictly read-only.
+- **Building the local scanner image (`Containerfile`):** Build `wythe:local`
+  once from the repository root (`container build -t wythe:local -f Containerfile .`,
+  `podman build -t wythe:local -f Containerfile .`, or
+  `docker build -t wythe:local -f Containerfile .`).
+- **macOS (`apple/container` lightweight micro-VMs):** Run Wythe inside a
+  dedicated per-invocation Linux micro-VM backed by Apple
+  `Virtualization.framework` with `--network none` (`NetworkClient.noNetworkName`
+  detaching VM network interfaces), mounting the target checkout read-only
+  (`readonly`) and keeping `--allow-local-plugins` omitted:
+  ```bash
+  container run --rm --network none \
+    -e WYTHE_STATE_DIR=/tmp/wythe-state \
+    --mount type=bind,source=/path/to/untrusted-repo,target=/workspace/target,readonly \
+    wythe:local \
+    wythe scan /workspace/target --profile auto
+  ```
+- **Linux / OCI rootless equivalents (`podman` / `docker`):** On shared-kernel
+  container runtimes, combine `--read-only`, `--network=none`, dropped
+  capabilities, `no-new-privileges`, a bounded `/tmp` tmpfs for Wythe's scratch
+  SQLite state (`WYTHE_STATE_DIR`), and a `:ro` bind
+  mount:
+  ```bash
+  podman run --rm --read-only --network=none \
+    --cap-drop=ALL --security-opt=no-new-privileges \
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+    -e WYTHE_STATE_DIR=/tmp/wythe-state \
+    -v /path/to/untrusted-repo:/workspace/target:ro \
+    wythe:local \
+    wythe scan /workspace/target --profile auto
+
+  docker run --rm --read-only --network=none \
+    --cap-drop=ALL --security-opt=no-new-privileges \
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+    -e WYTHE_STATE_DIR=/tmp/wythe-state \
+    -v /path/to/untrusted-repo:/workspace/target:ro \
+    wythe:local \
+    wythe scan /workspace/target --profile auto
+  ```
+- **Non-certification invariant:** Enclosing Wythe inside an `apple/container`
+  micro-VM or `--read-only --network=none` rootless container hardens *scanner
+  host isolation* only. Scan and `wythe gate` results remain static 3-tier
+  lineage and WCAG (`DISP-005`) evidence (`target_code_executed: false`,
+  `automated_security_audit: false`) and never certify that the inspected
+  repository is safe to build, execute, or deploy on the host.
+
 ### Unauthenticated local workstation server (`wythe serve`)
 
 - **Loopback default:** `wythe serve` runs an unauthenticated HTTP API and

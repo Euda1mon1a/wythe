@@ -23,6 +23,11 @@ import { createBatchedNodes, createBatchedEdges, fitGraphCamera, type SceneRende
 import { buildLiveViewportDigest } from '../src/lib/wytheVisionBridge';
 import { buildDiagnosticBrief, selectReferenceExemplar } from '../src/lib/wytheBriefBuilder';
 import { computeWrappedFocusIndex } from '../src/lib/wytheDialogFocus';
+import {
+  bumpViewportCameraRevision,
+  probeBrowserLocalOpenAi,
+  registerWytheWebMcpBridge,
+} from '../src/lib/wytheBrowserAi';
 import { WYTHE_PRESETS } from '../src/lib/wytheTheme';
 
 const node = (id: string, overrides: Partial<AtlasNode> = {}): AtlasNode => ({
@@ -519,4 +524,84 @@ test('computeWrappedFocusIndex wraps Tab and Shift+Tab focus cleanly across dial
   assert.equal(computeWrappedFocusIndex(4, -1, true), 3);
   assert.equal(computeWrappedFocusIndex(4, 4, false), 0);
   assert.equal(computeWrappedFocusIndex(4, 99, true), 3);
+});
+
+test('WebMCP 4/4 bridge executes handlers, bumpViewportCameraRevision advances monotonically, and multi-model probe avoids weight swaps', async () => {
+  const r1 = bumpViewportCameraRevision(5);
+  const r2 = bumpViewportCameraRevision(2);
+  assert.ok(r1 >= 6);
+  assert.equal(r2, r1 + 1);
+
+  const registered = new Map<string, { execute: (args: Record<string, unknown>) => Promise<unknown> }>();
+  const unregistered: string[] = [];
+  const g = globalThis as Record<string, unknown>;
+  const prevWin = g.window;
+  const prevNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const prevFetch = g.fetch;
+  try {
+    g.window = { location: { origin: 'http://127.0.0.1:8780' } };
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: {
+        modelContext: {
+          registerTool: (def: { name: string; execute: (args: Record<string, unknown>) => Promise<unknown> }) => {
+            registered.set(def.name, def);
+          },
+          unregisterTool: (name: string) => {
+            unregistered.push(name);
+            registered.delete(name);
+          },
+        },
+      },
+    });
+
+    const selectedIds: string[] = [];
+    const askedQuestions: string[] = [];
+    const cleanup = registerWytheWebMcpBridge({
+      getWhatIsThis: async () => ({ active_slug: 'demo' }),
+      getLineageCone: async (q) => ({ query: q, matched_seed_ids: ['t:orders'] }),
+      selectNode: (id) => selectedIds.push(id),
+      openAskDrawer: (q) => askedQuestions.push(q ?? ''),
+    });
+
+    assert.deepEqual(
+      Array.from(registered.keys()).sort(),
+      ['wythe_ask', 'wythe_lineage_cone', 'wythe_select_node', 'wythe_what_is_this'],
+    );
+    await registered.get('wythe_select_node')!.execute({ nodeId: 't:orders' });
+    await registered.get('wythe_ask')!.execute({ question: 'Why gray?' });
+    const coneOut = await registered.get('wythe_lineage_cone')!.execute({ query: 'orders' });
+    assert.deepEqual(selectedIds, ['t:orders']);
+    assert.deepEqual(askedQuestions, ['Why gray?']);
+    assert.match(JSON.stringify(coneOut), /t:orders/);
+
+    // L7: Multi-model seat (`qwen3:8b` first, `llava:34b` second) must NOT pick `llava:34b` to force a weight swap
+    g.fetch = async (url: unknown) => {
+      if (String(url) === 'http://127.0.0.1:19999/v1/models') {
+        return {
+          ok: true,
+          headers: { get: () => '' },
+          json: async () => ({
+            data: [{ id: 'qwen3:8b' }, { id: 'llava:34b' }],
+          }),
+        };
+      }
+      throw new Error('offline');
+    };
+    const probe = await probeBrowserLocalOpenAi('http://127.0.0.1:19999/v1', true);
+    assert.equal(probe.state, 'ready');
+    assert.equal(probe.requestModelId, 'qwen3:8b');
+    assert.equal(probe.supportsVision, false);
+
+    cleanup();
+    assert.equal(unregistered.length, 4);
+  } finally {
+    g.window = prevWin;
+    if (prevNavDesc) {
+      Object.defineProperty(globalThis, 'navigator', prevNavDesc);
+    } else {
+      delete g.navigator;
+    }
+    g.fetch = prevFetch;
+  }
 });

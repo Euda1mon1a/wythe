@@ -478,7 +478,7 @@ export interface paths {
         };
         /**
          * Get Mcp Http Manifest Route
-         * @description Return Streamable HTTP MCP discovery manifest & read-only tool schemas.
+         * @description Return Streamable HTTP MCP discovery manifest & read-only tool/resource schemas.
          */
         get: operations["get_mcp_http_manifest_route_api_v1_mcp_get"];
         put?: never;
@@ -2005,6 +2005,15 @@ export interface components {
             has_snapshot: boolean;
             /** Snapshot Path */
             snapshot_path?: string | null;
+            /** Snapshot Mime Type */
+            snapshot_mime_type?: string | null;
+            /** Camera Revision */
+            camera_revision?: number | null;
+            /**
+             * Snapshot Stale
+             * @default false
+             */
+            snapshot_stale: boolean;
             /** Markdown Brief */
             markdown_brief: string;
         };
@@ -2104,6 +2113,8 @@ export interface components {
             visual_headline?: string | null;
             /** Live Viewport Brief */
             live_viewport_brief?: string | null;
+            /** Camera Revision */
+            camera_revision?: number | null;
             /** Snapshot Data Url */
             snapshot_data_url?: string | null;
         };
@@ -2120,6 +2131,15 @@ export interface components {
             has_snapshot: boolean;
             /** Snapshot Path */
             snapshot_path?: string | null;
+            /** Snapshot Mime Type */
+            snapshot_mime_type?: string | null;
+            /** Camera Revision */
+            camera_revision?: number | null;
+            /**
+             * Snapshot Stale
+             * @default false
+             */
+            snapshot_stale: boolean;
         };
         /** ValidationError */
         ValidationError: {
@@ -3144,7 +3164,9 @@ export interface operations {
     };
     get_mcp_http_manifest_route_api_v1_mcp_get: {
         parameters: {
-            query?: never;
+            query?: {
+                slice?: "full" | "slm";
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -3162,11 +3184,22 @@ export interface operations {
                     };
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     post_mcp_http_rpc_route_api_v1_mcp_post: {
         parameters: {
-            query?: never;
+            query?: {
+                slice?: "full" | "slm";
+            };
             header?: never;
             path?: never;
             cookie?: never;
