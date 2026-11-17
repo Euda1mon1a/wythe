@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import urllib.parse
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
+from pydantic import BeforeValidator
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -14,12 +16,15 @@ from app.schemas.atlas import (
     DiffBlastRadiusReport,
     LlmBriefRead,
     LlmContextConeReport,
+    MicroStratumZoom,
     OpenLineageBundleResponse,
     RatchetBaselineRead,
     RatchetCaptureRequest,
     ScanSnapshotSummary,
     SnapshotComparisonReport,
     SourceSnippetRead,
+    StratumDrilldownRead,
+    StratumZoom,
     TruthAtlasReport,
 )
 from app.services.companion_export_service import build_openlineage_static_bundle
@@ -45,10 +50,21 @@ from app.services.source_peek_service import (
     SourcePeekPermissionError,
     read_target_source_snippet,
 )
+from app.services.stratum_service import build_node_stratum_drilldown
 
 router = APIRouter()
 DbSession = Annotated[Session, Depends(get_db)]
 BoolFlag = Annotated[bool, Query()]
+
+
+def _coerce_query_int(val: object) -> object:
+    if isinstance(val, str) and val.strip().isdigit():
+        return int(val.strip())
+    return val
+
+
+ConeZoomQuery = Annotated[StratumZoom, BeforeValidator(_coerce_query_int), Query()]
+MicroZoomQuery = Annotated[MicroStratumZoom, BeforeValidator(_coerce_query_int), Query()]
 
 
 @router.get("/{target_slug}", response_model=TruthAtlasReport)
@@ -208,18 +224,62 @@ def export_target_llms_plaintext(
 
 
 @router.get("/{target_slug}/context", response_model=LlmContextConeReport)
+@router.get("/{target_slug}/context/cone", response_model=LlmContextConeReport)
 def export_target_lineage_cone_context(
     target_slug: str,
     db: DbSession,
     q: Annotated[str, Query(min_length=1, max_length=256)],
     max_nodes: Annotated[int, Query(ge=5, le=5000)] = DEFAULT_CONE_NODES,
     full: bool = Query(default=False),
+    zoom: ConeZoomQuery = 1,
+    unfiltered_ir: BoolFlag = False,
 ) -> LlmContextConeReport:
     target = get_target_by_slug(db, target_slug)
     if target is None:
         raise HTTPException(status_code=404, detail=f"Target '{target_slug}' not found")
     report = run_target_scan(db, target, strict_gate=True, persist_snapshot=False)
-    return build_lineage_cone_slice(report, q, max_nodes=max_nodes, full=full)
+    return build_lineage_cone_slice(
+        report,
+        q,
+        max_nodes=max_nodes,
+        full=full,
+        zoom=zoom,
+        unfiltered_ir=unfiltered_ir,
+    )
+
+
+@router.get(
+    "/{target_slug}/nodes/{node_id:path}/strata",
+    response_model=StratumDrilldownRead,
+)
+def inspect_target_node_strata(
+    target_slug: str,
+    node_id: str,
+    db: DbSession,
+    zoom: MicroZoomQuery = 2,
+    unfiltered_ir: BoolFlag = False,
+) -> StratumDrilldownRead:
+    target = get_target_by_slug(db, target_slug)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"Target '{target_slug}' not found")
+    raw_id = node_id.strip()
+    if not raw_id:
+        raise HTTPException(status_code=404, detail="Node ID must not be empty")
+    report = run_target_scan(db, target, strict_gate=True, persist_snapshot=False)
+    known_ids = {n.id for n in report.nodes}
+    resolved_id = raw_id if raw_id in known_ids else urllib.parse.unquote(raw_id).strip()
+    if resolved_id not in known_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Node '{raw_id}' not found in target '{target_slug}'",
+        )
+    return build_node_stratum_drilldown(
+        Path(target.repo_path).resolve(),
+        report,
+        resolved_id,
+        zoom=zoom,
+        unfiltered_ir=unfiltered_ir,
+    )
 
 
 @router.get("/{target_slug}/source", response_model=SourceSnippetRead)

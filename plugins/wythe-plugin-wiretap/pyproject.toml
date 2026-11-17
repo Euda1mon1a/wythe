@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wythe-plugin-wiretap"
+version = "0.1.0"
+description = "Optional passive Zoom-3 runtime OTLP/eBPF trace correlator, macOS .memgraph/vmmap heap inspector, and host port occupancy verifier for Wythe."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Euda1mon1a" }]
+requires-python = ">=3.12"
+keywords = [
+  "wythe",
+  "opentelemetry",
+  "ebpf",
+  "memgraph",
+  "vmmap",
+  "port-occupancy",
+  "runtime-lineage",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Euda1mon1a/wythe"
+Repository = "https://github.com/Euda1mon1a/wythe"
+Issues = "https://github.com/Euda1mon1a/wythe/issues"
+
+[project.entry-points."wythe.plugins"]
+wiretap = "wythe_plugin_wiretap.plugin:WIRETAP_PLUGIN"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wythe_plugin_wiretap"]

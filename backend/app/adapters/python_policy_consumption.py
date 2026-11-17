@@ -235,10 +235,67 @@ def classify_table_policy_columns(
     return matched
 
 
+_ALGORITHMIC_OR_PROTOCOL_PREFIXES = (
+    "SECONDS_PER_",
+    "MINUTES_PER_",
+    "HOURS_PER_",
+    "DAYS_PER_",
+    "MS_PER_",
+    "US_PER_",
+    "NS_PER_",
+    "BYTES_PER_",
+    "BITS_PER_",
+    "KIB_",
+    "MIB_",
+    "GIB_",
+    "TIB_",
+    "HTTP_",
+    "HTTPS_",
+    "GRPC_",
+    "TCP_",
+    "UDP_",
+    "TLS_",
+    "SSL_",
+    "IPV4_",
+    "IPV6_",
+    "UTF8_",
+    "ASCII_",
+    "SHA256_",
+    "BASE64_",
+)
+_ALGORITHMIC_OR_PROTOCOL_EXACT = frozenset(
+    {"EPSILON", "RADIX", "PI", "TAU", "INF", "NAN", "MIB_BYTES", "KIB_BYTES", "GIB_BYTES"}
+)
+_UNIT_BYTE_STEMS = frozenset({"KIB", "MIB", "GIB", "TIB", "KB", "MB", "GB", "TB"})
+
+
+def is_algorithmic_or_protocol_constant(name: str) -> bool:
+    """True when `name` denotes a unit conversion, wire protocol, or math/algorithmic constant."""
+    stripped = name.lstrip("_").upper()
+    if not stripped:
+        return False
+    if stripped in _ALGORITHMIC_OR_PROTOCOL_EXACT or stripped.startswith(
+        _ALGORITHMIC_OR_PROTOCOL_PREFIXES
+    ):
+        return True
+    parts = stripped.split("_")
+    if "PER" in parts and (
+        set(parts)
+        & {"SECOND", "SECONDS", "MINUTE", "MINUTES", "HOUR", "HOURS", "DAY", "DAYS", "BYTE", "BYTES", "BIT", "BITS", "MS", "NS"}
+    ):
+        return True
+    return parts[-1] == "BYTES" and bool(set(parts[:-1]) & _UNIT_BYTE_STEMS)
+
+
 def is_policy_constant_symbol(name: str, active_tokens: Sequence[str] | None = None) -> bool:
     """True when `name` is an uppercase constant identifier carrying policy/limit semantics."""
     stripped = name.lstrip("_")
-    if not stripped or not stripped.isupper() or stripped in {"TRUE", "FALSE", "NONE", "SQL"}:
+    if (
+        not stripped
+        or not stripped.isupper()
+        or stripped in {"TRUE", "FALSE", "NONE", "SQL"}
+        or is_algorithmic_or_protocol_constant(stripped)
+    ):
         return False
     tokens = tuple(active_tokens) if active_tokens is not None else get_active_policy_tokens()
     if name_has_policy_token(stripped, tokens):
@@ -285,16 +342,24 @@ class _Val:
     tuple_cols: tuple[str, ...] = ()
     dict_items: tuple[tuple[str, _Val], ...] = ()
     consts: frozenset[str] = frozenset()
+    num_lits: frozenset[str] = frozenset()
     fallbacks: frozenset[str] = frozenset()
+    zero_clobbers: frozenset[tuple[str, str]] = frozenset()
+    overwrite_line: int = 0
+    overwritten_cols: frozenset[str] = frozenset()
     dynamic: bool = False
 
-    def merge(self, other: _Val) -> _Val:
+    def merge(self, other: _Val, *, keep_num_lits: bool = True) -> _Val:
         return _Val(
             row=self.row or other.row,
             row_map=self.row_map or other.row_map,
             cols=self.cols | other.cols,
             consts=self.consts | other.consts,
+            num_lits=(self.num_lits | other.num_lits) if keep_num_lits else frozenset(),
             fallbacks=self.fallbacks | other.fallbacks,
+            zero_clobbers=self.zero_clobbers | other.zero_clobbers,
+            overwrite_line=other.overwrite_line or self.overwrite_line,
+            overwritten_cols=self.overwritten_cols | other.overwritten_cols,
             dynamic=self.dynamic or other.dynamic,
         )
 
@@ -399,13 +464,23 @@ class _ScopeAccum:
     touched_cols: set[str] = field(default_factory=set)
     dead_cols: set[str] = field(default_factory=set)
     return_consts: set[str] = field(default_factory=set)
+    sink_consts: set[str] = field(default_factory=set)
+    enforced_num_consts: set[str] = field(default_factory=set)
+    overwritten_consts: set[str] = field(default_factory=set)
+    overwritten_pol_cols: set[str] = field(default_factory=set)
+    overwritten_vars: list[tuple[str, tuple[str, ...], tuple[str, ...], int]] = field(
+        default_factory=list
+    )
     fallback_consts: set[str] = field(default_factory=set)
+    zero_clobbers: set[tuple[str, str]] = field(default_factory=set)
     opaque_callees: set[str] = field(default_factory=set)
     sink_dynamic: bool = False
     any_dynamic: bool = False
     mutates_row: bool = False
     primary_return_line: int = 0
     first_query_line: int = 0
+    causal_overwrite_line: int = 0
+    causal_enforcement_line: int = 0
 
 
 _SESSION_MUTATION_METHODS = frozenset(
@@ -448,6 +523,68 @@ class _FlowRunner:
         if lineno and (self.acc.first_query_line == 0 or lineno < self.acc.first_query_line):
             self.acc.first_query_line = lineno
 
+    def _note_enforcement(self, lineno: int) -> None:
+        if lineno and self.acc.causal_enforcement_line == 0:
+            self.acc.causal_enforcement_line = lineno
+
+    def _consume_sink_val(self, val: _Val, *, lineno: int = 0) -> None:
+        self.acc.sink_cols.update(val.cols)
+        self.acc.fallback_consts.update(val.fallbacks)
+        self.acc.zero_clobbers.update(val.zero_clobbers)
+        self.acc.sink_consts.update(val.consts)
+        if val.overwrite_line:
+            self.acc.causal_overwrite_line = val.overwrite_line
+        elif (val.consts or val.num_lits) and lineno:
+            self._note_enforcement(lineno)
+        if val.dynamic:
+            self.acc.sink_dynamic = True
+
+    def _is_policy_like_key(self, raw_name: str) -> bool:
+        norm = _normalize_ident_upper(raw_name)
+        if (
+            not norm
+            or norm in _IDENTITY_OR_AUDIT_EXACT
+            or norm.endswith(_IDENTITY_OR_AUDIT_SUFFIXES)
+            or is_algorithmic_or_protocol_constant(norm)
+        ):
+            return False
+        if raw_name in self.policy_cols:
+            return True
+        return bool(set(norm.split("_")) & _POLICY_COLUMN_STEMS)
+
+    def _truthy_pol_cols(self, test: ast.AST, env: dict[str, _Val]) -> tuple[str | None, frozenset[str]]:
+        if _null_guard_polarity(test, env) is not None:
+            return None, frozenset()
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            sub_pol, sub_cols = self._truthy_pol_cols(test.operand, env)
+            if sub_pol == "truthy_present":
+                return "falsy_missing", sub_cols
+            return None, frozenset()
+        if isinstance(test, ast.Name) and test.id in env:
+            ev = env[test.id]
+            pol_c = ev.cols & self.policy_cols
+            if pol_c and not ev.row:
+                return "truthy_present", pol_c
+        if (
+            isinstance(test, ast.Attribute)
+            and isinstance(test.value, ast.Name)
+            and test.value.id in env
+            and env[test.value.id].row
+            and test.attr in self.policy_cols
+        ):
+            return "truthy_present", frozenset({test.attr})
+        if (
+            isinstance(test, ast.Subscript)
+            and isinstance(test.value, ast.Name)
+            and test.value.id in env
+            and env[test.value.id].row
+            and isinstance(test.slice, ast.Constant)
+            and isinstance(test.slice.value, str)
+            and test.slice.value in self.policy_cols
+        ):
+            return "truthy_present", frozenset({test.slice.value})
+        return None, frozenset()
+
     def _resolve_dotted(self, dotted: str) -> str:
         head, sep, tail = dotted.partition(".")
         resolved = self.aliases.get(head, head)
@@ -465,7 +602,7 @@ class _FlowRunner:
         if isinstance(node, ast.NamedExpr):
             val = self.eval_expr(node.value, env, dead=dead)
             if not dead and isinstance(node.target, ast.Name):
-                env[node.target.id] = val
+                self._bind_target(node.target, val, env, lineno=getattr(node, "lineno", 0))
             return val
         if isinstance(node, ast.Name):
             if node.id in env:
@@ -487,7 +624,53 @@ class _FlowRunner:
                     else:
                         self.acc.dead_cols.update(proj.cols)
                     return proj if not dead else _Val()
+            if (
+                not dead
+                and isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool)
+            ):
+                return _Val(num_lits=frozenset({repr(node.value)}))
             return _Val()
+        if (
+            isinstance(node, ast.UnaryOp)
+            and isinstance(node.op, ast.USub)
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, (int, float))
+            and not isinstance(node.operand.value, bool)
+        ):
+            return _Val(num_lits=frozenset({repr(-node.operand.value)})) if not dead else _Val()
+        if isinstance(node, ast.BinOp):
+            lv = self.eval_expr(node.left, env, dead=dead)
+            rv = self.eval_expr(node.right, env, dead=dead)
+            return lv.merge(rv, keep_num_lits=False)
+        if isinstance(node, ast.Compare):
+            lv = self.eval_expr(node.left, env, dead=dead)
+            merged = lv
+            comp_vals = [self.eval_expr(c, env, dead=dead) for c in node.comparators]
+            for cv in comp_vals:
+                merged = merged.merge(cv, keep_num_lits=False)
+            if not dead and any(
+                isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)) for op in node.ops
+            ):
+                bound_lits: set[str] = set()
+                for side in (lv, *comp_vals):
+                    for lit in side.num_lits:
+                        if lit not in {"0", "1", "-1"}:
+                            bound_lits.add(lit)
+                if bound_lits and not (merged.cols & self.policy_cols):
+                    merged = _Val(
+                        row=merged.row,
+                        row_map=merged.row_map,
+                        cols=merged.cols,
+                        consts=merged.consts,
+                        num_lits=frozenset(bound_lits),
+                        fallbacks=merged.fallbacks,
+                        zero_clobbers=merged.zero_clobbers,
+                        overwrite_line=merged.overwrite_line,
+                        overwritten_cols=merged.overwritten_cols,
+                        dynamic=merged.dynamic,
+                    )
+            return merged
         if isinstance(node, ast.Attribute):
             if self._is_model_expr(node):
                 if not dead:
@@ -518,6 +701,9 @@ class _FlowRunner:
                 cols=base.cols,
                 consts=base.consts,
                 fallbacks=base.fallbacks,
+                zero_clobbers=base.zero_clobbers,
+                overwrite_line=base.overwrite_line,
+                overwritten_cols=base.overwritten_cols,
                 dynamic=base.dynamic,
             )
         if isinstance(node, ast.Subscript):
@@ -539,7 +725,7 @@ class _FlowRunner:
             if base.row_map:
                 sl_val = self.eval_expr(slc, env, dead=dead)
                 if not dead:
-                    self.acc.sink_cols.update(sl_val.cols)
+                    self._consume_sink_val(sl_val, lineno=getattr(node, "lineno", 0))
                 return _Val(row=True, cols=base.cols, fallbacks=base.fallbacks)
             if base.row:
                 if isinstance(slc, ast.Constant) and isinstance(slc.value, str):
@@ -556,7 +742,7 @@ class _FlowRunner:
                 if not dead:
                     self.acc.any_dynamic = True
                 return _Val(dynamic=not dead)
-            return base.merge(self.eval_expr(slc, env, dead=dead))
+            return base.merge(self.eval_expr(slc, env, dead=dead), keep_num_lits=False)
         if isinstance(node, ast.BoolOp):
             return self._eval_boolop(node, env, dead=dead)
         if isinstance(node, ast.IfExp):
@@ -589,11 +775,18 @@ class _FlowRunner:
                     primary = val
                     cur = val
                 elif (primary.cols & self.policy_cols) or primary.row:
+                    fb_items = val.consts | val.num_lits | val.fallbacks
+                    clobbers = set(cur.zero_clobbers) | set(val.zero_clobbers)
+                    if not primary.row:
+                        for pcol in primary.cols & self.policy_cols:
+                            for fk in val.consts | val.num_lits:
+                                clobbers.add((pcol, fk))
                     cur = _Val(
                         row=cur.row or val.row,
                         cols=cur.cols | val.cols,
                         consts=cur.consts,
-                        fallbacks=cur.fallbacks | val.consts | val.fallbacks,
+                        fallbacks=cur.fallbacks | fb_items,
+                        zero_clobbers=frozenset(clobbers),
                         dynamic=cur.dynamic or val.dynamic,
                     )
                 else:
@@ -623,10 +816,11 @@ class _FlowRunner:
             self.eval_expr(node.body, env, dead=True)
             return self.eval_expr(node.orelse, env, dead=dead)
         pol = _null_guard_polarity(node.test, env)
-        if pol is None:
+        truthy_pol, truthy_cols = self._truthy_pol_cols(node.test, env)
+        if pol is None and truthy_pol is None:
             t_val = self.eval_expr(node.test, env, dead=dead)
             if not dead:
-                self.acc.sink_cols.update(t_val.cols)
+                self._consume_sink_val(t_val, lineno=getattr(node.test, "lineno", 0))
         b_val = self.eval_expr(node.body, env, dead=dead)
         o_val = self.eval_expr(node.orelse, env, dead=dead)
         if pol == "null_false" and ((b_val.cols & self.policy_cols) or b_val.row):
@@ -634,7 +828,8 @@ class _FlowRunner:
                 row=b_val.row or o_val.row,
                 cols=b_val.cols | o_val.cols,
                 consts=b_val.consts,
-                fallbacks=b_val.fallbacks | o_val.consts | o_val.fallbacks,
+                fallbacks=b_val.fallbacks | o_val.consts | o_val.num_lits | o_val.fallbacks,
+                zero_clobbers=b_val.zero_clobbers | o_val.zero_clobbers,
                 dynamic=b_val.dynamic or o_val.dynamic,
             )
         if pol == "null_true" and ((o_val.cols & self.policy_cols) or o_val.row):
@@ -642,7 +837,30 @@ class _FlowRunner:
                 row=b_val.row or o_val.row,
                 cols=b_val.cols | o_val.cols,
                 consts=o_val.consts,
-                fallbacks=o_val.fallbacks | b_val.consts | b_val.fallbacks,
+                fallbacks=o_val.fallbacks | b_val.consts | b_val.num_lits | b_val.fallbacks,
+                zero_clobbers=b_val.zero_clobbers | o_val.zero_clobbers,
+                dynamic=b_val.dynamic or o_val.dynamic,
+            )
+        if truthy_pol == "truthy_present" and (b_val.cols & self.policy_cols):
+            fb_k = o_val.consts | o_val.num_lits
+            clob = {(c, k) for c in truthy_cols for k in fb_k}
+            return _Val(
+                row=b_val.row or o_val.row,
+                cols=b_val.cols | o_val.cols,
+                consts=b_val.consts,
+                fallbacks=b_val.fallbacks | fb_k | o_val.fallbacks,
+                zero_clobbers=b_val.zero_clobbers | o_val.zero_clobbers | frozenset(clob),
+                dynamic=b_val.dynamic or o_val.dynamic,
+            )
+        if truthy_pol == "falsy_missing" and (o_val.cols & self.policy_cols):
+            fb_k = b_val.consts | b_val.num_lits
+            clob = {(c, k) for c in truthy_cols for k in fb_k}
+            return _Val(
+                row=b_val.row or o_val.row,
+                cols=b_val.cols | o_val.cols,
+                consts=o_val.consts,
+                fallbacks=o_val.fallbacks | fb_k | b_val.fallbacks,
+                zero_clobbers=b_val.zero_clobbers | o_val.zero_clobbers | frozenset(clob),
                 dynamic=b_val.dynamic or o_val.dynamic,
             )
         return b_val.merge(o_val)
@@ -661,23 +879,50 @@ class _FlowRunner:
                         cols=v_val.cols,
                         consts=v_val.consts,
                         fallbacks=v_val.fallbacks,
+                        zero_clobbers=v_val.zero_clobbers,
                         dynamic=is_dyn and not dead,
                     )
                 )
             elif isinstance(k_node, ast.Constant) and isinstance(k_node.value, str):
-                if (
-                    not dead
-                    and k_node.value in self.policy_cols
-                    and isinstance(v_node, ast.Constant)
-                    and isinstance(v_node.value, (int, float, bool))
-                ):
-                    v_val = v_val.merge(
-                        _Val(consts=frozenset({f"{k_node.value}={v_node.value!r}"}))
+                k_str = k_node.value
+                if not dead and self._is_policy_like_key(k_str):
+                    if v_val.num_lits and not v_val.cols and not v_val.consts:
+                        self._note_enforcement(getattr(v_node, "lineno", 0))
+                        v_val = _Val(
+                            row=v_val.row,
+                            cols=v_val.cols,
+                            consts=v_val.num_lits,
+                            fallbacks=v_val.fallbacks,
+                            zero_clobbers=v_val.zero_clobbers,
+                            overwrite_line=v_val.overwrite_line,
+                            overwritten_cols=v_val.overwritten_cols,
+                            dynamic=v_val.dynamic,
+                        )
+                    elif (
+                        k_str in self.policy_cols
+                        and isinstance(v_node, ast.Constant)
+                        and isinstance(v_node.value, bool)
+                    ):
+                        v_val = v_val.merge(
+                            _Val(consts=frozenset({f"{k_str}={v_node.value!r}"}))
+                        )
+                else:
+                    v_val = _Val(
+                        row=v_val.row,
+                        row_map=v_val.row_map,
+                        cols=v_val.cols,
+                        dict_items=v_val.dict_items,
+                        consts=v_val.consts,
+                        fallbacks=v_val.fallbacks,
+                        zero_clobbers=v_val.zero_clobbers,
+                        overwrite_line=v_val.overwrite_line,
+                        overwritten_cols=v_val.overwritten_cols,
+                        dynamic=v_val.dynamic,
                     )
-                items_map[k_node.value] = v_val
+                items_map[k_str] = v_val
             else:
                 k_val = self.eval_expr(k_node, env, dead=dead)
-                anon.append(k_val.merge(v_val))
+                anon.append(k_val.merge(v_val, keep_num_lits=False))
         merged = _Val()
         for item_val in (*items_map.values(), *anon):
             merged = merged.merge(item_val)
@@ -686,38 +931,105 @@ class _FlowRunner:
             cols=merged.cols,
             dict_items=tuple(items_map.items()),
             consts=merged.consts,
+            num_lits=merged.num_lits,
             fallbacks=merged.fallbacks,
+            zero_clobbers=merged.zero_clobbers,
+            overwrite_line=merged.overwrite_line,
+            overwritten_cols=merged.overwritten_cols,
             dynamic=merged.dynamic,
         )
 
-    def _bind_target(self, target: ast.AST, val: _Val, env: dict[str, _Val]) -> None:
+    def _bind_target(
+        self,
+        target: ast.AST,
+        val: _Val,
+        env: dict[str, _Val],
+        *,
+        lineno: int = 0,
+    ) -> None:
         if isinstance(target, ast.Name):
+            prev = env.get(target.id)
+            prev_pol = (
+                (prev.cols & self.policy_cols)
+                if prev is not None and not prev.row
+                else (self.policy_cols if prev is not None and prev.row else frozenset())
+            )
+            killed_pol = prev_pol - (val.cols & self.policy_cols) if not val.row else frozenset()
+            if killed_pol:
+                repl = val.consts | val.num_lits
+                if lineno:
+                    self.acc.causal_overwrite_line = lineno
+                self.acc.overwritten_pol_cols.update(killed_pol)
+                self.acc.overwritten_consts.update(repl)
+                self.acc.overwritten_vars.append(
+                    (target.id, tuple(sorted(killed_pol)), tuple(sorted(repl)), lineno)
+                )
+                val = _Val(
+                    row=val.row,
+                    row_map=val.row_map,
+                    cols=val.cols,
+                    tuple_cols=val.tuple_cols,
+                    dict_items=val.dict_items,
+                    consts=repl,
+                    fallbacks=val.fallbacks,
+                    zero_clobbers=val.zero_clobbers,
+                    overwrite_line=lineno or val.overwrite_line,
+                    overwritten_cols=(prev.overwritten_cols if prev else frozenset()) | killed_pol,
+                    dynamic=val.dynamic,
+                )
+            elif (
+                val.num_lits
+                and not val.cols
+                and not val.consts
+                and self._is_policy_like_key(target.id)
+            ):
+                if lineno:
+                    self._note_enforcement(lineno)
+                val = _Val(
+                    cols=val.cols,
+                    consts=val.num_lits,
+                    num_lits=val.num_lits,
+                    fallbacks=val.fallbacks,
+                    zero_clobbers=val.zero_clobbers,
+                    overwrite_line=val.overwrite_line,
+                    overwritten_cols=val.overwritten_cols,
+                    dynamic=val.dynamic,
+                )
             env[target.id] = val
         elif isinstance(target, (ast.Tuple, ast.List)):
             for idx, elt in enumerate(target.elts):
                 if val.tuple_cols and idx < len(val.tuple_cols):
                     col = val.tuple_cols[idx]
                     self.acc.touched_cols.add(col)
-                    self._bind_target(elt, _Val(cols=frozenset({col})), env)
+                    self._bind_target(elt, _Val(cols=frozenset({col})), env, lineno=lineno)
                 else:
-                    self._bind_target(elt, val, env)
+                    self._bind_target(elt, val, env, lineno=lineno)
         elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
             d_name = target.value.id
             sl_val = self.eval_expr(target.slice, env)
-            self.acc.sink_cols.update(sl_val.cols)
+            self._consume_sink_val(sl_val, lineno=lineno)
             prev = env.get(d_name)
             if isinstance(target.slice, ast.Constant) and isinstance(target.slice.value, str):
                 if prev is not None and not prev.row_map:
                     d_map = dict(prev.dict_items)
                     s_key = target.slice.value
+                    prev_entry = d_map.get(s_key)
+                    prev_k_pol = (prev_entry.cols & self.policy_cols) if prev_entry else frozenset()
                     if (
-                        s_key in self.policy_cols
-                        and not val.cols
+                        (s_key in self.policy_cols or prev_k_pol)
+                        and not (val.cols & self.policy_cols)
                         and not val.row
-                        and not val.consts
-                        and not val.dynamic
                     ):
-                        val = val.merge(_Val(consts=frozenset({f"{s_key}=<override>"})))
+                        repl_k = val.consts | val.num_lits
+                        if prev_k_pol:
+                            if lineno:
+                                self.acc.causal_overwrite_line = lineno
+                            self.acc.overwritten_pol_cols.update(prev_k_pol)
+                            self.acc.overwritten_consts.update(repl_k)
+                        if repl_k:
+                            val = val.merge(_Val(consts=repl_k))
+                        elif not val.dynamic:
+                            val = val.merge(_Val(consts=frozenset({f"{s_key}=<override>"})))
                     d_map[s_key] = val
                     merged = _Val()
                     for dv in d_map.values():
@@ -728,18 +1040,14 @@ class _FlowRunner:
                         dict_items=tuple(d_map.items()),
                         consts=merged.consts,
                         fallbacks=merged.fallbacks,
+                        zero_clobbers=merged.zero_clobbers,
+                        overwrite_line=merged.overwrite_line,
+                        overwritten_cols=merged.overwritten_cols,
                         dynamic=prev.dynamic or merged.dynamic,
                     )
             else:
                 base_prev = prev if prev is not None else _Val()
-                env[d_name] = _Val(
-                    row=base_prev.row or val.row,
-                    row_map=base_prev.row_map or val.row,
-                    cols=base_prev.cols | val.cols,
-                    consts=base_prev.consts | val.consts,
-                    fallbacks=base_prev.fallbacks | val.fallbacks,
-                    dynamic=base_prev.dynamic or val.dynamic,
-                )
+                env[d_name] = base_prev.merge(val)
 
     def _eval_comprehension(
         self,
@@ -752,16 +1060,16 @@ class _FlowRunner:
         for gen in node.generators:
             it_val = self.eval_expr(gen.iter, comp_env, dead=dead)
             if not dead:
-                self._bind_target(gen.target, it_val, comp_env)
+                self._bind_target(gen.target, it_val, comp_env, lineno=getattr(gen.target, "lineno", 0))
             for if_clause in gen.ifs:
                 g_val = self.eval_expr(if_clause, comp_env, dead=dead)
                 if not dead:
-                    self.acc.sink_cols.update(g_val.cols)
+                    self._consume_sink_val(g_val, lineno=getattr(if_clause, "lineno", 0))
         if isinstance(node, ast.DictComp):
             k_val = self.eval_expr(node.key, comp_env, dead=dead)
             v_val = self.eval_expr(node.value, comp_env, dead=dead)
             if not dead:
-                self.acc.sink_cols.update(k_val.cols)
+                self._consume_sink_val(k_val, lineno=getattr(node.key, "lineno", 0))
             merged = k_val.merge(v_val)
             return _Val(
                 row=merged.row,
@@ -769,6 +1077,7 @@ class _FlowRunner:
                 cols=merged.cols,
                 consts=merged.consts,
                 fallbacks=merged.fallbacks,
+                zero_clobbers=merged.zero_clobbers,
                 dynamic=merged.dynamic,
             )
         return self.eval_expr(node.elt, comp_env, dead=dead)
@@ -806,7 +1115,10 @@ class _FlowRunner:
                         self.acc.dead_cols.add(col)
                         return _Val()
                     self.acc.touched_cols.add(col)
-                    return _Val(cols=frozenset({col}), fallbacks=fb_val.consts | fb_val.fallbacks)
+                    return _Val(
+                        cols=frozenset({col}),
+                        fallbacks=fb_val.consts | fb_val.num_lits | fb_val.fallbacks,
+                    )
                 if not dead:
                     self.acc.any_dynamic = True
                 return _Val(dynamic=not dead)
@@ -847,16 +1159,16 @@ class _FlowRunner:
                 )
                 if recv_val.row_map and short == "get":
                     fb = (
-                        arg_vals[1].consts | arg_vals[1].fallbacks
+                        arg_vals[1].consts | arg_vals[1].num_lits | arg_vals[1].fallbacks
                         if len(arg_vals) >= 2
                         else frozenset()
                     )
                     if arg_vals and not dead:
-                        self.acc.sink_cols.update(arg_vals[0].cols)
+                        self._consume_sink_val(arg_vals[0], lineno=getattr(node, "lineno", 0))
                     return _Val(row=True, cols=recv_val.cols, fallbacks=fb)
                 if recv_val.row and short == "get" and node.args and not is_orm_objects:
                     fb = (
-                        arg_vals[1].consts | arg_vals[1].fallbacks
+                        arg_vals[1].consts | arg_vals[1].num_lits | arg_vals[1].fallbacks
                         if len(arg_vals) >= 2
                         else frozenset()
                     )
@@ -896,6 +1208,7 @@ class _FlowRunner:
                         cols=prev_c.cols | comb.cols,
                         consts=prev_c.consts | comb.consts,
                         fallbacks=prev_c.fallbacks | comb.fallbacks,
+                        zero_clobbers=prev_c.zero_clobbers | comb.zero_clobbers,
                         dynamic=prev_c.dynamic or comb.dynamic,
                     )
                 return arg_vals[1] if short == "setdefault" and len(arg_vals) >= 2 else _Val()
@@ -908,12 +1221,15 @@ class _FlowRunner:
                 for a in (*node.args, *(kw.value for kw in node.keywords)):
                     av = self.eval_expr(a, env, dead=dead)
                     if not dead:
-                        self.acc.sink_cols.update(av.cols)
+                        self._consume_sink_val(av, lineno=getattr(node, "lineno", 0))
                 return _Val()
             recv_seed = _Val(
                 cols=recv_val.cols,
                 consts=recv_val.consts,
                 fallbacks=recv_val.fallbacks,
+                zero_clobbers=recv_val.zero_clobbers,
+                overwrite_line=recv_val.overwrite_line,
+                overwritten_cols=recv_val.overwritten_cols,
                 dynamic=recv_val.dynamic,
             )
 
@@ -929,7 +1245,7 @@ class _FlowRunner:
                 if kw.arg and kw.arg in helper.param_names:
                     by_idx[helper.param_names.index(kw.arg)] = kv
                 elif not dead:
-                    self.acc.sink_cols.update(kv.cols)
+                    self._consume_sink_val(kv, lineno=getattr(node, "lineno", 0))
             out_cols: set[str] = set(helper.returned_cols)
             if not dead and helper.guard_cols:
                 self.acc.sink_cols.update(helper.guard_cols)
@@ -949,8 +1265,8 @@ class _FlowRunner:
                         ret_dyn = True
                         if not dead:
                             self.acc.any_dynamic = True
-                elif aval.cols and not dead:
-                    self.acc.sink_cols.update(aval.cols)
+                elif not dead:
+                    self._consume_sink_val(aval, lineno=getattr(node, "lineno", 0))
                     out_cols.update(aval.cols)
             return _Val(
                 row=ret_row,
@@ -962,29 +1278,39 @@ class _FlowRunner:
 
         out = recv_seed
         res_dyn = False
+        call_line = getattr(node, "lineno", 0)
         for a in node.args:
             av = self.eval_expr(a, env, dead=dead)
             if not dead:
-                self.acc.sink_cols.update(av.cols)
+                self._consume_sink_val(av, lineno=call_line)
+                if isinstance(a, ast.Compare) and av.num_lits and not (av.cols & self.policy_cols):
+                    self.acc.enforced_num_consts.update(av.num_lits)
+                    self._note_enforcement(getattr(a, "lineno", call_line))
                 if av.row and short not in _NON_CONSUMING_ROW_BUILTINS:
                     self.acc.opaque_callees.add(dotted or short or "<call>")
                     res_dyn = True
-            out = out.merge(av)
+            out = out.merge(av, keep_num_lits=False)
         for kw in node.keywords:
             kv = self.eval_expr(kw.value, env, dead=dead)
             if not dead:
-                self.acc.sink_cols.update(kv.cols)
+                self._consume_sink_val(kv, lineno=call_line)
+                if kw.arg and self._is_policy_like_key(kw.arg) and kv.num_lits and not kv.cols:
+                    self.acc.enforced_num_consts.update(kv.num_lits)
+                    self._note_enforcement(getattr(kw.value, "lineno", call_line))
                 if kw.arg is None and (kv.row or kv.dynamic):
                     self.acc.any_dynamic = True
                     res_dyn = True
                 elif kv.row and short not in _NON_CONSUMING_ROW_BUILTINS:
                     self.acc.opaque_callees.add(dotted or short or "<call>")
                     res_dyn = True
-            out = out.merge(kv)
+            out = out.merge(kv, keep_num_lits=False)
         return _Val(
             cols=out.cols,
             consts=out.consts,
             fallbacks=out.fallbacks,
+            zero_clobbers=out.zero_clobbers,
+            overwrite_line=out.overwrite_line,
+            overwritten_cols=out.overwritten_cols,
             dynamic=(out.dynamic or res_dyn) and not dead,
         )
 
@@ -1009,7 +1335,8 @@ class _FlowRunner:
                     if rv.row and returned_whole_flag is not None:
                         returned_whole_flag.append("map" if rv.row_map else "row")
                     if null_fallback:
-                        self.acc.fallback_consts.update(rv.consts | rv.fallbacks)
+                        self.acc.fallback_consts.update(rv.consts | rv.num_lits | rv.fallbacks)
+                        self.acc.zero_clobbers.update(rv.zero_clobbers)
                         self.acc.sink_cols.update(rv.cols)
                         self.acc.return_cols.update(rv.cols)
                         if rv.row:
@@ -1018,26 +1345,29 @@ class _FlowRunner:
                         self.acc.primary_return_line = stmt.lineno
                         if rv.row:
                             self.acc.sink_cols.update(self.all_table_cols)
-                        self.acc.sink_cols.update(rv.cols)
+                        self._consume_sink_val(rv, lineno=stmt.lineno)
                         self.acc.return_cols.update(rv.cols)
                         self.acc.return_consts.update(rv.consts)
-                        self.acc.fallback_consts.update(rv.fallbacks)
-                        if rv.dynamic:
-                            self.acc.sink_dynamic = True
+                        if rv.num_lits and not rv.cols and not rv.consts:
+                            self.acc.enforced_num_consts.update(rv.num_lits)
+                            self._note_enforcement(stmt.lineno)
                     terminated = True
                 continue
             if isinstance(stmt, (ast.Raise, ast.Break, ast.Continue)):
                 if isinstance(stmt, ast.Raise):
                     ev = self.eval_expr(stmt.exc, env, dead=cur_dead)
                     if not cur_dead:
-                        self.acc.sink_cols.update(ev.cols)
+                        self._consume_sink_val(ev, lineno=stmt.lineno)
                 if not cur_dead:
                     terminated = True
                 continue
             if isinstance(stmt, ast.Assert):
                 tv = self.eval_expr(stmt.test, env, dead=cur_dead)
                 if not cur_dead:
-                    self.acc.sink_cols.update(tv.cols)
+                    self._consume_sink_val(tv, lineno=stmt.lineno)
+                    if isinstance(stmt.test, ast.Compare) and tv.num_lits and not (tv.cols & self.policy_cols):
+                        self.acc.enforced_num_consts.update(tv.num_lits)
+                        self._note_enforcement(stmt.lineno)
                 continue
             if isinstance(stmt, ast.Expr):
                 val_node = stmt.value
@@ -1046,14 +1376,13 @@ class _FlowRunner:
                     if not cur_dead:
                         if yv.row:
                             self.acc.sink_cols.update(self.all_table_cols)
-                        self.acc.sink_cols.update(yv.cols)
                         if null_fallback:
-                            self.acc.fallback_consts.update(yv.consts | yv.fallbacks)
+                            self.acc.sink_cols.update(yv.cols)
+                            self.acc.fallback_consts.update(yv.consts | yv.num_lits | yv.fallbacks)
+                            self.acc.zero_clobbers.update(yv.zero_clobbers)
                         else:
+                            self._consume_sink_val(yv, lineno=stmt.lineno)
                             self.acc.return_consts.update(yv.consts)
-                            self.acc.fallback_consts.update(yv.fallbacks)
-                        if yv.dynamic:
-                            self.acc.sink_dynamic = True
                 else:
                     self.eval_expr(val_node, env, dead=cur_dead)
                 continue
@@ -1065,9 +1394,9 @@ class _FlowRunner:
                             t_recv = self.eval_expr(tgt.value, env, dead=cur_dead)
                             if t_recv.row:
                                 self.acc.mutates_row = True
-                            self.acc.sink_cols.update(val.cols)
+                            self._consume_sink_val(val, lineno=stmt.lineno)
                         else:
-                            self._bind_target(tgt, val, env)
+                            self._bind_target(tgt, val, env, lineno=stmt.lineno)
                 continue
             if isinstance(stmt, ast.AnnAssign):
                 if stmt.value is not None:
@@ -1077,18 +1406,18 @@ class _FlowRunner:
                             t_recv = self.eval_expr(stmt.target.value, env, dead=cur_dead)
                             if t_recv.row:
                                 self.acc.mutates_row = True
-                            self.acc.sink_cols.update(val.cols)
+                            self._consume_sink_val(val, lineno=stmt.lineno)
                         else:
-                            self._bind_target(stmt.target, val, env)
+                            self._bind_target(stmt.target, val, env, lineno=stmt.lineno)
                 continue
             if isinstance(stmt, ast.AugAssign):
                 val = self.eval_expr(stmt.value, env, dead=cur_dead)
                 if not cur_dead:
                     if isinstance(stmt.target, ast.Name):
                         prev = env.get(stmt.target.id, _Val())
-                        env[stmt.target.id] = prev.merge(val)
+                        env[stmt.target.id] = prev.merge(val, keep_num_lits=False)
                     else:
-                        self.acc.sink_cols.update(val.cols)
+                        self._consume_sink_val(val, lineno=stmt.lineno)
                 continue
             if isinstance(stmt, ast.If):
                 cb = _const_bool(stmt.test, self.const_truth)
@@ -1111,24 +1440,28 @@ class _FlowRunner:
                         terminated = True
                     continue
                 pol = _null_guard_polarity(stmt.test, env)
+                truthy_pol, truthy_cols = self._truthy_pol_cols(stmt.test, env)
                 if pol is None:
                     tv = self.eval_expr(stmt.test, env, dead=cur_dead)
                     if not cur_dead:
-                        self.acc.sink_cols.update(tv.cols)
+                        self._consume_sink_val(tv, lineno=stmt.lineno)
+                        if isinstance(stmt.test, ast.Compare) and tv.num_lits and not (tv.cols & self.policy_cols):
+                            self.acc.enforced_num_consts.update(tv.num_lits)
+                            self._note_enforcement(stmt.lineno)
                 env_b = dict(env)
                 env_o = dict(env)
                 term_b = self.run_stmts(
                     stmt.body,
                     env_b,
                     dead=cur_dead,
-                    null_fallback=null_fallback or (pol == "null_true"),
+                    null_fallback=null_fallback or (pol == "null_true") or (truthy_pol == "falsy_missing"),
                     returned_whole_flag=returned_whole_flag,
                 )
                 term_o = self.run_stmts(
                     stmt.orelse,
                     env_o,
                     dead=cur_dead,
-                    null_fallback=null_fallback or (pol == "null_false"),
+                    null_fallback=null_fallback or (pol == "null_false") or (truthy_pol == "truthy_present"),
                     returned_whole_flag=returned_whole_flag,
                 )
                 if cur_dead:
@@ -1150,20 +1483,38 @@ class _FlowRunner:
                     for k in all_k:
                         vb = env_b.get(k, _Val())
                         vo = env_o.get(k, _Val())
-                        if pol == "null_false" and ((vb.cols & self.policy_cols) or vb.row):
+                        if (pol == "null_false" or truthy_pol == "truthy_present") and (
+                            (vb.cols & self.policy_cols) or vb.row
+                        ):
+                            fb_add = vo.consts | vo.num_lits | vo.fallbacks
+                            clob = set(vb.zero_clobbers) | set(vo.zero_clobbers)
+                            if truthy_pol == "truthy_present":
+                                for c in truthy_cols:
+                                    for fk in vo.consts | vo.num_lits:
+                                        clob.add((c, fk))
                             env[k] = _Val(
                                 row=vb.row or vo.row,
                                 cols=vb.cols | vo.cols,
                                 consts=vb.consts,
-                                fallbacks=vb.fallbacks | vo.consts | vo.fallbacks,
+                                fallbacks=vb.fallbacks | fb_add,
+                                zero_clobbers=frozenset(clob),
                                 dynamic=vb.dynamic or vo.dynamic,
                             )
-                        elif pol == "null_true" and ((vo.cols & self.policy_cols) or vo.row):
+                        elif (pol == "null_true" or truthy_pol == "falsy_missing") and (
+                            (vo.cols & self.policy_cols) or vo.row
+                        ):
+                            fb_add = vb.consts | vb.num_lits | vb.fallbacks
+                            clob = set(vb.zero_clobbers) | set(vo.zero_clobbers)
+                            if truthy_pol == "falsy_missing":
+                                for c in truthy_cols:
+                                    for fk in vb.consts | vb.num_lits:
+                                        clob.add((c, fk))
                             env[k] = _Val(
                                 row=vb.row or vo.row,
                                 cols=vb.cols | vo.cols,
                                 consts=vo.consts,
-                                fallbacks=vo.fallbacks | vb.consts | vb.fallbacks,
+                                fallbacks=vo.fallbacks | fb_add,
+                                zero_clobbers=frozenset(clob),
                                 dynamic=vb.dynamic or vo.dynamic,
                             )
                         else:
@@ -1173,7 +1524,7 @@ class _FlowRunner:
                 itv = self.eval_expr(stmt.iter, env, dead=cur_dead)
                 loop_env = dict(env)
                 if not cur_dead:
-                    self._bind_target(stmt.target, itv, loop_env)
+                    self._bind_target(stmt.target, itv, loop_env, lineno=stmt.lineno)
                 self.run_stmts(stmt.body, loop_env, dead=cur_dead, null_fallback=null_fallback)
                 self.run_stmts(stmt.orelse, loop_env, dead=cur_dead, null_fallback=null_fallback)
                 if not cur_dead:
@@ -1188,7 +1539,7 @@ class _FlowRunner:
                     continue
                 tv = self.eval_expr(stmt.test, env, dead=cur_dead)
                 if not cur_dead:
-                    self.acc.sink_cols.update(tv.cols)
+                    self._consume_sink_val(tv, lineno=stmt.lineno)
                 loop_env = dict(env)
                 self.run_stmts(stmt.body, loop_env, dead=cur_dead, null_fallback=null_fallback)
                 if not cur_dead:
@@ -1199,7 +1550,7 @@ class _FlowRunner:
                 for item in stmt.items:
                     iv = self.eval_expr(item.context_expr, env, dead=cur_dead)
                     if not cur_dead and item.optional_vars is not None:
-                        self._bind_target(item.optional_vars, iv, env)
+                        self._bind_target(item.optional_vars, iv, env, lineno=stmt.lineno)
                 if self.run_stmts(stmt.body, env, dead=cur_dead, null_fallback=null_fallback):
                     terminated = True
                 continue
@@ -1446,11 +1797,27 @@ def analyze_module_policy_table_read(
         consumed_cols = sorted(acc.sink_cols & known_cols) if known_cols else sorted(acc.sink_cols)
         consumed_pol = acc.sink_cols & policy_col_set
         unconsumed_pol = sorted(policy_col_set - consumed_pol)
-        raw_return_consts = sorted(acc.return_consts)
-        subst_consts = raw_return_consts if unconsumed_pol else []
+        overwritten_unconsumed = acc.overwritten_pol_cols & set(unconsumed_pol)
+        cand_subst = (
+            set(acc.overwritten_consts)
+            | set(acc.return_consts)
+            | set(acc.sink_consts)
+            | (set(acc.enforced_num_consts) if not consumed_pol else set())
+        )
+        raw_return_consts = sorted(cand_subst)
+        if unconsumed_pol and (not consumed_pol or overwritten_unconsumed):
+            subst_consts = sorted(acc.overwritten_consts) if overwritten_unconsumed and acc.overwritten_consts else raw_return_consts
+        else:
+            subst_consts = []
         fb_consts = sorted(acc.fallback_consts - set(subst_consts))
         dead_pol = bool(acc.dead_cols & policy_col_set)
-        ev_line = acc.primary_return_line or acc.first_query_line or sc_line
+        ev_line = (
+            (acc.causal_overwrite_line if overwritten_unconsumed else 0)
+            or (acc.causal_enforcement_line if subst_consts and not consumed_pol else 0)
+            or acc.primary_return_line
+            or acc.first_query_line
+            or sc_line
+        )
         called_direct_helpers = [
             cal
             for cal in func_calls.get(sc, ())
@@ -1482,9 +1849,15 @@ def analyze_module_policy_table_read(
         elif subst_consts and unconsumed_pol:
             state = "bypassed"
             mech = "constant_or_fallback_wins"
+            ov_trail = ""
+            if acc.overwritten_vars and overwritten_unconsumed:
+                v_name, _k_cols, _r_consts, ov_ln = acc.overwritten_vars[-1]
+                ov_trail = f" (local `{v_name}` overwritten at line {ov_ln})"
+            elif ev_line:
+                ov_trail = f" (at line {ev_line})"
             note = (
                 f"`{sc}()` leaves policy column(s) {', '.join(f'`{c}`' for c in unconsumed_pol)} "
-                f"unconsumed and substitutes {', '.join(f'`{k}`' for k in subst_consts)}."
+                f"unconsumed and substitutes {', '.join(f'`{k}`' for k in subst_consts)}{ov_trail}."
             )
         elif consumed_pol:
             state = "consumed"
@@ -1494,9 +1867,19 @@ def analyze_module_policy_table_read(
                 if fb_consts
                 else ""
             )
+            clobber_tag = ""
+            live_clobbers = sorted(
+                (col, fk) for col, fk in acc.zero_clobbers if col in consumed_pol
+            )
+            if live_clobbers:
+                pairs_txt = ", ".join(f"`{col}` -> `{fk}`" for col, fk in live_clobbers)
+                clobber_tag = (
+                    f" Warning: zero-clobbering truthiness fallback ({pairs_txt}) "
+                    "overwrites valid `0` policy values; use `is not None`."
+                )
             note = (
                 f"`{sc}()` flows policy column(s) "
-                f"{', '.join(f'`{c}`' for c in sorted(consumed_pol))} into result/guard{fb_tag}."
+                f"{', '.join(f'`{c}`' for c in sorted(consumed_pol))} into result/guard{fb_tag}.{clobber_tag}"
             )
         elif acc.sink_dynamic or acc.any_dynamic or acc.opaque_callees:
             state = "unresolved"

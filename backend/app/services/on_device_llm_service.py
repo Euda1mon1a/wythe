@@ -19,6 +19,9 @@ from app.schemas.atlas import (
     AskEnginesRead,
     AskWytheRequest,
     AskWytheResponse,
+    InvestigationCreateRequest,
+    InvestigationTurnCreate,
+    LlmNodePointer,
     OnDeviceEngineStatus,
 )
 from app.services.apple_fm_service import (
@@ -26,8 +29,20 @@ from app.services.apple_fm_service import (
     run_apple_engine_ask,
 )
 from app.services.governance_service import get_target_by_slug
-from app.services.llm_context_service import build_lineage_cone_slice
-from app.services.scanner_service import run_target_scan
+from app.services.investigation_service import (
+    build_evidence_identity,
+    create_or_reopen_investigation,
+    get_active_session_ids_for_target,
+    get_investigation_session,
+    get_or_run_cached_scan,
+    list_session_corrections,
+    record_investigation_turn,
+    validate_references_against_report,
+)
+from app.services.llm_context_service import (
+    build_lineage_cone_slice,
+    build_section_budgeted_ask_prompt,
+)
 from app.services.ui_focus_service import explain_ui_focus
 
 _default_local_seats = (
@@ -132,9 +147,10 @@ def probe_local_openai_engine(
                 state="unavailable",
                 note=str(exc),
             )
-    for seat in _default_local_seats:
-        if seat not in candidates:
-            candidates.append(seat)
+    else:
+        for seat in _default_local_seats:
+            if seat not in candidates:
+                candidates.append(seat)
 
     last_note = "No loopback OpenAI-compatible /v1 seat detected (:8080, :8084, :8083, :8085, :8093, :8081, :1234, :11434)."
     fallback_text_seat: OnDeviceEngineStatus | None = None
@@ -325,7 +341,7 @@ def _run_local_chat_completion(
     try:
         return _post_chat(user_content), used_vision
     except urllib.error.HTTPError as exc:
-        if used_vision and exc.code in (400, 415, 422):
+        if used_vision and exc.code in (400, 415, 422, 500):
             try:
                 return _post_chat(user_text), False
             except (TimeoutError, OSError, ValueError) as inner_exc:
@@ -343,15 +359,99 @@ def _run_local_chat_completion(
 
 def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> AskWytheResponse:
     """Answer an architectural question grounded in live 3D X-Ray focus + lineage cone."""
-    focus = explain_ui_focus(session, target_override=payload.target_slug)
+    req_sid = (payload.session_id or "").strip() or None
+    if (
+        req_sid is not None
+        and get_investigation_session(req_sid) is None
+        and payload.target_slug
+        and get_target_by_slug(session, payload.target_slug.strip()) is not None
+    ):
+        create_or_reopen_investigation(
+            session,
+            InvestigationCreateRequest(
+                target_slug=payload.target_slug.strip(),
+                session_id=req_sid,
+                client_id=payload.client_id,
+            ),
+        )
+
+    focus = explain_ui_focus(
+        session,
+        target_override=payload.target_slug,
+        session_id=req_sid,
+    )
     target = get_target_by_slug(session, focus.active_slug)
-    report = run_target_scan(session, target, strict_gate=True, persist_snapshot=False) if target else None
+    report = get_or_run_cached_scan(session, target, strict_gate=True) if target else None
+    ev_identity = focus.evidence_identity or (build_evidence_identity(report) if report else None)
 
-    cone_md = ""
-    if report is not None and focus.focused_node is not None:
-        cone = build_lineage_cone_slice(report, focus.focused_node.id, max_nodes=18)
-        cone_md = f"\n\n### Surgical 3-Tier Lineage Cone\n{cone.markdown[:1600]}"
+    eff_sid = req_sid or focus.session_id
+    if eff_sid is not None and get_investigation_session(eff_sid) is None and target is not None:
+        create_or_reopen_investigation(
+            session,
+            InvestigationCreateRequest(
+                target_slug=target.slug,
+                session_id=eff_sid,
+                client_id=payload.client_id,
+            ),
+            precomputed_report=report,
+        )
 
+    if report is not None and (
+        payload.selected_node_id or payload.selected_finding_id or payload.selected_edge_id
+    ):
+        upd_focus: dict[str, Any] = {}
+        if payload.selected_edge_id:
+            upd_focus["selected_edge_id"] = payload.selected_edge_id
+        if payload.selected_finding_id:
+            upd_focus["selected_finding_id"] = payload.selected_finding_id
+            f_match = next((f for f in report.findings if f.id == payload.selected_finding_id), None)
+            if f_match is not None and f_match not in focus.active_findings:
+                upd_focus["active_findings"] = [f_match, *focus.active_findings[:11]]
+        if payload.selected_node_id:
+            n_match = next((n for n in report.nodes if n.id == payload.selected_node_id), None)
+            if n_match is not None:
+                upd_focus["focused_node"] = LlmNodePointer(
+                    id=n_match.id,
+                    tier=n_match.tier,
+                    subkind=n_match.subkind,
+                    label=n_match.label,
+                    pointer=f"{n_match.source_file}:{n_match.line}",
+                    status=n_match.status,
+                    columns=list(n_match.columns[:8]),
+                    http_paths=list(n_match.http_paths[:6]),
+                )
+        if upd_focus:
+            focus = focus.model_copy(update=upd_focus)
+
+    cone_seed_id = (
+        payload.selected_node_id
+        or (focus.focused_node.id if focus.focused_node is not None else None)
+    )
+    cone = (
+        build_lineage_cone_slice(report, cone_seed_id, max_nodes=18)
+        if (report is not None and cone_seed_id)
+        else None
+    )
+
+    corrections = list_session_corrections(eff_sid)
+    eff_history: list[AskChatTurn] = list(payload.history)
+    if not eff_history and eff_sid is not None:
+        inv_hist = get_investigation_session(eff_sid)
+        if inv_hist is not None:
+            for prior_t in inv_hist.turns[-6:]:
+                if prior_t.status == "answered" and prior_t.answer_markdown:
+                    eff_history.append(AskChatTurn(role="user", content=prior_t.question[:2000]))
+                    eff_history.append(
+                        AskChatTurn(role="assistant", content=prior_t.answer_markdown[:4000])
+                    )
+
+    corr_sys_note = (
+        " Respect active Human Investigation Corrections in Section 2 as authoritative working "
+        "clarifications for this session, while noting they remain conversation context until "
+        "deliberately promoted to a governance ruling."
+        if corrections
+        else ""
+    )
     instructions = (
         "You are Wythe's embedded real-time 3-tier software architecture & lineage verifier assistant. "
         "Ground all repository, node, color, rule, and lineage statements strictly in the Live 3D Camera & X-Ray "
@@ -361,12 +461,19 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         "proof of duplicate contents, authoritative ownership, or safe deletion. Keep declared store purpose "
         "distinct from observed verification, distinguish a node's discovery coordinate from causal writer "
         "operation lines, preserve uncertainty when expiration or invalidation is unknown, and present "
-        "remediations as suggested changes rather than verified fixes."
+        f"remediations as suggested changes rather than verified fixes.{corr_sys_note}"
     )
-    live_vp_override = (payload.live_viewport_brief or "").strip()
-    vp_section = f"\n\n{live_vp_override[:2400]}" if live_vp_override and live_vp_override[:80] not in focus.markdown_brief else ""
-    compact_context = f"{focus.markdown_brief[:2300]}{vp_section}{cone_md}"
-    full_prompt = f"## Live 3D Wythe Viewport & X-Ray\n{compact_context}\n\n## User Question\n{payload.question.strip()}"
+
+    full_prompt, apple_prompt, budget = build_section_budgeted_ask_prompt(
+        question=payload.question,
+        focus=focus,
+        report=report,
+        cone=cone,
+        evidence_identity=ev_identity,
+        corrections=corrections,
+        live_viewport_brief=payload.live_viewport_brief,
+        history=eff_history,
+    )
 
     snap_path = (
         Path(focus.snapshot_path)
@@ -378,16 +485,26 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         _sniff_image_data_url(snap_path, inline_snap) if payload.include_vision_snapshot else None
     )
     has_multimodal_image = attached_img_url is not None
-    engine_choice = payload.engine
+
+    explicit_local_url = (payload.local_base_url or "").strip() or None
+    if explicit_local_url is not None:
+        _normalize_private_v1_url(explicit_local_url)
+
+    engine_choice: str = (
+        "local"
+        if (explicit_local_url is not None and payload.engine == "auto")
+        else payload.engine
+    )
     answer_md = ""
     engine_used: str = "local"
     model_used = ""
     used_vision = False
+    fallback_reason: str | None = None
     hinted_refs: list[str] = []
 
     apple_status = check_apple_engine_status() if engine_choice in ("auto", "apple") else None
     local_status = probe_local_openai_engine(
-        payload.local_base_url,
+        explicit_local_url,
         payload.local_model_id,
         prefer_vision=has_multimodal_image,
     )
@@ -400,31 +517,70 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         has_screenshot=has_multimodal_image,
     )
 
+    def _preserve_unresolved_question(reason: str) -> str | None:
+        nonlocal eff_sid
+        if eff_sid is None and target is not None:
+            active_sids = get_active_session_ids_for_target(target.slug)
+            if len(active_sids) == 1:
+                eff_sid = active_sids[0]
+            elif len(active_sids) == 0:
+                created = create_or_reopen_investigation(
+                    session,
+                    InvestigationCreateRequest(
+                        target_slug=target.slug,
+                        client_id=payload.client_id,
+                    ),
+                    precomputed_report=report,
+                )
+                eff_sid = created.session_id
+        if eff_sid is None:
+            return None
+        saved_unres = record_investigation_turn(
+            session,
+            eff_sid,
+            InvestigationTurnCreate(
+                client_id=payload.client_id,
+                actor="human",
+                question=payload.question,
+                answer_markdown=None,
+                authored_by="none",
+                failure_reason=reason[:480],
+                selected_node_id=cone_seed_id,
+                selected_edge_id=payload.selected_edge_id or focus.selected_edge_id,
+                selected_finding_id=payload.selected_finding_id or focus.selected_finding_id,
+            ),
+            report=report,
+        )
+        return saved_unres.turn_id
+
+    prior_fail_note: str | None = None
     for idx, candidate_engine in enumerate(cascade):
         has_fallback = idx + 1 < len(cascade)
         if candidate_engine == "apple":
             try:
-                hist_tail = "\n".join(
-                    f"{'User' if t.role == 'user' else 'Assistant'}: {t.content[:360]}"
-                    for t in payload.history[-4:]
-                )
-                hist_block = f"\n\n## Recent Session Turns\n{hist_tail}" if hist_tail else ""
-                apple_prompt = (
-                    f"## Live Wythe Viewport\n{focus.markdown_brief[:1600]}{vp_section[:900]}"
-                    f"{hist_block}\n\n## Question\n{payload.question.strip()}"
-                )
                 answer_md, hinted_refs = run_apple_engine_ask(instructions, apple_prompt)
                 engine_used = "apple"
                 model_used = "apple-foundation-models-on-device"
                 used_vision = False
+                if prior_fail_note:
+                    fallback_reason = f"{prior_fail_note}; answered via fallback `apple`."
+                elif has_multimodal_image:
+                    fallback_reason = "Viewport image available, but `apple` engine answered in text-only mode."
                 break
             except (RuntimeError, TimeoutError, OSError, ValueError) as exc:
+                prior_fail_note = f"Primary `apple` engine failed ({type(exc).__name__}: {exc})"
                 if not has_fallback:
-                    if isinstance(exc, RuntimeError):
-                        raise
-                    raise RuntimeError(f"Local model completion failed ({type(exc).__name__}: {exc}).") from exc
+                    err_msg = (
+                        str(exc)
+                        if isinstance(exc, RuntimeError)
+                        else f"Local model completion failed ({type(exc).__name__}: {exc})."
+                    )
+                    tid = _preserve_unresolved_question(err_msg)
+                    suffix = f" [question preserved in session={eff_sid}, turn={tid}]" if tid else ""
+                    raise RuntimeError(f"{err_msg}{suffix}") from exc
         else:
             if local_status.state != "ready" or not local_status.base_url or not local_status.model_id:
+                prior_fail_note = f"Local `/v1` unavailable ({local_status.note})"
                 if has_fallback:
                     continue
                 break
@@ -436,7 +592,7 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                     full_prompt,
                     snap_path,
                     inline_data_url=inline_snap,
-                    history=payload.history,
+                    history=eff_history,
                     supports_vision=local_status.supports_vision,
                 )
                 engine_used = "local"
@@ -448,47 +604,98 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                     model_used = local_status.note.split(" ready at ", 1)[0]
                 else:
                     model_used = local_status.model_id
+                if prior_fail_note:
+                    fallback_reason = f"{prior_fail_note}; answered via fallback `local` ({model_used})."
+                elif has_multimodal_image and not used_vision:
+                    fallback_reason = "Viewport image available, but selected local model ran in text-only mode."
                 break
             except (RuntimeError, TimeoutError, OSError, ValueError) as exc:
+                prior_fail_note = f"Primary `local` engine failed ({type(exc).__name__}: {exc})"
                 if not has_fallback:
-                    if isinstance(exc, RuntimeError):
-                        raise
-                    raise RuntimeError(f"Local model completion failed ({type(exc).__name__}: {exc}).") from exc
+                    err_msg = (
+                        str(exc)
+                        if isinstance(exc, RuntimeError)
+                        else f"Local model completion failed ({type(exc).__name__}: {exc})."
+                    )
+                    tid = _preserve_unresolved_question(err_msg)
+                    suffix = f" [question preserved in session={eff_sid}, turn={tid}]" if tid else ""
+                    raise RuntimeError(f"{err_msg}{suffix}") from exc
 
     if not answer_md:
-        raise ValueError(
+        unavail_msg = (
             f"No ready backend LLM engine (Apple: {apple_status.note if apple_status else 'skipped'}; "
             f"Local: {local_status.note}). Try Chrome Built-In in the browser or start a local `/v1` model."
         )
+        tid = _preserve_unresolved_question(unavail_msg)
+        suffix = f" [question preserved in session={eff_sid}, turn={tid}]" if tid else ""
+        raise RuntimeError(f"{unavail_msg}{suffix}")
 
-    matched_ids: list[str] = []
-    if focus.focused_node is not None:
-        matched_ids.append(focus.focused_node.id)
-    if report is not None:
-        low_ans = answer_md.lower()
-        hinted_low = {h.strip("` ").lower() for h in hinted_refs if h.strip()}
-        for node in report.nodes:
-            if len(matched_ids) >= 6:
-                break
-            if node.id in matched_ids:
-                continue
-            lbl_low = node.label.lower()
-            is_code_identifier = "_" in lbl_low or "/" in lbl_low or ":" in lbl_low
-            if (
-                node.id.lower() in low_ans
-                or node.id.lower() in hinted_low
-                or lbl_low in hinted_low
-                or f"`{lbl_low}`" in low_ans
-                or (is_code_identifier and len(lbl_low) >= 5 and lbl_low in low_ans)
-            ):
-                matched_ids.append(node.id)
+    explicit_seed_refs = [
+        r
+        for r in (
+            cone_seed_id,
+            payload.selected_edge_id or focus.selected_edge_id,
+            payload.selected_finding_id or focus.selected_finding_id,
+            *(h.strip("` ") for h in hinted_refs if h.strip()),
+        )
+        if r
+    ]
+    ev_rev_id = ev_identity.evidence_revision_id if ev_identity else "ev_unknown"
+    val_refs = validate_references_against_report(
+        explicit_seed_refs,
+        report,
+        evidence_revision_id=ev_rev_id,
+        answer_markdown=answer_md,
+    )
+    matched_node_ids: list[str] = []
+    for vref in val_refs:
+        if (
+            vref.kind == "node"
+            and vref.validation_state in ("validated", "text_convenience")
+            and vref.ref_id not in matched_node_ids
+        ):
+            matched_node_ids.append(vref.ref_id)
+
+    recorded_tid: str | None = None
+    if eff_sid is not None:
+        saved_turn = record_investigation_turn(
+            session,
+            eff_sid,
+            InvestigationTurnCreate(
+                client_id=payload.client_id,
+                actor="human",
+                question=payload.question,
+                answer_markdown=answer_md,
+                engine=engine_used,
+                model_id=model_used,
+                used_vision=used_vision,
+                image_supplied=has_multimodal_image,
+                authored_by="model",
+                fallback_reason=fallback_reason,
+                selected_node_id=cone_seed_id,
+                selected_edge_id=payload.selected_edge_id or focus.selected_edge_id,
+                selected_finding_id=payload.selected_finding_id or focus.selected_finding_id,
+                referenced_ids=[r.ref_id for r in val_refs if r.validation_state == "validated"],
+            ),
+            report=report,
+        )
+        recorded_tid = saved_turn.turn_id
+        val_refs = saved_turn.validated_references or val_refs
 
     return AskWytheResponse(
+        session_id=eff_sid,
+        turn_id=recorded_tid,
+        authored_by="model",
         engine_used=engine_used,  # type: ignore[arg-type]
         model_id=model_used,
         used_vision_snapshot=used_vision,
+        image_supplied=has_multimodal_image,
+        fallback_reason=fallback_reason,
         context_headline=focus.headline,
         answer_markdown=answer_md,
-        referenced_node_ids=matched_ids[:6],
+        referenced_node_ids=matched_node_ids[:6],
+        validated_references=val_refs,
+        evidence_identity=ev_identity,
+        context_budget=budget,
         observed_at=utc_now(),
     )

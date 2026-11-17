@@ -17,6 +17,7 @@ class Settings:
     api_host: str
     api_port: int
     cors_origins: tuple[str, ...]
+    state_dir: Path = DEFAULT_STATE_DIR
 
 
 def _env_with_legacy(primary: str, legacy: str, default: str) -> str:
@@ -27,12 +28,18 @@ def load_settings() -> Settings:
     """Resolve runtime bind and database URL from environment with safe loopback defaults."""
     explicit_db = os.getenv("WYTHE_DATABASE_URL") or os.getenv("TRUTH_ATLAS_DATABASE_URL")
     explicit_state = os.getenv("WYTHE_STATE_DIR") or os.getenv("TRUTH_ATLAS_STATE_DIR")
-    state_dir = Path(explicit_state) if explicit_state else DEFAULT_STATE_DIR
+    default_state = Path.home() / ".local" / "state" / "wythe"
     if explicit_db:
         database_url = explicit_db
         if explicit_state:
+            state_dir = Path(explicit_state)
             state_dir.mkdir(parents=True, exist_ok=True)
+        elif explicit_db.startswith("sqlite:///") and ":memory:" not in explicit_db:
+            state_dir = Path(explicit_db.removeprefix("sqlite:///")).expanduser().resolve().parent
+        else:
+            state_dir = default_state
     else:
+        state_dir = Path(explicit_state) if explicit_state else default_state
         state_dir.mkdir(parents=True, exist_ok=True)
         database_url = f"sqlite:///{(state_dir / 'wythe.db').as_posix()}"
     api_host = _env_with_legacy("WYTHE_HOST", "TRUTH_ATLAS_HOST", "127.0.0.1")
@@ -48,4 +55,5 @@ def load_settings() -> Settings:
         api_host=api_host,
         api_port=api_port,
         cors_origins=origins,
+        state_dir=state_dir,
     )

@@ -1,5 +1,46 @@
-import type { AtlasEdge, AtlasNode } from '@/api/atlas';
+import type {
+  AtlasEdge,
+  AtlasNode,
+  BoundaryFinding,
+  DiffBlastRadiusReport,
+  SnapshotComparisonReport,
+} from '@/api/atlas';
 import type { WythePaletteColors } from '@/lib/wytheTheme';
+import {
+  computeCanonicalXYPositions,
+  computeLifecycleWallTies,
+  computeLifecycleZProjection,
+  computeTemporalZProjection,
+  type CanonicalXYOptions,
+  type LifecycleEntityPresence,
+  type LifecycleProjectedBrick,
+  type LifecycleWallTie,
+  type LifecycleWytheIndex,
+  type LifecycleZProjectionResult,
+  type TemporalDiffSummaryRow,
+  type TemporalProjectedBrick,
+  type TemporalVectorKind,
+  type TemporalZProjectionResult,
+  type TemporalZVector,
+} from './wytheZProjections';
+
+export {
+  computeCanonicalXYPositions,
+  computeLifecycleWallTies,
+  computeLifecycleZProjection,
+  computeTemporalZProjection,
+  type CanonicalXYOptions,
+  type LifecycleEntityPresence,
+  type LifecycleProjectedBrick,
+  type LifecycleWallTie,
+  type LifecycleWytheIndex,
+  type LifecycleZProjectionResult,
+  type TemporalDiffSummaryRow,
+  type TemporalProjectedBrick,
+  type TemporalVectorKind,
+  type TemporalZProjectionResult,
+  type TemporalZVector,
+};
 
 export type SceneLens =
   | 'status'
@@ -8,13 +49,21 @@ export type SceneLens =
   | 'subkind'
   | 'cluster'
   | 'containers';
-export type SceneLayoutMode = 'cluster' | 'grid' | 'subkind' | 'connected';
+export type SceneLayoutMode =
+  | 'cluster'
+  | 'grid'
+  | 'subkind'
+  | 'connected'
+  | 'lifecycle_z'
+  | 'temporal_z';
 
 export const SCENE_LAYOUT_LABELS: Record<SceneLayoutMode, string> = {
   cluster: 'Domain Districts',
   grid: 'Uniform Grid',
   subkind: 'Kind Groups',
   connected: 'Connected Components',
+  lifecycle_z: 'Lifecycle Z-Depth',
+  temporal_z: 'Temporal Z-Diff',
 };
 
 export const SCENE_LAYOUT_DISTANCE_NOTES: Record<SceneLayoutMode, string> = {
@@ -23,10 +72,21 @@ export const SCENE_LAYOUT_DISTANCE_NOTES: Record<SceneLayoutMode, string> = {
   subkind: 'Distances group nodes by subkind across tiers; not runtime call flow.',
   connected:
     'Deterministic spring heuristic pulls linked nodes closer and packs singletons separately; illustrative only.',
+  lifecycle_z:
+    'Orthogonal X=domain columns, Y=Display/Manipulate/Truth tiers, Z=Blueprint (Z=0) -> Built Crate (Z=1) -> Live Runtime (Z=2) wall-tie wythes.',
+  temporal_z:
+    'Pins X=domain and Y=tier across the union of base and HEAD while projecting Z_base (back) -> Z_head (front) deltas.',
 };
 
 export interface ScenePositionOptions {
   edges?: AtlasEdge[];
+  findings?: BoundaryFinding[];
+  observationSource?: string;
+  gitDiffReport?: DiffBlastRadiusReport | null;
+  snapCompareReport?: SnapshotComparisonReport | null;
+  baseNodes?: AtlasNode[];
+  baseEdges?: AtlasEdge[];
+  unionNodes?: AtlasNode[];
   flatten2D?: boolean;
   pinnedPositions?:
     | ReadonlyMap<string, [number, number, number]>
@@ -48,7 +108,7 @@ export const SCENE_LENS_LABELS: Record<SceneLens, string> = {
   status: 'Boundary Status',
   contention: 'Write Contention',
   gravity: 'Fan-Out Gravity',
-  subkind: '11-Subkind Taxonomy',
+  subkind: 'Subkind Taxonomy',
   cluster: 'Domain Clusters',
   containers: 'Containers',
 };
@@ -84,8 +144,12 @@ export const ALL_NODE_SUBKINDS: Array<AtlasNode['subkind']> = [
   'table',
   'sql_function',
   'cache_store',
+  'entity_store',
+  'entitlement_spec',
   'route',
+  'ipc_handler',
   'service',
+  'ffi_shim',
   'solver',
   'cli',
   'page',
@@ -98,8 +162,12 @@ export const SUBKIND_HEX: Record<AtlasNode['subkind'], string> = {
   table: '#2dd4bf',
   sql_function: '#a3e635',
   cache_store: '#fb923c',
+  entity_store: '#34d399',
+  entitlement_spec: '#fbbf24',
   route: '#38bdf8',
+  ipc_handler: '#67e8f9',
   service: '#818cf8',
+  ffi_shim: '#fb7185',
   solver: '#e879f9',
   cli: '#facc15',
   page: '#3b82f6',
@@ -547,6 +615,39 @@ export function computeScenePositions(
     map = packGroupedDistricts(nodes, (n) => n.subkind, [...ALL_NODE_SUBKINDS], flatten2D, yForNode);
   } else if (layoutMode === 'connected') {
     map = layoutConnectedComponents(nodes, options.edges ?? [], flatten2D, yForNode);
+  } else if (layoutMode === 'lifecycle_z') {
+    map = computeLifecycleZProjection(nodes, options.edges ?? [], options.findings ?? [], {
+      observationSource: options.observationSource,
+      flatten2D,
+    }).primaryPositions;
+  } else if (layoutMode === 'temporal_z') {
+    if (
+      options.unionNodes &&
+      !options.gitDiffReport &&
+      !options.snapCompareReport &&
+      !options.baseNodes
+    ) {
+      const xyMap = computeCanonicalXYPositions(nodes, {
+        edges: options.edges,
+        unionNodes: options.unionNodes,
+        flatten2D,
+      });
+      map = new Map<string, [number, number, number]>();
+      for (const n of nodes) {
+        const xy = xyMap.get(n.id) ?? [0, 0];
+        map.set(n.id, [xy[0], xy[1], 0]);
+      }
+    } else {
+      map = computeTemporalZProjection({
+        headNodes: nodes,
+        headEdges: options.edges,
+        gitDiffReport: options.gitDiffReport,
+        snapCompareReport: options.snapCompareReport,
+        baseNodes: options.baseNodes,
+        baseEdges: options.baseEdges,
+        flatten2D,
+      }).headPositions;
+    }
   } else {
     map = packGroupedDistricts(nodes, deriveDomainCluster, null, flatten2D, yForNode);
   }

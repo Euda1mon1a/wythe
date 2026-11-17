@@ -1,15 +1,34 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, Crosshair, Maximize2, Minimize2, Play, Sparkles, X } from 'lucide-react';
+import { Bot, Copy, Crosshair, Maximize2, Minimize2, Pause, Play, Sparkles, X } from 'lucide-react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import type { AtlasEdge, AtlasNode, BoundaryFinding, EndToEndChain } from '@/api/atlas';
+import type {
+  AtlasEdge,
+  AtlasNode,
+  BoundaryFinding,
+  DiffBlastRadiusReport,
+  EndToEndChain,
+  FramingPreset,
+  SnapshotComparisonReport,
+  ZWytheSliceChoice,
+} from '@/api/atlas';
+import { copyTextToClipboard } from '@/lib/clipboard';
+import {
+  computeCameraTransition,
+  solveSemanticCameraFraming,
+  type HumanInputInterruptKind,
+  type NormalizedTimelineItem,
+  type SemanticFramingBeamEndpoint,
+} from '@/lib/wytheCameraChoreography';
 import { selectSceneGraph, type NeighborhoodHops } from '@/lib/wytheSceneGraph';
 import { createBatchedNodes, createBatchedEdges, fitGraphCamera, type SceneRenderNode, type SceneRenderEdge, type SceneRenderStats } from '@/lib/wytheSceneBatches';
 import {
   collectContainerEntrypointIds,
+  computeLifecycleZProjection,
   computeScenePositions,
+  computeTemporalZProjection,
   deriveDomainCluster,
   evaluateEdgeVisual,
   evaluateNodeVisual,
@@ -42,6 +61,10 @@ interface StratifiedScene3DProps {
   nodes: AtlasNode[];
   edges: AtlasEdge[];
   findings?: BoundaryFinding[];
+  observationSource?: string;
+  gitDiffReport?: DiffBlastRadiusReport | null;
+  snapCompareReport?: SnapshotComparisonReport | null;
+  zWytheSlice?: ZWytheSliceChoice;
   activeSlug?: string;
   sourceCommit?: string;
   selectedNodeId: string | null;
@@ -59,6 +82,31 @@ interface StratifiedScene3DProps {
   pinnedPositions?: Record<string, [number, number, number]>;
   diffOverlay?: DiffOverlaySet | null;
   activeTraceChain?: EndToEndChain | null;
+  agentCameraRequest?: {
+    seq: number;
+    preset: FramingPreset;
+    focusNodeIds: string[];
+    highlightEdgeIds: string[];
+    caption: string;
+  } | null;
+  agentFocusNodeIds?: ReadonlySet<string>;
+  agentHighlightEdgeIds?: ReadonlySet<string>;
+  agentFollowMode?: 'following' | 'paused';
+  agentLiveFollowing?: boolean;
+  agentHaltedReason?: string | null;
+  agentCaption?: string;
+  agentTimelineItems?: NormalizedTimelineItem[];
+  agentTimelineStepIndex?: number;
+  agentTimelinePlaying?: boolean;
+  agentPermalinkHash?: string;
+  hasPendingAgentCommand?: boolean;
+  onHumanInputYield?: (reason: HumanInputInterruptKind) => void;
+  onToggleAgentFollow?: () => void;
+  onRejectPendingAgentCommand?: () => void;
+  onStepAgentTimeline?: (step: -1 | 1 | { index: number }) => void;
+  onToggleAgentPlay?: () => void;
+  onExitAgentTimeline?: () => void;
+  onChangeZWytheSlice?: (slice: ZWytheSliceChoice) => void;
   onlyFlagged: boolean;
   isolateCone?: boolean;
   connectedOnly?: boolean;
@@ -167,10 +215,50 @@ function createGroupBillboardSprite(label: string, accentHex: string): THREE.Spr
   return sprite;
 }
 
+function createStructuralBeamGroup(
+  start: [number, number, number],
+  end: [number, number, number],
+  radius: number,
+  colorHex: number,
+  opacity: number,
+  collarHex?: number,
+): THREE.Group | null {
+  const a = new THREE.Vector3(...start);
+  const b = new THREE.Vector3(...end);
+  const delta = b.clone().sub(a);
+  const len = delta.length();
+  if (len < 0.05) return null;
+  const grp = new THREE.Group();
+  const mid = a.clone().addScaledVector(delta, 0.5);
+  const cylGeo = new THREE.CylinderGeometry(radius, radius, len, 8, 1);
+  const cylMat = new THREE.MeshBasicMaterial({
+    color: colorHex,
+    transparent: opacity < 1,
+    opacity,
+  });
+  const cyl = new THREE.Mesh(cylGeo, cylMat);
+  cyl.position.copy(mid);
+  cyl.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), delta.clone().normalize());
+  grp.add(cyl);
+  if (collarHex !== undefined) {
+    const ringGeo = new THREE.TorusGeometry(radius * 2.6, radius * 0.75, 8, 16);
+    const ringMat = new THREE.MeshBasicMaterial({ color: collarHex });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.position.copy(mid);
+    ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), delta.clone().normalize());
+    grp.add(ring);
+  }
+  return grp;
+}
+
 export function StratifiedScene3D({
   nodes,
   edges,
   findings = [],
+  observationSource,
+  gitDiffReport = null,
+  snapCompareReport = null,
+  zWytheSlice = 'all',
   activeSlug = 'wythe',
   sourceCommit = '',
   selectedNodeId,
@@ -188,6 +276,25 @@ export function StratifiedScene3D({
   pinnedPositions,
   diffOverlay = null,
   activeTraceChain = null,
+  agentCameraRequest = null,
+  agentFocusNodeIds,
+  agentHighlightEdgeIds,
+  agentFollowMode = 'following',
+  agentLiveFollowing = true,
+  agentHaltedReason = null,
+  agentCaption = '',
+  agentTimelineItems = [],
+  agentTimelineStepIndex = 0,
+  agentTimelinePlaying = false,
+  agentPermalinkHash = '',
+  hasPendingAgentCommand = false,
+  onHumanInputYield,
+  onToggleAgentFollow,
+  onRejectPendingAgentCommand,
+  onStepAgentTimeline,
+  onToggleAgentPlay,
+  onExitAgentTimeline,
+  onChangeZWytheSlice,
   onlyFlagged,
   isolateCone = false,
   connectedOnly = false,
@@ -239,10 +346,23 @@ export function StratifiedScene3D({
   const selectedNodeIdRef = useRef<string | null>(selectedNodeId);
   const onSelectNodeRef = useRef(onSelectNode);
   const onToggleWorkingSetNodeRef = useRef(onToggleWorkingSetNode);
+  const onHumanInputYieldRef = useRef(onHumanInputYield);
+  const agentFollowModeRef = useRef(agentFollowMode);
+  const [copiedPermalink, setCopiedPermalink] = useState(false);
+  const [showHudSubsteps, setShowHudSubsteps] = useState(false);
+  const cameraSweepRef = useRef<{
+    startMs: number;
+    fromPos: [number, number, number];
+    fromTarget: [number, number, number];
+    toPos: [number, number, number];
+    toTarget: [number, number, number];
+  } | null>(null);
 
   selectedNodeIdRef.current = selectedNodeId;
   onSelectNodeRef.current = onSelectNode;
   onToggleWorkingSetNodeRef.current = onToggleWorkingSetNode;
+  onHumanInputYieldRef.current = onHumanInputYield;
+  agentFollowModeRef.current = agentFollowMode;
 
 
   const syncCameraTelemetry = useCallback(() => {
@@ -398,21 +518,81 @@ export function StratifiedScene3D({
     () => (compactVisible ? visibleNodes : nodes),
     [compactVisible, visibleNodes, nodes],
   );
+  const lifecycleProj = useMemo(
+    () =>
+      layoutMode === 'lifecycle_z'
+        ? computeLifecycleZProjection(positionInputNodes, edges, findings, {
+            observationSource,
+            flatten2D,
+          })
+        : null,
+    [layoutMode, positionInputNodes, edges, findings, observationSource, flatten2D],
+  );
+  const temporalProj = useMemo(
+    () =>
+      layoutMode === 'temporal_z'
+        ? computeTemporalZProjection({
+            headNodes: positionInputNodes,
+            headEdges: edges,
+            gitDiffReport,
+            snapCompareReport,
+            flatten2D,
+          })
+        : null,
+    [layoutMode, positionInputNodes, edges, gitDiffReport, snapCompareReport, flatten2D],
+  );
   const positions = useMemo(
     () =>
       computeScenePositions(positionInputNodes, layoutMode, {
         edges,
+        findings,
+        observationSource,
+        gitDiffReport,
+        snapCompareReport,
         flatten2D,
         pinnedPositions,
       }),
-    [positionInputNodes, layoutMode, edges, flatten2D, pinnedPositions],
+    [
+      positionInputNodes,
+      layoutMode,
+      edges,
+      findings,
+      observationSource,
+      gitDiffReport,
+      snapCompareReport,
+      flatten2D,
+      pinnedPositions,
+    ],
   );
+  const framingPositionMap = useMemo(() => {
+    const merged = new Map<string, [number, number, number]>(positions);
+    if (lifecycleProj) {
+      for (const b of lifecycleProj.bricks) merged.set(b.instanceId, b.position);
+    }
+    if (temporalProj) {
+      for (const b of temporalProj.bricks) {
+        merged.set(b.instanceId, b.position);
+        if (!merged.has(b.node.id)) merged.set(b.node.id, b.position);
+      }
+    }
+    return merged;
+  }, [positions, lifecycleProj, temporalProj]);
+  const extraBeamEndpoints = useMemo<SemanticFramingBeamEndpoint[]>(() => {
+    const out: SemanticFramingBeamEndpoint[] = [];
+    for (const t of lifecycleProj?.wallTies ?? []) {
+      out.push({ id: t.id, start: t.start, end: t.end });
+    }
+    for (const v of temporalProj?.vectors ?? []) {
+      out.push({ id: v.id, start: v.start, end: v.end });
+    }
+    return out;
+  }, [lifecycleProj, temporalProj]);
   const fitSignature = useMemo(
     () =>
       `${nodes.length}|${layoutMode}|${compactVisible ? 1 : 0}|${flatten2D ? 1 : 0}|${
-        compactVisible ? visibleNodeIdList.join(',') : ''
-      }`,
-    [nodes.length, layoutMode, compactVisible, flatten2D, visibleNodeIdList],
+        temporalProj?.hasDiff ? temporalProj.label : ''
+      }|${compactVisible ? visibleNodeIdList.join(',') : ''}`,
+    [nodes.length, layoutMode, compactVisible, flatten2D, temporalProj, visibleNodeIdList],
   );
 
   const nodesById = useMemo(() => {
@@ -440,17 +620,22 @@ export function StratifiedScene3D({
 
   useEffect(() => {
     if (!stepRequest) return;
+    cameraSweepRef.current = null;
     stepSelection(stepRequest.delta);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stepRequest?.seq]);
 
   useEffect(() => {
     if (resetCameraRequest > 0) {
+      cameraSweepRef.current = null;
+      onHumanInputYieldRef.current?.('keydown_nav');
       setFitSerial((s) => s + 1);
     }
   }, [resetCameraRequest]);
 
   const centerCameraOnSelected = useCallback(() => {
+    cameraSweepRef.current = null;
+    onHumanInputYieldRef.current?.('pointerdown');
     if (!selectedNodeId || !positions.has(selectedNodeId)) return;
     const cam = cameraRef.current;
     const ctrl = controlsRef.current;
@@ -598,13 +783,29 @@ export function StratifiedScene3D({
 
     let downX = 0;
     let downY = 0;
+    let pointerDownActive = false;
     const onPointerDown = (ev: PointerEvent) => {
       downX = ev.clientX;
       downY = ev.clientY;
+      pointerDownActive = true;
+      cameraSweepRef.current = null;
+      onHumanInputYieldRef.current?.('pointerdown');
+    };
+    const onPointerUp = () => {
+      pointerDownActive = false;
+    };
+    const onWheel = () => {
+      cameraSweepRef.current = null;
+      onHumanInputYieldRef.current?.('wheel');
+    };
+    const onTouchStart = () => {
+      cameraSweepRef.current = null;
+      onHumanInputYieldRef.current?.('touchstart');
     };
 
     const onClick = (ev: MouseEvent) => {
       if (Math.hypot(ev.clientX - downX, ev.clientY - downY) > 5) {
+        onHumanInputYieldRef.current?.('pointerdrag');
         return;
       }
       const hit = hitTest(ev as unknown as PointerEvent);
@@ -621,18 +822,67 @@ export function StratifiedScene3D({
       }
     };
 
+    const onMoveWithYield = (ev: PointerEvent) => {
+      if (pointerDownActive && Math.hypot(ev.clientX - downX, ev.clientY - downY) > 5) {
+        cameraSweepRef.current = null;
+        onHumanInputYieldRef.current?.('pointerdrag');
+      }
+      onMove(ev);
+    };
+
+    const onCanvasKeyDown = (ev: KeyboardEvent) => {
+      if (
+        ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', '+', '-', '='].includes(
+          ev.key,
+        )
+      ) {
+        cameraSweepRef.current = null;
+        onHumanInputYieldRef.current?.('keydown_nav');
+      }
+    };
+
     canvas.addEventListener('pointerdown', onPointerDown);
-    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointermove', onMoveWithYield);
+    canvas.addEventListener('wheel', onWheel, { passive: true });
+    canvas.addEventListener('touchstart', onTouchStart, { passive: true });
     canvas.addEventListener('click', onClick);
+    container.addEventListener('keydown', onCanvasKeyDown);
 
     let raf = 0;
     const tStart = performance.now();
     const animate = () => {
       raf = requestAnimationFrame(animate);
-      const elapsed = (performance.now() - tStart) * 0.001;
+      const nowMs = performance.now();
+      const elapsed = (nowMs - tStart) * 0.001;
       if (!prefersReducedMotion && atomicMaterialsRef.current.length > 0) {
         for (const m of atomicMaterialsRef.current) {
           m.uniforms.uTime.value = elapsed;
+        }
+      }
+      const sweep = cameraSweepRef.current;
+      if (sweep && agentFollowModeRef.current !== 'following') {
+        cameraSweepRef.current = null;
+      } else if (sweep) {
+        const liveReducedMotion =
+          prefersReducedMotion ||
+          (typeof window !== 'undefined' &&
+            window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+        const step = computeCameraTransition({
+          fromPos: sweep.fromPos,
+          fromTarget: sweep.fromTarget,
+          toPos: sweep.toPos,
+          toTarget: sweep.toTarget,
+          prefersReducedMotion: liveReducedMotion,
+          progress01: (nowMs - sweep.startMs) / 480,
+        });
+        camera.position.set(...step.position);
+        controls.target.set(...step.target);
+        if (step.done) {
+          cameraSweepRef.current = null;
+          syncCameraTelemetry();
+        } else {
+          lodDirtyRef.current = true;
         }
       }
       const wps = traceWaypointsRef.current;
@@ -669,8 +919,12 @@ export function StratifiedScene3D({
       lastFitRef.current = null;
       controls.removeEventListener('change', syncCameraTelemetry);
       canvas.removeEventListener('pointerdown', onPointerDown);
-      canvas.removeEventListener('pointermove', onMove);
+      canvas.removeEventListener('pointerup', onPointerUp);
+      canvas.removeEventListener('pointermove', onMoveWithYield);
+      canvas.removeEventListener('wheel', onWheel);
+      canvas.removeEventListener('touchstart', onTouchStart);
       canvas.removeEventListener('click', onClick);
+      container.removeEventListener('keydown', onCanvasKeyDown);
       disposeGroupContents(contentGroup);
       packetCore.geometry.dispose();
       (packetCore.material as THREE.Material).dispose();
@@ -685,6 +939,19 @@ export function StratifiedScene3D({
   const lastFitRef = useRef<{ signature: string; serial: number } | null>(null);
   useEffect(() => {
     if (lastFitRef.current?.signature === fitSignature && lastFitRef.current?.serial === fitSerial) return;
+    const isManualReset =
+      lastFitRef.current !== null && lastFitRef.current.serial !== fitSerial;
+    if (
+      !isManualReset &&
+      agentCameraRequest &&
+      agentFollowMode === 'following' &&
+      (agentCameraRequest.focusNodeIds.length > 0 ||
+        agentCameraRequest.highlightEdgeIds.length > 0 ||
+        agentCameraRequest.preset !== 'iso_overview')
+    ) {
+      lastFitRef.current = { signature: fitSignature, serial: fitSerial };
+      return;
+    }
     const cam = cameraRef.current;
     const ctrl = controlsRef.current;
     if (!cam || !ctrl) return;
@@ -693,12 +960,98 @@ export function StratifiedScene3D({
       const position = positions.get(node.id);
       return position ? [position] : [];
     });
+    for (const p of framingPositionMap.values()) {
+      points.push(p);
+    }
+    cameraSweepRef.current = null;
     ctrl.target.copy(fitGraphCamera(cam, points));
     ctrl.maxDistance = cam.far / 2;
     ctrl.update();
     lastFitRef.current = { signature: fitSignature, serial: fitSerial };
     syncCameraTelemetry();
-  }, [fitSerial, fitSignature, positions, visibleNodes, nodes, syncCameraTelemetry]);
+  }, [
+    fitSerial,
+    fitSignature,
+    positions,
+    framingPositionMap,
+    visibleNodes,
+    nodes,
+    agentCameraRequest,
+    agentFollowMode,
+    syncCameraTelemetry,
+  ]);
+
+  // 2b. Semantic Agent Camera Choreography (#86): bounding-frustum + slab/column occlusion solver
+  const appliedAgentSeqRef = useRef<{ seq: number; posCount: number } | null>(null);
+  useEffect(() => {
+    if (!agentCameraRequest || agentFollowMode !== 'following') {
+      cameraSweepRef.current = null;
+      return;
+    }
+    if (
+      appliedAgentSeqRef.current?.seq === agentCameraRequest.seq &&
+      appliedAgentSeqRef.current?.posCount === framingPositionMap.size
+    ) {
+      return;
+    }
+    const cam = cameraRef.current;
+    const ctrl = controlsRef.current;
+    if (!cam || !ctrl || framingPositionMap.size === 0) return;
+
+    const framing = solveSemanticCameraFraming({
+      preset: agentCameraRequest.preset,
+      focusNodeIds: agentCameraRequest.focusNodeIds,
+      highlightEdgeIds: agentCameraRequest.highlightEdgeIds,
+      positions: framingPositionMap,
+      allEdges: visibleEdges,
+      extraBeamEndpoints,
+      fovDeg: cam.fov,
+      aspect: cam.aspect,
+      flatten2D,
+    });
+    cam.far = Math.max(520, framing.distance + framing.boundingRadius * 8);
+    cam.updateProjectionMatrix();
+    ctrl.maxDistance = cam.far / 2;
+
+    const reducedMotion =
+      typeof window !== 'undefined' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reducedMotion) {
+      cameraSweepRef.current = null;
+      const cut = computeCameraTransition({
+        fromPos: [cam.position.x, cam.position.y, cam.position.z],
+        fromTarget: [ctrl.target.x, ctrl.target.y, ctrl.target.z],
+        toPos: framing.cameraPosition,
+        toTarget: framing.cameraTarget,
+        prefersReducedMotion: true,
+        progress01: 1,
+      });
+      cam.position.set(...cut.position);
+      ctrl.target.set(...cut.target);
+      ctrl.update();
+      syncCameraTelemetry();
+    } else {
+      cameraSweepRef.current = {
+        startMs: performance.now(),
+        fromPos: [cam.position.x, cam.position.y, cam.position.z],
+        fromTarget: [ctrl.target.x, ctrl.target.y, ctrl.target.z],
+        toPos: framing.cameraPosition,
+        toTarget: framing.cameraTarget,
+      };
+    }
+    appliedAgentSeqRef.current = {
+      seq: agentCameraRequest.seq,
+      posCount: framingPositionMap.size,
+    };
+  }, [
+    agentCameraRequest,
+    agentFollowMode,
+    framingPositionMap,
+    visibleEdges,
+    extraBeamEndpoints,
+    flatten2D,
+    syncCameraTelemetry,
+  ]);
 
   // 3. Scene-Content Sync: updates meshes/lines/planes WITHOUT moving camera or OrbitControls!
   useEffect(() => {
@@ -758,54 +1111,263 @@ export function StratifiedScene3D({
     }
 
     const renderNodes: SceneRenderNode[] = [];
-    visibleNodes.forEach((n) => {
-      const pos = positions.get(n.id);
-      if (!pos) return;
+    const hasAgentFocus = Boolean(agentFocusNodeIds && agentFocusNodeIds.size > 0);
+    const pushNodeRecord = (
+      n: AtlasNode,
+      pos: [number, number, number],
+      overrides?: {
+        barHex?: string;
+        inquiryHex?: string;
+        hollow?: boolean;
+        flagged?: boolean;
+        scaleMult?: number;
+        sliceDimmed?: boolean;
+      },
+    ) => {
       const isSelected = n.id === selectedNodeId;
+      const inAgentFocus = agentFocusNodeIds?.has(n.id) ?? false;
       const inTrace = traceHopSet.has(n.id);
-      const inCone = (selectedNodeId !== null && coneNodeIds.has(n.id)) || inTrace;
+      const inCone = (selectedNodeId !== null && coneNodeIds.has(n.id)) || inTrace || inAgentFocus;
       const vis = evaluateNodeVisual({
-        node: n, lens, palette: activePalette, degree: degreeByNode.get(n.id) ?? 0,
-        guardedTableIds, mutatorNodeIds, diffOverlay, containerEntrypointIds,
+        node: n,
+        lens,
+        palette: activePalette,
+        degree: degreeByNode.get(n.id) ?? 0,
+        guardedTableIds,
+        mutatorNodeIds,
+        diffOverlay,
+        containerEntrypointIds,
       });
-      const dimmed = vis.forceDim ||
-        (traceHopIds.length > 0 && !inTrace && !isSelected) ||
-        (selectedNodeId !== null && !inCone && traceHopIds.length === 0);
-      const mult = isSelected ? 1.58 : inTrace ? 1.38 : inCone ? 1.18 : 1.0;
+      const dimmed =
+        Boolean(overrides?.sliceDimmed) ||
+        vis.forceDim ||
+        (hasAgentFocus && !inAgentFocus && !isSelected && !inTrace) ||
+        (traceHopIds.length > 0 && !inTrace && !isSelected && !inAgentFocus) ||
+        (selectedNodeId !== null && !inCone && traceHopIds.length === 0 && !hasAgentFocus);
+      const mult =
+        (isSelected ? 1.58 : inAgentFocus ? 1.42 : inTrace ? 1.38 : inCone ? 1.18 : 1.0) *
+        (overrides?.scaleMult ?? 1.0);
       renderNodes.push({
-        node: n, position: pos, scale: vis.scale * mult,
-        style: { barColor: vis.barHex, inquiryColor: vis.inquiryHex, hollow: vis.hollow,
-          flagged: vis.flagged, dimmed, selected: isSelected || inTrace, inCone, phase: 0 },
+        node: n,
+        position: pos,
+        scale: vis.scale * mult,
+        style: {
+          barColor: overrides?.barHex ?? vis.barHex,
+          inquiryColor: overrides?.inquiryHex ?? vis.inquiryHex,
+          hollow: overrides?.hollow ?? vis.hollow,
+          flagged: overrides?.flagged ?? vis.flagged,
+          dimmed,
+          selected: isSelected || inTrace || inAgentFocus,
+          inCone,
+          phase: 0,
+        },
       });
-    });
+    };
+
+    if (layoutMode === 'lifecycle_z' && lifecycleProj) {
+      const wytheMeta: Record<0 | 1 | 2, { label: string; hex: string; sliceKey: ZWytheSliceChoice }> = {
+        0: { label: 'Z=0 SOURCE BLUEPRINT', hex: activePalette.display, sliceKey: 'z0_blueprint' },
+        1: { label: 'Z=1 BUILT CRATE', hex: '#22d3ee', sliceKey: 'z1_built' },
+        2: { label: 'Z=2 LIVE RUNTIME', hex: '#34d399', sliceKey: 'z2_runtime' },
+      };
+      const curtainHeight = flatten2D ? 16 : 46;
+      for (const w of lifecycleProj.activeWythes) {
+        const wz = lifecycleProj.wytheZ.get(w) ?? 0;
+        const wm = wytheMeta[w];
+        const vPlane = new THREE.Mesh(
+          new THREE.PlaneGeometry(planeWidth, curtainHeight),
+          new THREE.MeshBasicMaterial({
+            color: new THREE.Color(wm.hex),
+            transparent: true,
+            opacity: polarity === 'light' ? 0.045 : 0.028,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          }),
+        );
+        vPlane.position.set(planeCenter.x, flatten2D ? 0 : 0, wz);
+        contentGroup.add(vPlane);
+        const banner = createGroupBillboardSprite(wm.label, wm.hex);
+        if (banner) {
+          banner.position.set(planeCenter.x, flatten2D ? 7.5 : 24.5, wz);
+          contentGroup.add(banner);
+        }
+      }
+      for (const brick of lifecycleProj.bricks) {
+        if (!visibleNodeIds.has(brick.node.id)) continue;
+        const targetSlice = wytheMeta[brick.wythe].sliceKey;
+        const sliceDimmed =
+          zWytheSlice !== 'all' &&
+          zWytheSlice !== 'z_base' &&
+          zWytheSlice !== 'z_head' &&
+          zWytheSlice !== targetSlice;
+        pushNodeRecord(brick.node, brick.position, {
+          barHex:
+            brick.driftStatus === 'drift'
+              ? '#f43f5e'
+              : brick.isReplica
+                ? brick.wythe === 2
+                  ? '#34d399'
+                  : '#22d3ee'
+                : undefined,
+          hollow: brick.isReplica && brick.driftStatus === 'drift' ? true : undefined,
+          flagged: brick.driftStatus === 'drift' ? true : undefined,
+          scaleMult: brick.driftStatus === 'drift' ? 1.22 : 1.0,
+          sliceDimmed,
+        });
+      }
+      for (const tie of lifecycleProj.wallTies) {
+        if (!visibleNodeIds.has(tie.sourceNodeId) && !visibleNodeIds.has(tie.targetNodeId)) {
+          continue;
+        }
+        const tieHighlighted =
+          agentHighlightEdgeIds?.has(tie.id) ||
+          selectedNodeId === tie.sourceNodeId ||
+          selectedNodeId === tie.targetNodeId;
+        const beam = createStructuralBeamGroup(
+          tie.start,
+          tie.end,
+          tie.status === 'drift' ? 0.24 : 0.13,
+          tie.status === 'drift' ? 0xf43f5e : 0x14b8a6,
+          tieHighlighted ? 0.96 : tie.status === 'drift' ? 0.86 : 0.52,
+          tie.status === 'drift' ? 0xfacc15 : undefined,
+        );
+        if (beam) contentGroup.add(beam);
+      }
+    } else if (layoutMode === 'temporal_z' && temporalProj && temporalProj.hasDiff) {
+      const curtainHeight = flatten2D ? 16 : 46;
+      for (const [sz, sLabel, sHex] of [
+        [temporalProj.zBase, 'Z_BASE BEFORE-IMAGE', '#f59e0b'],
+        [temporalProj.zHead, 'Z_HEAD CURRENT', '#38bdf8'],
+      ] as const) {
+        const vPlane = new THREE.Mesh(
+          new THREE.PlaneGeometry(planeWidth, curtainHeight),
+          new THREE.MeshBasicMaterial({
+            color: new THREE.Color(sHex),
+            transparent: true,
+            opacity: polarity === 'light' ? 0.045 : 0.028,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          }),
+        );
+        vPlane.position.set(planeCenter.x, 0, sz);
+        contentGroup.add(vPlane);
+        const banner = createGroupBillboardSprite(sLabel, sHex);
+        if (banner) {
+          banner.position.set(planeCenter.x, flatten2D ? 7.5 : 24.5, sz);
+          contentGroup.add(banner);
+        }
+      }
+      for (const brick of temporalProj.bricks) {
+        if (brick.changeState !== 'removed' && !visibleNodeIds.has(brick.node.id)) continue;
+        const sliceDimmed =
+          (zWytheSlice === 'z_base' && brick.slice !== 'z_base') ||
+          (zWytheSlice === 'z_head' && brick.slice !== 'z_head');
+        pushNodeRecord(brick.node, brick.position, {
+          barHex:
+            brick.changeState === 'removed'
+              ? '#fb923c'
+              : brick.changeState === 'new_finding'
+                ? '#f43f5e'
+                : brick.changeState === 'added'
+                  ? '#34d399'
+                  : brick.changeState === 'touched'
+                    ? '#facc15'
+                    : brick.changeState === 'impacted'
+                      ? '#38bdf8'
+                      : undefined,
+          hollow: brick.changeState === 'removed' ? true : undefined,
+          flagged:
+            brick.changeState === 'new_finding' || brick.changeState === 'removed'
+              ? true
+              : undefined,
+          scaleMult:
+            brick.changeState === 'new_finding'
+              ? 1.28
+              : brick.changeState === 'added' || brick.changeState === 'removed'
+                ? 1.18
+                : brick.slice === 'z_base'
+                  ? 0.88
+                  : 1.0,
+          sliceDimmed,
+        });
+      }
+      const continuityLines: SceneRenderEdge[] = [];
+      for (const vec of temporalProj.vectors) {
+        if (vec.kind === 'unchanged_continuity') {
+          if (visibleNodeIds.has(vec.sourceNodeId)) {
+            continuityLines.push({
+              start: vec.start,
+              end: vec.end,
+              color: 0x475569,
+              opacity: 0.16,
+              pattern: 'dashed',
+            });
+          }
+          continue;
+        }
+        if (vec.kind === 'removed_severed') {
+          continuityLines.push({
+            start: vec.start,
+            end: vec.end,
+            color: 0xf97316,
+            opacity: 0.92,
+            pattern: 'broken_gap',
+          });
+          continue;
+        }
+        const beam = createStructuralBeamGroup(
+          vec.start,
+          vec.end,
+          vec.kind === 'new_finding_delta' ? 0.24 : 0.16,
+          vec.kind === 'new_finding_delta' ? 0xf43f5e : 0x34d399,
+          0.88,
+          vec.kind === 'new_finding_delta' ? 0xfacc15 : undefined,
+        );
+        if (beam) contentGroup.add(beam);
+      }
+      if (continuityLines.length > 0) {
+        contentGroup.add(createBatchedEdges(continuityLines));
+      }
+    } else {
+      visibleNodes.forEach((n) => {
+        const pos = positions.get(n.id);
+        if (pos) pushNodeRecord(n, pos);
+      });
+    }
+
     const nodeBatch = createBatchedNodes(renderNodes, polygonMode);
     contentGroup.add(nodeBatch.group);
     nodeBatchRef.current = nodeBatch;
     atomicMaterialsRef.current = nodeBatch.atomicMaterials;
 
-    // Edges with 8-EdgeKind + VerificationState styling
+    // Edges with 8-EdgeKind + VerificationState styling (intra-wythe Z=0 / Z_head)
     const renderEdges: SceneRenderEdge[] = [];
     for (const e of visibleEdges) {
       const p1 = positions.get(e.source_id);
       const p2 = positions.get(e.target_id);
       if (!p1 || !p2) continue;
+      if (layoutMode === 'lifecycle_z' && Math.abs(p1[2] - p2[2]) > 1) continue;
       const edgeVis = evaluateEdgeVisual(e, edgeFilter);
       if (!edgeVis.visible) continue;
 
+      const isAgentEdge = agentHighlightEdgeIds?.has(e.id) ?? false;
       const inConeEdge =
+        isAgentEdge ||
         (selectedNodeId !== null && coneNodeIds.has(e.source_id) && coneNodeIds.has(e.target_id)) ||
         (traceHopSet.has(e.source_id) && traceHopSet.has(e.target_id));
 
       const isCrossTier = Math.abs(p1[1] - p2[1]) > 4;
-      const opacity = inConeEdge
-        ? 0.94
-        : selectedNodeId || traceHopIds.length > 0
-          ? 0.08
-          : edgeFilter !== 'all'
-            ? 0.68
-            : isCrossTier
-              ? 0.36
-              : 0.18;
+      const opacity = isAgentEdge
+        ? 0.98
+        : inConeEdge
+          ? 0.94
+          : selectedNodeId || traceHopIds.length > 0 || hasAgentFocus
+            ? 0.08
+            : edgeFilter !== 'all'
+              ? 0.68
+              : isCrossTier
+                ? 0.36
+                : 0.18;
       renderEdges.push({
         start: p1,
         end: p2,
@@ -890,6 +1452,13 @@ export function StratifiedScene3D({
     effectiveGroupBy,
     preCollapseGraph.nodes,
     groupSummaries,
+    layoutMode,
+    lifecycleProj,
+    temporalProj,
+    zWytheSlice,
+    agentFocusNodeIds,
+    agentHighlightEdgeIds,
+    containerEntrypointIds,
     syncCameraTelemetry,
   ]);
 
@@ -1074,15 +1643,23 @@ export function StratifiedScene3D({
         onKeyDown={(e) => {
           if (e.key === 'Escape') {
             e.preventDefault();
+            cameraSweepRef.current = null;
+            onHumanInputYield?.('keydown_nav');
             onSelectNode(null);
           } else if (e.key === '[' || e.key === 'ArrowLeft') {
             e.preventDefault();
+            cameraSweepRef.current = null;
+            onHumanInputYield?.('keydown_nav');
             stepSelection(-1);
           } else if (e.key === ']' || e.key === 'ArrowRight') {
             e.preventDefault();
+            cameraSweepRef.current = null;
+            onHumanInputYield?.('keydown_nav');
             stepSelection(1);
           } else if (e.key.toLowerCase() === 'm' && selectedNodeId) {
             e.preventDefault();
+            cameraSweepRef.current = null;
+            onHumanInputYield?.('keydown_nav');
             centerCameraOnSelected();
           } else if (e.key.toLowerCase() === 'w') {
             e.preventDefault();
@@ -1220,9 +1797,236 @@ export function StratifiedScene3D({
         )}
       </div>
 
-      {/* Animated Request Packet Trace Narrator HUD */}
-      {activeTraceChain && traceHopIds.length > 0 && (
-        <div className="absolute right-4 top-4 z-10 max-w-md border border-amber-400/50 bg-slate-950/95 p-3 font-mono text-xs shadow-2xl backdrop-blur">
+      {/* Agent Co-Navigation HUD Pill & Tour / Chronicle Timeline Scrubber (#86 / #88) */}
+      <div className="absolute right-4 top-4 z-10 flex max-w-md flex-col items-end gap-2 font-mono text-xs">
+        {onToggleAgentFollow && (
+          <div className="flex flex-wrap items-center gap-1.5 border border-slate-700 bg-slate-950/95 px-2.5 py-1.5 shadow-xl backdrop-blur">
+            <button
+              type="button"
+              aria-pressed={agentFollowMode === 'following'}
+              onClick={onToggleAgentFollow}
+              className={`min-h-6 border px-2 py-0.5 text-[11px] font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
+                agentFollowMode === 'following'
+                  ? 'border-teal-400/60 bg-teal-500/20 text-teal-200'
+                  : 'border-amber-400/80 bg-amber-950/90 text-amber-100'
+              }`}
+            >
+              {agentFollowMode === 'following'
+                ? 'Follow Agent Camera: Following'
+                : 'Agent Follow Paused — Resume Follow'}
+            </button>
+            {agentFollowMode === 'paused' && hasPendingAgentCommand && onRejectPendingAgentCommand && (
+              <button
+                type="button"
+                onClick={onRejectPendingAgentCommand}
+                aria-label="Reject queued agent camera command"
+                className="min-h-6 border border-rose-500/45 bg-rose-950/75 px-2 py-0.5 text-[10px] text-rose-200 hover:border-rose-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+              >
+                Reject Queued
+              </button>
+            )}
+            {agentPermalinkHash && (
+              <button
+                type="button"
+                aria-label="Copy canonical viewport permalink URL"
+                onClick={() => {
+                  const fullUrl =
+                    typeof window !== 'undefined'
+                      ? `${window.location.origin}${window.location.pathname}${agentPermalinkHash}`
+                      : agentPermalinkHash;
+                  void copyTextToClipboard(fullUrl).then((ok) => {
+                    if (ok) {
+                      setCopiedPermalink(true);
+                      window.setTimeout(() => setCopiedPermalink(false), 1800);
+                    }
+                  });
+                }}
+                className="flex min-h-6 items-center gap-1 border border-sky-500/40 bg-sky-950/60 px-2 py-0.5 text-[11px] text-sky-200 hover:border-sky-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+              >
+                <Copy className="h-3 w-3" />
+                {copiedPermalink ? 'Copied Link' : 'Permalink'}
+              </button>
+            )}
+          </div>
+        )}
+
+        {(layoutMode === 'lifecycle_z' || layoutMode === 'temporal_z') && onChangeZWytheSlice && (
+          <div
+            role="group"
+            aria-label="Filter Z-axis wythe or snapshot slice"
+            className="flex flex-wrap items-center gap-1 border border-slate-700 bg-slate-950/95 px-2 py-1 text-[10px] backdrop-blur"
+          >
+            {(layoutMode === 'lifecycle_z'
+              ? ([
+                  ['all', 'All Z'],
+                  ['z0_blueprint', 'Z=0 Blueprint'],
+                  ['z1_built', 'Z=1 Crate'],
+                  ['z2_runtime', 'Z=2 Runtime'],
+                ] as const)
+              : ([
+                  ['all', 'Both Slices'],
+                  ['z_base', 'Z_base'],
+                  ['z_head', 'Z_head'],
+                ] as const)
+            ).map(([sKey, sLabel]) => (
+              <button
+                key={sKey}
+                type="button"
+                aria-pressed={zWytheSlice === sKey}
+                onClick={() => onChangeZWytheSlice(sKey)}
+                className={`min-h-6 border px-1.5 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
+                  zWytheSlice === sKey
+                    ? 'border-teal-400/60 bg-teal-500/20 text-teal-200'
+                    : 'border-slate-700 bg-slate-900 text-slate-300 hover:text-slate-100'
+                }`}
+              >
+                {sLabel}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {(agentCaption || agentHaltedReason || agentTimelineItems.length > 0) && (
+          <div className="w-full border border-teal-500/45 bg-slate-950/95 p-2.5 text-slate-200 shadow-2xl backdrop-blur">
+            {agentCaption && (
+              <div aria-live="polite" className="font-sans text-[11px] leading-snug text-slate-100">
+                {agentCaption}
+              </div>
+            )}
+            {agentHaltedReason && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="mt-1.5 border border-rose-500/50 bg-rose-950/60 px-2 py-1 font-mono text-[10px] text-rose-200"
+              >
+                Live Follow Halted: {agentHaltedReason}
+              </div>
+            )}
+            {agentTimelineItems.length > 0 && (() => {
+              const curStep =
+                agentTimelineItems[
+                  Math.min(agentTimelineStepIndex, agentTimelineItems.length - 1)
+                ];
+              const isLiveFollowing = agentLiveFollowing && agentFollowMode === 'following';
+              return (
+                <div className="mt-2 space-y-1.5 border-t border-slate-800 pt-2 text-[11px]">
+                  <div className="flex flex-wrap items-center justify-between gap-1">
+                    <span className="truncate font-semibold text-teal-300">
+                      {curStep.kind === 'chronicle' ? 'Chronicle' : 'Tour'}{' '}
+                      {curStep.index + 1}/{agentTimelineItems.length}: {curStep.title}
+                      {curStep.tier ? ` (${curStep.tier})` : ''}
+                      {curStep.kind === 'chronicle' ? ` [${curStep.status}]` : ''}
+                    </span>
+                    {curStep.kind === 'chronicle' && onToggleAgentFollow && (
+                      <button
+                        type="button"
+                        aria-pressed={isLiveFollowing}
+                        onClick={onToggleAgentFollow}
+                        className={`min-h-6 border px-1.5 py-0.5 text-[10px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
+                          isLiveFollowing
+                            ? 'border-teal-400/60 bg-teal-500/20 text-teal-200'
+                            : 'border-amber-400/70 bg-amber-950/80 text-amber-200'
+                        }`}
+                      >
+                        Live Follow: {isLiveFollowing ? 'Following' : 'Paused — Resume Follow'}
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1">
+                    {onStepAgentTimeline && (
+                      <button
+                        type="button"
+                        onClick={() => onStepAgentTimeline({ index: 0 })}
+                        aria-label="First tour or chronicle step"
+                        className="min-h-6 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                      >
+                        |&lt;
+                      </button>
+                    )}
+                    {onStepAgentTimeline && (
+                      <button
+                        type="button"
+                        onClick={() => onStepAgentTimeline(-1)}
+                        aria-label="Previous tour or chronicle step"
+                        className="min-h-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                      >
+                        Prev
+                      </button>
+                    )}
+                    {onToggleAgentPlay && (
+                      <button
+                        type="button"
+                        onClick={onToggleAgentPlay}
+                        aria-label={agentTimelinePlaying ? 'Pause walkthrough' : 'Play walkthrough'}
+                        className="flex min-h-6 items-center gap-1 border border-teal-500/40 bg-teal-950/70 px-2 py-0.5 text-teal-200 hover:border-teal-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                      >
+                        {agentTimelinePlaying ? (
+                          <Pause className="h-3 w-3" />
+                        ) : (
+                          <Play className="h-3 w-3" />
+                        )}
+                        {agentTimelinePlaying ? 'Pause' : 'Play'}
+                      </button>
+                    )}
+                    {onStepAgentTimeline && (
+                      <button
+                        type="button"
+                        onClick={() => onStepAgentTimeline(1)}
+                        aria-label="Next tour or chronicle step"
+                        className="min-h-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                      >
+                        Next
+                      </button>
+                    )}
+                    {onStepAgentTimeline && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onStepAgentTimeline({ index: Math.max(0, agentTimelineItems.length - 1) })
+                        }
+                        aria-label="Last tour or chronicle step"
+                        className="min-h-6 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                      >
+                        &gt;|
+                      </button>
+                    )}
+                    {curStep.substeps.length > 0 && (
+                      <button
+                        type="button"
+                        aria-expanded={showHudSubsteps}
+                        onClick={() => setShowHudSubsteps((v) => !v)}
+                        className="min-h-6 border border-sky-500/40 bg-sky-950/60 px-2 py-0.5 text-sky-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                      >
+                        {showHudSubsteps ? 'Hide' : 'Substeps'} ({curStep.substeps.length})
+                      </button>
+                    )}
+                    {onExitAgentTimeline && (
+                      <button
+                        type="button"
+                        onClick={onExitAgentTimeline}
+                        aria-label="Exit tour or chronicle playback"
+                        className="min-h-6 border border-rose-500/40 bg-rose-950/70 px-2 py-0.5 text-rose-200 hover:border-rose-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                      >
+                        Exit
+                      </button>
+                    )}
+                  </div>
+                  {showHudSubsteps && curStep.substeps.length > 0 && (
+                    <ol className="max-h-24 list-decimal space-y-0.5 overflow-y-auto pl-4 font-sans text-[10px] text-slate-300">
+                      {curStep.substeps.map((sub, idx) => (
+                        <li key={idx}>{sub}</li>
+                      ))}
+                    </ol>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* Animated Request Packet Trace Narrator HUD */}
+        {activeTraceChain && traceHopIds.length > 0 && (
+          <div className="max-w-md border border-amber-400/50 bg-slate-950/95 p-3 font-mono text-xs shadow-2xl backdrop-blur">
           <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-1.5">
             <span className="flex items-center gap-1.5 font-semibold text-amber-300">
               <Play className="h-3.5 w-3.5 fill-amber-300" />
@@ -1267,6 +2071,7 @@ export function StratifiedScene3D({
           </div>
         </div>
       )}
+      </div>
 
       {/* Camera / Keyboard / Legend Bar */}
       <div className="absolute bottom-3 left-4 right-4 flex flex-wrap items-center justify-between gap-3 text-xs">
@@ -1407,7 +2212,11 @@ export function StratifiedScene3D({
             )}
           <button
             type="button"
-            onClick={() => stepSelection(-1)}
+            onClick={() => {
+              cameraSweepRef.current = null;
+              onHumanInputYieldRef.current?.('pointerdown');
+              stepSelection(-1);
+            }}
             aria-label="Select previous node in 3D atlas"
             className="border border-slate-700 bg-slate-900/90 px-2.5 py-1 font-mono text-xs text-slate-200 hover:border-teal-400 hover:text-teal-300"
           >
@@ -1415,7 +2224,11 @@ export function StratifiedScene3D({
           </button>
           <button
             type="button"
-            onClick={() => stepSelection(1)}
+            onClick={() => {
+              cameraSweepRef.current = null;
+              onHumanInputYieldRef.current?.('pointerdown');
+              stepSelection(1);
+            }}
             aria-label="Select next node in 3D atlas"
             className="border border-slate-700 bg-slate-900/90 px-2.5 py-1 font-mono text-xs text-slate-200 hover:border-teal-400 hover:text-teal-300"
           >
@@ -1423,7 +2236,11 @@ export function StratifiedScene3D({
           </button>
           <button
             type="button"
-            onClick={() => setFitSerial((s) => s + 1)}
+            onClick={() => {
+              cameraSweepRef.current = null;
+              onHumanInputYieldRef.current?.('pointerdown');
+              setFitSerial((s) => s + 1);
+            }}
             className="border border-slate-700 bg-slate-900/90 px-2.5 py-1 font-mono text-xs text-slate-200 hover:border-teal-400 hover:text-teal-300"
           >
             Fit view ({visibleNodes.length} nodes)

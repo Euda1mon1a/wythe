@@ -1,4 +1,4 @@
-# Wythe User Guide (`v0.2.2`)
+# Wythe User Guide (`v0.2.3`)
 
 **Wythe** (**Why `?` → Therefore `∴`**) audits full-stack repositories around three architectural invariants:
 
@@ -58,11 +58,13 @@ Use the two control rows above the canvas in **3D Stratified Atlas** to narrow t
 Filters alone preserve overview coordinates so nodes do not jump unexpectedly when you toggle checkboxes. When you want to pull the remaining nodes tightly together:
 
 - **`Compact visible` (`Compacted ✓`):** Repacks *only* the currently visible/filtered/cone/working-set nodes into tight bounding boxes and re-fits the camera. Toggle it off to return to stable global coordinates.
-- **`Layout [L]`:** Cycles through 4 deterministic arrangements:
+- **`Layout [L]`:** Cycles through 6 deterministic arrangements:
   1. `Domain Districts` (`cluster`): Groups nodes by inferred domain cluster across tiers.
   2. `Uniform Grid` (`grid`): Alphabetical rows per stratum.
   3. `Role Subkinds` (`subkind`): Packs tables, SQL guards, routes, services, pages, hooks, and components into role districts.
   4. `Linked Components` (`connected`): Uses a deterministic BFS/spring heuristic to pull edge-connected nodes tightly together and packs disconnected singletons separately *(illustrative proximity, not runtime call weighting)*.
+  5. `Lifecycle Z-Depth` (`lifecycle_z`): Pins canonical `(X, Y)` coordinates (`X` = domain column, `Y` = `Display / Manipulate / Truth` tier) across `Z=0` (`Source Blueprint`), `Z=1` (`Built / Sealed Crate`), and `Z=2` (`Live Runtime`), collapsing empty `Z` planes and rendering intact vs. drift wall-tie beams (`TRUTH-002`, `TRUTH-005`, `MANIP-005`).
+  6. `Temporal Z-Diff` (`temporal_z`): Computes union `(X, Y)` coordinates across `Z_base` (including ghosted removed before-image anchors) and `Z_head` so surviving domain columns never shift when nodes are added or deleted.
 - **`3D Tiers` ↔ `2D Flat ✓`:** Collapses the three vertical planes (`display` top, `manipulate` mid, `truth` bedrock) onto a single `y = 0` working plane so tightly connected clusters sit side by side.
 - **`Group: Off | Domain | Subkind`:** Renders collapsible group pills (`[-] key (count)` / `[+] key (count)`) above the HUD so you can fold noisy districts or subkinds while keeping counts visible.
 - **`Pin` / `Pinned ★`:** Selected nodes can be pinned to keep their exact `[x, y, z]` coordinate across layout switches.
@@ -112,9 +114,9 @@ Shortcuts apply when focus is outside `<input>`, `<textarea>`, and `<select>` co
 Clicking any node opens the right-hand **Node Inspector** (`frontend/src/components/NodeInspector.tsx`):
 
 - **Source Peek & Editor Deep-Links:** View highlighted source context around `file:line`, copy `path:line`, or jump straight to `vscode://` / `cursor://`.
-- **Bounded vs. `--full` Lineage Cone Export:**
-  - `Copy LLM Cone` copies a ~300-token 3-tier slice and displays an explicit completeness banner showing included vs. eligible upstream/downstream nodes, edges, and findings whenever a cap omits items.
-  - `Full Cone` requests `?full=true` (`wythe context --full`) with zero truncation.
+- **Bounded vs. `--full` Lineage Cone Export & Microscope Strata (`Zoom 1..3`):**
+  - `Copy LLM Cone` copies a ~300-token 3-tier slice and displays an explicit completeness banner showing included vs. eligible upstream/downstream nodes, edges, findings, and stratum items whenever a cap omits items (`Full Cone` requests `?full=true`).
+  - **Microscope Strata (`Zoom 2: IR / AIR`, `Zoom 3: Binary / Heap`):** Lazily fetches `/api/v1/scans/{slug}/nodes/{node_id}/strata` on click without inflating `Zoom 1` scans, folding stdlib, Swift/ObjC ARC, and compiler witness/thunk boilerplate into expandable `+N runtime/stdlib thunks collapsed` edges unless `Unfiltered IR` (`--unfiltered-ir`) is toggled.
 - **3-State Policy Field Consumption (`PolicyFieldConsumption`):**
   - On Python `reads_truth` edges, Tier-1 policy tables, Tier-2
     readers, and `wythe context` cones, `NodeInspector` renders
@@ -184,9 +186,61 @@ wythe security ownership /path/to/repo \
   - **WebMCP:** Exposes `window.wythe` / `navigator.modelContext` (`whatIsThis`, `getLineageCone`, `selectNode`, `ask`).
 - **Terminal & Agent Bridges:**
   - `wythe llms /path/to/repo --max-tokens 2200` emits a compact `llms.txt` architecture pointer map.
-  - `wythe context /path/to/repo <query> [--full]` extracts a focused 3-tier slice around any table, route, queue, file, or node ID.
+  - `wythe context /path/to/repo <query> [--zoom 1|2|3] [--unfiltered-ir] [--full]` extracts a focused 3-tier slice (with optional `StratumPlugin` microscope drill-downs at `--zoom 2|3`) around any table, route, queue, file, or node ID.
   - `wythe focus [--remote http://<tailnet-host>:8780]` pulls the active browser viewport brief over LAN/Tailnet.
-  - `wythe plugins [--json]` (plus `GET /api/v1/adapters/plugins` and MCP `wythe_plugins`) lists built-in (`tach-boundaries`, `container-sources`) and `wythe.plugins` entry-point extensions without executing target repository code (`--allow-local-plugins` is CLI-only).
+  - **Agent -> Human Camera Choreography (`wythe_focus_camera`,
+    `wythe_camera_tour`):** Steers connected 3D WebGL tabs over
+    `/api/v1/viewport/events` SSE (and hydrates cold
+    `#target=...&focus=...&chronicle=<id>&phase=<idx>` permalinks)
+    across `iso_overview`, `tier_elevation`, `wythe_cross_section`,
+    and `corridor_trace` presets plus `TourKeyframe[]` /
+    `ChronicleTimeline` scrubbers; `Live Follow` halts automatically
+    on `halted_reason` or human `OrbitControls`/keyboard input
+    (`Paused — Resume Follow`), and `Index` (`AccessibleIndexView`)
+    mirrors captions and `Z`/stratum attribution via
+    `aria-live="polite"`.
+  - `wythe plugins [--json]` (plus `GET /api/v1/adapters/plugins` and
+    MCP `wythe_plugins`) lists built-in (`tach-boundaries`,
+    `container-sources`) and optional `wythe.plugins` companions
+    (`wythe-plugin-agent-harness`, `wythe-plugin-cpsat`,
+    `wythe-plugin-solver-chronicle`, `wythe-plugin-apple-ipc`,
+    `wythe-plugin-compiler-ir`, `wythe-plugin-solver-internals`,
+    `wythe-plugin-binary`, `wythe-plugin-wiretap`) with explicit
+    `interaction_capabilities` and `evidence_source_kinds` without
+    executing target repo code (`--allow-local-plugins` is CLI-only).
+  - **Optional Solver, IR, Binary & Wiretap Companion CLI Flags:**
+    When companion packages are installed (or passed via
+    `--allow-local-plugins --plugin ...`), `wythe context`,
+    `wythe scan`, `wythe companion`, and `wythe security companion`
+    accept read-only `--index-store`, `--sil`, `--llvm-ir`,
+    `--metallib`, `--proto-descriptor`, `--compile-commands`,
+    repeatable `--binary`, and passive wiretap `--otel-traces`,
+    `--ebpf-flows`, `--memgraph`, `--vmmap`, `--port-listeners`, and
+    opt-in `--probe-local-ports` flags (`--cp-model-proto` /
+    `--cp-solver-response` for CP-SAT, and `wythe watch-solver` for
+    6-phase chronicles)—failing closed with install guidance when a
+    required companion plugin is absent, never invoking `ldd`,
+    build tools, or target binaries (`automated_security_audit:
+    false`).
+  - **Shared Human-Agent Investigation & Six-Link Understanding
+    Quickstart:**
+    1. *Human quickstart (Browser / Accessible Mode):* Run
+       `wythe serve /path/to/repo`, select a node or finding in 3D or
+       `AccessibleIndexView`, copy the per-tab `session_id` (or share
+       `#target=<slug>&session=<id>`), submit clarifications via
+       **Challenge / Add Correction** (`promoted_to_ruling: false`),
+       diff source changes via **Compare Revisions**, and inspect the
+       **Six-Link Understanding Chain** (`Intent -> Effective Policy ->
+       Execution -> Committed Result -> Human-Visible Result ->
+       Preservation Checks`).
+    2. *External-agent quickstart (Stdio / HTTP MCP / CLI):* Point an
+       agent at the same `session_id` via `wythe focus --session-id
+       <id>`, MCP `wythe_what_is_this(session_id="<id>")`,
+       `wythe_focus_camera(session_id="<id>", correlation_id="...")`
+       (verified via `POST /api/v1/viewport/receipts`
+       `applied_by_browser` vs `paused_by_human`),
+       `wythe_investigation(action="explain_understanding", ...)`, or
+       `wythe understand schedule-policy-to-export --json`.
   - `wythe export-openlineage /path/to/repo [--profile auto] [--out openlineage.json]` (plus `GET /api/v1/scans/{slug}/openlineage`, MCP `wythe_openlineage`, and the Governance **Export OpenLineage** button) exports Tier-1 datasets and Tier-2 jobs as OpenLineage static JSON.
   - `wythe security companion /path/to/repo [--trivy-report FILE] [--syft-sbom FILE] [--json FILE]` (or `wythe scan ... --companion-out FILE`) correlates static blueprint findings with read-only `Syft` SBOM and `Trivy` CVE/SARIF artifacts.
   - **MCP:** Connect coding agents directly to `http://127.0.0.1:8780/api/v1/mcp` (Streamable HTTP) or `wythe mcp` (stdio).

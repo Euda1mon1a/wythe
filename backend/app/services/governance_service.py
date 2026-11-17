@@ -7,6 +7,10 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.adapters.plugin_registry import (
+    PluginStackProfileSpec,
+    collect_enabled_plugin_stack_profiles,
+)
 from app.core.clock import utc_now, utc_today
 from app.models import (
     AuditRuling,
@@ -39,7 +43,7 @@ from app.services.ruling_metadata import (
 
 def list_stack_profiles(session: Session) -> list[StackProfileRead]:
     rows = session.scalars(select(StackProfile).order_by(StackProfile.id)).all()
-    return [
+    items = [
         StackProfileRead(
             slug=r.slug,
             label=r.label,
@@ -52,6 +56,23 @@ def list_stack_profiles(session: Session) -> list[StackProfileRead]:
         )
         for r in rows
     ]
+    seen_slugs = {it.slug for it in items}
+    for p in collect_enabled_plugin_stack_profiles():
+        if p.slug not in seen_slugs:
+            seen_slugs.add(p.slug)
+            items.append(
+                StackProfileRead(
+                    slug=p.slug,
+                    label=p.name,
+                    truth_adapter=p.truth_adapter,
+                    manipulator_adapter=p.manipulator_adapter,
+                    display_adapter=p.display_adapter,
+                    implementation_status=p.maturity_status,
+                    is_enabled=True,
+                    description=p.description,
+                )
+            )
+    return items
 
 
 def list_targets(session: Session) -> list[TargetProjectRead]:
@@ -80,6 +101,35 @@ def register_target(session: Session, payload: TargetProjectCreate) -> TargetPro
     profile = session.scalar(
         select(StackProfile).where(StackProfile.slug == effective_slug)
     )
+    if profile is None:
+        plugin_prof: PluginStackProfileSpec | None = next(
+            (p for p in collect_enabled_plugin_stack_profiles() if p.slug == effective_slug),
+            None,
+        )
+        if plugin_prof is None and effective_slug == "no-coverage-fallback":
+            plugin_prof = PluginStackProfileSpec(
+                slug="no-coverage-fallback",
+                name="Partial / Uninstalled Plugin Fallback",
+                truth_adapter="no-truth",
+                manipulator_adapter="no-manipulator",
+                display_adapter="no-display",
+                maturity_status="experimental",
+                description="Explicit partial no-coverage fallback profile when optional stack plugin is absent.",
+            )
+        if plugin_prof is not None:
+            profile = StackProfile(
+                slug=plugin_prof.slug,
+                label=plugin_prof.name,
+                truth_adapter=plugin_prof.truth_adapter,
+                manipulator_adapter=plugin_prof.manipulator_adapter,
+                display_adapter=plugin_prof.display_adapter,
+                implementation_status=plugin_prof.maturity_status,
+                is_enabled=True,
+                description=plugin_prof.description,
+                created_at=utc_now(),
+            )
+            session.add(profile)
+            session.flush()
     if profile is None or not profile.is_enabled:
         raise ValueError(f"Stack profile '{payload.stack_profile_slug}' is not enabled")
 

@@ -2,13 +2,27 @@
 
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Bot, Copy, Cpu, Download, Eye, RefreshCw, Send, Sparkles, Trash2, X } from 'lucide-react';
-import type {
-  AskChatTurn,
-  AtlasNode,
-  UiFocusExplainRead,
-  UiFocusStatePayload,
-  UiFocusSyncAck,
+import {
+  atlasApi,
+  type AskChatTurn,
+  type AtlasNode,
+  type ContextBudgetSummary,
+  type FollowState,
+  type InvestigationCorrectionRead,
+  type InvestigationRevisionComparisonRead,
+  type InvestigationSessionRead,
+  type InvestigationTurnRead,
+  type UiFocusExplainRead,
+  type UiFocusStatePayload,
+  type UiFocusSyncAck,
+  type ValidatedReferenceRead,
 } from '@/api/atlas';
+import {
+  ChallengeCorrectionBox,
+  RevisionComparisonPanel,
+  ValidatedReferencesList,
+} from '@/components/InvestigationCollabControls';
+import { UnderstandingChainPanel } from '@/components/UnderstandingChainPanel';
 import { useAskEngines, useAskWythe } from '@/hooks/useAtlas';
 import { post } from '@/lib/api';
 import { copyTextToClipboard } from '@/lib/clipboard';
@@ -32,24 +46,81 @@ export type SelectedEngineChoice = 'auto' | 'apple' | 'chrome' | 'local';
 interface QaTurn {
   id: string;
   question: string;
-  answerMarkdown: string;
+  answerMarkdown: string | null;
+  status: 'answered' | 'unresolved';
+  authoredBy: 'model' | 'scanner_brief' | 'none';
   engineBadge: string;
   usedVision: boolean;
+  imageSupplied: boolean;
+  fallbackReason: string | null;
+  failureReason: string | null;
   referencedNodeIds: string[];
+  validatedReferences: ValidatedReferenceRead[];
+  contextBudget: ContextBudgetSummary | null;
+  evidenceRevisionId: string | null;
+  needsRevalidation: boolean;
 }
 
 interface AskWytheDrawerProps {
   open: boolean;
   activeSlug: string;
+  sessionId?: string | null;
+  clientId?: string | null;
+  followState?: FollowState;
+  selectedNodeId?: string | null;
+  selectedFindingId?: string | null;
+  selectedEdgeId?: string | null;
+  sessionData?: InvestigationSessionRead | null;
+  revisionComparison?: InvestigationRevisionComparisonRead | null;
   explanation: UiFocusExplainRead | null;
   liveDigest?: LiveViewportDigest | null;
   snapshotDataUrl: string | null;
   captureLiveWebp?: () => string | null;
   nodesById: Map<string, AtlasNode>;
   initialQuestion?: string;
+  onSessionMutated?: () => void;
+  onCorrectionAdded?: (created: InvestigationCorrectionRead) => void;
+  onCompareRevisions?: () => Promise<void>;
   onRefreshFocus: () => void;
   onSelectNode: (nodeId: string) => void;
   onClose: () => void;
+}
+
+function mapStoredTurnToQaTurn(
+  t: InvestigationTurnRead,
+  latestEvidenceRevisionId?: string | null,
+): QaTurn {
+  const isScannerBrief = t.authored_by === 'scanner_brief';
+  const isUnresolved = t.status === 'unresolved' || t.authored_by === 'none' || !t.answer_markdown;
+  const engineBadge = isScannerBrief
+    ? 'Scanner Brief (no model running)'
+    : isUnresolved
+      ? 'Model Unavailable (question preserved)'
+      : `${t.engine ?? 'local'} · ${t.model_id ?? 'model'}`;
+  const drifted = Boolean(
+    latestEvidenceRevisionId &&
+      t.evidence_revision_id &&
+      t.evidence_revision_id !== latestEvidenceRevisionId,
+  );
+  return {
+    id: t.turn_id,
+    question: t.question,
+    answerMarkdown: t.answer_markdown ?? null,
+    status: isUnresolved ? 'unresolved' : 'answered',
+    authoredBy: t.authored_by ?? (isUnresolved ? 'none' : 'model'),
+    engineBadge,
+    usedVision: Boolean(t.used_vision),
+    imageSupplied: Boolean(t.image_supplied),
+    fallbackReason: t.fallback_reason ?? null,
+    failureReason: t.failure_reason ?? null,
+    referencedNodeIds: (t.validated_references ?? [])
+      .filter((r) => r.kind === 'node' && r.validation_state !== 'vanished_in_current_scan')
+      .map((r) => r.ref_id),
+    validatedReferences: t.validated_references ?? [],
+    contextBudget: null,
+    evidenceRevisionId: t.evidence_revision_id ?? null,
+    needsRevalidation: Boolean(t.needs_revalidation || drifted),
+  };
 }
 
 const PRESET_QUESTIONS = [
@@ -143,12 +214,23 @@ function matchReferencedNodeIds(
 export function AskWytheDrawer({
   open,
   activeSlug,
+  sessionId = null,
+  clientId = null,
+  followState = 'following',
+  selectedNodeId = null,
+  selectedFindingId = null,
+  selectedEdgeId = null,
+  sessionData = null,
+  revisionComparison = null,
   explanation,
   liveDigest = null,
   snapshotDataUrl,
   captureLiveWebp,
   nodesById,
   initialQuestion = '',
+  onSessionMutated,
+  onCorrectionAdded,
+  onCompareRevisions,
   onRefreshFocus,
   onSelectNode,
   onClose,
@@ -201,6 +283,20 @@ export function AskWytheDrawer({
     if (initialQuestion) setQuestion(initialQuestion);
   }, [initialQuestion]);
 
+  useEffect(() => {
+    if (!sessionData) return;
+    const latestRev = sessionData.latest_evidence?.evidence_revision_id ?? null;
+    const combined: InvestigationTurnRead[] = [...sessionData.turns];
+    const seenIds = new Set(combined.map((t) => t.turn_id));
+    for (const unres of sessionData.unresolved_questions ?? []) {
+      if (!seenIds.has(unres.turn_id)) {
+        combined.push(unres);
+        seenIds.add(unres.turn_id);
+      }
+    }
+    setTurns([...combined].reverse().map((t) => mapStoredTurnToQaTurn(t, latestRev)));
+  }, [sessionData]);
+
   const syncCapturedWebpToUiFocus = async (webpDataUrl: string | null): Promise<void> => {
     if (!activeSlug || !webpDataUrl || !webpDataUrl.startsWith('data:image/')) return;
     const knownServerRev =
@@ -212,9 +308,19 @@ export function AskWytheDrawer({
       snapshot_data_url: string;
     } = {
       active_slug: activeSlug,
+      session_id: sessionId,
+      client_id: clientId,
+      actor: 'human',
+      selected_edge_id: selectedEdgeId,
+      selected_finding_id: selectedFindingId,
+      follow_state: followState,
       camera_revision: monotonicDrawerCameraRevision,
       snapshot_data_url: webpDataUrl,
-      ...(liveDigest?.selectedNodeId !== undefined ? { selected_node_id: liveDigest.selectedNodeId } : {}),
+      ...(liveDigest?.selectedNodeId !== undefined
+        ? { selected_node_id: liveDigest.selectedNodeId }
+        : selectedNodeId
+          ? { selected_node_id: selectedNodeId }
+          : {}),
       ...(liveDigest?.hoveredNodeId !== undefined ? { hovered_node_id: liveDigest.hoveredNodeId } : {}),
       ...(liveDigest?.lens ? { lens: liveDigest.lens } : {}),
       ...(liveDigest?.layoutMode ? { layout_mode: liveDigest.layoutMode } : {}),
@@ -269,6 +375,80 @@ export function AskWytheDrawer({
     });
   };
 
+  const persistClientTurn = async (payload: {
+    question: string;
+    answerMarkdown: string | null;
+    engine: string | null;
+    modelId: string | null;
+    usedVision: boolean;
+    imageSupplied: boolean;
+    authoredBy: 'model' | 'scanner_brief' | 'none';
+    failureReason?: string | null;
+    referencedIds?: string[];
+  }) => {
+    if (!sessionId) return;
+    try {
+      await atlasApi.recordInvestigationTurn(sessionId, {
+        client_id: clientId ?? undefined,
+        actor: 'human',
+        question: payload.question,
+        answer_markdown: payload.answerMarkdown,
+        engine: payload.engine,
+        model_id: payload.modelId,
+        used_vision: payload.usedVision,
+        image_supplied: payload.imageSupplied,
+        authored_by: payload.authoredBy,
+        failure_reason: payload.failureReason ?? undefined,
+        selected_node_id: selectedNodeId ?? undefined,
+        selected_edge_id: selectedEdgeId ?? undefined,
+        selected_finding_id: selectedFindingId ?? undefined,
+        referenced_ids: payload.referencedIds ?? [],
+      });
+      onSessionMutated?.();
+    } catch {
+      // Keep client-side mode resilient when server is offline
+    }
+  };
+
+  const insertScannerBriefNow = async () => {
+    const q = question.trim() || 'Inspect scanner evidence for the current selection';
+    const briefMd =
+      explanation?.markdown_brief ??
+      liveDigest?.markdownBrief ??
+      `Target: ${activeSlug} (scanner brief)`;
+    const refIds = selectedNodeId ? [selectedNodeId] : [];
+    setTurns((prev) => [
+      {
+        id: `scanner-${Date.now()}`,
+        question: q,
+        answerMarkdown: briefMd,
+        status: 'answered',
+        authoredBy: 'scanner_brief',
+        engineBadge: 'Scanner Brief (no model running)',
+        usedVision: false,
+        imageSupplied: false,
+        fallbackReason: 'Generated directly from deterministic scanner facts without a running LLM.',
+        failureReason: null,
+        referencedNodeIds: refIds,
+        validatedReferences: [],
+        contextBudget: explanation?.context_budget ?? null,
+        evidenceRevisionId: explanation?.evidence_revision_id ?? null,
+        needsRevalidation: false,
+      },
+      ...prev,
+    ]);
+    await persistClientTurn({
+      question: q,
+      answerMarkdown: briefMd,
+      engine: 'none',
+      modelId: 'wythe-scanner-brief',
+      usedVision: false,
+      imageSupplied: false,
+      authoredBy: 'scanner_brief',
+      referencedIds: refIds,
+    });
+  };
+
   const runQuestion = async (rawQ: string) => {
     const trimmed = rawQ.trim();
     if (!trimmed || isBusy) return;
@@ -284,17 +464,19 @@ export function AskWytheDrawer({
       ? `${liveDigest.markdownBrief}\n\n${explanation?.markdown_brief ?? ''}`.trim()
       : (explanation?.markdown_brief ?? `Target: ${activeSlug}`);
     const focusedNodeId =
+      selectedNodeId ??
       explanation?.focused_node?.id ??
       (liveDigest?.referencedNodeIds && liveDigest.referencedNodeIds.length > 0
         ? liveDigest.referencedNodeIds[0]
         : null);
     const sessionHistory: AskChatTurn[] = keepSession
       ? [...turns]
+          .filter((t) => t.status === 'answered' && Boolean(t.answerMarkdown))
           .reverse()
           .slice(-6)
           .flatMap((t) => [
             { role: 'user' as const, content: t.question },
-            { role: 'assistant' as const, content: t.answerMarkdown },
+            { role: 'assistant' as const, content: t.answerMarkdown! },
           ])
       : [];
 
@@ -319,30 +501,66 @@ export function AskWytheDrawer({
           snapshotDataUrl: liveFrameUrl,
           history: sessionHistory,
         });
+        const refs = matchReferencedNodeIds(out.answerMarkdown, focusedNodeId, nodesById);
         setTurns((prev) => [
           {
             id: `turn-${prev.length + 1}`,
             question: trimmed,
             answerMarkdown: out.answerMarkdown,
+            status: 'answered',
+            authoredBy: 'model',
             engineBadge: 'chrome · gemini-nano-in-browser',
             usedVision: out.usedVision,
-            referencedNodeIds: matchReferencedNodeIds(out.answerMarkdown, focusedNodeId, nodesById),
+            imageSupplied: hasAttachedFrame,
+            fallbackReason:
+              hasAttachedFrame && !out.usedVision
+                ? 'Viewport WebP available, but Chrome model answered in text-only mode.'
+                : null,
+            failureReason: null,
+            referencedNodeIds: refs,
+            validatedReferences: [],
+            contextBudget: explanation?.context_budget ?? null,
+            evidenceRevisionId: explanation?.evidence_revision_id ?? null,
+            needsRevalidation: false,
           },
           ...prev,
         ]);
+        void persistClientTurn({
+          question: trimmed,
+          answerMarkdown: out.answerMarkdown,
+          engine: 'chrome',
+          modelId: 'gemini-nano-in-browser',
+          usedVision: out.usedVision,
+          imageSupplied: hasAttachedFrame,
+          authoredBy: 'model',
+          referencedIds: refs,
+        });
         setQuestion('');
         setIsRunningClientModel(false);
         return;
       } catch (err) {
         setIsRunningClientModel(false);
         if (engineChoice === 'chrome') {
-          setActiveError((err as Error).message);
+          const msg = (err as Error).message;
+          setActiveError(msg);
+          void persistClientTurn({
+            question: trimmed,
+            answerMarkdown: null,
+            engine: 'chrome',
+            modelId: null,
+            usedVision: false,
+            imageSupplied: hasAttachedFrame,
+            authoredBy: 'none',
+            failureReason: msg,
+          });
           return;
         }
       }
     }
 
     const useBrowserLocal =
+      !sessionId &&
+      !customLocalUrl.trim() &&
       browserLocalProbe.state === 'ready' &&
       (engineChoice === 'local' ||
         (engineChoice === 'auto' &&
@@ -359,24 +577,59 @@ export function AskWytheDrawer({
           snapshotDataUrl: liveFrameUrl,
           history: sessionHistory,
         });
+        const dispModel = browserLocalProbe.displayModel ?? 'default_model';
+        const refs = matchReferencedNodeIds(out.answerMarkdown, focusedNodeId, nodesById);
         setTurns((prev) => [
           {
             id: `turn-${prev.length + 1}`,
             question: trimmed,
             answerMarkdown: out.answerMarkdown,
-            engineBadge: `local (this Mac) · ${browserLocalProbe.displayModel ?? 'default_model'}`,
+            status: 'answered',
+            authoredBy: 'model',
+            engineBadge: `local · ${dispModel}`,
             usedVision: out.usedVision,
-            referencedNodeIds: matchReferencedNodeIds(out.answerMarkdown, focusedNodeId, nodesById),
+            imageSupplied: hasAttachedFrame,
+            fallbackReason:
+              hasAttachedFrame && !out.usedVision
+                ? 'Viewport WebP available, but local /v1 model answered in text-only mode.'
+                : null,
+            failureReason: null,
+            referencedNodeIds: refs,
+            validatedReferences: [],
+            contextBudget: explanation?.context_budget ?? null,
+            evidenceRevisionId: explanation?.evidence_revision_id ?? null,
+            needsRevalidation: false,
           },
           ...prev,
         ]);
+        void persistClientTurn({
+          question: trimmed,
+          answerMarkdown: out.answerMarkdown,
+          engine: 'local',
+          modelId: dispModel,
+          usedVision: out.usedVision,
+          imageSupplied: hasAttachedFrame,
+          authoredBy: 'model',
+          referencedIds: refs,
+        });
         setQuestion('');
         setIsRunningClientModel(false);
         return;
       } catch (err) {
         setIsRunningClientModel(false);
         if (localSt?.state !== 'ready') {
-          setActiveError((err as Error).message);
+          const msg = (err as Error).message;
+          setActiveError(msg);
+          void persistClientTurn({
+            question: trimmed,
+            answerMarkdown: null,
+            engine: 'local',
+            modelId: browserLocalProbe.displayModel,
+            usedVision: false,
+            imageSupplied: hasAttachedFrame,
+            authoredBy: 'none',
+            failureReason: msg,
+          });
           return;
         }
       }
@@ -387,6 +640,11 @@ export function AskWytheDrawer({
         question: trimmed,
         engine: engineChoice,
         target_slug: activeSlug || undefined,
+        session_id: sessionId ?? undefined,
+        client_id: clientId ?? undefined,
+        selected_node_id: focusedNodeId ?? undefined,
+        selected_finding_id: selectedFindingId ?? undefined,
+        selected_edge_id: selectedEdgeId ?? undefined,
         local_base_url: customLocalUrl.trim() || undefined,
         include_vision_snapshot: true,
         history: sessionHistory,
@@ -395,20 +653,37 @@ export function AskWytheDrawer({
       },
       {
         onSuccess: (res) => {
+          const isScanner = res.authored_by === 'scanner_brief';
           setTurns((prev) => [
             {
-              id: `turn-${prev.length + 1}`,
+              id: res.turn_id ?? `turn-${prev.length + 1}`,
               question: trimmed,
               answerMarkdown: res.answer_markdown,
-              engineBadge: `${res.engine_used} · ${res.model_id}`,
+              status: 'answered',
+              authoredBy: res.authored_by ?? 'model',
+              engineBadge: isScanner
+                ? 'Scanner Brief (no model running)'
+                : `${res.engine_used} · ${res.model_id}`,
               usedVision: res.used_vision_snapshot,
+              imageSupplied: Boolean(res.image_supplied ?? hasAttachedFrame),
+              fallbackReason: res.fallback_reason ?? null,
+              failureReason: null,
               referencedNodeIds: res.referenced_node_ids ?? [],
+              validatedReferences: res.validated_references ?? [],
+              contextBudget: res.context_budget ?? null,
+              evidenceRevisionId: res.evidence_identity?.evidence_revision_id ?? null,
+              needsRevalidation: false,
             },
             ...prev,
           ]);
           setQuestion('');
+          onSessionMutated?.();
         },
-        onError: (err) => setActiveError((err as Error).message),
+        onError: (err) => {
+          // Preserve question in input and refresh stored unresolved_questions
+          setActiveError((err as Error).message);
+          onSessionMutated?.();
+        },
       },
     );
   };
@@ -634,42 +909,160 @@ export function AskWytheDrawer({
         </div>
 
         {activeError && (
-          <div className="border border-rose-500/40 bg-rose-950/30 p-2.5 font-mono text-[11px] text-rose-200">
-            {activeError}
+          <div className="space-y-2 border border-rose-500/40 bg-rose-950/30 p-2.5 font-mono text-[11px] text-rose-200">
+            <div>{activeError}</div>
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-amber-200">
+              <span>Your question is preserved in this session and input box.</span>
+              <button
+                type="button"
+                onClick={() => void insertScannerBriefNow()}
+                className="min-h-6 border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-amber-100 hover:bg-amber-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+              >
+                Scanner Brief (no model running)
+              </button>
+            </div>
           </div>
         )}
 
+        <ChallengeCorrectionBox
+          sessionId={sessionId}
+          clientId={clientId}
+          targetRefId={selectedFindingId ?? selectedEdgeId ?? selectedNodeId}
+          turnId={turns[0]?.id ?? null}
+          corrections={sessionData?.corrections ?? explanation?.corrections ?? []}
+          compact
+          onCorrectionAdded={(created) => {
+            onCorrectionAdded?.(created);
+            onSessionMutated?.();
+          }}
+        />
+
+        {onCompareRevisions && (
+          <RevisionComparisonPanel
+            sessionId={sessionId}
+            evidenceDrifted={Boolean(sessionData?.evidence_drifted)}
+            comparison={revisionComparison}
+            nodesById={nodesById}
+            onRunCompare={onCompareRevisions}
+            onSelectNode={onSelectNode}
+          />
+        )}
+
+        <UnderstandingChainPanel
+          activeSlug={activeSlug}
+          sessionId={sessionId}
+          subjectId={selectedNodeId ?? explanation?.focused_node?.id ?? null}
+          selectedFindingId={selectedFindingId}
+          selectedEdgeId={selectedEdgeId}
+        />
+
         <div className="space-y-3">
-          {turns.map((t) => (
-            <div key={t.id} className="space-y-2 border border-slate-800 bg-slate-900/60 p-3">
-              <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-1.5 font-mono text-[10px]">
-                <span className="font-semibold text-teal-300">Q: {t.question}</span>
-                <span className="border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-200">
-                  {t.engineBadge}
-                  {t.usedVision ? ' + WebP Vision' : ' + Live Frustum'}
-                </span>
-              </div>
-              <div className="space-y-0.5">{renderFormattedAnswer(t.answerMarkdown)}</div>
-              {t.referencedNodeIds.length > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                  <span className="font-mono text-[10px] uppercase text-slate-300">Jump in 3D:</span>
-                  {t.referencedNodeIds.map((nid) => {
-                    const n = nodesById.get(nid);
-                    return (
-                      <button
-                        key={nid}
-                        type="button"
-                        onClick={() => onSelectNode(nid)}
-                        className="inline-flex min-h-6 min-w-6 items-center border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 font-mono text-[10px] text-sky-200 hover:bg-sky-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
-                      >
-                        {n ? `${n.tier}:${n.label}` : nid}
-                      </button>
-                    );
-                  })}
+          {turns.map((t) => {
+            const budget = t.contextBudget ?? explanation?.context_budget ?? null;
+            const incTotal = budget?.included_counts
+              ? Object.values(budget.included_counts).reduce((a, b) => a + b, 0)
+              : null;
+            const omitTotal = budget?.omitted_counts
+              ? Object.values(budget.omitted_counts).reduce((a, b) => a + b, 0)
+              : null;
+            return (
+              <div key={t.id} className="space-y-2 border border-slate-800 bg-slate-900/60 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-1.5 border-b border-slate-800 pb-1.5 font-mono text-[10px]">
+                  <span className="font-semibold text-teal-300">Q: {t.question}</span>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span
+                      className={`border px-1.5 py-0.5 ${
+                        t.authoredBy === 'scanner_brief'
+                          ? 'border-amber-500/45 bg-amber-950/60 text-amber-200'
+                          : t.status === 'unresolved'
+                            ? 'border-rose-500/45 bg-rose-950/60 text-rose-200'
+                            : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+                      }`}
+                    >
+                      {t.engineBadge}
+                    </span>
+                    <span className="border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-slate-200">
+                      {t.usedVision ? 'Vision: WebP' : 'Text-only'}
+                    </span>
+                    {t.needsRevalidation && (
+                      <span className="border border-amber-500/50 bg-amber-950/60 px-1.5 py-0.5 text-amber-200">
+                        [historical / needs revalidation]
+                      </span>
+                    )}
+                  </div>
                 </div>
-              )}
-            </div>
-          ))}
+
+                {budget && incTotal !== null && (
+                  <div className="flex flex-wrap items-center justify-between gap-1 border border-slate-800 bg-slate-950/80 px-2 py-1 font-mono text-[10px] text-slate-300">
+                    <span>
+                      Context Budget: included <strong>{incTotal}</strong> · omitted{' '}
+                      <strong>{omitTotal ?? 0}</strong>
+                      {budget.prompt_chars
+                        ? ` (${budget.prompt_chars}/${budget.max_prompt_chars || '—'} chars)`
+                        : ''}
+                    </span>
+                    {budget.expand_hint && (
+                      <span className="text-sky-300">{budget.expand_hint}</span>
+                    )}
+                  </div>
+                )}
+
+                {t.fallbackReason && (
+                  <div className="font-mono text-[10px] text-amber-200">{t.fallbackReason}</div>
+                )}
+
+                {t.status === 'unresolved' || !t.answerMarkdown ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 border border-rose-500/30 bg-rose-950/25 p-2 font-mono text-[11px] text-rose-200">
+                    <span>
+                      Unanswered question preserved ({t.failureReason ?? 'model unavailable'}).
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setQuestion(t.question);
+                        void runQuestion(t.question);
+                      }}
+                      className="min-h-6 border border-teal-500/50 bg-teal-500/20 px-2 py-0.5 text-[10px] text-teal-100 hover:bg-teal-500/30"
+                    >
+                      Retry Question
+                    </button>
+                  </div>
+                ) : (
+                  <div className="space-y-0.5">{renderFormattedAnswer(t.answerMarkdown)}</div>
+                )}
+
+                {t.validatedReferences.length > 0 ? (
+                  <ValidatedReferencesList
+                    references={t.validatedReferences}
+                    nodesById={nodesById}
+                    needsRevalidation={t.needsRevalidation}
+                    onSelectNode={onSelectNode}
+                  />
+                ) : (
+                  t.referencedNodeIds.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                      <span className="font-mono text-[10px] uppercase text-slate-300">
+                        Jump in 3D:
+                      </span>
+                      {t.referencedNodeIds.map((nid) => {
+                        const n = nodesById.get(nid);
+                        return (
+                          <button
+                            key={nid}
+                            type="button"
+                            onClick={() => onSelectNode(nid)}
+                            className="inline-flex min-h-6 min-w-6 items-center border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 font-mono text-[10px] text-sky-200 hover:bg-sky-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                          >
+                            {n ? `${n.tier}:${n.label}` : nid}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 

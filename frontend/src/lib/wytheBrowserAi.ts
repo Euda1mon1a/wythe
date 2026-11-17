@@ -381,6 +381,10 @@ export interface WythePageBridgeHandlers {
   getLineageCone: (query: string) => Promise<unknown>;
   selectNode: (nodeId: string) => void;
   openAskDrawer: (prefill?: string) => void;
+  getSession?: () => Promise<unknown>;
+  submitCorrection?: (note: string, kind?: string) => Promise<unknown>;
+  setFollowState?: (state: 'following' | 'paused') => Promise<unknown>;
+  compareRevisions?: () => Promise<unknown>;
 }
 
 export const WYTHE_WEBMCP_TOOL_NAMES = [
@@ -401,6 +405,24 @@ export function registerWytheWebMcpBridge(handlers: WythePageBridgeHandlers): ()
     getLineageCone: (query: string) => handlers.getLineageCone(query),
     selectNode: (nodeId: string) => handlers.selectNode(nodeId),
     ask: (question?: string) => handlers.openAskDrawer(question),
+    getSession: () =>
+      handlers.getSession ? handlers.getSession() : Promise.resolve(null),
+    submitCorrection: (note: string, kind?: string) =>
+      handlers.submitCorrection
+        ? handlers.submitCorrection(note, kind)
+        : Promise.reject(new Error('Investigation session bridge not bound.')),
+    setFollowState: (state: 'following' | 'paused') => {
+      if (state !== 'following' && state !== 'paused') {
+        return Promise.reject(new Error("`state` must be 'following' or 'paused'."));
+      }
+      return handlers.setFollowState
+        ? handlers.setFollowState(state)
+        : Promise.resolve({ follow_state: state });
+    },
+    compareRevisions: () =>
+      handlers.compareRevisions
+        ? handlers.compareRevisions()
+        : Promise.resolve(null),
   };
 
   const nav = navigator as unknown as {

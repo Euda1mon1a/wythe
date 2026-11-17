@@ -17,7 +17,7 @@ Wythe supports **38 stack profiles** via `--profile auto` (**1 production-dogfoo
 
 > [!IMPORTANT]
 > **Status, Maturity & Zero-Maintenance Notice (`"AS IS"`)**
-> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.2.2` or `wythe==0.2.2`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
+> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.2.3` or `wythe==0.2.3`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
 > - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **36 experimental profiles** (`nextjs-prisma`, `node-kysely-react`, `node-sql-tools-sveltekit`, `django-nextjs`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, partial-coverage profiles, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
 
 ---
@@ -61,7 +61,7 @@ Pin an explicit release tag (do not track unpinned branches if you want zero-sur
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0
-- uses: Euda1mon1a/wythe@v0.2.2
+- uses: Euda1mon1a/wythe@v0.2.3
   with:
     mode: diff
     base-ref: origin/main
@@ -123,6 +123,22 @@ or substituting `substituted_constants`, emitting a causal
 dynamic subscripts, or opaque whole-row handoffs).
 
 **Containers, Kubernetes, `tach.toml` & `wythe.plugins` (`cluster="containers"`).** Across every stack profile, built-in `wythe.plugins` augmenters statically inspect `Dockerfile`/`Containerfile` (including `.docker/` subdirectories) and `.dockerignore`, `compose.yaml`/`docker-compose.*.yml`, Kubernetes manifests (`Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Pod`, `ConfigMap` in root or `k8s/`, `kubernetes/`, `manifests/`, `deploy/`, `deployments/`, `.k8s/`, safely skipping Helm/Mustache `{{` templates with a coverage note), and `tach.toml` modular-monolith walls (`MANIP-006`). Container and K8s edges populate `AtlasEdge.symbol_links` (`*->sym` on callable entrypoints like `dramatiq app.tasks:process_queue`, falling back to whole-module `[]` on framework variable/router hubs like `uvicorn app.main:app` or `celery -A app.worker.celery_app`) so Lineage Cones stay surgical without severing mounted routers or tasks; K8s `$(VAR_NAME)` parenthesized interpolation is honored while bare `$VAR`/`~` in exec arrays triggers `MANIP-004`, and literal policy tokens in Compose `environment:` or K8s `env:`/`ConfigMap.data` trigger `MANIP-001`. Scanning never imports or executes `.py` files from a target repository unless `--allow-local-plugins` is explicitly passed on the CLI.
+
+**Optional companion plugins (`plugins/wythe-plugin-*`).**
+Core `wythe` stays 100% domain-agnostic (`0` domain rules or solver
+packages in the core wheel). Optional `wythe.plugins` distributions
+under `plugins/` attach cleanly when installed (or opted in via CLI
+`--allow-local-plugins --plugin ...`):
+`wythe-plugin-agent-harness` (`AGENT-001` prompt KV-cache prefix
+stability, `AGENT-002` SLM/MCP tool-schema budget & registry parity,
+`AGENT-003` bounded agent-loop termination), `wythe-plugin-cpsat`
+(pure-Python OR-Tools CP-SAT `Zoom 2` variable-constraint lattice &
+`wythe companion --cp-model-proto` / `--cp-solver-response`), and
+`wythe-plugin-solver-chronicle` (6-phase `[1.Load]`..`[6.Render]`
+chronicle, passive `wythe watch-solver` watcher, MCP
+`wythe_solver_chronicle`, and `#chronicle=<id>&phase=<idx>` `Live
+Follow` permalinks). All three remain passive static/log inspectors
+and never execute target code or certify NP-hard optimality.
 
 **Deletion and rename diffs.** `wythe diff` resolves the requested base to an exact commit and scans its committed files in a temporary directory, without checking out or executing target code. It traverses the base and current graphs separately, retaining removed nodes, their old callers and import-time dependencies. Renames include both paths. New violation counts still use current-side changed lines. `PASS` means the diff gate found no blocking findings on those lines; it does not certify safe deletion. Invalid bases exit with code 2. If the base cannot be reconstructed (including unresolved symlinks or submodules), JSON and SARIF explicitly report incomplete evidence and the CLI exits 2.
 
@@ -205,19 +221,29 @@ Full JSON scans on large repositories span megabytes; Wythe exposes five zero-co
 # 1. Token-budgeted llms.txt pointer map (~2,000 tokens regardless of repo size)
 wythe llms /path/to/repo --max-tokens 2200 --out llms-wythe.txt
 
-# 2. Surgical ~300-token 3-tier Lineage Cone around any table, file, route, or queue (add --full for complete slice)
+# 2. Surgical ~300-token 3-tier Lineage Cone around any table, file, route, or queue (add --full or --zoom 2|3)
 wythe context /path/to/repo audit_exports
-wythe context /path/to/repo /api/v1/scans --full --json
+wythe context /path/to/repo /api/v1/scans --zoom 2 --full --json
 
 # 3. Zero-copy-paste Human <-> LLM Bridge (local state or remote private/Tailnet server)
 wythe focus
 wythe focus --remote http://100.64.0.10:8780
 
-# 4. Zero-dependency read-only stdio MCP server (or connect directly to http://127.0.0.1:8780/api/v1/mcp)
+# 4. Zero-dependency stdio MCP server (full 11-tool slice or compact <=2KB `--slice slm`)
 wythe mcp
+wythe mcp --slice slm
+
+# 5. Six-Link Outcome, Effective-Authority, Provenance & Preservation Understanding
+wythe understand --list-examples
+wythe understand schedule-policy-to-export --json
+wythe understand assistant-context-to-delivery
 ```
 
-MCP client configuration (Stdio or Streamable HTTP — exposes `wythe_what_is_this`, `wythe_list_targets`, `wythe_overview`, `wythe_lineage_cone`, `wythe_blast_radius`, `wythe_findings`, `wythe_plugins`, `wythe_openlineage`):
+MCP client configuration (Stdio or Streamable HTTP — exposes
+`wythe_what_is_this`, `wythe_list_targets`, `wythe_overview`,
+`wythe_lineage_cone`, `wythe_blast_radius`, `wythe_findings`,
+`wythe_plugins`, `wythe_openlineage`, `wythe_focus_camera`,
+`wythe_camera_tour`, and `wythe_investigation`):
 
 ```json
 {
@@ -264,6 +290,36 @@ Only the dogfooded Python/SQLAlchemy/Next.js trio is classified **`Implemented`*
 | **Tier 3 (Display)** | `vue-sfc` | Experimental | Vue 3 & Nuxt 3 `.vue` SFCs + composables (`$fetch`, `useFetch`) + WCAG `DISP-005` |
 | **Tier 3 (Display)** | `sveltekit` | Experimental | Svelte 5 & SvelteKit `+page.svelte`, `+page.ts`, `#lib`/`$lib`, `oazapfts` SDK barrels + WCAG `DISP-005` |
 | **Tier 3 (Display)** | `rust-wasm` | Experimental | Rust WASM `Leptos`, `Dioxus`, `Yew` (`gloo-net` / `reqwest` / Tauri WASM) + WCAG `DISP-005` |
+| **Optional Plugin** | `swift-systems-ipc` | Optional (`wythe.plugins`) | `wythe-plugin-apple-ipc`: `Package.swift` CLI (`cli`) ↔ XPC/`vsock`/gRPC/C-FFI (`ipc_handler`, `ffi_shim`, `IPC-001`) ↔ OCI stores & `.entitlements` (`entity_store`, `entitlement_spec`) |
+
+### Optional Microscope & Companion Plugins (`plugins/wythe-plugin-*`)
+
+Core `wythe` stays pure-Python and domain-neutral; install optional
+`wythe.plugins` packages for systems, compiler IR, solver, and passive
+binary strata (`0` target-binary/`ldd` or build-tool execution;
+`automated_security_audit: false`):
+- `wythe-plugin-apple-ipc` (`#76`): Native Swift & Systems IPC
+  3-wythe stack profile (`swift-systems-ipc`, `IPC-001`, `MANIP-006`).
+- `wythe-plugin-compiler-ir` (`#77`): `Zoom 2` `IndexStoreDB` USR,
+  Swift `.sil`, LLVM `.ll`, and CPU ↔ Metal `AIR` compute seam
+  verifier (`METAL-001..003`; `.metallib` `AIR` bitcode vs
+  driver-lowered `AGX` GPU ISA).
+- `wythe-plugin-solver-internals` (`#85`): `Zoom 2` C++/Protobuf
+  7-stage `ConstraintProto` matrix, `SatParameters` lineage,
+  `Model::GetOrCreate<T>()` cycles, and wrapper parity (`SAT-INT-001..004`).
+- `wythe-plugin-binary` (`#78`): Passive `Zoom 3` Mach-O 64/Universal
+  & ELF64 dylib/symbol/reflection inspector, `unverified`
+  `binary_string_witness` literals, and `BIN-ENT-001` signed
+  entitlement drift (`--binary`).
+- `wythe-plugin-wiretap` (`#79`): Passive `Zoom 3` OTLP/eBPF trace
+  correlator (`corroborated`, `static_dark_matter`, `runtime_only`),
+  `.memgraph`/`vmmap` heap & Tarjan retain-cycle inspector, and host
+  port occupancy verifier (`PORT-001`, `PORT-002`; `--otel-traces`,
+  `--ebpf-flows`, `--memgraph`, `--vmmap`, `--port-listeners`, and
+  opt-in `--probe-local-ports`).
+- `wythe-plugin-agent-harness`, `wythe-plugin-cpsat`, &
+  `wythe-plugin-solver-chronicle`: Agent prompt/tool hygiene
+  (`AGENT-001..003`), domain CP-SAT lineage, and 6-phase chronicles.
 
 ---
 
@@ -271,11 +327,11 @@ Only the dogfooded Python/SQLAlchemy/Next.js trio is classified **`Implemented`*
 
 The [Open WebUI source audit](docs/audits/open-webui.md) records the 0.1.7 repairs, measured coverage and remaining gaps. Its FastAPI/Svelte profile remains experimental.
 
-Every stack family has been scanned against synthetic regression suites and pinned open-source repositories (`wythe[treesitter]==0.2.2`):
+Every stack family has been scanned against synthetic regression suites and pinned open-source repositories (`wythe[treesitter]==0.2.3`):
 
 | Repository | Profile (`--profile auto`) | Maturity | Tier 1 (Truth) | Tier 2 (Manipulate) | Tier 3 (Display) | Verified Edges / E2E Chains | Notes & Observed Boundaries |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`Euda1mon1a/wythe`** (`v0.2.2`) | `fastapi-sqlalchemy-nextjs` | **Implemented** | 7 tables, 1 SQL fn | 9 routes, 71 services | 1 page, 27 hooks/clients | **346 / 31** | Self-dogfooded (`PASS --strict`, 0 blocking, 0 warnings) |
+| **`Euda1mon1a/wythe`** (`v0.2.3`) | `fastapi-sqlalchemy-nextjs` | **Implemented** | 7 tables, 1 SQL fn | 9 routes, 71 services | 1 page, 27 hooks/clients | **346 / 31** | Self-dogfooded (`PASS --strict`, 0 blocking, 0 warnings) |
 | **`fastapi/full-stack-fastapi-template`** (`aabb90126964`) | `fastapi-react-spa` | Experimental | 2 tables | 6 routes, 7 services | 10 pages, 58 hooks/clients | **229 / 39** | SQLModel + nested Alembic + Hey API OpenAPI SDK (`0` `DISP-004`/`007`) |
 | **`makeplane/plane`** (`9cefae892c4c`) | `django-nextjs` | Experimental | 112 tables, 34 Redis | 109 routes, 238 services | 58 pages, 1,590 UI nodes | **5,095 / 300** | Imported Django URL packages & CBVs; Next.js `pages`+`app` (`300` report cap) |
 | **`docmost/docmost`** (`3a3e812f25e8`) | `node-kysely-react` | Experimental | 49 tables, 16 fn, 14 Redis/BullMQ | 70 routes, 486 services | 26 pages, 817 UI nodes | **3,854 / 300** | Kysely `CamelCasePlugin` replay + NestJS BullMQ `@Processor`/`@InjectQueue` |

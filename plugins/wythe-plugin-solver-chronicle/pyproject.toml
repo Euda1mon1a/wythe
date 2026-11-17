@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wythe-plugin-solver-chronicle"
+version = "0.1.0"
+description = "Phase-ordered 3-tier solver chronicle, passive wythe watch-solver log watcher, and MODEL_INVALID/INFEASIBLE forensics plugin for Wythe."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Euda1mon1a" }]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.entry-points."wythe.plugins"]
+solver-chronicle = "wythe_plugin_solver_chronicle:register_wythe_plugin"
+
+[project.scripts]
+wythe-watch-solver = "wythe_plugin_solver_chronicle.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wythe_plugin_solver_chronicle"]

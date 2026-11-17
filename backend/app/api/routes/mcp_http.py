@@ -52,14 +52,20 @@ def post_mcp_http_rpc_route(
             res
             for item in payload
             if isinstance(item, dict)
-            for res in [dispatch_mcp_request(db, item, slice_mode=slice_mode)]
+            for res in [
+                dispatch_mcp_request(
+                    db, item, slice_mode=slice_mode, local_viewport_only=True
+                )
+            ]
             if res is not None
         ]
         if not responses:
             return Response(status_code=202)
         return JSONResponse(content=responses)
 
-    res = dispatch_mcp_request(db, payload, slice_mode=slice_mode)
+    res = dispatch_mcp_request(
+        db, payload, slice_mode=slice_mode, local_viewport_only=True
+    )
     if res is None:
         return Response(status_code=202)
     return JSONResponse(content=res)

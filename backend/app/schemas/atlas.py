@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import re
+import uuid
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 TierKind = Literal["truth", "manipulate", "display"]
 NodeSubkind = Literal[
     "table",
     "sql_function",
     "cache_store",
+    "entity_store",
+    "entitlement_spec",
     "route",
+    "ipc_handler",
     "service",
+    "ffi_shim",
     "solver",
     "cli",
     "page",
@@ -94,6 +100,18 @@ class PolicyFieldConsumption(StrictSchema):
     note: str = ""
 
 
+StratumZoom = Literal[1, 2, 3]
+MicroStratumZoom = Literal[2, 3]
+
+
+class StratumSummaryBadge(StrictSchema):
+    """Compact Zoom-1 summary badge contributed by an optional `StratumPlugin`."""
+
+    key: str
+    label: str
+    count: int = Field(default=0, ge=0)
+
+
 class AtlasNode(StrictSchema):
     id: str
     tier: TierKind
@@ -117,6 +135,7 @@ class AtlasNode(StrictSchema):
     store_purpose: StorePurposeDeclaration | None = None
     verification_note: str | None = None
     policy_field_consumption: PolicyFieldConsumption | None = None
+    stratum_badges: list[StratumSummaryBadge] = Field(default_factory=list)
 
 
 class AtlasEdge(StrictSchema):
@@ -547,6 +566,59 @@ class ConeEdgeSummary(StrictSchema):
     policy_field_consumption: PolicyFieldConsumption | None = None
 
 
+class StratumMicroNode(StrictSchema):
+    """Scoped Zoom-2 (IR/AIR) or Zoom-3 (binary/heap) microscope node."""
+
+    id: str
+    label: str
+    kind: str
+    zoom: MicroStratumZoom
+    source_file: str | None = None
+    line: int | None = None
+    verification: VerificationState = "declared"
+    summary: str = ""
+
+
+class StratumMicroEdge(StrictSchema):
+    """Scoped Zoom-2/Zoom-3 microscope edge with deterministic thunk compaction metadata."""
+
+    id: str
+    source_id: str
+    target_id: str
+    label: str = ""
+    kind: str = "calls_ir"
+    verification: VerificationState = "declared"
+    collapsed_count: int = 0
+    collapsed_samples: list[str] = Field(default_factory=list)
+    evidence_note: str = ""
+
+
+class StratumExpansionResult(StrictSchema):
+    """Read-only Zoom-2/Zoom-3 subgraph emitted by a `StratumPlugin` for one parent node."""
+
+    summary_badges: list[StratumSummaryBadge] = Field(default_factory=list)
+    nodes: list[StratumMicroNode] = Field(default_factory=list)
+    edges: list[StratumMicroEdge] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class StratumDrilldownRead(StrictSchema):
+    """On-demand progressive LOD drill-down payload for a single parent Zoom-1 node."""
+
+    target_slug: str
+    parent_node_id: str
+    zoom: MicroStratumZoom
+    unfiltered_ir: bool = False
+    summary_badges: list[StratumSummaryBadge] = Field(default_factory=list)
+    nodes: list[StratumMicroNode] = Field(default_factory=list)
+    edges: list[StratumMicroEdge] = Field(default_factory=list)
+    raw_node_count: int = 0
+    compacted_node_count: int = 0
+    collapsed_thunk_count: int = 0
+    active_plugins: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class ConeSectionCount(StrictSchema):
     included: int = 0
     eligible: int = 0
@@ -565,6 +637,8 @@ class ConeCompleteness(StrictSchema):
     findings: ConeSectionCount = Field(default_factory=ConeSectionCount)
     seed_findings: ConeSectionCount = Field(default_factory=ConeSectionCount)
     chains: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    stratum_nodes: ConeSectionCount = Field(default_factory=ConeSectionCount)
+    stratum_edges: ConeSectionCount = Field(default_factory=ConeSectionCount)
     truncation_reasons: list[str] = Field(default_factory=list)
     full_export_hint: str = ""
 
@@ -576,6 +650,7 @@ class LlmContextConeReport(StrictSchema):
     worktree_dirty: bool | None = None
     dirty_path_count: int | None = None
     content_digest: str = ""
+    zoom: StratumZoom = 1
     matched_seed_ids: list[str] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
     upstream_display_nodes: list[LlmNodePointer] = Field(default_factory=list)
@@ -585,9 +660,13 @@ class LlmContextConeReport(StrictSchema):
     cone_edge_items: list[ConeEdgeSummary] = Field(default_factory=list)
     matching_chains: list[EndToEndChain] = Field(default_factory=list)
     cone_findings: list[BoundaryFinding] = Field(default_factory=list)
+    stratum_drilldowns: list[StratumDrilldownRead] = Field(default_factory=list)
     completeness: ConeCompleteness | None = None
     approx_tokens: int = 0
     markdown: str = ""
+
+
+LineageConeSlice = LlmContextConeReport
 
 
 class SourceSnippetLine(StrictSchema):
@@ -608,12 +687,100 @@ class SourceSnippetRead(StrictSchema):
     lines: list[SourceSnippetLine] = Field(default_factory=list)
 
 
+EvidenceSourceKind = Literal["source_static", "compiled_artifact", "runtime_capture"]
+EpistemicKind = Literal[
+    "observation",
+    "static_inference",
+    "compiled_artifact",
+    "runtime_capture",
+    "model_interpretation",
+    "suggested_action",
+    "verified_result",
+]
+ReferenceSubjectKind = Literal["node", "edge", "finding", "snippet", "capture"]
+ReferenceValidationState = Literal[
+    "validated",
+    "text_convenience",
+    "vanished_in_current_scan",
+    "historical_needs_revalidation",
+    "unresolved",
+]
+InvestigationActor = Literal["human", "agent", "system"]
+FollowState = Literal["following", "paused"]
+
+
+class EvidenceSourceItem(StrictSchema):
+    kind: EvidenceSourceKind
+    producer: str
+    freshness: str
+    sampling_note: str = ""
+
+
+class EvidenceIdentityRead(StrictSchema):
+    evidence_revision_id: str
+    snapshot_id: int | None = None
+    source_commit: str
+    content_tree_sha256: str | None = None
+    worktree_dirty: bool | None = None
+    dirty_path_count: int | None = None
+    content_digest: str
+    observed_at: datetime
+    coverage_complete: bool = True
+    stack_profile: str
+    active_plugins: list[str] = Field(default_factory=list)
+    evidence_sources: list[EvidenceSourceItem] = Field(default_factory=list)
+
+
+class ValidatedReferenceRead(StrictSchema):
+    ref_id: str
+    kind: ReferenceSubjectKind
+    label: str = ""
+    source_file: str | None = None
+    line: int | None = None
+    evidence_revision_id: str
+    validation_state: ReferenceValidationState
+    epistemic_kind: EpistemicKind = "static_inference"
+    producer: str = "wythe-scanner"
+    note: str = ""
+
+
+class ContextBudgetSummary(StrictSchema):
+    included_counts: dict[str, int] = Field(default_factory=dict)
+    omitted_counts: dict[str, int] = Field(default_factory=dict)
+    truncated_sections: list[str] = Field(default_factory=list)
+    prompt_chars: int = 0
+    max_prompt_chars: int = 0
+    expand_hint: str = ""
+
+
+class InvestigationCorrectionRead(StrictSchema):
+    correction_id: str
+    session_id: str
+    client_id: str | None = None
+    actor: InvestigationActor = "human"
+    target_ref_id: str | None = None
+    turn_id: str | None = None
+    kind: str = "disagreement"
+    note: str
+    evidence_revision_id: str | None = None
+    promoted_to_ruling: bool = False
+    created_at: datetime
+
+
 class UiFocusStatePayload(StrictSchema):
     active_slug: str = Field(min_length=1, max_length=64)
+    session_id: str | None = Field(default=None, max_length=64)
+    client_id: str | None = Field(default=None, max_length=128)
+    actor: InvestigationActor = "human"
     active_tab: str = Field(default="3d", max_length=24)
     selected_node_id: str | None = Field(default=None, max_length=200)
+    selected_edge_id: str | None = Field(default=None, max_length=200)
+    selected_finding_id: str | None = Field(default=None, max_length=200)
     hovered_node_id: str | None = Field(default=None, max_length=200)
     focused_district: str | None = Field(default=None, max_length=80)
+    follow_state: FollowState | None = None
+    focus_revision: int | None = Field(default=None, ge=0)
+    evidence_revision_id: str | None = Field(default=None, max_length=96)
     tier_filter: str = Field(default="all", max_length=24)
     subkind_filter: str = Field(default="all", max_length=32)
     edge_filter: str = Field(default="all", max_length=32)
@@ -639,11 +806,19 @@ class UiFocusStatePayload(StrictSchema):
 
 class UiFocusSyncAck(StrictSchema):
     active_slug: str
+    session_id: str | None = None
+    client_id: str | None = None
+    actor: InvestigationActor = "human"
+    follow_state: FollowState = "following"
+    focus_revision: int = 0
+    evidence_revision_id: str | None = None
     observed_at: datetime
     has_snapshot: bool
     snapshot_path: str | None = None
     snapshot_mime_type: str | None = None
     camera_revision: int | None = None
+    snapshot_focus_revision: int | None = None
+    snapshot_evidence_revision: str | None = None
     snapshot_stale: bool = False
 
 
@@ -663,6 +838,12 @@ class UiFocusExplainRead(StrictSchema):
     target_name: str
     source_commit: str
     observed_at: datetime
+    session_id: str | None = None
+    client_id: str | None = None
+    actor: InvestigationActor = "human"
+    follow_state: FollowState = "following"
+    focus_revision: int = 0
+    evidence_revision_id: str | None = None
     active_tab: str
     lens: str
     layout_mode: str
@@ -671,6 +852,8 @@ class UiFocusExplainRead(StrictSchema):
     headline: str
     color_reason: str
     focused_node: LlmNodePointer | None = None
+    selected_edge_id: str | None = None
+    selected_finding_id: str | None = None
     focused_district: DistrictXraySummary | None = None
     active_findings: list[BoundaryFinding] = Field(default_factory=list)
     cone_edges: list[str] = Field(default_factory=list)
@@ -678,7 +861,13 @@ class UiFocusExplainRead(StrictSchema):
     snapshot_path: str | None = None
     snapshot_mime_type: str | None = None
     camera_revision: int | None = None
+    snapshot_focus_revision: int | None = None
+    snapshot_evidence_revision: str | None = None
     snapshot_stale: bool = False
+    ambiguous_session_ids: list[str] = Field(default_factory=list)
+    corrections: list[InvestigationCorrectionRead] = Field(default_factory=list)
+    evidence_identity: EvidenceIdentityRead | None = None
+    context_budget: ContextBudgetSummary | None = None
     markdown_brief: str
 
 
@@ -712,6 +901,11 @@ class AskWytheRequest(StrictSchema):
     question: str = Field(min_length=1, max_length=2000)
     engine: Literal["auto", "apple", "local"] = "auto"
     target_slug: str | None = Field(default=None, max_length=64)
+    session_id: str | None = Field(default=None, max_length=64)
+    client_id: str | None = Field(default=None, max_length=128)
+    selected_node_id: str | None = Field(default=None, max_length=200)
+    selected_finding_id: str | None = Field(default=None, max_length=200)
+    selected_edge_id: str | None = Field(default=None, max_length=200)
     local_base_url: str | None = Field(default=None, max_length=256)
     local_model_id: str | None = Field(default=None, max_length=160)
     include_vision_snapshot: bool = True
@@ -721,24 +915,46 @@ class AskWytheRequest(StrictSchema):
 
 
 class AskWytheResponse(StrictSchema):
+    session_id: str | None = None
+    turn_id: str | None = None
+    authored_by: Literal["model", "scanner_brief"] = "model"
     engine_used: Literal["apple", "local"]
     model_id: str
     used_vision_snapshot: bool = False
+    image_supplied: bool = False
+    fallback_reason: str | None = None
     context_headline: str
     answer_markdown: str
     referenced_node_ids: list[str] = Field(default_factory=list)
+    validated_references: list[ValidatedReferenceRead] = Field(default_factory=list)
+    evidence_identity: EvidenceIdentityRead | None = None
+    context_budget: ContextBudgetSummary | None = None
     observed_at: datetime
 
 
 class PluginSpecItem(StrictSchema):
     name: str
-    kind: Literal["manipulator_augmenter", "post_scan_check"]
+    kind: Literal[
+        "manipulator_augmenter",
+        "post_scan_check",
+        "stratum_inspector",
+        "stack_adapter",
+    ]
     source: str
     origin: Literal["builtin", "entry_point", "local_opt_in"]
     tier: str = "manipulate"
     version: str = "unknown"
     description: str = ""
     enabled_by_default: bool = True
+    supported_zooms: list[int] = Field(default_factory=list)
+    rules: list[str] = Field(default_factory=list)
+    mcp_tools: list[str] = Field(default_factory=list)
+    cli_subcommands: list[str] = Field(default_factory=list)
+    stack_profiles: list[str] = Field(default_factory=list)
+    tier_adapters: list[str] = Field(default_factory=list)
+    interaction_capabilities: list[str] = Field(default_factory=list)
+    unsupported_interaction_capabilities: list[str] = Field(default_factory=list)
+    evidence_source_kinds: list[EvidenceSourceKind] = Field(default_factory=list)
     trusted: bool = True
 
 
@@ -785,3 +1001,663 @@ class OpenLineageBundleResponse(StrictSchema):
     datasets: list[OpenLineageDatasetItem] = Field(default_factory=list)
     jobs: list[OpenLineageJobItem] = Field(default_factory=list)
     nonCertificationNotice: str
+
+
+FramingPreset = Literal[
+    "iso_overview",
+    "tier_elevation",
+    "wythe_cross_section",
+    "corridor_trace",
+]
+ViewportLayoutChoice = Literal[
+    "cluster",
+    "grid",
+    "subkind",
+    "connected",
+    "lifecycle_z",
+    "temporal_z",
+]
+ZWytheSliceChoice = Literal[
+    "all",
+    "z0_blueprint",
+    "z1_built",
+    "z2_runtime",
+    "z_base",
+    "z_head",
+]
+ViewportLensChoice = Literal[
+    "status",
+    "contention",
+    "gravity",
+    "subkind",
+    "cluster",
+    "containers",
+]
+
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_EXECUTABLE_TEXT_RE = re.compile(
+    r"<\s*/?\s*(?:script|iframe|object|embed)\b"
+    r"|\b(?:javascript|vbscript)\s*:"
+    r"|\bdata\s*:\s*text/html"
+    r"|<\s*[a-zA-Z][^>]*\bon[a-zA-Z]+\s*=",
+    re.IGNORECASE,
+)
+_HTML_TAG_RE = re.compile(
+    r"<(?:!--[\s\S]*?--|![a-zA-Z][^>]*|\?[^>]*|/\s*[a-zA-Z][a-zA-Z0-9:-]*\s*"
+    r"|[a-zA-Z][a-zA-Z0-9:-]*(?:\s[^<>]*)?/?)>"
+)
+_UNCLOSED_HTML_TAG_RE = re.compile(r"<(?:/\s*)?[a-zA-Z][a-zA-Z0-9:-]*(?:\s[^<>]*)?$")
+_NUMERIC_SCALAR_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
+_NUMERIC_TUPLE_RE = re.compile(
+    r"^[\[\(\{]?\s*[+-]?(?:\d+\.?\d*|\.\d+)"
+    r"(?:\s*[,;\s]\s*[+-]?(?:\d+\.?\d*|\.\d+))+\s*[\]\)\}]?$"
+)
+_COORD_SMUGGLE_RE = re.compile(
+    r"^(?:camera_?(?:pos|position|target|lookat)|pos|position|coords?|coordinates?"
+    r"|euler|rot|rotation|quat|quaternion|xyz|azimuth|elevation)\s*[:=]"
+    r"|(?:^|[,;\s])[xyz]\s*=\s*[+-]?(?:\d|\.\d)",
+    re.IGNORECASE,
+)
+
+
+def sanitize_viewport_plain_text(value: str, *, field_name: str = "text") -> str:
+    """Strip HTML tags to plain text and reject script/executable URI payloads."""
+    cleaned = _CTRL_CHARS_RE.sub("", value)
+    if _EXECUTABLE_TEXT_RE.search(cleaned):
+        raise ValueError(
+            f"Unsafe executable markup or script URI rejected in `{field_name}`."
+        )
+    while True:
+        nxt = _HTML_TAG_RE.sub("", cleaned)
+        nxt = _UNCLOSED_HTML_TAG_RE.sub("", nxt)
+        if _EXECUTABLE_TEXT_RE.search(nxt):
+            raise ValueError(
+                f"Unsafe executable markup or script URI rejected in `{field_name}`."
+            )
+        if nxt == cleaned:
+            break
+        cleaned = nxt
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def validate_semantic_atlas_id(raw_id: str, *, field_name: str = "id") -> str:
+    """Enforce semantic Atlas IDs and reject raw numeric coordinate smuggling."""
+    cleaned = _CTRL_CHARS_RE.sub("", raw_id).strip()
+    if not cleaned:
+        raise ValueError(f"`{field_name}` entries must be non-empty semantic identifiers.")
+    if len(cleaned) > 200:
+        raise ValueError(f"`{field_name}` entry exceeds 200 characters.")
+    if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
+        raise ValueError(f"Markup or script content is forbidden in `{field_name}`.")
+    if (
+        _NUMERIC_SCALAR_RE.match(cleaned)
+        or _NUMERIC_TUPLE_RE.match(cleaned)
+        or _COORD_SMUGGLE_RE.search(cleaned)
+    ):
+        raise ValueError(
+            f"Raw numeric coordinates are forbidden in `{field_name}`; "
+            "pass semantic Atlas IDs and `framing_preset` instead."
+        )
+    return cleaned
+
+
+class TourKeyframe(StrictSchema):
+    step_index: int = Field(ge=0, le=64)
+    title: str = Field(max_length=120)
+    focus_node_ids: list[str] = Field(default_factory=list, max_length=50)
+    highlight_edge_ids: list[str] = Field(default_factory=list, max_length=80)
+    finding_id: str | None = Field(default=None, max_length=120)
+    lens: ViewportLensChoice | None = None
+    layout_mode: ViewportLayoutChoice | None = None
+    z_wythe_slice: ZWytheSliceChoice | None = None
+    zoom_stratum: Literal[1, 2, 3] = 1
+    framing_preset: FramingPreset = "iso_overview"
+    caption: str = Field(default="", max_length=400)
+
+    @field_validator("title", "caption", mode="before")
+    @classmethod
+    def _clean_text(cls, value: Any, info: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return sanitize_viewport_plain_text(value, field_name=str(info.field_name))
+
+    @field_validator("focus_node_ids", "highlight_edge_ids", mode="before")
+    @classmethod
+    def _clean_id_list(cls, value: Any, info: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        fname = str(info.field_name)
+        return [
+            validate_semantic_atlas_id(item, field_name=fname) if isinstance(item, str) else item
+            for item in value
+        ]
+
+    @field_validator("finding_id", mode="before")
+    @classmethod
+    def _clean_finding_id(cls, value: Any) -> Any:
+        if value is None or not isinstance(value, str):
+            return value
+        return validate_semantic_atlas_id(value, field_name="finding_id")
+
+    @field_validator("step_index", "zoom_stratum", mode="before")
+    @classmethod
+    def _reject_bool_int(cls, value: Any, info: Any) -> Any:
+        if value is True or value is False:
+            raise ValueError(f"`{info.field_name}` must be an integer, not boolean.")
+        return value
+
+
+class ChronicleFrame(StrictSchema):
+    phase_index: int = Field(ge=0, le=64)
+    phase_key: str = Field(min_length=1, max_length=64)
+    phase_label: str = Field(min_length=1, max_length=120)
+    tier: TierKind
+    focus_node_ids: list[str] = Field(default_factory=list, max_length=80)
+    highlight_edge_ids: list[str] = Field(default_factory=list, max_length=120)
+    status: Literal["ok", "warning", "failed", "pending"] = "ok"
+    caption: str = Field(default="", max_length=400)
+    substeps: list[str] = Field(default_factory=list, max_length=24)
+
+    @field_validator("phase_key", mode="before")
+    @classmethod
+    def _clean_phase_key(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return validate_semantic_atlas_id(value, field_name="phase_key")
+
+    @field_validator("phase_index", mode="before")
+    @classmethod
+    def _reject_bool_phase_idx(cls, value: Any) -> Any:
+        if value is True or value is False:
+            raise ValueError("`phase_index` must be an integer, not boolean.")
+        return value
+
+    @field_validator("phase_label", "caption", mode="before")
+    @classmethod
+    def _clean_frame_text(cls, value: Any, info: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return sanitize_viewport_plain_text(value, field_name=str(info.field_name))
+
+    @field_validator("substeps", mode="before")
+    @classmethod
+    def _clean_substeps(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        cleaned_steps: list[Any] = []
+        for item in value:
+            if not isinstance(item, str):
+                cleaned_steps.append(item)
+                continue
+            sanitized = sanitize_viewport_plain_text(item, field_name="substeps")
+            if len(sanitized) > 240:
+                raise ValueError("`substeps` entry exceeds 240 characters.")
+            cleaned_steps.append(sanitized)
+        return cleaned_steps
+
+    @field_validator("focus_node_ids", "highlight_edge_ids", mode="before")
+    @classmethod
+    def _clean_frame_ids(cls, value: Any, info: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        fname = str(info.field_name)
+        return [
+            validate_semantic_atlas_id(item, field_name=fname) if isinstance(item, str) else item
+            for item in value
+        ]
+
+
+class ChronicleTimeline(StrictSchema):
+    timeline_id: str = Field(min_length=1, max_length=64)
+    target_slug: str = Field(min_length=1, max_length=64)
+    title: str = Field(default="", max_length=160)
+    live_following: bool = True
+    halted_reason: str | None = Field(default=None, max_length=240)
+    active_phase_index: int = Field(default=0, ge=0, le=64)
+    frames: list[ChronicleFrame] = Field(default_factory=list, max_length=32)
+
+    @field_validator("timeline_id", "target_slug", mode="before")
+    @classmethod
+    def _clean_timeline_identifiers(cls, value: Any, info: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        fname = str(info.field_name)
+        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
+        if not cleaned:
+            raise ValueError(f"`{fname}` must be non-empty.")
+        if (
+            _EXECUTABLE_TEXT_RE.search(cleaned)
+            or _HTML_TAG_RE.search(cleaned)
+            or _UNCLOSED_HTML_TAG_RE.search(cleaned)
+            or _NUMERIC_TUPLE_RE.match(cleaned)
+            or _COORD_SMUGGLE_RE.search(cleaned)
+        ):
+            raise ValueError(f"Markup or coordinate tuples are forbidden in `{fname}`.")
+        return cleaned
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _clean_timeline_title(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return sanitize_viewport_plain_text(value, field_name="title")
+
+    @field_validator("halted_reason", mode="before")
+    @classmethod
+    def _clean_halted_reason(cls, value: Any) -> Any:
+        if value is None or not isinstance(value, str):
+            return value
+        sanitized = sanitize_viewport_plain_text(value, field_name="halted_reason")
+        return sanitized or None
+
+    @field_validator("active_phase_index", mode="before")
+    @classmethod
+    def _reject_bool_active_phase(cls, value: Any) -> Any:
+        if value is True or value is False:
+            raise ValueError("`active_phase_index` must be an integer, not boolean.")
+        return value
+
+
+ViewportDeliveryState = Literal[
+    "accepted_by_service",
+    "waiting_for_follow",
+    "applied_by_browser",
+    "paused_by_human",
+    "rejected",
+    "stale",
+    "expired",
+]
+ViewportReceiptOutcome = Literal["applied", "paused_by_human", "rejected", "stale_revision"]
+
+
+def _new_command_id() -> str:
+    return f"cmd_{uuid.uuid4().hex[:12]}"
+
+
+class ViewportCommand(StrictSchema):
+    command_id: str = Field(default_factory=_new_command_id, max_length=64)
+    correlation_id: str | None = Field(default=None, max_length=128)
+    target_slug: str = Field(min_length=1, max_length=64)
+    session_id: str | None = Field(default=None, max_length=64)
+    expected_evidence_revision: str | None = Field(default=None, max_length=96)
+    expires_at: datetime | None = None
+    delivery_state: ViewportDeliveryState = "accepted_by_service"
+    applied_by_client_ids: list[str] = Field(default_factory=list, max_length=64)
+    focus_node_ids: list[str] = Field(default_factory=list, max_length=50)
+    highlight_edge_ids: list[str] = Field(default_factory=list, max_length=80)
+    finding_id: str | None = Field(default=None, max_length=120)
+    lens: ViewportLensChoice | None = None
+    layout_mode: ViewportLayoutChoice | None = None
+    z_wythe_slice: ZWytheSliceChoice | None = None
+    zoom_stratum: Literal[1, 2, 3] = 1
+    framing_preset: FramingPreset = "iso_overview"
+    caption: str = Field(default="", max_length=400)
+    tour_keyframes: list[TourKeyframe] = Field(default_factory=list, max_length=32)
+    chronicle_frames: list[ChronicleFrame] = Field(default_factory=list, max_length=32)
+    chronicle_timeline: ChronicleTimeline | None = None
+
+    @field_validator("command_id", mode="before")
+    @classmethod
+    def _clean_command_id(cls, value: Any) -> Any:
+        if value is None:
+            return _new_command_id()
+        if not isinstance(value, str):
+            return value
+        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
+        if not cleaned:
+            return _new_command_id()
+        if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
+            raise ValueError("Markup or script content is forbidden in `command_id`.")
+        return cleaned
+
+    @field_validator("correlation_id", "expected_evidence_revision", mode="before")
+    @classmethod
+    def _clean_optional_identifiers(cls, value: Any, info: Any) -> Any:
+        if value is None or not isinstance(value, str):
+            return value
+        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
+        if not cleaned:
+            return None
+        if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
+            raise ValueError(f"Markup or script content is forbidden in `{info.field_name}`.")
+        return cleaned
+
+    @field_validator("zoom_stratum", mode="before")
+    @classmethod
+    def _reject_bool_zoom_stratum(cls, value: Any) -> Any:
+        if value is True or value is False:
+            raise ValueError("`zoom_stratum` must be integer 1, 2, or 3, not boolean.")
+        return value
+
+    @field_validator("target_slug", mode="before")
+    @classmethod
+    def _clean_target_slug(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
+        if not cleaned:
+            raise ValueError("`target_slug` must be non-empty.")
+        if (
+            _EXECUTABLE_TEXT_RE.search(cleaned)
+            or _HTML_TAG_RE.search(cleaned)
+            or _UNCLOSED_HTML_TAG_RE.search(cleaned)
+            or _NUMERIC_TUPLE_RE.match(cleaned)
+            or _COORD_SMUGGLE_RE.search(cleaned)
+        ):
+            raise ValueError("Markup or coordinate tuples are forbidden in `target_slug`.")
+        return cleaned
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def _clean_session_id(cls, value: Any) -> Any:
+        if value is None or not isinstance(value, str):
+            return value
+        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
+        if not cleaned:
+            return None
+        if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
+            raise ValueError("Markup or script content is forbidden in `session_id`.")
+        return cleaned
+
+    @field_validator("caption", mode="before")
+    @classmethod
+    def _clean_command_caption(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return sanitize_viewport_plain_text(value, field_name="caption")
+
+    @field_validator("focus_node_ids", "highlight_edge_ids", mode="before")
+    @classmethod
+    def _clean_command_ids(cls, value: Any, info: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        fname = str(info.field_name)
+        return [
+            validate_semantic_atlas_id(item, field_name=fname) if isinstance(item, str) else item
+            for item in value
+        ]
+
+    @field_validator("finding_id", mode="before")
+    @classmethod
+    def _clean_command_finding(cls, value: Any) -> Any:
+        if value is None or not isinstance(value, str):
+            return value
+        return validate_semantic_atlas_id(value, field_name="finding_id")
+
+
+class ViewportCommandEvent(StrictSchema):
+    seq: int = Field(ge=1)
+    issued_at: datetime
+    permalink: str
+    delivery_state: ViewportDeliveryState = "accepted_by_service"
+    applied_by_client_ids: list[str] = Field(default_factory=list)
+    command: ViewportCommand
+
+
+class ViewportCommandAck(StrictSchema):
+    seq: int = Field(ge=1)
+    command_id: str = ""
+    correlation_id: str | None = None
+    issued_at: datetime
+    target_slug: str
+    session_id: str | None = None
+    permalink: str
+    subscriber_count: int = Field(ge=0)
+    delivery_state: ViewportDeliveryState = "accepted_by_service"
+    applied_by_client_ids: list[str] = Field(default_factory=list)
+    idempotent_replay: bool = False
+    command: ViewportCommand
+
+
+class ViewportStateRead(StrictSchema):
+    target_slug: str
+    session_id: str | None = None
+    latest: ViewportCommandEvent | None = None
+    history: list[ViewportCommandEvent] = Field(default_factory=list)
+    subscriber_count: int = Field(default=0, ge=0)
+
+
+class ViewportCommandReceiptCreate(StrictSchema):
+    command_id: str = Field(min_length=1, max_length=64)
+    seq: int | None = Field(default=None, ge=1)
+    target_slug: str = Field(min_length=1, max_length=64)
+    session_id: str | None = Field(default=None, max_length=64)
+    client_id: str = Field(min_length=1, max_length=128)
+    outcome: ViewportReceiptOutcome
+    applied_focus_revision: int | None = Field(default=None, ge=0)
+    note: str = Field(default="", max_length=400)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _clean_receipt_note(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return sanitize_viewport_plain_text(value, field_name="note")
+
+
+class ViewportCommandReceiptRead(StrictSchema):
+    receipt_id: str
+    command_id: str
+    seq: int | None = None
+    target_slug: str
+    session_id: str | None = None
+    client_id: str
+    outcome: ViewportReceiptOutcome
+    delivery_state: ViewportDeliveryState
+    applied_by_client_ids: list[str] = Field(default_factory=list)
+    applied_focus_revision: int | None = None
+    note: str = ""
+    recorded_at: datetime
+
+
+class RetentionPolicyRead(StrictSchema):
+    max_sessions: int = 64
+    max_turns_per_session: int = 100
+    max_events_per_session: int = 200
+    storage_backend: str = "sqlite_wal"
+    db_filename: str = "viewport_bus.sqlite3"
+
+
+class InvestigationFocusSnapshot(StrictSchema):
+    focus_revision: int = 0
+    actor: InvestigationActor = "human"
+    client_id: str | None = None
+    active_tab: str = "3d"
+    selected_node_id: str | None = None
+    selected_edge_id: str | None = None
+    selected_finding_id: str | None = None
+    hovered_node_id: str | None = None
+    focused_district: str | None = None
+    lens: str = "status"
+    layout_mode: str = "cluster"
+    blast_mode: str = "off"
+    diff_base_ref: str = "HEAD~1"
+    has_snapshot: bool = False
+    snapshot_path: str | None = None
+    snapshot_focus_revision: int | None = None
+    snapshot_evidence_revision: str | None = None
+    updated_at: datetime
+
+
+class InvestigationCorrectionCreate(StrictSchema):
+    client_id: str | None = Field(default=None, max_length=128)
+    actor: InvestigationActor = "human"
+    target_ref_id: str | None = Field(default=None, max_length=200)
+    turn_id: str | None = Field(default=None, max_length=64)
+    kind: str = Field(default="disagreement", max_length=64)
+    note: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _clean_correction_note(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        cleaned = sanitize_viewport_plain_text(value, field_name="note")
+        if not cleaned:
+            raise ValueError("`note` must be non-empty.")
+        return cleaned
+
+
+class InvestigationFollowUpdate(StrictSchema):
+    client_id: str | None = Field(default=None, max_length=128)
+    actor: InvestigationActor = "human"
+    follow_state: FollowState
+    reason: str = Field(default="", max_length=400)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _clean_follow_reason(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return sanitize_viewport_plain_text(value, field_name="reason")
+
+
+class InvestigationTurnCreate(StrictSchema):
+    client_id: str | None = Field(default=None, max_length=128)
+    actor: InvestigationActor = "human"
+    question: str = Field(min_length=1, max_length=2000)
+    answer_markdown: str | None = Field(default=None, max_length=24000)
+    engine: str | None = Field(default=None, max_length=64)
+    model_id: str | None = Field(default=None, max_length=200)
+    used_vision: bool = False
+    image_supplied: bool = False
+    authored_by: Literal["model", "scanner_brief", "none"] = "model"
+    fallback_reason: str | None = Field(default=None, max_length=500)
+    failure_reason: str | None = Field(default=None, max_length=500)
+    selected_node_id: str | None = Field(default=None, max_length=200)
+    selected_edge_id: str | None = Field(default=None, max_length=200)
+    selected_finding_id: str | None = Field(default=None, max_length=200)
+    referenced_ids: list[str] = Field(default_factory=list, max_length=64)
+
+
+class InvestigationTurnRead(StrictSchema):
+    turn_id: str
+    session_id: str
+    client_id: str | None = None
+    actor: InvestigationActor = "human"
+    question: str
+    answer_markdown: str | None = None
+    status: Literal["answered", "unresolved"] = "answered"
+    authored_by: Literal["model", "scanner_brief", "none"] = "model"
+    engine: str | None = None
+    model_id: str | None = None
+    used_vision: bool = False
+    image_supplied: bool = False
+    fallback_reason: str | None = None
+    failure_reason: str | None = None
+    evidence_revision_id: str
+    focus_revision: int = 0
+    selected_node_id: str | None = None
+    selected_edge_id: str | None = None
+    selected_finding_id: str | None = None
+    validated_references: list[ValidatedReferenceRead] = Field(default_factory=list)
+    needs_revalidation: bool = False
+    created_at: datetime
+
+
+class InvestigationDeltaEventRead(StrictSchema):
+    revision: int
+    session_id: str
+    event_kind: str
+    actor: InvestigationActor = "system"
+    client_id: str | None = None
+    summary: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class InvestigationDeltaEventsResponse(StrictSchema):
+    session_id: str
+    latest_revision: int
+    since_revision: int
+    events: list[InvestigationDeltaEventRead] = Field(default_factory=list)
+
+
+class InvestigationCreateRequest(StrictSchema):
+    target_slug: str = Field(min_length=1, max_length=64)
+    session_id: str | None = Field(default=None, max_length=64)
+    client_id: str | None = Field(default=None, max_length=128)
+    title: str | None = Field(default=None, max_length=200)
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def _clean_create_session_id(cls, value: Any) -> Any:
+        if value is None or not isinstance(value, str):
+            return value
+        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
+        if not cleaned:
+            return None
+        if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
+            raise ValueError("Markup or script content is forbidden in `session_id`.")
+        return cleaned
+
+
+class InvestigationSummaryRead(StrictSchema):
+    session_id: str
+    target_slug: str
+    title: str
+    follow_state: FollowState = "following"
+    session_revision: int = 0
+    focus_revision: int = 0
+    pinned_evidence_revision_id: str
+    latest_evidence_revision_id: str
+    participating_client_ids: list[str] = Field(default_factory=list)
+    turn_count: int = 0
+    unresolved_question_count: int = 0
+    correction_count: int = 0
+    selected_node_id: str | None = None
+    selected_edge_id: str | None = None
+    selected_finding_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class InvestigationListResponse(StrictSchema):
+    sessions: list[InvestigationSummaryRead] = Field(default_factory=list)
+    retention_policy: RetentionPolicyRead = Field(default_factory=RetentionPolicyRead)
+
+
+class InvestigationSessionRead(StrictSchema):
+    session_id: str
+    target_slug: str
+    title: str
+    follow_state: FollowState = "following"
+    follow_reason: str = ""
+    session_revision: int = 0
+    focus_revision: int = 0
+    participating_client_ids: list[str] = Field(default_factory=list)
+    pinned_evidence: EvidenceIdentityRead
+    latest_evidence: EvidenceIdentityRead
+    evidence_drifted: bool = False
+    focus: InvestigationFocusSnapshot
+    turns: list[InvestigationTurnRead] = Field(default_factory=list)
+    unresolved_questions: list[InvestigationTurnRead] = Field(default_factory=list)
+    corrections: list[InvestigationCorrectionRead] = Field(default_factory=list)
+    recent_receipts: list[ViewportCommandReceiptRead] = Field(default_factory=list)
+    recent_events: list[InvestigationDeltaEventRead] = Field(default_factory=list)
+    retention_policy: RetentionPolicyRead = Field(default_factory=RetentionPolicyRead)
+    permalink: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+class InvestigationRevisionComparisonRead(StrictSchema):
+    session_id: str
+    target_slug: str
+    pinned_evidence: EvidenceIdentityRead
+    current_evidence: EvidenceIdentityRead
+    digest_changed: bool
+    surviving_refs: list[ValidatedReferenceRead] = Field(default_factory=list)
+    vanished_refs: list[ValidatedReferenceRead] = Field(default_factory=list)
+    modified_refs: list[ValidatedReferenceRead] = Field(default_factory=list)
+    added_finding_ids: list[str] = Field(default_factory=list)
+    resolved_finding_ids: list[str] = Field(default_factory=list)
+    invalidated_turn_ids: list[str] = Field(default_factory=list)
+    summary_markdown: str
+
+
+class InvestigationExportBundle(StrictSchema):
+    schema_version: str = "1.0"
+    exported_at: datetime
+    session: InvestigationSessionRead
+    comparison: InvestigationRevisionComparisonRead | None = None

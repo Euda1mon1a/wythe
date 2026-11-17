@@ -70,6 +70,16 @@ def _source_location_facet(
     }
 
 
+def _dataset_namespace_kind(subkind: str) -> str:
+    if subkind == "cache_store":
+        return "cache"
+    if subkind == "entity_store":
+        return "entity_store"
+    if subkind == "entitlement_spec":
+        return "entitlement_spec"
+    return "sql"
+
+
 def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, object]:
     """Build a deterministic OpenLineage Static Lineage JSON bundle from `report`."""
     node_by_id: dict[str, AtlasNode] = {n.id: n for n in report.nodes}
@@ -77,20 +87,21 @@ def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, objec
         (
             n
             for n in report.nodes
-            if n.tier == "truth" and n.subkind in ("table", "cache_store")
+            if n.tier == "truth"
+            and n.subkind in ("table", "cache_store", "entity_store", "entitlement_spec")
         ),
         key=lambda n: (n.subkind, n.label, n.id),
     )
 
     label_counts: dict[tuple[str, str], int] = {}
     for dn in dataset_nodes:
-        ns_kind = "cache" if dn.subkind == "cache_store" else "sql"
+        ns_kind = _dataset_namespace_kind(dn.subkind)
         label_counts[(ns_kind, dn.label)] = label_counts.get((ns_kind, dn.label), 0) + 1
 
     dataset_ref_by_id: dict[str, dict[str, str]] = {}
     datasets_out: list[dict[str, object]] = []
     for dn in dataset_nodes:
-        ns_kind = "cache" if dn.subkind == "cache_store" else "sql"
+        ns_kind = _dataset_namespace_kind(dn.subkind)
         namespace = f"wythe://{report.target_slug}/{ns_kind}"
         ds_name = dn.label if label_counts[(ns_kind, dn.label)] == 1 else f"{dn.label}:{dn.id}"
         dataset_ref_by_id[dn.id] = {"namespace": namespace, "name": ds_name}
@@ -164,6 +175,16 @@ def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, objec
             ):
                 continue
             prop_edges_by_src.setdefault(edge.source_id, []).append((edge, edge.target_id))
+        elif (
+            edge.kind in ("queries_endpoint", "mutates_endpoint", "uses_client")
+            and edge.verification in ("verified", "declared")
+        ):
+            src_n = node_by_id.get(edge.source_id)
+            if src_n is not None and (
+                (src_n.tier == "display" and src_n.subkind == "cli")
+                or (src_n.tier == "manipulate" and tgt is not None and tgt.tier == "manipulate")
+            ):
+                prop_edges_by_src.setdefault(edge.source_id, []).append((edge, edge.target_id))
 
     for src_id, edge_list in prop_edges_by_src.items():
         prop_edges_by_src[src_id] = sorted(edge_list, key=lambda item: (item[1], item[0].id))
@@ -222,7 +243,16 @@ def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, objec
         (n for n in report.nodes if n.tier == "manipulate"),
         key=lambda n: (n.subkind, n.id),
     )
-    for mn in manip_nodes:
+    display_cli_nodes = sorted(
+        (n for n in report.nodes if n.tier == "display" and n.subkind == "cli"),
+        key=lambda n: (n.subkind, n.id),
+    )
+    cli_out_kinds: dict[str, set[str]] = {}
+    for edge in report.edges:
+        if edge.verification in ("verified", "declared"):
+            cli_out_kinds.setdefault(edge.source_id, set()).add(edge.kind)
+
+    for mn in (*manip_nodes, *display_cli_nodes):
         reached = _active_closure(mn.id)
         r_ids: set[str] = set()
         w_ids: set[str] = set()
@@ -230,6 +260,11 @@ def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, objec
             mn.subkind == "route"
             and bool(mn.http_methods)
             and all(m in ("GET", "HEAD", "OPTIONS") for m in mn.http_methods)
+        ) or (
+            mn.tier == "display"
+            and mn.subkind == "cli"
+            and "queries_endpoint" in cli_out_kinds.get(mn.id, set())
+            and "mutates_endpoint" not in cli_out_kinds.get(mn.id, set())
         )
         for nid, cur_syms in reached.items():
             for edge, ds_id in read_edges_by_src.get(nid, ()):
@@ -241,9 +276,10 @@ def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, objec
                 for edge, ds_id in write_edges_by_src.get(nid, ()):
                     if _truth_edge_active(nid, edge, cur_syms):
                         w_ids.add(ds_id)
+        job_ns_tier = "display" if mn.tier == "display" else "manipulate"
         jobs_out.append(
             {
-                "namespace": f"wythe://{report.target_slug}/manipulate",
+                "namespace": f"wythe://{report.target_slug}/{job_ns_tier}",
                 "name": mn.id,
                 "inputs": _refs_for(r_ids),
                 "outputs": _refs_for(w_ids),

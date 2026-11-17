@@ -1,18 +1,25 @@
 'use client';
 
-import { useMemo, useState, type FormEvent } from 'react';
-import { Copy, History, Stamp, X } from 'lucide-react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { Copy, History, Layers, Stamp, X } from 'lucide-react';
 import type {
   AtlasEdge,
   AtlasNode,
   BoundaryFinding,
   ConeCompleteness,
+  InvestigationCorrectionRead,
+  InvestigationRevisionComparisonRead,
   PolicyFieldConsumption,
   PortableReferenceExemplar,
   StorePurposeDeclaration,
 } from '@/api/atlas';
+import {
+  ChallengeCorrectionBox,
+  RevisionComparisonPanel,
+} from '@/components/InvestigationCollabControls';
 import { NodeSourceAndPromptPanel } from '@/components/NodeSourceAndPromptPanel';
-import { useCreateRuling, useFetchContextCone } from '@/hooks/useAtlas';
+import { UnderstandingChainPanel } from '@/components/UnderstandingChainPanel';
+import { useCreateRuling, useFetchContextCone, useNodeStrata } from '@/hooks/useAtlas';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { formatCalendarDay } from '@/lib/clock';
 import {
@@ -29,6 +36,18 @@ interface NodeInspectorProps {
   referenceExemplars?: PortableReferenceExemplar[];
   diffOverlay?: DiffOverlaySet | null;
   inWorkingSet?: boolean;
+  requestedZoomStratum?: 1 | 2 | 3;
+  sessionId?: string | null;
+  clientId?: string | null;
+  selectedFindingId?: string | null;
+  selectedEdgeId?: string | null;
+  corrections?: InvestigationCorrectionRead[];
+  evidenceDrifted?: boolean;
+  revisionComparison?: InvestigationRevisionComparisonRead | null;
+  onCorrectionAdded?: (created: InvestigationCorrectionRead) => void;
+  onCompareRevisions?: () => Promise<void>;
+  onSelectFinding?: (findingId: string | null) => void;
+  onSelectEdge?: (edgeId: string | null) => void;
   onToggleWorkingSet?: (nodeId: string) => void;
   onSelectNode: (nodeId: string) => void;
   onClose: () => void;
@@ -85,6 +104,18 @@ export function NodeInspector({
   referenceExemplars = [],
   diffOverlay = null,
   inWorkingSet = false,
+  requestedZoomStratum = 1,
+  sessionId = null,
+  clientId = null,
+  selectedFindingId = null,
+  selectedEdgeId = null,
+  corrections = [],
+  evidenceDrifted = false,
+  revisionComparison = null,
+  onCorrectionAdded,
+  onCompareRevisions,
+  onSelectFinding,
+  onSelectEdge,
   onToggleWorkingSet,
   onSelectNode,
   onClose,
@@ -104,8 +135,29 @@ export function NodeInspector({
   const [copiedFullLabel, setCopiedFullLabel] = useState<string | null>(null);
   const [coneCompleteness, setConeCompleteness] = useState<ConeCompleteness | null>(null);
   const [showAllColumns, setShowAllColumns] = useState(false);
+  const [activeStratumZoom, setActiveStratumZoom] = useState<2 | 3 | null>(
+    requestedZoomStratum === 2 || requestedZoomStratum === 3 ? requestedZoomStratum : null,
+  );
+  const [unfilteredIr, setUnfilteredIr] = useState(false);
+  const [expandedThunkEdges, setExpandedThunkEdges] = useState<Set<string>>(() => new Set());
   const createRuling = useCreateRuling(activeSlug);
   const fetchCone = useFetchContextCone(activeSlug);
+  const strataQuery = useNodeStrata(
+    activeSlug,
+    node?.id ?? null,
+    activeStratumZoom ?? 2,
+    unfilteredIr,
+    activeStratumZoom !== null,
+  );
+
+  useEffect(() => {
+    setExpandedThunkEdges(new Set());
+    if (requestedZoomStratum === 2 || requestedZoomStratum === 3) {
+      setActiveStratumZoom(requestedZoomStratum);
+    } else {
+      setActiveStratumZoom(null);
+    }
+  }, [node?.id, requestedZoomStratum]);
 
   const { inbound, outbound, nodeFindings } = useMemo(() => {
     if (!node) return { inbound: [], outbound: [], nodeFindings: [] };
@@ -120,11 +172,28 @@ export function NodeInspector({
 
   if (!node) {
     return (
-      <aside aria-label="Node Inspector" className="border-l border-slate-800 bg-slate-950/60 p-5 text-xs text-slate-300">
-        <div className="font-mono uppercase tracking-wider text-slate-400">Node Inspector</div>
-        <p className="mt-2 leading-relaxed">
-          Click any icosahedron (SQL table), hex-torus (Redis queue/cache), octahedron (backend manipulator), or hex-bipyramid (frontend display surface) in the 3D Wythe lattice—or any row in Lineage/Index—to inspect verified links, provenance, and rulings.
-        </p>
+      <aside aria-label="Node Inspector" className="space-y-4 border-l border-slate-800 bg-slate-950/60 p-5 text-xs text-slate-300">
+        <div>
+          <div className="font-mono uppercase tracking-wider text-slate-400">Node Inspector</div>
+          <p className="mt-2 leading-relaxed">
+            Click any icosahedron (SQL table), hex-torus (Redis queue/cache), octahedron (backend manipulator), or hex-bipyramid (frontend display surface) in the 3D Wythe lattice—or any row in Lineage/Index—to inspect verified links, provenance, and rulings.
+          </p>
+        </div>
+        <UnderstandingChainPanel
+          activeSlug={activeSlug}
+          sessionId={sessionId}
+          selectedFindingId={selectedFindingId}
+          selectedEdgeId={selectedEdgeId}
+        />
+        {sessionId && (
+          <ChallengeCorrectionBox
+            sessionId={sessionId}
+            clientId={clientId}
+            corrections={corrections}
+            compact
+            onCorrectionAdded={onCorrectionAdded}
+          />
+        )}
       </aside>
     );
   }
@@ -194,6 +263,21 @@ export function NodeInspector({
             <span className="text-slate-200">{deriveDomainCluster(node)}</span>
             {node.role ? ` · ${node.role}` : ''}
           </div>
+          {node.stratum_badges && node.stratum_badges.length > 0 && (
+            <div
+              aria-label="Zoom-1 microscope stratum summary badges"
+              className="mt-1.5 flex flex-wrap gap-1 font-mono text-[10px]"
+            >
+              {node.stratum_badges.map((bg) => (
+                <span
+                  key={bg.key}
+                  className="border border-sky-500/40 bg-sky-950/35 px-1.5 py-0.5 text-sky-200"
+                >
+                  {bg.label}: <strong>{bg.count}</strong>
+                </span>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           <button
@@ -299,13 +383,33 @@ export function NodeInspector({
           {nodeFindings.slice(0, 4).map((f) => {
             const isCausalWriter =
               f.target_node_id === node.id && f.node_id !== node.id;
+            const isPinnedFinding = selectedFindingId === f.id;
             return (
-              <div key={f.id} className="border border-rose-500/20 bg-slate-950/75 p-2 text-[11px] text-slate-200">
+              <div
+                key={f.id}
+                className={`border p-2 text-[11px] text-slate-200 ${
+                  isPinnedFinding
+                    ? 'border-amber-400/70 bg-amber-950/30'
+                    : 'border-rose-500/20 bg-slate-950/75'
+                }`}
+              >
                 <div className="flex flex-wrap items-center justify-between gap-1">
                   <strong className="font-mono text-rose-300">{f.rule_code}</strong>
-                  <span className="font-mono text-[10px] text-slate-300">
-                    {f.severity} · {f.confidence} · {f.evidence_strength}
-                  </span>
+                  <div className="flex items-center gap-1.5 font-mono text-[10px] text-slate-300">
+                    <span>
+                      {f.severity} · {f.confidence} · {f.evidence_strength}
+                    </span>
+                    {onSelectFinding && (
+                      <button
+                        type="button"
+                        aria-pressed={isPinnedFinding}
+                        onClick={() => onSelectFinding(isPinnedFinding ? null : f.id)}
+                        className="min-h-6 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-teal-300 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                      >
+                        {isPinnedFinding ? 'Focused ✓' : 'Focus Finding'}
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="mt-0.5">{f.title}</div>
                 <div className="mt-0.5 font-mono text-[10px] text-amber-200/90">
@@ -505,6 +609,200 @@ export function NodeInspector({
         </div>
       )}
 
+      {/* Scoped Progressive LOD Drill-Down (#80 Microscope Strata) */}
+      <section
+        aria-label="Microscope Strata Zoom 2 and Zoom 3 drill-down"
+        className="space-y-2 border border-slate-800 bg-slate-900/45 p-3"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-sky-300">
+            <Layers className="h-3.5 w-3.5" />
+            <span>Microscope Strata (Zoom 2 / Zoom 3)</span>
+          </div>
+          <label className="flex cursor-pointer items-center gap-1.5 font-mono text-[10px] text-slate-300">
+            <input
+              type="checkbox"
+              checked={unfilteredIr}
+              onChange={(e) => setUnfilteredIr(e.target.checked)}
+              aria-label="Include unfiltered IR and stdlib or ARC runtime thunks"
+              className="accent-sky-400"
+            />
+            <span>Unfiltered IR</span>
+          </label>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px]">
+          <button
+            type="button"
+            aria-pressed={activeStratumZoom === 2}
+            onClick={() => setActiveStratumZoom((cur) => (cur === 2 ? null : 2))}
+            className={`min-h-6 border px-2 py-0.5 ${
+              activeStratumZoom === 2
+                ? 'border-sky-400/70 bg-sky-500/20 text-sky-200'
+                : 'border-slate-700 bg-slate-950 text-slate-300 hover:border-sky-400'
+            }`}
+          >
+            Zoom 2: IR / AIR
+          </button>
+          <button
+            type="button"
+            aria-pressed={activeStratumZoom === 3}
+            onClick={() => setActiveStratumZoom((cur) => (cur === 3 ? null : 3))}
+            className={`min-h-6 border px-2 py-0.5 ${
+              activeStratumZoom === 3
+                ? 'border-teal-400/70 bg-teal-500/20 text-teal-200'
+                : 'border-slate-700 bg-slate-950 text-slate-300 hover:border-teal-400'
+            }`}
+          >
+            Zoom 3: Binary / Heap
+          </button>
+          {activeStratumZoom !== null && (
+            <button
+              type="button"
+              onClick={() => setActiveStratumZoom(null)}
+              aria-label="Close microscope stratum drill-down"
+              className="min-h-6 border border-slate-700 bg-slate-950 px-2 py-0.5 text-slate-400 hover:text-slate-200"
+            >
+              Zoom 1 Default
+            </button>
+          )}
+        </div>
+        {activeStratumZoom === null ? (
+          <p className="text-[11px] text-slate-400">
+            Zoom-1 3-wythe graph stays isolated by default. Click Zoom 2 or Zoom 3 to lazily inspect compiler IR, Metal AIR, binary linkage, or heap retention without flooding the 3D canvas.
+          </p>
+        ) : strataQuery.isLoading ? (
+          <div role="status" className="font-mono text-[11px] text-sky-300">
+            Loading Zoom {activeStratumZoom} microscope stratum…
+          </div>
+        ) : strataQuery.error ? (
+          <div role="alert" className="border border-amber-500/35 bg-amber-950/20 p-2 font-mono text-[11px] text-amber-200">
+            Stratum endpoint unavailable ({(strataQuery.error as Error).message}).
+          </div>
+        ) : strataQuery.data ? (
+          (() => {
+            const activePlugins = strataQuery.data.active_plugins ?? [];
+            const summaryBadges = strataQuery.data.summary_badges ?? [];
+            const strataNotes = strataQuery.data.notes ?? [];
+            const strataNodes = strataQuery.data.nodes ?? [];
+            const strataEdges = strataQuery.data.edges ?? [];
+            return (
+          <div className="space-y-2 border-t border-slate-800 pt-2 font-mono text-[11px]">
+            <div className="text-slate-200">
+              Compacted <strong>{strataQuery.data.compacted_node_count}</strong> /{' '}
+              <strong>{strataQuery.data.raw_node_count}</strong> micro-nodes ·{' '}
+              <strong className="text-teal-300">{strataQuery.data.collapsed_thunk_count}</strong>{' '}
+              runtime/stdlib thunks folded
+            </div>
+            <div className="text-[10px] text-slate-400">
+              Active plugins:{' '}
+              {activePlugins.length > 0
+                ? activePlugins.join(', ')
+                : 'none installed (core Zoom-1 only)'}
+            </div>
+            {summaryBadges.length > 0 && (
+              <div className="flex flex-wrap gap-1 text-[10px]">
+                {summaryBadges.map((bg) => (
+                  <span
+                    key={bg.key}
+                    className="border border-teal-500/35 bg-teal-950/25 px-1.5 py-0.5 text-teal-200"
+                  >
+                    {bg.label}: {bg.count}
+                  </span>
+                ))}
+              </div>
+            )}
+            {strataNotes.length > 0 && (
+              <ul className="list-disc space-y-0.5 pl-4 font-sans text-[11px] text-slate-300">
+                {strataNotes.map((nt, idx) => (
+                  <li key={idx}>{nt}</li>
+                ))}
+              </ul>
+            )}
+            {strataNodes.length > 0 && (
+              <div className="max-h-36 space-y-1 overflow-y-auto border border-slate-800 bg-slate-950/70 p-2">
+                <div className="text-[10px] uppercase text-slate-400">
+                  Micro-Nodes ({strataNodes.length})
+                </div>
+                {strataNodes.slice(0, 40).map((mn) => {
+                  const vBadge = edgeStateBadge(mn.verification);
+                  return (
+                    <div key={mn.id} className="border-b border-slate-900 pb-1 last:border-b-0">
+                      <div className="flex flex-wrap items-center justify-between gap-1 text-slate-200">
+                        <span className="truncate font-semibold">{mn.label}</span>
+                        <span className={`text-[10px] ${vBadge.tone}`}>
+                          [{mn.kind}] {vBadge.text}
+                        </span>
+                      </div>
+                      {(mn.source_file || mn.summary) && (
+                        <div className="truncate text-[10px] text-slate-400">
+                          {mn.source_file ? `${mn.source_file}:${mn.line ?? 1}` : ''}
+                          {mn.source_file && mn.summary ? ' · ' : ''}
+                          {mn.summary}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {strataEdges.length > 0 && (
+              <div className="max-h-36 space-y-1 overflow-y-auto border border-slate-800 bg-slate-950/70 p-2">
+                <div className="text-[10px] uppercase text-slate-400">
+                  Micro-Edges &amp; Thunk Compaction ({strataEdges.length})
+                </div>
+                {strataEdges.slice(0, 40).map((me) => {
+                  const vBadge = edgeStateBadge(me.verification);
+                  const isThunkSummary = me.collapsed_count > 0;
+                  const isExpanded = expandedThunkEdges.has(me.id);
+                  const collapsedSamples = me.collapsed_samples ?? [];
+                  return (
+                    <div key={me.id} className="border-b border-slate-900 pb-1 last:border-b-0">
+                      {isThunkSummary ? (
+                        <div>
+                          <button
+                            type="button"
+                            aria-expanded={isExpanded}
+                            onClick={() =>
+                              setExpandedThunkEdges((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(me.id)) next.delete(me.id);
+                                else next.add(me.id);
+                                return next;
+                              })
+                            }
+                            className="text-left text-amber-200 hover:underline"
+                          >
+                            {isExpanded ? '[-]' : '[+]'}{' '}
+                            {me.label || `+${me.collapsed_count} runtime/stdlib thunks collapsed`}
+                          </button>
+                          {isExpanded && collapsedSamples.length > 0 && (
+                            <div className="mt-1 pl-3 text-[10px] text-slate-300">
+                              Samples: {collapsedSamples.join(', ')}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap items-center justify-between gap-1 text-slate-200">
+                          <span className="truncate">
+                            [{me.kind}] {me.source_id} → {me.target_id}
+                          </span>
+                          <span className={`text-[10px] ${vBadge.tone}`}>{vBadge.text}</span>
+                        </div>
+                      )}
+                      {me.evidence_note && (
+                        <div className="truncate text-[10px] text-slate-400">{me.evidence_note}</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+            );
+          })()
+        ) : null}
+      </section>
+
       <NodeSourceAndPromptPanel
         activeSlug={activeSlug}
         node={node}
@@ -530,13 +828,25 @@ export function NodeInspector({
             const badge = edgeStateBadge(e.verification);
             return (
               <div key={e.id} className="border-b border-slate-900 pb-1">
-                <button
-                  type="button"
-                  onClick={() => onSelectNode(e.source_id)}
-                  className="block w-full truncate text-left font-mono text-[11px] text-slate-200 hover:text-teal-300"
-                >
-                  ← [{e.kind}] {peer?.label ?? e.source_id}
-                </button>
+                <div className="flex items-center justify-between gap-1">
+                  <button
+                    type="button"
+                    onClick={() => onSelectNode(e.source_id)}
+                    className="block flex-1 truncate text-left font-mono text-[11px] text-slate-200 hover:text-teal-300"
+                  >
+                    ← [{e.kind}] {peer?.label ?? e.source_id}
+                  </button>
+                  {onSelectEdge && (
+                    <button
+                      type="button"
+                      aria-pressed={selectedEdgeId === e.id}
+                      onClick={() => onSelectEdge(selectedEdgeId === e.id ? null : e.id)}
+                      className="min-h-6 border border-slate-800 bg-slate-950 px-1.5 py-0.5 font-mono text-[10px] text-sky-300 hover:border-sky-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                    >
+                      {selectedEdgeId === e.id ? 'Edge ✓' : 'Focus Edge'}
+                    </button>
+                  )}
+                </div>
                 <div className="flex items-center gap-1.5 truncate font-mono text-[10px] text-slate-400">
                   <span className={badge.tone}>{badge.text}</span>
                   {e.policy_field_consumption && (
@@ -561,13 +871,25 @@ export function NodeInspector({
             const badge = edgeStateBadge(e.verification);
             return (
               <div key={e.id} className="border-b border-slate-900 pb-1">
-                <button
-                  type="button"
-                  onClick={() => onSelectNode(e.target_id)}
-                  className="block w-full truncate text-left font-mono text-[11px] text-slate-200 hover:text-teal-300"
-                >
-                  → [{e.kind}] {peer?.label ?? e.target_id}
-                </button>
+                <div className="flex items-center justify-between gap-1">
+                  <button
+                    type="button"
+                    onClick={() => onSelectNode(e.target_id)}
+                    className="block flex-1 truncate text-left font-mono text-[11px] text-slate-200 hover:text-teal-300"
+                  >
+                    → [{e.kind}] {peer?.label ?? e.target_id}
+                  </button>
+                  {onSelectEdge && (
+                    <button
+                      type="button"
+                      aria-pressed={selectedEdgeId === e.id}
+                      onClick={() => onSelectEdge(selectedEdgeId === e.id ? null : e.id)}
+                      className="min-h-6 border border-slate-800 bg-slate-950 px-1.5 py-0.5 font-mono text-[10px] text-sky-300 hover:border-sky-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                    >
+                      {selectedEdgeId === e.id ? 'Edge ✓' : 'Focus Edge'}
+                    </button>
+                  )}
+                </div>
                 <div className="flex items-center gap-1.5 truncate font-mono text-[10px] text-slate-400">
                   <span className={badge.tone}>{badge.text}</span>
                   {e.policy_field_consumption && (
@@ -583,6 +905,35 @@ export function NodeInspector({
           })}
         </div>
       </div>
+
+      {/* Wave 6 Six-Link Understanding Chain */}
+      <UnderstandingChainPanel
+        activeSlug={activeSlug}
+        sessionId={sessionId}
+        subjectId={node.id}
+        selectedFindingId={selectedFindingId}
+        selectedEdgeId={selectedEdgeId}
+      />
+
+      {/* Shared Investigation Corrections & Revision Comparison (Distinct from Governance Rulings) */}
+      <ChallengeCorrectionBox
+        sessionId={sessionId}
+        clientId={clientId}
+        targetRefId={selectedFindingId ?? selectedEdgeId ?? node.id}
+        corrections={corrections}
+        onCorrectionAdded={onCorrectionAdded}
+      />
+
+      {onCompareRevisions && (
+        <RevisionComparisonPanel
+          sessionId={sessionId}
+          evidenceDrifted={evidenceDrifted}
+          comparison={revisionComparison}
+          nodesById={allNodesById}
+          onRunCompare={onCompareRevisions}
+          onSelectNode={onSelectNode}
+        />
+      )}
 
       {/* Audited Ruling Write Door */}
       <form onSubmit={handleSubmit} className="space-y-2 border-t border-slate-800 pt-3">
