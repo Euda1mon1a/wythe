@@ -7,6 +7,7 @@ import builtins
 import re
 from dataclasses import dataclass, field
 
+from app.adapters.python_policy_consumption import is_algorithmic_or_protocol_constant
 from app.core.policy_context import get_active_policy_tokens, name_has_policy_token
 
 _SQL_IDENT = r'(?:"?[A-Za-z_][A-Za-z0-9_]*"?\.)?"?[A-Za-z_][A-Za-z0-9_]*"?'
@@ -2989,7 +2990,13 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             target_name, val = stmt.targets[0].id, stmt.value
         elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
             target_name, val = stmt.target.id, stmt.value
-        if not target_name or val is None or not target_name.isupper() or target_name.startswith("_"):
+        if (
+            not target_name
+            or val is None
+            or not target_name.isupper()
+            or target_name.startswith("_")
+            or is_algorithmic_or_protocol_constant(target_name)
+        ):
             continue
         if isinstance(val, ast.Constant) and isinstance(val.value, (int, float)) and not isinstance(val.value, bool):
             if name_has_policy_token(target_name, active_policy_tokens):

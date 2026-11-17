@@ -3,37 +3,141 @@
 import { useMemo, useState } from 'react';
 import type {
   AdapterSlotSchema,
+  AtlasEdge,
   AtlasNode,
   AuditRulingRead,
+  BoundaryFinding,
+  DiffBlastRadiusReport,
+  InvestigationCorrectionRead,
+  InvestigationRevisionComparisonRead,
   LegacyBridgeSummary,
+  SnapshotComparisonReport,
   StackProfileRead,
+  ViewportCommandReceiptRead,
 } from '@/api/atlas';
+import {
+  ChallengeCorrectionBox,
+  RevisionComparisonPanel,
+} from '@/components/InvestigationCollabControls';
+import { UnderstandingChainPanel } from '@/components/UnderstandingChainPanel';
 import { formatCalendarDay } from '@/lib/clock';
-import { ALL_NODE_SUBKINDS, deriveDomainCluster } from '@/lib/wytheSceneLenses';
+import {
+  normalizeViewportTimeline,
+  type AgentCameraFollowState,
+} from '@/lib/wytheCameraChoreography';
+import {
+  ALL_NODE_SUBKINDS,
+  computeLifecycleZProjection,
+  computeTemporalZProjection,
+  deriveDomainCluster,
+  type TemporalDiffSummaryRow,
+} from '@/lib/wytheSceneLenses';
 
 interface AccessibleIndexViewProps {
   nodes: AtlasNode[];
+  edges?: AtlasEdge[];
+  findings?: BoundaryFinding[];
+  observationSource?: string;
+  gitDiffReport?: DiffBlastRadiusReport | null;
+  snapCompareReport?: SnapshotComparisonReport | null;
   rulings?: AuditRulingRead[];
   slots: AdapterSlotSchema[];
   profiles: StackProfileRead[];
   legacyBridge: LegacyBridgeSummary;
   scanNotes?: string[];
+  agentCameraState?: AgentCameraFollowState;
+  activeAgentCaption?: string;
+  activeAgentFocusIds?: string[];
+  activeSlug?: string;
+  sessionId?: string | null;
+  clientId?: string | null;
+  selectedNodeId?: string | null;
+  selectedFindingId?: string | null;
+  selectedEdgeId?: string | null;
+  corrections?: InvestigationCorrectionRead[];
+  evidenceDrifted?: boolean;
+  revisionComparison?: InvestigationRevisionComparisonRead | null;
+  lastReceipt?: ViewportCommandReceiptRead | null;
+  onCorrectionAdded?: (created: InvestigationCorrectionRead) => void;
+  onCompareRevisions?: () => Promise<void>;
+  onRejectPendingAgentCommand?: () => void;
+  onOpenAskAi?: () => void;
+  onToggleAgentFollow?: () => void;
+  onStepAgentTimeline?: (step: -1 | 1 | { index: number }) => void;
+  onToggleAgentPlay?: () => void;
+  onExitAgentTimeline?: () => void;
+  onHumanNavigateYield?: () => void;
   onSelectNode: (nodeId: string) => void;
 }
 
 export function AccessibleIndexView({
   nodes,
+  edges = [],
+  findings = [],
+  observationSource,
+  gitDiffReport = null,
+  snapCompareReport = null,
   rulings = [],
   slots,
   profiles,
   legacyBridge,
   scanNotes = [],
+  agentCameraState,
+  activeAgentCaption = '',
+  activeAgentFocusIds = [],
+  activeSlug = '',
+  sessionId = null,
+  clientId = null,
+  selectedNodeId = null,
+  selectedFindingId = null,
+  selectedEdgeId = null,
+  corrections = [],
+  evidenceDrifted = false,
+  revisionComparison = null,
+  lastReceipt = null,
+  onCorrectionAdded,
+  onCompareRevisions,
+  onRejectPendingAgentCommand,
+  onOpenAskAi,
+  onToggleAgentFollow,
+  onStepAgentTimeline,
+  onToggleAgentPlay,
+  onExitAgentTimeline,
+  onHumanNavigateYield,
   onSelectNode,
 }: AccessibleIndexViewProps) {
   const [search, setSearch] = useState('');
   const [tier, setTier] = useState<'all' | 'truth' | 'manipulate' | 'display'>('all');
   const [subkind, setSubkind] = useState<'all' | AtlasNode['subkind']>('all');
+  const [wytheFilter, setWytheFilter] = useState<'all' | 'drift' | 'multi_wythe'>('all');
+  const [diffFilter, setDiffFilter] = useState<
+    'all' | TemporalDiffSummaryRow['transition']
+  >('all');
+  const [showSubsteps, setShowSubsteps] = useState(false);
   const [pageLimit, setPageLimit] = useState(150);
+
+  const lifecycleProjection = useMemo(
+    () => computeLifecycleZProjection(nodes, edges, findings, { observationSource }),
+    [nodes, edges, findings, observationSource],
+  );
+  const temporalProjection = useMemo(
+    () =>
+      computeTemporalZProjection({
+        headNodes: nodes,
+        headEdges: edges,
+        gitDiffReport,
+        snapCompareReport,
+      }),
+    [nodes, edges, gitDiffReport, snapCompareReport],
+  );
+  const timelineItems = useMemo(
+    () => normalizeViewportTimeline(agentCameraState?.activeEvent?.command),
+    [agentCameraState?.activeEvent?.command],
+  );
+  const currentTimelineItem =
+    timelineItems.length > 0
+      ? timelineItems[Math.min(agentCameraState?.stepIndex ?? 0, timelineItems.length - 1)]
+      : null;
 
   const exemplars = useMemo(() => {
     const pick = (t: AtlasNode['tier'], preferredSubkind: AtlasNode['subkind']) =>
@@ -49,26 +153,409 @@ export function AccessibleIndexView({
     };
   }, [nodes]);
 
+  const nodesById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return nodes.filter((n) => {
       if (tier !== 'all' && n.tier !== tier) return false;
       if (subkind !== 'all' && n.subkind !== subkind) return false;
+      const pres = lifecycleProjection.entityPresence.get(n.id);
+      if (wytheFilter === 'drift' && pres?.tieStatus !== 'drift') return false;
+      if (wytheFilter === 'multi_wythe' && (pres?.wythes.length ?? 1) < 2) return false;
       if (!q) return true;
       return (
         n.label.toLowerCase().includes(q) ||
         n.source_file.toLowerCase().includes(q) ||
         n.status.toLowerCase().includes(q) ||
         n.subkind.toLowerCase().includes(q) ||
-        (n.columns ?? []).some((c) => c.toLowerCase().includes(q))
+        (n.columns ?? []).some((c) => c.toLowerCase().includes(q)) ||
+        (n.stratum_badges ?? []).some(
+          (bg) => bg.key.toLowerCase().includes(q) || bg.label.toLowerCase().includes(q),
+        ) ||
+        (pres?.summary ?? '').toLowerCase().includes(q)
       );
     });
-  }, [nodes, search, tier, subkind]);
+  }, [nodes, search, tier, subkind, wytheFilter, lifecycleProjection.entityPresence]);
+
+  const filteredDiffRows = useMemo(
+    () =>
+      diffFilter === 'all'
+        ? temporalProjection.diffRows
+        : temporalProjection.diffRows.filter((r) => r.transition === diffFilter),
+    [temporalProjection.diffRows, diffFilter],
+  );
 
   const sampleReceipts = legacyBridge.sample_receipts ?? [];
 
   return (
-    <div className="space-y-6">
+    <div
+      className="space-y-6"
+      onKeyDown={(e) => {
+        if (['ArrowDown', 'ArrowUp', 'Home', 'End', 'PageDown', 'PageUp'].includes(e.key)) {
+          onHumanNavigateYield?.();
+        }
+      }}
+    >
+      {/* WCAG AA Parity (#86/#88): Live Agent Viewport Caption & Tour / Chronicle Stepper */}
+      <section
+        aria-label="Agent viewport co-navigation and walkthrough stepper"
+        className="space-y-2 border border-teal-500/35 bg-slate-950/75 p-4 text-xs"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="font-mono text-sm font-semibold text-teal-300">
+            Agent Co-Navigation &amp; Walkthrough Stepper
+          </h2>
+          {onToggleAgentFollow && agentCameraState && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(agentCameraState.timelineMode === 'chronicle' ||
+                Boolean(agentCameraState.haltedReason)) && (
+                <button
+                  type="button"
+                  aria-pressed={
+                    agentCameraState.liveFollowing && agentCameraState.followMode === 'following'
+                  }
+                  onClick={onToggleAgentFollow}
+                  className={`min-h-6 border px-2.5 py-0.5 font-mono text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
+                    agentCameraState.liveFollowing && agentCameraState.followMode === 'following'
+                      ? 'border-teal-400/60 bg-teal-500/20 text-teal-200'
+                      : 'border-amber-400/60 bg-amber-950/70 text-amber-200'
+                  }`}
+                >
+                  Live Follow:{' '}
+                  {agentCameraState.liveFollowing && agentCameraState.followMode === 'following'
+                    ? 'Following'
+                    : 'Paused — Resume Follow'}
+                </button>
+              )}
+              <button
+                type="button"
+                aria-pressed={agentCameraState.followMode === 'following'}
+                onClick={onToggleAgentFollow}
+                className={`min-h-6 border px-2.5 py-0.5 font-mono text-xs font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
+                  agentCameraState.followMode === 'following'
+                    ? 'border-teal-400/60 bg-teal-500/20 text-teal-200'
+                    : 'border-amber-400/80 bg-amber-950/90 text-amber-100'
+                }`}
+              >
+                {agentCameraState.followMode === 'following'
+                  ? 'Follow Agent Camera: Following'
+                  : 'Agent Follow Paused — Resume Follow'}
+              </button>
+              {agentCameraState.followMode === 'paused' &&
+                agentCameraState.pendingEventWhilePaused &&
+                onRejectPendingAgentCommand && (
+                  <button
+                    type="button"
+                    onClick={onRejectPendingAgentCommand}
+                    className="min-h-6 border border-rose-500/45 bg-rose-950/75 px-2.5 py-0.5 font-mono text-xs text-rose-200 hover:border-rose-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    Reject Queued Command
+                  </button>
+                )}
+              {onOpenAskAi && (
+                <button
+                  type="button"
+                  onClick={onOpenAskAi}
+                  className="min-h-6 border border-sky-500/50 bg-sky-500/15 px-2.5 py-0.5 font-mono text-xs text-sky-200 hover:bg-sky-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                >
+                  Ask AI / Explanation [A]
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+        {lastReceipt && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="border border-emerald-500/35 bg-emerald-950/25 px-3 py-1 font-mono text-[11px] text-emerald-200"
+          >
+            Viewport Receipt: command={lastReceipt.command_id} · outcome={lastReceipt.outcome} · delivery={lastReceipt.delivery_state}
+          </div>
+        )}
+        {agentCameraState?.haltedReason && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="border border-rose-500/45 bg-rose-950/45 px-3 py-1.5 font-mono text-xs text-rose-200"
+          >
+            Live Follow Halted: {agentCameraState.haltedReason}
+          </div>
+        )}
+        <div
+          role="status"
+          aria-live="polite"
+          className="border border-slate-800 bg-slate-900/60 px-3 py-2 font-mono text-xs text-slate-200"
+        >
+          {activeAgentCaption
+            ? `Agent Focus: ${activeAgentCaption}`
+            : activeAgentFocusIds.length > 0
+              ? `Agent focused ${activeAgentFocusIds.length} node(s): ${activeAgentFocusIds.join(', ')}`
+              : 'No active MCP camera command. Standing by for live agent focus or URL permalink.'}
+        </div>
+        {activeAgentFocusIds.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px]">
+            <span className="text-slate-400">Focused entities &amp; Z-wythe / badge attribution:</span>
+            {activeAgentFocusIds.slice(0, 12).map((fid) => {
+              const fNode = nodesById.get(fid);
+              const fPres = lifecycleProjection.entityPresence.get(fid);
+              const wytheTag = fPres ? fPres.wythes.map((w) => `Z=${w}`).join('/') : 'Z=0';
+              const badgeTag =
+                fNode?.stratum_badges && fNode.stratum_badges.length > 0
+                  ? ` [${fNode.stratum_badges.map((b) => `${b.label}:${b.count}`).join(', ')}]`
+                  : '';
+              return (
+                <button
+                  key={fid}
+                  type="button"
+                  onClick={() => {
+                    onHumanNavigateYield?.();
+                    onSelectNode(fid);
+                  }}
+                  className="min-h-6 border border-sky-500/40 bg-sky-950/35 px-2 py-0.5 text-sky-200 hover:border-sky-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                >
+                  {fid} ({wytheTag})
+                  {badgeTag}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        {timelineItems.length > 0 && currentTimelineItem && (
+          <div className="space-y-2 border-t border-slate-800 pt-2 font-mono text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-slate-200">
+                {currentTimelineItem.kind === 'chronicle' ? 'Chronicle Phase' : 'Tour Step'}{' '}
+                <strong>
+                  {currentTimelineItem.index + 1} / {timelineItems.length}
+                </strong>
+                : {currentTimelineItem.title}
+                {currentTimelineItem.tier ? ` (${currentTimelineItem.tier})` : ''}
+                {currentTimelineItem.kind === 'chronicle'
+                  ? ` [${currentTimelineItem.status}]`
+                  : ''}
+              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {onStepAgentTimeline && (
+                  <button
+                    type="button"
+                    onClick={() => onStepAgentTimeline({ index: 0 })}
+                    aria-label="First tour or chronicle step"
+                    className="min-h-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    |&lt; First
+                  </button>
+                )}
+                {onStepAgentTimeline && (
+                  <button
+                    type="button"
+                    onClick={() => onStepAgentTimeline(-1)}
+                    aria-label="Previous tour or chronicle step"
+                    className="min-h-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    Prev
+                  </button>
+                )}
+                {onToggleAgentPlay && (
+                  <button
+                    type="button"
+                    onClick={onToggleAgentPlay}
+                    aria-label={
+                      agentCameraState?.isPlaying ? 'Pause walkthrough' : 'Play walkthrough'
+                    }
+                    className="min-h-6 border border-teal-500/40 bg-teal-950/60 px-2 py-0.5 text-teal-200 hover:border-teal-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    {agentCameraState?.isPlaying ? 'Pause' : 'Play'}
+                  </button>
+                )}
+                {onStepAgentTimeline && (
+                  <button
+                    type="button"
+                    onClick={() => onStepAgentTimeline(1)}
+                    aria-label="Next tour or chronicle step"
+                    className="min-h-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    Next
+                  </button>
+                )}
+                {onStepAgentTimeline && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onStepAgentTimeline({ index: Math.max(0, timelineItems.length - 1) })
+                    }
+                    aria-label="Last tour or chronicle step"
+                    className="min-h-6 border border-slate-700 bg-slate-900 px-2 py-0.5 text-slate-200 hover:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    Last &gt;|
+                  </button>
+                )}
+                {currentTimelineItem.substeps.length > 0 && (
+                  <button
+                    type="button"
+                    aria-expanded={showSubsteps}
+                    onClick={() => setShowSubsteps((v) => !v)}
+                    className="min-h-6 border border-sky-500/40 bg-sky-950/50 px-2 py-0.5 text-sky-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    {showSubsteps ? 'Hide' : 'Substeps'} ({currentTimelineItem.substeps.length})
+                  </button>
+                )}
+                {onExitAgentTimeline && (
+                  <button
+                    type="button"
+                    onClick={onExitAgentTimeline}
+                    aria-label="Exit tour or chronicle walkthrough"
+                    className="min-h-6 border border-rose-500/40 bg-rose-950/60 px-2 py-0.5 text-rose-200 hover:border-rose-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                  >
+                    Exit
+                  </button>
+                )}
+              </div>
+            </div>
+            {showSubsteps && currentTimelineItem.substeps.length > 0 && (
+              <ol className="list-decimal space-y-0.5 pl-5 text-[11px] text-slate-300">
+                {currentTimelineItem.substeps.map((sub, sIdx) => (
+                  <li key={sIdx}>{sub}</li>
+                ))}
+              </ol>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* WCAG AA Parity (DISP-005): Non-WebGL Shared Investigation Corrections, Revision Diff & Understanding Chain */}
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+        <ChallengeCorrectionBox
+          sessionId={sessionId}
+          clientId={clientId}
+          targetRefId={selectedFindingId ?? selectedEdgeId ?? selectedNodeId}
+          corrections={corrections}
+          onCorrectionAdded={onCorrectionAdded}
+        />
+        {onCompareRevisions ? (
+          <RevisionComparisonPanel
+            sessionId={sessionId}
+            evidenceDrifted={evidenceDrifted}
+            comparison={revisionComparison}
+            nodesById={nodesById}
+            onRunCompare={onCompareRevisions}
+            onSelectNode={onSelectNode}
+          />
+        ) : null}
+      </div>
+
+      <UnderstandingChainPanel
+        activeSlug={activeSlug}
+        sessionId={sessionId}
+        subjectId={selectedNodeId}
+        selectedFindingId={selectedFindingId}
+        selectedEdgeId={selectedEdgeId}
+      />
+
+      {/* WCAG AA Parity (#82): Accessible Temporal Z-Diff Snapshot-Slice Summary Table */}
+      <section
+        aria-label="Temporal Z-Diff base to HEAD snapshot comparison"
+        className="space-y-3 border border-slate-800 bg-slate-950/60 p-4 text-xs"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="font-mono text-sm font-semibold text-slate-100">
+              Temporal Z-Diff Summary :: {temporalProjection.label}
+            </h2>
+            <p className="mt-0.5 text-slate-300">
+              {temporalProjection.hasDiff
+                ? `Canonical (X, Y) domain-and-tier coordinates pinned across Z_base and Z_head (${temporalProjection.diffRows.length} transitions).`
+                : 'Single-snapshot fallback active (enable Git Diff or Snapshot Delta in 3D view to compare base -> HEAD slices).'}
+            </p>
+          </div>
+          {temporalProjection.hasDiff && (
+            <div
+              role="group"
+              aria-label="Filter temporal diff transitions"
+              className="flex flex-wrap border border-slate-800 bg-slate-950 p-0.5 font-mono text-[11px]"
+            >
+              {(['all', 'new_finding', 'removed', 'added', 'touched', 'impacted'] as const).map(
+                (df) => (
+                  <button
+                    key={df}
+                    type="button"
+                    aria-pressed={diffFilter === df}
+                    onClick={() => setDiffFilter(df)}
+                    className={`min-h-6 px-2 py-0.5 uppercase focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
+                      diffFilter === df ? 'bg-amber-500/20 text-amber-200' : 'text-slate-300'
+                    }`}
+                  >
+                    {df.replace('_', ' ')}
+                  </button>
+                ),
+              )}
+            </div>
+          )}
+        </div>
+        {temporalProjection.hasDiff && filteredDiffRows.length > 0 && (
+          <div className="overflow-x-auto border border-slate-800 bg-slate-950/40">
+            <table className="w-full text-left text-xs">
+              <caption className="sr-only">
+                Base to HEAD snapshot transitions including added, removed before-image, impacted, and new-finding nodes
+              </caption>
+              <thead className="border-b border-slate-800 bg-slate-950 font-mono text-[11px] uppercase text-slate-300">
+                <tr>
+                  <th scope="col" className="px-3 py-2">Entity</th>
+                  <th scope="col" className="px-3 py-2">Transition</th>
+                  <th scope="col" className="px-3 py-2">Slices</th>
+                  <th scope="col" className="px-3 py-2">Tier · District</th>
+                  <th scope="col" className="px-3 py-2">Delta Evidence</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/70 font-mono text-[11px]">
+                {filteredDiffRows.slice(0, 80).map((row) => (
+                  <tr key={`${row.transition}-${row.nodeId}`} className="hover:bg-slate-900/50">
+                    <td className="px-3 py-1.5">
+                      {row.presentInHead ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onHumanNavigateYield?.();
+                            onSelectNode(row.nodeId);
+                          }}
+                          className="min-h-6 text-left text-teal-300 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                        >
+                          {row.label}
+                        </button>
+                      ) : (
+                        <span className="text-slate-400 line-through">{row.label}</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-1.5 uppercase">
+                      <span
+                        className={
+                          row.transition === 'new_finding'
+                            ? 'text-rose-300'
+                            : row.transition === 'removed'
+                              ? 'text-amber-300'
+                              : row.transition === 'added'
+                                ? 'text-emerald-300'
+                                : 'text-sky-300'
+                        }
+                      >
+                        {row.transition}
+                      </span>
+                    </td>
+                    <td className="px-3 py-1.5 text-slate-300">
+                      {row.presentInBase ? 'Z_base' : '—'} → {row.presentInHead ? 'Z_head' : 'deleted'}
+                    </td>
+                    <td className="px-3 py-1.5 text-slate-300">
+                      {row.tier} · {row.district}
+                    </td>
+                    <td className="px-3 py-1.5 font-sans text-slate-300">{row.detail}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
       {scanNotes.length > 0 && (
         <section className="space-y-1 border border-sky-500/30 bg-sky-950/20 p-3 font-mono text-xs text-sky-200">
           <h2 className="font-semibold text-sky-300">Scan Provenance &amp; Probe Notes</h2>
@@ -312,12 +799,25 @@ export function AccessibleIndexView({
               }}
               className="min-h-6 border border-slate-800 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
             >
-              <option value="all">All 11 subkinds</option>
+              <option value="all">All {ALL_NODE_SUBKINDS.length} subkinds</option>
               {ALL_NODE_SUBKINDS.map((sk) => (
                 <option key={sk} value={sk}>
                   {sk}
                 </option>
               ))}
+            </select>
+            <select
+              aria-label="Filter index by lifecycle Z-wythe presence and wall-tie drift"
+              value={wytheFilter}
+              onChange={(e) => {
+                setWytheFilter(e.target.value as 'all' | 'drift' | 'multi_wythe');
+                setPageLimit(150);
+              }}
+              className="min-h-6 border border-slate-800 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+            >
+              <option value="all">Z-Wythes: All</option>
+              <option value="drift">Wall-Tie Drift Only</option>
+              <option value="multi_wythe">Multi-Wythe (Z=0/1/2)</option>
             </select>
             <div
               role="group"
@@ -353,18 +853,24 @@ export function AccessibleIndexView({
               <tr>
                 <th scope="col" className="px-3 py-2">Node</th>
                 <th scope="col" className="px-3 py-2">Tier · Subkind · District</th>
+                <th scope="col" className="px-3 py-2">Z-Wythes &amp; Wall-Tie</th>
                 <th scope="col" className="px-3 py-2">Coupling</th>
                 <th scope="col" className="px-3 py-2">Status</th>
                 <th scope="col" className="px-3 py-2">Source Coordinate</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/70">
-              {filtered.slice(0, pageLimit).map((n) => (
+              {filtered.slice(0, pageLimit).map((n) => {
+                const pres = lifecycleProjection.entityPresence.get(n.id);
+                return (
                 <tr key={n.id} className="hover:bg-slate-900/50">
                   <td className="px-3 py-2 font-mono font-medium">
                     <button
                       type="button"
-                      onClick={() => onSelectNode(n.id)}
+                      onClick={() => {
+                        onHumanNavigateYield?.();
+                        onSelectNode(n.id);
+                      }}
                       className="min-h-6 text-left text-teal-300 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                     >
                       {n.label}
@@ -372,6 +878,38 @@ export function AccessibleIndexView({
                   </td>
                   <td className="px-3 py-2 font-mono text-slate-300">
                     {n.tier} · {n.subkind} · <span className="text-slate-400">{deriveDomainCluster(n)}</span>
+                  </td>
+                  <td className="px-3 py-2 font-mono text-[11px]">
+                    <div className="flex flex-wrap items-center gap-1">
+                      {(pres?.wythes ?? [0]).map((w) => (
+                        <span
+                          key={w}
+                          className="border border-slate-700 bg-slate-900 px-1 py-0.5 text-[10px] text-slate-200"
+                        >
+                          Z={w}
+                        </span>
+                      ))}
+                      <span
+                        className={
+                          pres?.tieStatus === 'drift'
+                            ? 'text-rose-300'
+                            : pres?.tieStatus === 'intact'
+                              ? 'text-teal-300'
+                              : 'text-slate-400'
+                        }
+                      >
+                        {pres?.tieStatus === 'drift'
+                          ? `drift (${pres.driftRuleCodes.join(',') || 'mismatch'})`
+                          : pres?.tieStatus === 'intact'
+                            ? 'tie intact'
+                            : 'blueprint'}
+                      </span>
+                    </div>
+                    {n.stratum_badges && n.stratum_badges.length > 0 && (
+                      <div className="mt-0.5 text-[10px] text-sky-300">
+                        {n.stratum_badges.map((bg) => `${bg.label}:${bg.count}`).join(' · ')}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2 font-mono text-[11px] text-slate-300">
                     {n.tier === 'truth'
@@ -409,7 +947,8 @@ export function AccessibleIndexView({
                     {n.source_file}:{n.line}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

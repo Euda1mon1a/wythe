@@ -9,7 +9,7 @@ own use; it is not a supported product (see [SUPPORT.md](SUPPORT.md)).
   no security SLA, and no promised fix, patch, release, compatibility, or
   response timeline.
 - **Pin and fork:** Downstream users who depend on Wythe should pin an exact
-  version (`wythe==0.2.2`, or `Euda1mon1a/wythe@v0.2.2` in GitHub Actions) and
+  version (`wythe==0.2.3`, or `Euda1mon1a/wythe@v0.2.3` in GitHub Actions) and
   fork the repository whenever immediate fixes or changes are needed.
 - **Vulnerability reporting:** Per [SUPPORT.md](SUPPORT.md), there is no formal
   security response process. If GitHub Private Vulnerability Reporting or
@@ -100,6 +100,78 @@ for complete specifications and exit codes.
   passing `--allow-local-plugins` alongside `--plugin MODULE` on the CLI; it is
   never enabled over HTTP (`/api/v1/adapters/plugins`) or MCP
   (`wythe_plugins`).
+- **Zoom-1 invariance & fault-isolated `StratumPlugin` expansion:**
+  `Zoom 1` remains the invariant default across `wythe scan`,
+  `wythe gate`, HTTP, MCP, and initial WebGL load. Optional
+  `StratumPlugin` (`stratum_inspector`) extensions are read-only,
+  execute zero target-repo code, never alter `content_digest` or
+  flatten `Zoom 2`/`Zoom 3` micro-nodes into `TruthAtlasReport.nodes`,
+  and roll back in-place report mutations if a plugin raises.
+- **Optional companion plugins (`agent-harness`, `cpsat`,
+  `solver-chronicle`):** Core `wythe` ships zero domain-specific
+  rules or solver dependencies (`MCP_TOOLS` = 10, `MCP_SLM_TOOLS` = 4
+  `< 2,000` bytes, seeded `RulePolicy` = 19). When optional
+  `wythe.plugins` packages are installed or opted in via CLI:
+  - **Passive non-execution & containment:** `wythe-plugin-agent-harness`
+    (`AGENT-001..003`), `wythe-plugin-cpsat` (`Zoom 2` lattice and
+    `wythe companion --cp-model-proto` / `--cp-solver-response`), and
+    `wythe-plugin-solver-chronicle` (`wythe watch-solver` and MCP
+    `wythe_solver_chronicle`) read only repository-contained,
+    non-symlink regular files (`<= 8..16 MiB`) and pure-Python AST or
+    wire-format artifacts without importing target code, invoking
+    `ortools` or external solvers, or calling LLM endpoints.
+  - **Non-certification & NP-hard epistemic boundary:** Companion
+    findings and 6-phase solver chronicles (`MODEL_INVALID`,
+    `INFEASIBLE`, scaling/presolve/stall forensics) are structural
+    leads only. They never certify prompt-injection safety, agent loop
+    termination, mathematical feasibility, global optimality of
+    NP-hard optimization models, or runtime solver correctness.
+  - **Systems, compiler IR, solver-internals & static binary plugins
+    (`apple-ipc`, `compiler-ir`, `solver-internals`, `binary`):**
+    - **Zero target-binary, `ldd`, or build-system execution:**
+      `wythe-plugin-binary` (`--binary`, `Zoom 3`, `BIN-ENT-001`),
+      `wythe-plugin-compiler-ir` (`--index-store`, `--sil`,
+      `--llvm-ir`, `--metallib`, `Zoom 2`, `METAL-001..003`),
+      `wythe-plugin-solver-internals` (`--proto-descriptor`,
+      `--compile-commands`, `SAT-INT-001..004`), and
+      `wythe-plugin-apple-ipc` (`swift-systems-ipc`, `IPC-001`) are
+      100% passive pure-Python readers. They never execute target
+      binaries, never invoke `ldd` (which may run dynamic linkers on
+      untrusted ELFs), and never run CMake, Bazel, `swiftc`, `xcrun`,
+      or `protoc`, rejecting symlinks on every path component and
+      XML `<!DOCTYPE`/`<!ENTITY` XXE payloads.
+    - **Epistemic & non-certification invariants:** Compiled
+      `.metallib` inspection covers LLVM-based `AIR` bitcode and
+      reflection only—never OS driver-lowered `AGX` GPU hardware ISA,
+      occupancy, or register allocation. Strings extracted from
+      `__cstring` / `.rodata` remain `binary_string_witness` with
+      `verification="unverified"` and are never promoted to `verified`
+      call edges. `ConstraintProto` stage-coverage matrices report
+      structural C++ phase asymmetries and never claim formal
+      propagator mathematical soundness. All companion receipts keep
+      `target_code_executed: false` and
+      `automated_security_audit: false`.
+
+  - **`wythe-plugin-wiretap` (`--otel-traces`, `--ebpf-flows`,
+    `--memgraph`, `--vmmap`, `--port-listeners`, opt-in
+    `--probe-local-ports`):** Passively correlates captured spans,
+    socket flows, heap summaries, and port listeners without
+    attaching debuggers or executing target code. SQL bind literals,
+    URL query values, auth/cookie headers, raw heap buffers, and OS
+    usernames are redacted by default. Zero spans in a capture window
+    are reported as `unexercised_in_sample` (`static_dark_matter`),
+    never dead-code proof. `--probe-local-ports` is strictly opt-in
+    and takes a read-only local listener snapshot (`PORT-001`
+    squatter conflict, `PORT-002` wildcard vs loopback bind drift).
+  - **Six-Link Understanding Contract (`/api/v1/understanding`,
+    `wythe understand`):** Read-only evaluation across intent,
+    effective policy/context, execution, committed result,
+    human-visible delivery, and preservation contracts. Bundle reads
+    reject symlinks, `..` traversal, `.git`/`secrets`/`.env*`, and
+    files `> 8 MiB` (`depth <= 64`). Indeterminate
+    `committed_unacknowledged` states explicitly prohibit blind write
+    retries before settlement; `target_code_executed: false` and
+    `automated_security_audit: false` always hold.
 
 ### Hardware-isolated read-only scanning of untrusted repositories
 
@@ -168,6 +240,30 @@ for complete specifications and exit codes.
 - **Bind boundary:** Bind `wythe serve` only to `127.0.0.1` or an
   ACL-restricted single-owner Tailnet. Never bind `0.0.0.0` on untrusted LANs or
   expose the server to the public internet.
+- **Loopback SSE viewport choreography & plain-text sanitization:**
+  `/api/v1/viewport/command`, `/api/v1/viewport/state`, and
+  `/api/v1/viewport/events` (`wythe_focus_camera`, `wythe_camera_tour`)
+  use a bounded 64-event in-memory ring buffer scoped by `target_slug`
+  and optional `session_id` without mutating repositories or scan
+  digests. Raw numeric camera coordinates, `<script>`/`<iframe>` tags,
+  inline `on*=` handlers, and `javascript:`/`data:text/html` URIs are
+  rejected, HTML angle-bracket markup is stripped to plain text, and
+  any human pointer, wheel, touch, or keyboard input immediately flips
+  the HUD from `Following` to `Paused` (`prefers-reduced-motion` cuts
+  instantly without animated camera sweeps).
+
+- **Shared investigation sessions & bidirectional receipts:**
+  `/api/v1/investigations`, `/api/v1/ui-focus`,
+  `/api/v1/viewport/command`, and `/api/v1/viewport/receipts` store
+  bounded session state (`max_sessions=64`, `max_turns=100`,
+  `max_events=200`) and per-session snapshots in `WYTHE_STATE_DIR`
+  (`viewport_bus.sqlite3`, WAL mode). Independent browser tabs keep
+  isolated `session_id`s unless explicitly joined via `#session=<id>`,
+  multi-session ambiguity is surfaced instead of cross-tab guessing,
+  commands report `applied_by_browser` only upon an explicit browser
+  receipt (never subscriber count), and conversation corrections stay
+  `promoted_to_ruling: false` so chat notes never silently disable
+  governance rules.
 
 ### Read-only live probes (`--dsn`, `--redis-dsn`, `--probe-url`)
 

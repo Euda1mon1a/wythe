@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.adapters.plugin_registry import collect_enabled_plugin_stack_profiles
 from app.models import StackProfile
 from app.schemas.atlas import StackDetectionResult
 
@@ -308,7 +310,12 @@ def _has_standalone_sql_files(repo_root: Path, be_dir: Path) -> bool:
     )
 
 
-def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetectionResult:
+def detect_repository_stack(
+    session: Session,
+    raw_repo_path: str,
+    allow_local_plugins: bool = False,
+    local_plugin_modules: Sequence[str] | None = None,
+) -> StackDetectionResult:
     """Inspect repository tiers independently and resolve the best enabled StackProfile."""
     repo_root = Path(raw_repo_path).expanduser().resolve()
     if not repo_root.is_dir():
@@ -528,6 +535,71 @@ def detect_repository_stack(session: Session, raw_repo_path: str) -> StackDetect
     )
     has_py_backend_src_ev = _has_python_backend_source_evidence(repo_root, py_deps)
     has_py_project_deps = _has_python_project_deps(pyproj, reqs)
+    pkg_swift_file = repo_root / "Package.swift"
+    has_swift_package = pkg_swift_file.is_file() and not pkg_swift_file.is_symlink()
+    is_swift_systems_repo = (
+        has_swift_package
+        and not disp_ev
+        and not (
+            has_rust
+            or has_go
+            or has_django
+            or has_python_app_layout
+            or has_node_backend
+            or has_py_project_deps
+            or has_py_backend_src_ev
+        )
+    )
+    if is_swift_systems_repo:
+        plugin_profiles = collect_enabled_plugin_stack_profiles(
+            repo_root=repo_root,
+            allow_local_plugins=allow_local_plugins,
+            local_plugin_modules=local_plugin_modules,
+        )
+        swift_prof = next(
+            (p for p in plugin_profiles if p.slug == "swift-systems-ipc"),
+            None,
+        )
+        if swift_prof is not None:
+            signals.append(
+                "Swift Package.swift detected; activating optional plugin profile 'swift-systems-ipc'"
+            )
+            signals.append(
+                f"Subtrees: backend='.' ({swift_prof.manipulator_adapter}), "
+                f"frontend='.' ({swift_prof.display_adapter})"
+            )
+            return StackDetectionResult(
+                repo_path=str(repo_root),
+                recommended_profile_slug=swift_prof.slug,
+                truth_adapter=swift_prof.truth_adapter,
+                manipulator_adapter=swift_prof.manipulator_adapter,
+                display_adapter=swift_prof.display_adapter,
+                backend_subdir=".",
+                frontend_subdir=".",
+                confidence="high",
+                coverage_complete=True,
+                detected_signals=signals,
+            )
+        signals.append(
+            "Swift Package.swift detected; optional plugin 'wythe-plugin-apple-ipc' is not installed "
+            "(using partial no-coverage fallback)"
+        )
+        signals.append(
+            "Subtrees: backend='.' (no-manipulator), frontend='.' (no-display)"
+        )
+        return StackDetectionResult(
+            repo_path=str(repo_root),
+            recommended_profile_slug="no-coverage-fallback",
+            truth_adapter="no-truth",
+            manipulator_adapter="no-manipulator",
+            display_adapter="no-display",
+            backend_subdir=".",
+            frontend_subdir=".",
+            confidence="fallback",
+            coverage_complete=False,
+            detected_signals=signals,
+        )
+
     has_python_services = (
         not node_owned_backend
         and not has_python_app_layout

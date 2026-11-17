@@ -24,12 +24,24 @@ import {
   type AtlasNode,
   type BoundaryFinding,
   type EndToEndChain,
+  type FollowState,
+  type FramingPreset,
+  type InvestigationCorrectionRead,
+  type InvestigationRevisionComparisonRead,
+  type InvestigationSessionRead,
+  type InvestigationSummaryRead,
   type UiFocusExplainRead,
+  type ViewportCommand,
+  type ViewportCommandEvent,
+  type ViewportCommandReceiptRead,
+  type ViewportReceiptOutcome,
+  type ZWytheSliceChoice,
 } from '@/api/atlas';
 import { AccessibleIndexView } from '@/components/AccessibleIndexView';
 import { AskWytheDrawer } from '@/components/AskWytheDrawer';
 import { CommandPalette } from '@/components/CommandPalette';
 import { GateAndRulesView } from '@/components/GateAndRulesView';
+import { InvestigationSessionBar } from '@/components/InvestigationCollabControls';
 import { LineageExplorer } from '@/components/LineageExplorer';
 import { NodeInspector } from '@/components/NodeInspector';
 import { WhatsThisModal } from '@/components/WhatsThisModal';
@@ -52,10 +64,24 @@ import {
   useTargets,
   useTargetScan,
   useTriggerScan,
+  useViewportState,
   useVocabularies,
 } from '@/hooks/useAtlas';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { formatObservedInstant } from '@/lib/clock';
+import {
+  applyIncomingViewportEvent,
+  buildViewportPermalinkHash,
+  createInitialAgentCameraState,
+  normalizeViewportTimeline,
+  parseViewportPermalinkHash,
+  resumeAgentCameraFollow,
+  sanitizeViewportPlainText,
+  stepTimelineFrame,
+  yieldAgentCameraOnHumanInput,
+  type AgentCameraFollowState,
+  type HumanInputInterruptKind,
+} from '@/lib/wytheCameraChoreography';
 import type { QuickActionDef } from '@/lib/wytheCommands';
 import {
   ALL_NODE_SUBKINDS,
@@ -79,6 +105,23 @@ import {
 } from '@/lib/wytheWorkingSet';
 import { tryCopyDataUrlPngToClipboard, type LiveViewportDigest } from '@/lib/wytheVisionBridge';
 import { bumpViewportCameraRevision, registerWytheWebMcpBridge } from '@/lib/wytheBrowserAi';
+import {
+  MIN_UI_FOCUS_DEBOUNCE_MS,
+  evaluateIncomingViewportCommand,
+  extractExplicitSessionIdFromUrl,
+  extractExplicitTargetFromUrl,
+  getOrCreateTabClientId,
+  getViewportCommandKey,
+  readAckedCommandIds,
+  readPersistedActiveSlug,
+  readPersistedFollowState,
+  recordAckedCommandId,
+  resolveTabInvestigationIdentity,
+  rotateTabSessionId,
+  switchTabSessionId,
+  writePersistedActiveSlug,
+  writePersistedFollowState,
+} from '@/lib/wytheInvestigationSession';
 import { WYTHE_PRESETS, useWytheAppearance, type AppearanceMode } from '@/lib/wytheTheme';
 
 const StratifiedScene3D = dynamic(
@@ -108,6 +151,8 @@ export default function WytheWorkspacePage() {
   const [activeSlug, setActiveSlug] = useState<string>('');
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('3d');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [tierFilter, setTierFilter] = useState<'all' | 'truth' | 'manipulate' | 'display'>('all');
   const [onlyFlagged, setOnlyFlagged] = useState(false);
   const [isolateCone, setIsolateCone] = useState(false);
@@ -117,6 +162,8 @@ export default function WytheWorkspacePage() {
     if (!selectedNodeId) {
       setIsolateCone(false);
       setNeighborhoodHops(0);
+      setSelectedFindingId(null);
+      setSelectedEdgeId(null);
     }
   }, [selectedNodeId]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -130,11 +177,50 @@ export default function WytheWorkspacePage() {
   const [detectSummary, setDetectSummary] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!activeSlug && targets.length > 0) {
-      const preferred = targets.find((t) => t.slug === 'wythe') ?? targets[0];
-      setActiveSlug(preferred.slug);
+    if (activeSlug || targets.length === 0) return;
+    const href = typeof window !== 'undefined' ? window.location.href : '';
+    const urlTarget = extractExplicitTargetFromUrl(href);
+    if (urlTarget && targets.some((t) => t.slug === urlTarget)) {
+      setActiveSlug(urlTarget);
+      return;
     }
+    const urlSid = extractExplicitSessionIdFromUrl(href);
+    if (urlSid) {
+      let cancelled = false;
+      void atlasApi
+        .getInvestigation(urlSid)
+        .then((found) => {
+          if (cancelled) return;
+          if (found.target_slug && targets.some((t) => t.slug === found.target_slug)) {
+            switchTabSessionId(found.target_slug, found.session_id);
+            setActiveSlug(found.target_slug);
+            return;
+          }
+          const fallback = targets.find((t) => t.slug === 'wythe') ?? targets[0];
+          setActiveSlug(fallback.slug);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          const fallback = targets.find((t) => t.slug === 'wythe') ?? targets[0];
+          setActiveSlug(fallback.slug);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+    const storedSlug = readPersistedActiveSlug();
+    if (storedSlug && targets.some((t) => t.slug === storedSlug)) {
+      setActiveSlug(storedSlug);
+      return;
+    }
+    const preferred = targets.find((t) => t.slug === 'wythe') ?? targets[0];
+    setActiveSlug(preferred.slug);
   }, [targets, activeSlug]);
+
+  useEffect(() => {
+    if (!activeSlug) return;
+    writePersistedActiveSlug(activeSlug);
+  }, [activeSlug]);
 
   const { data: report, isLoading: loadingScan, error: scanError } = useTargetScan(activeSlug);
   const { data: rules = [] } = useRules();
@@ -222,15 +308,972 @@ export default function WytheWorkspacePage() {
   const latestSnapId = scanHistory[0]?.id ?? null;
   const effectiveBaseSnapId =
     snapBaseId ?? (scanHistory.length >= 2 ? scanHistory[1].id : null);
+  const shouldFetchGitDiff =
+    blastMode === 'git' || (sceneLayout === 'temporal_z' && blastMode === 'off');
   const { data: gitDiffReport } = useScanDiff(
     activeSlug,
-    blastMode === 'git' ? diffBaseRef : '',
+    shouldFetchGitDiff ? diffBaseRef : '',
   );
   const { data: snapCompareReport } = useCompareSnapshots(
     activeSlug,
     blastMode === 'snapshot' ? effectiveBaseSnapId : null,
     blastMode === 'snapshot' ? latestSnapId : null,
   );
+
+  const [zWytheSlice, setZWytheSlice] = useState<ZWytheSliceChoice>('all');
+  const [requestedZoomStratum, setRequestedZoomStratum] = useState<1 | 2 | 3>(1);
+  // Deterministic SSR-identical initial state (prevents React #418 hydration mismatch on static export)
+  const [tabClientId, setTabClientId] = useState<string>('');
+  const [sessionScope, setSessionScope] = useState<{ slug: string; sessionId: string } | null>(null);
+  const activeSessionId: string | null =
+    sessionScope && sessionScope.slug === activeSlug ? sessionScope.sessionId : null;
+  const activeSlugRef = useRef<string>(activeSlug);
+  activeSlugRef.current = activeSlug;
+  const activeSessionIdRef = useRef<string | null>(activeSessionId);
+  activeSessionIdRef.current = activeSessionId;
+  const scopeEpochRef = useRef<number>(0);
+  const [scopeEpoch, setScopeEpoch] = useState<number>(0);
+  const followReqSeqRef = useRef<number>(0);
+  const bumpScopeEpoch = useCallback(() => {
+    scopeEpochRef.current += 1;
+    followReqSeqRef.current += 1;
+    setScopeEpoch(scopeEpochRef.current);
+  }, []);
+
+  const [agentCamState, setAgentCamState] = useState<AgentCameraFollowState>(() =>
+    createInitialAgentCameraState('following'),
+  );
+  const followModeRef = useRef<FollowState>(agentCamState.followMode);
+  useEffect(() => {
+    followModeRef.current = agentCamState.followMode;
+  }, [agentCamState.followMode]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    setTabClientId(getOrCreateTabClientId());
+  }, []);
+
+  const [investigationSession, setInvestigationSession] =
+    useState<InvestigationSessionRead | null>(null);
+  const [priorSessions, setPriorSessions] = useState<InvestigationSummaryRead[]>([]);
+  const [revisionComparison, setRevisionComparison] =
+    useState<InvestigationRevisionComparisonRead | null>(null);
+  const [lastViewportReceipt, setLastViewportReceipt] =
+    useState<ViewportCommandReceiptRead | null>(null);
+  const latestFocusRevisionRef = useRef<number>(0);
+  const latestEvidenceRevRef = useRef<string | null>(null);
+  const ackedCommandIdsRef = useRef<Set<string>>(new Set());
+  const pausedNotifiedIdsRef = useRef<Set<string>>(new Set());
+  const lastFindingResolvedKeyRef = useRef<string | null>(null);
+
+  const [agentCameraRequest, setAgentCameraRequest] = useState<{
+    seq: number;
+    preset: FramingPreset;
+    focusNodeIds: string[];
+    highlightEdgeIds: string[];
+    caption: string;
+  } | null>(null);
+  const [coldPermalinkActive, setColdPermalinkActive] = useState<boolean>(false);
+  const coldPermalinkAppliedRef = useRef<boolean>(false);
+
+  const setScopedSessionId = useCallback(
+    (slug: string, sid: string | null) => {
+      const prevSid = activeSessionIdRef.current;
+      const prevSlug = activeSlugRef.current;
+      if (!slug || !sid) {
+        if (prevSid !== null) {
+          bumpScopeEpoch();
+        }
+        activeSessionIdRef.current = null;
+        setSessionScope(null);
+        return;
+      }
+      if (prevSlug !== slug || prevSid !== sid) {
+        bumpScopeEpoch();
+        latestFocusRevisionRef.current = 0;
+        latestEvidenceRevRef.current = null;
+      }
+      activeSlugRef.current = slug;
+      activeSessionIdRef.current = sid;
+      setSessionScope({ slug, sessionId: sid });
+    },
+    [bumpScopeEpoch],
+  );
+
+  const switchTargetCleanly = useCallback(
+    (nextSlug: string) => {
+      const cleanedSlug = nextSlug.trim();
+      if (!cleanedSlug) return;
+      const currentHref = typeof window !== 'undefined' ? window.location.href : '';
+      if (
+        cleanedSlug === activeSlugRef.current &&
+        !extractExplicitSessionIdFromUrl(currentHref)
+      ) {
+        return;
+      }
+      if (typeof window !== 'undefined' && window.location.hash) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      }
+      bumpScopeEpoch();
+      latestFocusRevisionRef.current = 0;
+      latestEvidenceRevRef.current = null;
+      coldPermalinkAppliedRef.current = false;
+      setColdPermalinkActive(false);
+      setRevisionComparison(null);
+      setInvestigationSession(null);
+      setPriorSessions([]);
+      setLastViewportReceipt(null);
+      setSelectedNodeId(null);
+      setSelectedFindingId(null);
+      setSelectedEdgeId(null);
+      const identity = resolveTabInvestigationIdentity({
+        targetSlug: cleanedSlug,
+        locationHref: '',
+      });
+      const savedFollow = readPersistedFollowState(identity.sessionId);
+      followModeRef.current = savedFollow;
+      setAgentCamState((prev) => ({
+        ...prev,
+        followMode: savedFollow,
+        liveFollowing: savedFollow === 'following',
+        isPlaying: savedFollow === 'paused' ? false : prev.isPlaying,
+        activeEvent: null,
+        pendingEventWhilePaused: null,
+      }));
+      writePersistedActiveSlug(cleanedSlug);
+      activeSlugRef.current = cleanedSlug;
+      activeSessionIdRef.current = identity.sessionId;
+      setActiveSlug(cleanedSlug);
+      setSessionScope({ slug: cleanedSlug, sessionId: identity.sessionId });
+      ackedCommandIdsRef.current = new Set(readAckedCommandIds(cleanedSlug, identity.sessionId));
+      pausedNotifiedIdsRef.current.clear();
+    },
+    [bumpScopeEpoch],
+  );
+
+  // Resolve per-tab `session_id` (or adopt `#session=` / `?session=` explicit shared ID)
+  useEffect(() => {
+    if (typeof window === 'undefined' || !activeSlug) return;
+    if (sessionScope && sessionScope.slug === activeSlug && sessionScope.sessionId) {
+      return;
+    }
+    const identity = resolveTabInvestigationIdentity({
+      targetSlug: activeSlug,
+      locationHref: window.location.href,
+    });
+    bumpScopeEpoch();
+    latestFocusRevisionRef.current = 0;
+    latestEvidenceRevRef.current = null;
+    activeSlugRef.current = activeSlug;
+    activeSessionIdRef.current = identity.sessionId;
+    setSessionScope({ slug: activeSlug, sessionId: identity.sessionId });
+    const savedFollow = readPersistedFollowState(identity.sessionId);
+    followModeRef.current = savedFollow;
+    setAgentCamState((prev) =>
+      prev.followMode === savedFollow
+        ? prev
+        : {
+            ...prev,
+            followMode: savedFollow,
+            liveFollowing: savedFollow === 'following',
+            isPlaying: savedFollow === 'paused' ? false : prev.isPlaying,
+          },
+    );
+    ackedCommandIdsRef.current = new Set(
+      readAckedCommandIds(activeSlug, identity.sessionId),
+    );
+    pausedNotifiedIdsRef.current.clear();
+  }, [activeSlug, sessionScope, bumpScopeEpoch]);
+
+  const refreshInvestigationState = useCallback(
+    async (sidOverride?: string | null) => {
+      const sid = sidOverride ?? activeSessionId;
+      if (!activeSlug || !sid || !tabClientId) return null;
+      const slugAtStart = activeSlug;
+      const epochAtStart = scopeEpochRef.current;
+      const followSeqAtStart = followReqSeqRef.current;
+      const isStaleScope = () =>
+        scopeEpochRef.current !== epochAtStart ||
+        activeSlugRef.current !== slugAtStart ||
+        activeSessionIdRef.current !== sid;
+      try {
+        const listRes = await atlasApi.listInvestigations(slugAtStart).catch(() => null);
+        if (isStaleScope()) return null;
+        if (listRes?.sessions) setPriorSessions(listRes.sessions);
+        let sess = await atlasApi.getInvestigation(sid).catch(() => null);
+        if (isStaleScope()) return null;
+        if (sess && sess.target_slug && sess.target_slug !== slugAtStart) {
+          const urlSid =
+            typeof window !== 'undefined'
+              ? extractExplicitSessionIdFromUrl(window.location.href)
+              : null;
+          if (urlSid === sid) {
+            switchTabSessionId(sess.target_slug, sess.session_id);
+            bumpScopeEpoch();
+            activeSlugRef.current = sess.target_slug;
+            activeSessionIdRef.current = sess.session_id;
+            setActiveSlug(sess.target_slug);
+            setSessionScope({ slug: sess.target_slug, sessionId: sess.session_id });
+            return sess;
+          }
+          const rotated = rotateTabSessionId(slugAtStart);
+          bumpScopeEpoch();
+          activeSessionIdRef.current = rotated;
+          setSessionScope({ slug: slugAtStart, sessionId: rotated });
+          return null;
+        }
+        if (!sess) {
+          sess = await atlasApi.createOrReopenInvestigation({
+            target_slug: slugAtStart,
+            session_id: sid,
+            client_id: tabClientId,
+          });
+        }
+        if (
+          !sess ||
+          isStaleScope() ||
+          sess.session_id !== sid ||
+          (sess.target_slug && sess.target_slug !== slugAtStart)
+        ) {
+          return null;
+        }
+        const humanChangedFollowInFlight = followReqSeqRef.current !== followSeqAtStart;
+        const storedLocalFollow = readPersistedFollowState(sid);
+        const mergedFollow: FollowState = humanChangedFollowInFlight
+          ? followModeRef.current
+          : sess.follow_state === 'paused' || storedLocalFollow === 'paused'
+            ? 'paused'
+            : 'following';
+        const effectiveSess: InvestigationSessionRead = humanChangedFollowInFlight
+          ? { ...sess, follow_state: mergedFollow }
+          : sess;
+        setInvestigationSession(effectiveSess);
+        latestFocusRevisionRef.current = Math.max(
+          latestFocusRevisionRef.current,
+          effectiveSess.focus_revision ?? 0,
+        );
+        latestEvidenceRevRef.current =
+          effectiveSess.latest_evidence?.evidence_revision_id ?? latestEvidenceRevRef.current;
+        if (!humanChangedFollowInFlight) {
+          writePersistedFollowState(sid, mergedFollow);
+          followModeRef.current = mergedFollow;
+          setAgentCamState((prev) =>
+            prev.followMode === mergedFollow
+              ? prev
+              : {
+                  ...prev,
+                  followMode: mergedFollow,
+                  liveFollowing: mergedFollow === 'following',
+                  isPlaying: mergedFollow === 'paused' ? false : prev.isPlaying,
+                },
+          );
+        }
+        if (!coldPermalinkAppliedRef.current) {
+          if (effectiveSess.focus?.selected_node_id) {
+            setSelectedNodeId((cur) => cur ?? effectiveSess.focus.selected_node_id ?? null);
+          }
+          if (effectiveSess.focus?.selected_finding_id) {
+            setSelectedFindingId((cur) => cur ?? effectiveSess.focus.selected_finding_id ?? null);
+          }
+          if (effectiveSess.focus?.selected_edge_id) {
+            setSelectedEdgeId((cur) => cur ?? effectiveSess.focus.selected_edge_id ?? null);
+          }
+        }
+        if (effectiveSess.evidence_drifted) {
+          void atlasApi
+            .compareInvestigationRevisions(sid)
+            .then((comp) => {
+              if (!isStaleScope()) {
+                setRevisionComparison(comp);
+              }
+            })
+            .catch(() => {});
+        }
+        return effectiveSess;
+      } catch {
+        return null;
+      }
+    },
+    [activeSlug, activeSessionId, tabClientId, bumpScopeEpoch],
+  );
+
+  useEffect(() => {
+    if (!activeSlug || !activeSessionId || !tabClientId) return;
+    void refreshInvestigationState(activeSessionId);
+  }, [activeSlug, activeSessionId, tabClientId, scopeEpoch, refreshInvestigationState]);
+
+  const { data: initialViewportState, isFetched: viewportStateFetched } = useViewportState(
+    activeSlug,
+    Boolean(activeSlug && activeSessionId),
+    activeSessionId,
+    {
+      clientId: tabClientId,
+      selectedEdgeId,
+      selectedFindingId,
+      followState: agentCamState.followMode,
+    },
+  );
+
+  const applyBeatToWorkspace = useCallback(
+    (beat: {
+      focusNodeIds: string[];
+      highlightEdgeIds: string[];
+      findingId?: string | null;
+      lens?: SceneLens | null;
+      layoutMode?: SceneLayoutMode | null;
+      zWytheSlice?: ZWytheSliceChoice | null;
+      zoomStratum?: 1 | 2 | 3;
+      framingPreset: FramingPreset;
+      caption: string;
+      targetSlug?: string;
+      chronicleTimeline?: ViewportCommand['chronicle_timeline'];
+    }) => {
+      if (beat.lens) setSceneLens(beat.lens);
+      if (beat.layoutMode) setSceneLayout(beat.layoutMode);
+      if (beat.zWytheSlice) setZWytheSlice(beat.zWytheSlice);
+      else setZWytheSlice('all');
+      setRequestedZoomStratum(beat.zoomStratum ?? 1);
+
+      let resolvedFocus = [...beat.focusNodeIds];
+      if (resolvedFocus.length === 0 && beat.findingId && report?.findings) {
+        const hitFinding = report.findings.find((f) => f.id === beat.findingId);
+        if (hitFinding?.node_id) resolvedFocus = [hitFinding.node_id];
+      }
+      if (resolvedFocus.length > 0) {
+        setSelectedNodeId(resolvedFocus[0]);
+      }
+
+      if (typeof window !== 'undefined') {
+        const hash = buildViewportPermalinkHash({
+          target_slug: beat.targetSlug || activeSlug,
+          session_id: activeSessionId ?? undefined,
+          focus_node_ids: resolvedFocus,
+          highlight_edge_ids: beat.highlightEdgeIds,
+          lens: beat.lens ?? undefined,
+          layout_mode: beat.layoutMode ?? undefined,
+          framing_preset: beat.framingPreset,
+          z_wythe_slice: beat.zWytheSlice ?? undefined,
+          zoom_stratum: beat.zoomStratum,
+          chronicle_timeline: beat.chronicleTimeline ?? undefined,
+        });
+        if (hash.length > 1) {
+          window.history.replaceState(null, '', hash);
+        }
+      }
+
+      setAgentCameraRequest((prev) => ({
+        seq: (prev?.seq ?? 0) + 1,
+        preset: beat.framingPreset,
+        focusNodeIds: resolvedFocus,
+        highlightEdgeIds: beat.highlightEdgeIds,
+        caption: sanitizeViewportPlainText(beat.caption),
+      }));
+    },
+    [activeSlug, activeSessionId, report?.findings],
+  );
+
+  const applyCommandOrFirstStep = useCallback(
+    (cmd: ViewportCommand) => {
+      const items = normalizeViewportTimeline(cmd);
+      if (items.length > 0) {
+        const desiredIdx = cmd.chronicle_timeline
+          ? Math.max(
+              0,
+              Math.min(items.length - 1, Math.trunc(cmd.chronicle_timeline.active_phase_index ?? 0)),
+            )
+          : 0;
+        const selected = items[desiredIdx];
+        applyBeatToWorkspace({
+          targetSlug: cmd.target_slug,
+          focusNodeIds: selected.focusNodeIds,
+          highlightEdgeIds: selected.highlightEdgeIds,
+          findingId: selected.findingId,
+          lens: selected.lens,
+          layoutMode: selected.layoutMode,
+          zWytheSlice: selected.zWytheSlice,
+          zoomStratum: selected.zoomStratum,
+          framingPreset: selected.framingPreset,
+          caption: selected.caption,
+          chronicleTimeline: cmd.chronicle_timeline
+            ? { ...cmd.chronicle_timeline, active_phase_index: desiredIdx }
+            : null,
+        });
+        return;
+      }
+      applyBeatToWorkspace({
+        targetSlug: cmd.target_slug,
+        focusNodeIds: cmd.focus_node_ids ?? [],
+        highlightEdgeIds: cmd.highlight_edge_ids ?? [],
+        findingId: cmd.finding_id,
+        lens: (cmd.lens ?? null) as SceneLens | null,
+        layoutMode: (cmd.layout_mode ?? null) as SceneLayoutMode | null,
+        zWytheSlice: cmd.z_wythe_slice ?? null,
+        zoomStratum: cmd.zoom_stratum ?? 1,
+        framingPreset: cmd.framing_preset ?? 'iso_overview',
+        caption: cmd.caption,
+        chronicleTimeline: cmd.chronicle_timeline ?? null,
+      });
+    },
+    [applyBeatToWorkspace],
+  );
+
+  const sendViewportReceipt = useCallback(
+    (
+      event: ViewportCommandEvent,
+      outcome: ViewportReceiptOutcome,
+      note = '',
+    ) => {
+      const cmdId = event.command.command_id?.trim() || `seq_${event.seq}`;
+      const slug = event.command.target_slug || activeSlug;
+      const sidAtReceipt = activeSessionId ?? event.command.session_id ?? undefined;
+      if (!slug || !tabClientId) return;
+      void atlasApi
+        .postViewportReceipt({
+          command_id: cmdId,
+          seq: event.seq > 0 ? event.seq : undefined,
+          target_slug: slug,
+          session_id: sidAtReceipt,
+          client_id: tabClientId,
+          outcome,
+          applied_focus_revision: latestFocusRevisionRef.current,
+          note,
+        })
+        .then((receipt) => {
+          if (
+            activeSlugRef.current === slug &&
+            (!sidAtReceipt || activeSessionIdRef.current === sidAtReceipt)
+          ) {
+            setLastViewportReceipt(receipt);
+          }
+        })
+        .catch(() => {});
+    },
+    [activeSlug, activeSessionId, tabClientId],
+  );
+
+  // Hydrate cold `#focus=...` / `#session=...` / `#chronicle=...&phase=...` URL permalinks on load and hashchange
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const hydrateFromHash = () => {
+      const explicitSid = extractExplicitSessionIdFromUrl(window.location.href);
+      const urlTarget = extractExplicitTargetFromUrl(window.location.href);
+      if (explicitSid && explicitSid !== activeSessionId) {
+        const effSlug = urlTarget || activeSlug;
+        if (effSlug && (!urlTarget || urlTarget === effSlug)) {
+          switchTabSessionId(effSlug, explicitSid);
+          setScopedSessionId(effSlug, explicitSid);
+        }
+      }
+      const parsed = parseViewportPermalinkHash(window.location.hash, activeSlug || 'wythe');
+      if (!parsed) return;
+      coldPermalinkAppliedRef.current = true;
+      setColdPermalinkActive(true);
+      const destSlug =
+        parsed.target_slug && targets.some((t) => t.slug === parsed.target_slug)
+          ? parsed.target_slug
+          : activeSlug || 'wythe';
+      if (parsed.target_slug && targets.some((t) => t.slug === parsed.target_slug)) {
+        setActiveSlug(parsed.target_slug);
+      }
+      if (parsed.session_id) {
+        switchTabSessionId(destSlug, parsed.session_id);
+        setScopedSessionId(destSlug, parsed.session_id);
+      }
+      const syntheticEvent: ViewportCommandEvent = {
+        seq: 0,
+        issued_at: 'permalink',
+        permalink: window.location.hash,
+        command: parsed,
+      };
+      const savedFollow = readPersistedFollowState(parsed.session_id ?? explicitSid ?? activeSessionId);
+      setAgentCamState((prev) => ({
+        ...prev,
+        followMode: savedFollow,
+        liveFollowing: savedFollow === 'following',
+        haltedReason: null,
+        chronicleTimelineId: parsed.chronicle_timeline?.timeline_id ?? null,
+        activeEvent: savedFollow === 'following' ? syntheticEvent : prev.activeEvent,
+        pendingEventWhilePaused: savedFollow === 'paused' ? syntheticEvent : null,
+        timelineMode: parsed.chronicle_timeline ? 'chronicle' : 'none',
+        stepIndex: parsed.chronicle_timeline?.active_phase_index ?? 0,
+      }));
+      if (savedFollow === 'following') {
+        applyCommandOrFirstStep(parsed);
+      } else {
+        coldPermalinkAppliedRef.current = false;
+        setColdPermalinkActive(false);
+      }
+    };
+    hydrateFromHash();
+    window.addEventListener('hashchange', hydrateFromHash);
+    return () => window.removeEventListener('hashchange', hydrateFromHash);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targets.length]);
+
+  // Hydrate initial `/viewport/state` WITHOUT unexpectedly seizing camera on reload, reconnect, or target switch
+  useEffect(() => {
+    const latest = initialViewportState?.latest ?? null;
+    if (!latest || !activeSlug) return;
+    if (coldPermalinkAppliedRef.current) {
+      const coldTl = agentCamState.activeEvent?.command.chronicle_timeline;
+      const latestTl = latest.command.chronicle_timeline;
+      const coldFrames = coldTl?.frames ?? [];
+      const latestFrames = latestTl?.frames ?? [];
+      if (
+        coldTl &&
+        coldFrames.length === 0 &&
+        latestTl &&
+        latestTl.timeline_id === coldTl.timeline_id &&
+        latestFrames.length > 0
+      ) {
+        const mergedPhase = Math.max(
+          0,
+          Math.min(latestFrames.length - 1, coldTl.active_phase_index ?? 0),
+        );
+        const mergedCmd: ViewportCommand = {
+          ...latest.command,
+          chronicle_timeline: { ...latestTl, active_phase_index: mergedPhase },
+        };
+        setAgentCamState((prev) => ({
+          ...prev,
+          activeEvent: { ...latest, command: mergedCmd },
+          timelineMode: 'chronicle',
+          stepIndex: mergedPhase,
+          haltedReason: sanitizeViewportPlainText(latestTl.halted_reason, 240) || null,
+          liveFollowing: !latestTl.halted_reason && latestTl.live_following !== false,
+          followMode:
+            latestTl.halted_reason || latestTl.live_following === false ? 'paused' : prev.followMode,
+        }));
+        applyCommandOrFirstStep(mergedCmd);
+      }
+      return;
+    }
+
+    const decision = evaluateIncomingViewportCommand({
+      event: latest,
+      source: 'initial_state',
+      activeTargetSlug: activeSlug,
+      activeSessionId,
+      clientId: tabClientId,
+      followState: followModeRef.current,
+      currentEvidenceRevisionId: latestEvidenceRevRef.current,
+      ackedCommandIds: ackedCommandIdsRef.current,
+    });
+    if (decision.markAcked) {
+      const updated = recordAckedCommandId(activeSlug, activeSessionId, decision.commandKey);
+      ackedCommandIdsRef.current = new Set(updated);
+    }
+    if (decision.action === 'hold_on_reload') {
+      setAgentCamState((prev) => ({
+        ...prev,
+        pendingEventWhilePaused: latest,
+        activeEvent: prev.activeEvent ?? latest,
+      }));
+    }
+  }, [
+    initialViewportState,
+    activeSlug,
+    activeSessionId,
+    tabClientId,
+    applyCommandOrFirstStep,
+    agentCamState.activeEvent?.command.chronicle_timeline,
+  ]);
+
+  // Re-resolve `findingId -> node_id` once scan `report` finishes loading after cold permalink / early SSE
+  useEffect(() => {
+    const activeEvent = agentCamState.activeEvent;
+    const activeCmd = activeEvent?.command;
+    if (!activeEvent || !activeCmd || !report?.findings?.length || agentCamState.followMode !== 'following') {
+      return;
+    }
+    const eventKey = `${activeEvent.seq}:${activeCmd.command_id ?? ''}:${activeCmd.finding_id ?? ''}`;
+    if (lastFindingResolvedKeyRef.current === eventKey) {
+      return;
+    }
+    const beatFinding = activeCmd.finding_id;
+    const hasFocus = (activeCmd.focus_node_ids ?? []).length > 0;
+    if (!hasFocus && beatFinding) {
+      const hitFinding = report.findings.find(
+        (f) => f.id === beatFinding || f.rule_code.toLowerCase() === beatFinding.toLowerCase(),
+      );
+      lastFindingResolvedKeyRef.current = eventKey;
+      if (hitFinding?.node_id) {
+        setSelectedNodeId(hitFinding.node_id);
+        setSelectedFindingId(hitFinding.id);
+        setAgentCameraRequest((prev) => ({
+          seq: (prev?.seq ?? 0) + 1,
+          preset: activeCmd.framing_preset ?? 'iso_overview',
+          focusNodeIds: [hitFinding.node_id!],
+          highlightEdgeIds: activeCmd.highlight_edge_ids ?? [],
+          caption: sanitizeViewportPlainText(activeCmd.caption),
+        }));
+      }
+    }
+  }, [report?.findings, agentCamState.activeEvent, agentCamState.followMode]);
+
+  // Subscribe to `/api/v1/viewport/stream?target_slug=...&session_id=...` SSE stream
+  const sseBaselineSeq = initialViewportState?.latest?.seq ?? 0;
+  useEffect(() => {
+    if (
+      !activeSlug ||
+      !activeSessionId ||
+      typeof window === 'undefined' ||
+      typeof EventSource === 'undefined'
+    ) {
+      return;
+    }
+    if (!viewportStateFetched) {
+      return;
+    }
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource(
+        atlasApi.buildViewportEventsUrl(activeSlug, {
+          sessionId: activeSessionId,
+          clientId: tabClientId,
+          actor: 'human',
+          followState: followModeRef.current,
+          sinceSeq: 0,
+        }),
+      );
+    } catch {
+      return;
+    }
+    const handleRawEvent = (ev: MessageEvent) => {
+      try {
+        const parsed = JSON.parse(String(ev.data)) as ViewportCommandEvent;
+        if (!parsed || !parsed.command) return;
+        if (coldPermalinkAppliedRef.current && parsed.seq <= sseBaselineSeq) {
+          return;
+        }
+        coldPermalinkAppliedRef.current = false;
+
+        const decision = evaluateIncomingViewportCommand({
+          event: parsed,
+          source: 'sse',
+          activeTargetSlug: activeSlug,
+          activeSessionId,
+          clientId: tabClientId,
+          followState: followModeRef.current,
+          currentEvidenceRevisionId:
+            latestEvidenceRevRef.current ??
+            (report?.content_digest ? undefined : null),
+          ackedCommandIds: ackedCommandIdsRef.current,
+          pausedNotifiedCommandIds: pausedNotifiedIdsRef.current,
+        });
+
+        if (decision.markAcked) {
+          const updated = recordAckedCommandId(
+            activeSlug,
+            activeSessionId,
+            decision.commandKey,
+          );
+          ackedCommandIdsRef.current = new Set(updated);
+        }
+        if (decision.markPausedNotified) {
+          pausedNotifiedIdsRef.current.add(decision.commandKey);
+        }
+
+        if (decision.action === 'apply') {
+          setAgentCamState((prev) => {
+            const res = applyIncomingViewportEvent(
+              { ...prev, followMode: 'following', liveFollowing: true },
+              parsed,
+            );
+            if (res.shouldMoveCamera) {
+              applyCommandOrFirstStep(parsed.command);
+            }
+            return res.state;
+          });
+          if (decision.receiptOutcome) {
+            sendViewportReceipt(parsed, decision.receiptOutcome);
+          }
+        } else if (decision.action === 'queue_while_paused') {
+          setAgentCamState((prev) => ({
+            ...prev,
+            pendingEventWhilePaused: parsed,
+            activeEvent: prev.activeEvent ?? parsed,
+          }));
+          if (decision.receiptOutcome) {
+            sendViewportReceipt(
+              parsed,
+              decision.receiptOutcome,
+              'Human camera follow is paused',
+            );
+          }
+        } else if (
+          decision.action === 'reject_stale' ||
+          decision.action === 'reject'
+        ) {
+          if (decision.receiptOutcome) {
+            sendViewportReceipt(parsed, decision.receiptOutcome, decision.reason);
+          }
+        }
+      } catch {
+        // Ignore malformed SSE heartbeats
+      }
+    };
+    es.addEventListener('viewport_command', handleRawEvent as EventListener);
+    es.onmessage = handleRawEvent;
+    return () => {
+      es?.close();
+    };
+  }, [
+    activeSlug,
+    activeSessionId,
+    tabClientId,
+    viewportStateFetched,
+    sseBaselineSeq,
+    report?.content_digest,
+    applyCommandOrFirstStep,
+    sendViewportReceipt,
+  ]);
+
+  const activeTimelineItems = useMemo(
+    () => normalizeViewportTimeline(agentCamState.activeEvent?.command),
+    [agentCamState.activeEvent?.command],
+  );
+  const currentAgentBeat = useMemo(() => {
+    if (activeTimelineItems.length > 0) {
+      return activeTimelineItems[
+        Math.min(agentCamState.stepIndex, activeTimelineItems.length - 1)
+      ];
+    }
+    const cmd = agentCamState.activeEvent?.command;
+    if (!cmd) return null;
+    return {
+      focusNodeIds: cmd.focus_node_ids ?? [],
+      highlightEdgeIds: cmd.highlight_edge_ids ?? [],
+      findingId: cmd.finding_id ?? null,
+      lens: (cmd.lens ?? null) as SceneLens | null,
+      layoutMode: (cmd.layout_mode ?? null) as SceneLayoutMode | null,
+      zWytheSlice: cmd.z_wythe_slice ?? null,
+      zoomStratum: cmd.zoom_stratum ?? 1,
+      framingPreset: cmd.framing_preset ?? 'iso_overview',
+      caption: sanitizeViewportPlainText(cmd.caption),
+    };
+  }, [activeTimelineItems, agentCamState.stepIndex, agentCamState.activeEvent?.command]);
+
+  const activeFocusNodeSet = useMemo(
+    () => new Set(currentAgentBeat?.focusNodeIds ?? []),
+    [currentAgentBeat],
+  );
+  const activeHighlightEdgeSet = useMemo(
+    () => new Set(currentAgentBeat?.highlightEdgeIds ?? []),
+    [currentAgentBeat],
+  );
+  const activePermalinkHash = useMemo(
+    () =>
+      buildViewportPermalinkHash({
+        target_slug: activeSlug || undefined,
+        session_id: activeSessionId ?? undefined,
+        focus_node_ids:
+          currentAgentBeat?.focusNodeIds && currentAgentBeat.focusNodeIds.length > 0
+            ? currentAgentBeat.focusNodeIds
+            : selectedNodeId
+              ? [selectedNodeId]
+              : [],
+        highlight_edge_ids: currentAgentBeat?.highlightEdgeIds ?? [],
+        lens: sceneLens,
+        layout_mode: sceneLayout,
+        framing_preset: currentAgentBeat?.framingPreset ?? 'iso_overview',
+        z_wythe_slice: zWytheSlice !== 'all' ? zWytheSlice : undefined,
+        zoom_stratum: requestedZoomStratum,
+        chronicle_timeline: agentCamState.activeEvent?.command.chronicle_timeline
+          ? {
+              ...agentCamState.activeEvent.command.chronicle_timeline,
+              active_phase_index: agentCamState.stepIndex,
+            }
+          : undefined,
+      }),
+    [
+      activeSlug,
+      activeSessionId,
+      currentAgentBeat,
+      selectedNodeId,
+      sceneLens,
+      sceneLayout,
+      zWytheSlice,
+      requestedZoomStratum,
+      agentCamState.activeEvent?.command.chronicle_timeline,
+      agentCamState.stepIndex,
+    ],
+  );
+
+  const syncFollowStateToBackend = useCallback(
+    (nextFollow: FollowState, reason: string) => {
+      const sidAtCall = activeSessionIdRef.current;
+      const slugAtCall = activeSlugRef.current;
+      const epochAtCall = scopeEpochRef.current;
+      const reqSeq = ++followReqSeqRef.current;
+      followModeRef.current = nextFollow;
+      writePersistedFollowState(sidAtCall, nextFollow);
+      if (!sidAtCall) return;
+      void atlasApi
+        .updateInvestigationFollow(sidAtCall, {
+          client_id: tabClientId,
+          actor: 'human',
+          follow_state: nextFollow,
+          reason,
+        })
+        .then((sess) => {
+          if (
+            scopeEpochRef.current === epochAtCall &&
+            activeSlugRef.current === slugAtCall &&
+            activeSessionIdRef.current === sidAtCall &&
+            followReqSeqRef.current === reqSeq &&
+            sess.session_id === sidAtCall
+          ) {
+            setInvestigationSession(sess);
+          }
+        })
+        .catch(() => {});
+    },
+    [tabClientId],
+  );
+
+  const handleHumanYield = useCallback(
+    (reason: HumanInputInterruptKind) => {
+      setAgentCamState((prev) => {
+        const next = yieldAgentCameraOnHumanInput(prev, reason);
+        if (prev.followMode !== 'paused') {
+          syncFollowStateToBackend('paused', `human_input:${reason}`);
+        }
+        return next;
+      });
+    },
+    [syncFollowStateToBackend],
+  );
+
+  const handleToggleAgentFollow = useCallback(() => {
+    setAgentCamState((prev) => {
+      if (prev.followMode === 'following') {
+        syncFollowStateToBackend('paused', 'manual_pause_button');
+        return yieldAgentCameraOnHumanInput(prev, 'pointerdown');
+      }
+      syncFollowStateToBackend('following', 'manual_resume_button');
+      const pendingEvt = prev.pendingEventWhilePaused;
+      const resumed = resumeAgentCameraFollow(prev);
+      if (resumed.activeEvent?.command) {
+        const items = normalizeViewportTimeline(resumed.activeEvent.command);
+        if (items.length > 0) {
+          const idx = Math.min(resumed.stepIndex, items.length - 1);
+          const item = items[idx];
+          applyBeatToWorkspace({
+            targetSlug: resumed.activeEvent.command.target_slug,
+            focusNodeIds: item.focusNodeIds,
+            highlightEdgeIds: item.highlightEdgeIds,
+            findingId: item.findingId,
+            lens: item.lens,
+            layoutMode: item.layoutMode,
+            zWytheSlice: item.zWytheSlice,
+            zoomStratum: item.zoomStratum,
+            framingPreset: item.framingPreset,
+            caption: item.caption,
+            chronicleTimeline: resumed.activeEvent.command.chronicle_timeline
+              ? { ...resumed.activeEvent.command.chronicle_timeline, active_phase_index: idx }
+              : null,
+          });
+        } else {
+          applyCommandOrFirstStep(resumed.activeEvent.command);
+        }
+      }
+      if (pendingEvt && pendingEvt.seq > 0 && activeSlug) {
+        const key = getViewportCommandKey(pendingEvt);
+        if (!ackedCommandIdsRef.current.has(key)) {
+          const updated = recordAckedCommandId(activeSlug, activeSessionId, key);
+          ackedCommandIdsRef.current = new Set(updated);
+          sendViewportReceipt(pendingEvt, 'applied', 'Applied on explicit human resume');
+        }
+      }
+      return resumed;
+    });
+  }, [
+    activeSlug,
+    activeSessionId,
+    applyBeatToWorkspace,
+    applyCommandOrFirstStep,
+    sendViewportReceipt,
+    syncFollowStateToBackend,
+  ]);
+
+  const handleRejectPendingAgentCommand = useCallback(() => {
+    setAgentCamState((prev) => {
+      const pendingEvt = prev.pendingEventWhilePaused;
+      if (pendingEvt && pendingEvt.seq > 0 && activeSlug) {
+        const key = getViewportCommandKey(pendingEvt);
+        const updated = recordAckedCommandId(activeSlug, activeSessionId, key);
+        ackedCommandIdsRef.current = new Set(updated);
+        sendViewportReceipt(pendingEvt, 'rejected', 'Rejected by human while follow paused');
+      }
+      return { ...prev, pendingEventWhilePaused: null };
+    });
+  }, [activeSlug, activeSessionId, sendViewportReceipt]);
+
+  const handleStepAgentTimeline = useCallback(
+    (delta: -1 | 1 | { index: number }) => {
+      setAgentCamState((prev) => {
+        const next = stepTimelineFrame(prev, delta);
+        const items = normalizeViewportTimeline(next.activeEvent?.command);
+        if (items.length > 0) {
+          const idx = Math.min(next.stepIndex, items.length - 1);
+          const item = items[idx];
+          applyBeatToWorkspace({
+            targetSlug: next.activeEvent?.command.target_slug,
+            focusNodeIds: item.focusNodeIds,
+            highlightEdgeIds: item.highlightEdgeIds,
+            findingId: item.findingId,
+            lens: item.lens,
+            layoutMode: item.layoutMode,
+            zWytheSlice: item.zWytheSlice,
+            zoomStratum: item.zoomStratum,
+            framingPreset: item.framingPreset,
+            caption: item.caption,
+            chronicleTimeline: next.activeEvent?.command.chronicle_timeline
+              ? { ...next.activeEvent.command.chronicle_timeline, active_phase_index: idx }
+              : null,
+          });
+        }
+        return { ...next, followMode: 'following', liveFollowing: true };
+      });
+    },
+    [applyBeatToWorkspace],
+  );
+
+  const handleToggleAgentPlay = useCallback(() => {
+    setAgentCamState((prev) => ({
+      ...prev,
+      followMode: 'following',
+      liveFollowing: true,
+      isPlaying: !prev.isPlaying,
+    }));
+  }, []);
+
+  const handleExitAgentTimeline = useCallback(() => {
+    setAgentCamState((prev) => ({
+      ...prev,
+      activeEvent: null,
+      pendingEventWhilePaused: null,
+      haltedReason: null,
+      chronicleTimelineId: null,
+      timelineMode: 'none',
+      stepIndex: 0,
+      isPlaying: false,
+    }));
+    setAgentCameraRequest(null);
+    setRequestedZoomStratum(1);
+    setZWytheSlice('all');
+  }, []);
+
+  useEffect(() => {
+    if (!agentCamState.isPlaying || activeTimelineItems.length <= 1 || prefersReducedMotion) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      handleStepAgentTimeline(1);
+    }, 2800);
+    return () => window.clearInterval(timer);
+  }, [agentCamState.isPlaying, activeTimelineItems.length, prefersReducedMotion, handleStepAgentTimeline]);
 
   const diffOverlay = useMemo<DiffOverlaySet | null>(() => {
     if (blastMode === 'git' && gitDiffReport) {
@@ -290,67 +1333,283 @@ export default function WytheWorkspacePage() {
 
   const selectedNode = selectedNodeId ? nodesById.get(selectedNodeId) ?? null : null;
 
-  // Debounced zero-copy-paste live sync of human viewport focus to MCP (`wythe_what_is_this`) & CLI (`wythe focus`)
-  useEffect(() => {
+  const handleReopenSession = useCallback(
+    (nextSessionId: string) => {
+      if (!activeSlug) return;
+      const clean = switchTabSessionId(activeSlug, nextSessionId);
+      if (clean === activeSessionIdRef.current) {
+        void refreshInvestigationState(clean);
+        flashToast(`Reopened investigation ${clean}`);
+        return;
+      }
+      setRevisionComparison(null);
+      setInvestigationSession(null);
+      setScopedSessionId(activeSlug, clean);
+      const savedFollow = readPersistedFollowState(clean);
+      followModeRef.current = savedFollow;
+      setAgentCamState((prev) => ({
+        ...prev,
+        followMode: savedFollow,
+        liveFollowing: savedFollow === 'following',
+        isPlaying: savedFollow === 'paused' ? false : prev.isPlaying,
+      }));
+      ackedCommandIdsRef.current = new Set(readAckedCommandIds(activeSlug, clean));
+      pausedNotifiedIdsRef.current.clear();
+      flashToast(`Reopened investigation ${clean}`);
+    },
+    [activeSlug, setScopedSessionId, refreshInvestigationState, flashToast],
+  );
+
+  const handleNewIndependentSession = useCallback(() => {
     if (!activeSlug) return;
+    const fresh = rotateTabSessionId(activeSlug);
+    if (typeof window !== 'undefined' && window.location.hash.includes('session=')) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+    setRevisionComparison(null);
+    setInvestigationSession(null);
+    setSelectedNodeId(null);
+    setScopedSessionId(activeSlug, fresh);
+    followModeRef.current = 'following';
+    setAgentCamState((prev) => ({
+      ...prev,
+      followMode: 'following',
+      liveFollowing: true,
+    }));
+    ackedCommandIdsRef.current = new Set();
+    pausedNotifiedIdsRef.current.clear();
+    flashToast(`Started independent tab investigation ${fresh}`);
+  }, [activeSlug, setScopedSessionId, flashToast]);
+
+  const handleResetSession = useCallback(() => {
+    const sidAtCall = activeSessionIdRef.current;
+    const slugAtCall = activeSlugRef.current;
+    const epochAtCall = scopeEpochRef.current;
+    if (!sidAtCall) return;
+    void atlasApi
+      .resetInvestigation(sidAtCall)
+      .then((sess) => {
+        if (
+          scopeEpochRef.current !== epochAtCall ||
+          activeSlugRef.current !== slugAtCall ||
+          activeSessionIdRef.current !== sidAtCall
+        ) {
+          return;
+        }
+        setInvestigationSession(sess);
+        setRevisionComparison(null);
+        void refreshInvestigationState(sidAtCall);
+        flashToast(`Reset investigation ${sidAtCall}`);
+      })
+      .catch((err) => flashToast(`Reset failed: ${(err as Error).message}`));
+  }, [refreshInvestigationState, flashToast]);
+
+  const handleExportSession = useCallback(() => {
+    if (!activeSessionId) return;
+    void atlasApi
+      .exportInvestigation(activeSessionId)
+      .then((bundle) => {
+        const jsonText = JSON.stringify(bundle, null, 2);
+        void copyTextToClipboard(jsonText);
+        if (typeof document !== 'undefined') {
+          const blob = new Blob([jsonText], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `wythe-investigation-${activeSessionId}.json`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        }
+        flashToast(`Exported investigation ${activeSessionId}.json`);
+      })
+      .catch((err) => flashToast(`Export failed: ${(err as Error).message}`));
+  }, [activeSessionId, flashToast]);
+
+  const handleDeleteSession = useCallback(() => {
+    const slugAtCall = activeSlugRef.current;
+    const doomed = activeSessionIdRef.current;
+    const epochAtCall = scopeEpochRef.current;
+    if (!slugAtCall || !doomed) return;
+    void atlasApi
+      .deleteInvestigation(doomed)
+      .then(() => {
+        if (
+          scopeEpochRef.current !== epochAtCall ||
+          activeSlugRef.current !== slugAtCall ||
+          activeSessionIdRef.current !== doomed
+        ) {
+          return;
+        }
+        const fresh = rotateTabSessionId(slugAtCall);
+        setRevisionComparison(null);
+        setInvestigationSession(null);
+        setScopedSessionId(slugAtCall, fresh);
+        flashToast(`Deleted ${doomed}; started ${fresh}`);
+      })
+      .catch((err) => flashToast(`Delete failed: ${(err as Error).message}`));
+  }, [setScopedSessionId, flashToast]);
+
+  const handleCompareRevisions = useCallback(async () => {
+    const sidAtCall = activeSessionIdRef.current;
+    const slugAtCall = activeSlugRef.current;
+    const epochAtCall = scopeEpochRef.current;
+    if (!sidAtCall) return;
+    try {
+      const comp = await atlasApi.compareInvestigationRevisions(sidAtCall);
+      if (
+        scopeEpochRef.current !== epochAtCall ||
+        activeSlugRef.current !== slugAtCall ||
+        activeSessionIdRef.current !== sidAtCall
+      ) {
+        return;
+      }
+      setRevisionComparison(comp);
+      await refreshInvestigationState(sidAtCall);
+    } catch (err) {
+      flashToast(`Compare failed: ${(err as Error).message}`);
+    }
+  }, [refreshInvestigationState, flashToast]);
+
+  const handleCorrectionAdded = useCallback(
+    (_created: InvestigationCorrectionRead) => {
+      void refreshInvestigationState(activeSessionId);
+    },
+    [activeSessionId, refreshInvestigationState],
+  );
+
+  const isSessionHydrated = Boolean(
+    activeSessionId && investigationSession && investigationSession.session_id === activeSessionId,
+  );
+
+  // Keep `focus=` in `window.location.hash` synchronized with human selection after hydration so `page.reload()` never reverts to an older agent `focus=`
+  useEffect(() => {
+    if (typeof window === 'undefined' || !isSessionHydrated) return;
+    const rawHash = window.location.hash;
+    if (!rawHash || rawHash.length <= 1) return;
+    const params = new URLSearchParams(rawHash.slice(1));
+    if (!params.has('focus') && !params.has('finding') && !params.has('edges')) {
+      return;
+    }
+    const prevFocus = params.get('focus') ?? '';
+    const nextFocus = selectedNodeId ?? '';
+    if (prevFocus === nextFocus && !params.has('finding')) {
+      return;
+    }
+    if (selectedNodeId) {
+      params.set('focus', selectedNodeId);
+    } else {
+      params.delete('focus');
+    }
+    params.delete('finding');
+    params.delete('edges');
+    const serialized = params.toString();
+    window.history.replaceState(
+      null,
+      '',
+      serialized ? `#${serialized}` : window.location.pathname + window.location.search,
+    );
+  }, [selectedNodeId, isSessionHydrated]);
+
+  const hoverAndDigestRef = useRef({ hoverFocusMeta, liveViewportDigest });
+  hoverAndDigestRef.current = { hoverFocusMeta, liveViewportDigest };
+
+  const emitUiFocusPayload = useCallback(() => {
+    if (!activeSlug || !activeSessionId || !tabClientId || !isSessionHydrated) return;
+    const { hoverFocusMeta: curHover, liveViewportDigest: curDigest } = hoverAndDigestRef.current;
     const derivedDistrict =
-      (selectedNode ? deriveDomainCluster(selectedNode) : null) ??
-      hoverFocusMeta.district;
-    const timer = window.setTimeout(() => {
-      const knownRev =
-        Number((whatsThisExplanation as { camera_revision?: number | null } | null)?.camera_revision ?? 0) || 0;
-      const nextRev = bumpViewportCameraRevision(knownRev);
-      syncUiFocus.mutate(
-        {
-          active_slug: activeSlug,
-          active_tab: activeTab,
-          selected_node_id: selectedNodeId,
-          hovered_node_id: hoverFocusMeta.hoveredNodeId,
-          focused_district: derivedDistrict,
-          tier_filter: tierFilter,
-          subkind_filter: subkindFilter,
-          edge_filter: edgeFilter,
-          lens: sceneLens,
-          layout_mode: sceneLayout,
-          blast_mode: blastMode,
-          diff_base_ref: diffBaseRef,
-          only_flagged: onlyFlagged,
-          isolate_cone: isolateCone,
-          connected_only: connectedOnly,
-          neighborhood_hops: neighborhoodHops,
-          search_query: searchQuery,
-          active_trace_route: activeTraceChain
-            ? `${activeTraceChain.http_method} ${activeTraceChain.http_path}`
-            : null,
-          camera_position: hoverFocusMeta.cameraPosition,
-          camera_target: hoverFocusMeta.cameraTarget,
-          visible_node_count: hoverFocusMeta.visibleNodeCount,
-          in_frustum_count: liveViewportDigest?.inFrustumCount ?? 0,
-          visual_headline: hoverFocusMeta.visualHeadline,
-          live_viewport_brief: liveViewportDigest?.markdownBrief ?? null,
-          camera_revision: nextRev,
+      (selectedNode ? deriveDomainCluster(selectedNode) : null) ?? curHover.district;
+    const knownRev =
+      Number((whatsThisExplanation as { camera_revision?: number | null } | null)?.camera_revision ?? 0) || 0;
+    const nextRev = bumpViewportCameraRevision(knownRev);
+    syncUiFocus.mutate(
+      {
+        active_slug: activeSlug,
+        session_id: activeSessionId,
+        client_id: tabClientId,
+        actor: 'human',
+        active_tab: activeTab,
+        selected_node_id: selectedNodeId,
+        selected_edge_id: selectedEdgeId,
+        selected_finding_id: selectedFindingId,
+        hovered_node_id: curHover.hoveredNodeId,
+        focused_district: derivedDistrict,
+        follow_state: agentCamState.followMode,
+        evidence_revision_id: latestEvidenceRevRef.current,
+        tier_filter: tierFilter,
+        subkind_filter: subkindFilter,
+        edge_filter: edgeFilter,
+        lens: sceneLens,
+        layout_mode: sceneLayout,
+        blast_mode: blastMode,
+        diff_base_ref: diffBaseRef,
+        only_flagged: onlyFlagged,
+        isolate_cone: isolateCone,
+        connected_only: connectedOnly,
+        neighborhood_hops: neighborhoodHops,
+        search_query: searchQuery,
+        active_trace_route: activeTraceChain
+          ? `${activeTraceChain.http_method} ${activeTraceChain.http_path}`
+          : null,
+        camera_position: curHover.cameraPosition,
+        camera_target: curHover.cameraTarget,
+        visible_node_count: curHover.visibleNodeCount,
+        in_frustum_count: curDigest?.inFrustumCount ?? 0,
+        visual_headline: curHover.visualHeadline,
+        live_viewport_brief: curDigest?.markdownBrief ?? null,
+        camera_revision: nextRev,
+      },
+      {
+        onSuccess: (ack) => {
+          if (
+            activeSlugRef.current !== activeSlug ||
+            activeSessionIdRef.current !== activeSessionId
+          ) {
+            return;
+          }
+          if (typeof ack.focus_revision === 'number') {
+            latestFocusRevisionRef.current = ack.focus_revision;
+          }
+          if (ack.evidence_revision_id) {
+            latestEvidenceRevRef.current = ack.evidence_revision_id;
+          }
+          if (askDrawerOpen) {
+            fetchUiFocus.mutate(
+              {
+                targetSlug: activeSlug,
+                sessionId: activeSessionId,
+                clientId: tabClientId,
+                selectedEdgeId,
+                selectedFindingId,
+                followState: agentCamState.followMode,
+              },
+              {
+                onSuccess: (exp) => {
+                  if (
+                    activeSlugRef.current === activeSlug &&
+                    activeSessionIdRef.current === activeSessionId
+                  ) {
+                    setWhatsThisExplanation(exp);
+                  }
+                },
+              },
+            );
+          }
         },
-        {
-          onSuccess: () => {
-            if (askDrawerOpen) {
-              fetchUiFocus.mutate(activeSlug, {
-                onSuccess: (exp) => setWhatsThisExplanation(exp),
-              });
-            }
-          },
-        },
-      );
-    }, 260);
-    return () => window.clearTimeout(timer);
+      },
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     activeSlug,
+    activeSessionId,
+    tabClientId,
     activeTab,
+    selectedNode,
     selectedNodeId,
-    hoverFocusMeta.hoveredNodeId,
-    hoverFocusMeta.district,
-    hoverFocusMeta.cameraPosition,
-    hoverFocusMeta.cameraTarget,
+    selectedEdgeId,
+    selectedFindingId,
+    agentCamState.followMode,
     tierFilter,
     subkindFilter,
     edgeFilter,
@@ -364,7 +1623,54 @@ export default function WytheWorkspacePage() {
     neighborhoodHops,
     searchQuery,
     activeTraceChain,
-    liveViewportDigest?.observedAtIso,
+    askDrawerOpen,
+    isSessionHydrated,
+  ]);
+
+  const emitUiFocusRef = useRef(emitUiFocusPayload);
+  emitUiFocusRef.current = emitUiFocusPayload;
+  const pendingHoverTimerRef = useRef<number | null>(null);
+
+  // 1) Prompt sync for explicit human selection, tab, filter, and follow changes (gated on session hydration so reload never wipes saved selection)
+  useEffect(() => {
+    if (!activeSlug || !activeSessionId || !tabClientId || !isSessionHydrated) return;
+    if (pendingHoverTimerRef.current !== null) {
+      window.clearTimeout(pendingHoverTimerRef.current);
+      pendingHoverTimerRef.current = null;
+    }
+    const timer = window.setTimeout(() => {
+      if (pendingHoverTimerRef.current !== null) {
+        window.clearTimeout(pendingHoverTimerRef.current);
+        pendingHoverTimerRef.current = null;
+      }
+      emitUiFocusRef.current();
+    }, 35);
+    return () => window.clearTimeout(timer);
+  }, [emitUiFocusPayload, activeSlug, activeSessionId, tabClientId, isSessionHydrated]);
+
+  // 2) Debounced (>= 250ms) sync for passive hover & settled camera framing metadata (always invokes fresh ref closure after hydration)
+  useEffect(() => {
+    if (!activeSlug || !activeSessionId || !tabClientId || !isSessionHydrated) return;
+    if (pendingHoverTimerRef.current !== null) {
+      window.clearTimeout(pendingHoverTimerRef.current);
+    }
+    const timer = window.setTimeout(() => {
+      pendingHoverTimerRef.current = null;
+      emitUiFocusRef.current();
+    }, MIN_UI_FOCUS_DEBOUNCE_MS);
+    pendingHoverTimerRef.current = timer;
+    return () => {
+      window.clearTimeout(timer);
+      if (pendingHoverTimerRef.current === timer) {
+        pendingHoverTimerRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    hoverFocusMeta.hoveredNodeId,
+    hoverFocusMeta.district,
+    hoverFocusMeta.cameraPosition,
+    hoverFocusMeta.cameraTarget,
   ]);
 
   const openAskWytheDrawer = useCallback(
@@ -372,27 +1678,113 @@ export default function WytheWorkspacePage() {
       if (typeof prefill === 'string') setAskPrefillQuestion(prefill);
       setWhatsThisOpen(false);
       setAskDrawerOpen(true);
+      void refreshInvestigationState(activeSessionId);
       if (activeTab === '3d' && !liveCaptureFnRef.current) {
         focusCaptureTargetRef.current = 'drawer';
         setWhatsThisRequest((n) => n + 1);
       } else if (activeSlug) {
-        fetchUiFocus.mutate(activeSlug, {
-          onSuccess: (exp) => setWhatsThisExplanation(exp),
-        });
+        fetchUiFocus.mutate(
+          {
+            targetSlug: activeSlug,
+            sessionId: activeSessionId,
+            clientId: tabClientId,
+            selectedEdgeId,
+            selectedFindingId,
+            followState: agentCamState.followMode,
+          },
+          {
+            onSuccess: (exp) => {
+              if (
+                activeSlugRef.current === activeSlug &&
+                activeSessionIdRef.current === activeSessionId
+              ) {
+                setWhatsThisExplanation(exp);
+              }
+            },
+          },
+        );
       }
     },
-    [activeTab, activeSlug, fetchUiFocus],
+    [
+      activeTab,
+      activeSlug,
+      activeSessionId,
+      tabClientId,
+      selectedEdgeId,
+      selectedFindingId,
+      agentCamState.followMode,
+      fetchUiFocus,
+      refreshInvestigationState,
+    ],
   );
 
   useEffect(() => {
     if (!activeSlug) return;
     return registerWytheWebMcpBridge({
-      getWhatIsThis: () => atlasApi.getUiFocus(activeSlug),
+      getWhatIsThis: () =>
+        atlasApi.getUiFocus(activeSlug, {
+          sessionId: activeSessionId,
+          clientId: tabClientId,
+          actor: 'human',
+          selectedEdgeId,
+          selectedFindingId,
+          followState: followModeRef.current,
+        }),
       getLineageCone: (query) => atlasApi.getScanContextCone(activeSlug, query),
       selectNode: (nodeId) => setSelectedNodeId(nodeId),
       openAskDrawer: (q) => openAskWytheDrawer(q),
+      getSession: () =>
+        activeSessionId ? atlasApi.getInvestigation(activeSessionId) : Promise.resolve(null),
+      submitCorrection: async (note, kind = 'disagreement') => {
+        if (!activeSessionId) {
+          throw new Error('No active investigation session.');
+        }
+        const sidAtCall = activeSessionId;
+        const created = await atlasApi.addInvestigationCorrection(sidAtCall, {
+          client_id: tabClientId,
+          actor: 'human',
+          target_ref_id: selectedFindingId ?? selectedEdgeId ?? selectedNodeId ?? undefined,
+          kind,
+          note,
+        });
+        await refreshInvestigationState(sidAtCall);
+        return created;
+      },
+      setFollowState: async (state) => {
+        setAgentCamState((prev) =>
+          state === 'paused'
+            ? yieldAgentCameraOnHumanInput(prev, 'pointerdown')
+            : resumeAgentCameraFollow(prev),
+        );
+        syncFollowStateToBackend(state, 'window_wythe_bridge');
+        return { session_id: activeSessionId, follow_state: state };
+      },
+      compareRevisions: async () => {
+        if (!activeSessionId) return null;
+        const sidAtCall = activeSessionId;
+        const slugAtCall = activeSlug;
+        const comp = await atlasApi.compareInvestigationRevisions(sidAtCall);
+        if (
+          activeSlugRef.current === slugAtCall &&
+          activeSessionIdRef.current === sidAtCall
+        ) {
+          setRevisionComparison(comp);
+          await refreshInvestigationState(sidAtCall);
+        }
+        return comp;
+      },
     });
-  }, [activeSlug, openAskWytheDrawer]);
+  }, [
+    activeSlug,
+    activeSessionId,
+    tabClientId,
+    selectedNodeId,
+    selectedEdgeId,
+    selectedFindingId,
+    openAskWytheDrawer,
+    refreshInvestigationState,
+    syncFollowStateToBackend,
+  ]);
 
   const handleTriggerWhatsThis = useCallback(
     (payload: {
@@ -419,11 +1811,18 @@ export default function WytheWorkspacePage() {
       syncUiFocus.mutate(
         {
           active_slug: activeSlug,
+          session_id: activeSessionId,
+          client_id: tabClientId,
+          actor: 'human',
           active_tab: activeTab,
           selected_node_id: selectedNodeId,
+          selected_edge_id: selectedEdgeId,
+          selected_finding_id: selectedFindingId,
           hovered_node_id: payload.hoveredNodeId,
           focused_district:
             (selectedNode ? deriveDomainCluster(selectedNode) : null) ?? payload.district,
+          follow_state: agentCamState.followMode,
+          evidence_revision_id: latestEvidenceRevRef.current,
           tier_filter: tierFilter,
           subkind_filter: subkindFilter,
           edge_filter: edgeFilter,
@@ -449,19 +1848,53 @@ export default function WytheWorkspacePage() {
           snapshot_data_url: payload.snapshotDataUrl,
         },
         {
-          onSuccess: () => {
-            fetchUiFocus.mutate(activeSlug, {
-              onSuccess: (exp) => setWhatsThisExplanation(exp),
-            });
+          onSuccess: (ack) => {
+            if (
+              activeSlugRef.current !== activeSlug ||
+              activeSessionIdRef.current !== activeSessionId
+            ) {
+              return;
+            }
+            if (typeof ack.focus_revision === 'number') {
+              latestFocusRevisionRef.current = ack.focus_revision;
+            }
+            if (ack.evidence_revision_id) {
+              latestEvidenceRevRef.current = ack.evidence_revision_id;
+            }
+            fetchUiFocus.mutate(
+              {
+                targetSlug: activeSlug,
+                sessionId: activeSessionId,
+                clientId: tabClientId,
+                selectedEdgeId,
+                selectedFindingId,
+                followState: agentCamState.followMode,
+              },
+              {
+                onSuccess: (exp) => {
+                  if (
+                    activeSlugRef.current === activeSlug &&
+                    activeSessionIdRef.current === activeSessionId
+                  ) {
+                    setWhatsThisExplanation(exp);
+                  }
+                },
+              },
+            );
           },
         },
       );
     },
     [
       activeSlug,
+      activeSessionId,
+      tabClientId,
       activeTab,
       selectedNodeId,
+      selectedEdgeId,
+      selectedFindingId,
       selectedNode,
+      agentCamState.followMode,
       tierFilter,
       subkindFilter,
       edgeFilter,
@@ -572,7 +2005,14 @@ export default function WytheWorkspacePage() {
   }, [flashToast]);
 
   const toggleSceneLayout = useCallback(() => {
-    const order: readonly SceneLayoutMode[] = ['cluster', 'grid', 'subkind', 'connected'];
+    const order: readonly SceneLayoutMode[] = [
+      'cluster',
+      'grid',
+      'subkind',
+      'connected',
+      'lifecycle_z',
+      'temporal_z',
+    ];
     setSceneLayout((cur) => {
       const next = order[(order.indexOf(cur) + 1) % order.length];
       flashToast(`3D Layout: ${SCENE_LAYOUT_LABELS[next]}`);
@@ -1146,10 +2586,13 @@ export default function WytheWorkspacePage() {
         setIsolateCone((v) => !v);
         setNeighborhoodHops(0);
       } else if (ev.key === '[' || lower === 'k') {
+        handleHumanYield('keydown_nav');
         setStepRequest((prev) => ({ seq: (prev?.seq ?? 0) + 1, delta: -1 }));
       } else if (ev.key === ']' || lower === 'j') {
+        handleHumanYield('keydown_nav');
         setStepRequest((prev) => ({ seq: (prev?.seq ?? 0) + 1, delta: 1 }));
       } else if (ev.key === '0') {
+        handleHumanYield('keydown_nav');
         setSelectedNodeId(null);
         setResetCameraRequest((n) => n + 1);
       } else if (lower === 'p') {
@@ -1242,7 +2685,7 @@ export default function WytheWorkspacePage() {
       },
       {
         onSuccess: (created) => {
-          setActiveSlug(created.slug);
+          switchTargetCleanly(created.slug);
           setShowAddTarget(false);
           setNewSlug('');
           setNewName('');
@@ -1305,8 +2748,7 @@ export default function WytheWorkspacePage() {
                 aria-label="Target repository"
                 value={activeSlug}
                 onChange={(e) => {
-                  setActiveSlug(e.target.value);
-                  setSelectedNodeId(null);
+                  switchTargetCleanly(e.target.value);
                 }}
                 className="min-h-6 border border-slate-700 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-100 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
@@ -1434,7 +2876,19 @@ export default function WytheWorkspacePage() {
                 <button
                   type="button"
                   disabled={triggerScan.isPending}
-                  onClick={() => triggerScan.mutate()}
+                  onClick={() =>
+                    triggerScan.mutate(undefined, {
+                      onSuccess: () => {
+                        void refreshInvestigationState(activeSessionId);
+                        if (activeSessionId) {
+                          void atlasApi
+                            .compareInvestigationRevisions(activeSessionId)
+                            .then(setRevisionComparison)
+                            .catch(() => {});
+                        }
+                      },
+                    })
+                  }
                   className="flex min-h-6 min-w-6 items-center gap-1.5 border border-slate-700 bg-slate-900 px-2.5 py-1 text-slate-200 hover:border-teal-400 hover:text-teal-300 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                 >
                   <RefreshCw
@@ -1531,6 +2985,27 @@ export default function WytheWorkspacePage() {
           </form>
         )}
       </header>
+
+      {activeSlug && activeSessionId && (
+        <InvestigationSessionBar
+          activeSlug={activeSlug}
+          sessionId={activeSessionId}
+          clientId={tabClientId}
+          followState={agentCamState.followMode}
+          sessionData={investigationSession}
+          priorSessions={priorSessions}
+          comparison={revisionComparison}
+          nodesById={nodesById}
+          onToggleFollow={handleToggleAgentFollow}
+          onReopenSession={handleReopenSession}
+          onNewIndependentSession={handleNewIndependentSession}
+          onResetSession={handleResetSession}
+          onExportSession={handleExportSession}
+          onDeleteSession={handleDeleteSession}
+          onCompareRevisions={handleCompareRevisions}
+          onSelectNode={setSelectedNodeId}
+        />
+      )}
 
       {/* 3-Tier Telemetry Strip + View Navigation */}
       {report && (
@@ -1676,7 +3151,7 @@ export default function WytheWorkspacePage() {
                             }
                             className="min-h-6 border border-slate-800 bg-slate-950 px-2 py-0.5 text-slate-200 focus:border-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                           >
-                            <option value="all">Subkind: All (11)</option>
+                            <option value="all">Subkind: All ({ALL_NODE_SUBKINDS.length})</option>
                             {ALL_NODE_SUBKINDS.map((sk) => (
                               <option key={sk} value={sk}>
                                 {sk}
@@ -1821,6 +3296,8 @@ export default function WytheWorkspacePage() {
                               <option value="grid">Layout [L]: Uniform Grid</option>
                               <option value="subkind">Layout [L]: Role Subkinds</option>
                               <option value="connected">Layout [L]: Linked Components</option>
+                              <option value="lifecycle_z">Layout [L]: Lifecycle Z-Depth</option>
+                              <option value="temporal_z">Layout [L]: Temporal Z-Diff</option>
                             </select>
                             <button
                               type="button"
@@ -2020,6 +3497,10 @@ export default function WytheWorkspacePage() {
                       nodes={report.nodes}
                       edges={report.edges}
                       findings={report.findings}
+                      observationSource={report.observation_source}
+                      gitDiffReport={gitDiffReport ?? null}
+                      snapCompareReport={snapCompareReport ?? null}
+                      zWytheSlice={zWytheSlice}
                       activeSlug={activeSlug}
                       sourceCommit={report.source_commit}
                       selectedNodeId={selectedNodeId}
@@ -2037,6 +3518,25 @@ export default function WytheWorkspacePage() {
                       pinnedPositions={pinnedPositions}
                       diffOverlay={diffOverlay}
                       activeTraceChain={activeTraceChain}
+                      agentCameraRequest={agentCameraRequest}
+                      agentFocusNodeIds={activeFocusNodeSet}
+                      agentHighlightEdgeIds={activeHighlightEdgeSet}
+                      agentFollowMode={agentCamState.followMode}
+                      agentLiveFollowing={agentCamState.liveFollowing}
+                      agentHaltedReason={agentCamState.haltedReason}
+                      agentCaption={currentAgentBeat?.caption ?? ''}
+                      agentTimelineItems={activeTimelineItems}
+                      agentTimelineStepIndex={agentCamState.stepIndex}
+                      agentTimelinePlaying={agentCamState.isPlaying}
+                      agentPermalinkHash={activePermalinkHash}
+                      hasPendingAgentCommand={Boolean(agentCamState.pendingEventWhilePaused)}
+                      onHumanInputYield={handleHumanYield}
+                      onToggleAgentFollow={handleToggleAgentFollow}
+                      onRejectPendingAgentCommand={handleRejectPendingAgentCommand}
+                      onStepAgentTimeline={handleStepAgentTimeline}
+                      onToggleAgentPlay={handleToggleAgentPlay}
+                      onExitAgentTimeline={handleExitAgentTimeline}
+                      onChangeZWytheSlice={setZWytheSlice}
                       onlyFlagged={onlyFlagged}
                       isolateCone={isolateCone}
                       connectedOnly={connectedOnly}
@@ -2082,6 +3582,18 @@ export default function WytheWorkspacePage() {
                           referenceExemplars={govBundle?.reference_exemplars ?? []}
                           diffOverlay={diffOverlay}
                           inWorkingSet={workingSetIds.has(selectedNode.id)}
+                          requestedZoomStratum={requestedZoomStratum}
+                          sessionId={activeSessionId}
+                          clientId={tabClientId}
+                          selectedFindingId={selectedFindingId}
+                          selectedEdgeId={selectedEdgeId}
+                          corrections={investigationSession?.corrections ?? []}
+                          evidenceDrifted={Boolean(investigationSession?.evidence_drifted)}
+                          revisionComparison={revisionComparison}
+                          onCorrectionAdded={handleCorrectionAdded}
+                          onCompareRevisions={handleCompareRevisions}
+                          onSelectFinding={setSelectedFindingId}
+                          onSelectEdge={setSelectedEdgeId}
                           onToggleWorkingSet={handleToggleWorkingSetNode}
                           onSelectNode={setSelectedNodeId}
                           onClose={() => setSelectedNodeId(null)}
@@ -2118,11 +3630,38 @@ export default function WytheWorkspacePage() {
                 {activeTab === 'index' && (
                   <AccessibleIndexView
                     nodes={report.nodes}
+                    edges={report.edges}
+                    findings={report.findings}
+                    observationSource={report.observation_source}
+                    gitDiffReport={gitDiffReport ?? null}
+                    snapCompareReport={snapCompareReport ?? null}
                     rulings={report.rulings}
                     slots={slots}
                     profiles={profiles}
                     legacyBridge={report.legacy_bridge}
                     scanNotes={report.scan_notes ?? []}
+                    agentCameraState={agentCamState}
+                    activeAgentCaption={currentAgentBeat?.caption ?? ''}
+                    activeAgentFocusIds={currentAgentBeat?.focusNodeIds ?? []}
+                    activeSlug={activeSlug}
+                    sessionId={activeSessionId}
+                    clientId={tabClientId}
+                    selectedNodeId={selectedNodeId}
+                    selectedFindingId={selectedFindingId}
+                    selectedEdgeId={selectedEdgeId}
+                    corrections={investigationSession?.corrections ?? []}
+                    evidenceDrifted={Boolean(investigationSession?.evidence_drifted)}
+                    revisionComparison={revisionComparison}
+                    lastReceipt={lastViewportReceipt}
+                    onCorrectionAdded={handleCorrectionAdded}
+                    onCompareRevisions={handleCompareRevisions}
+                    onRejectPendingAgentCommand={handleRejectPendingAgentCommand}
+                    onOpenAskAi={() => openAskWytheDrawer()}
+                    onToggleAgentFollow={handleToggleAgentFollow}
+                    onStepAgentTimeline={handleStepAgentTimeline}
+                    onToggleAgentPlay={handleToggleAgentPlay}
+                    onExitAgentTimeline={handleExitAgentTimeline}
+                    onHumanNavigateYield={() => handleHumanYield('keydown_nav')}
                     onSelectNode={setSelectedNodeId}
                   />
                 )}
@@ -2140,6 +3679,18 @@ export default function WytheWorkspacePage() {
             referenceExemplars={govBundle?.reference_exemplars ?? []}
             diffOverlay={diffOverlay}
             inWorkingSet={selectedNode ? workingSetIds.has(selectedNode.id) : false}
+            requestedZoomStratum={requestedZoomStratum}
+            sessionId={activeSessionId}
+            clientId={tabClientId}
+            selectedFindingId={selectedFindingId}
+            selectedEdgeId={selectedEdgeId}
+            corrections={investigationSession?.corrections ?? []}
+            evidenceDrifted={Boolean(investigationSession?.evidence_drifted)}
+            revisionComparison={revisionComparison}
+            onCorrectionAdded={handleCorrectionAdded}
+            onCompareRevisions={handleCompareRevisions}
+            onSelectFinding={setSelectedFindingId}
+            onSelectEdge={setSelectedEdgeId}
             onToggleWorkingSet={handleToggleWorkingSetNode}
             onSelectNode={setSelectedNodeId}
             onClose={() => setSelectedNodeId(null)}
@@ -2160,18 +3711,41 @@ export default function WytheWorkspacePage() {
       <AskWytheDrawer
         open={askDrawerOpen}
         activeSlug={activeSlug}
+        sessionId={activeSessionId}
+        clientId={tabClientId}
+        followState={agentCamState.followMode}
+        selectedNodeId={selectedNodeId}
+        selectedFindingId={selectedFindingId}
+        selectedEdgeId={selectedEdgeId}
+        sessionData={investigationSession}
+        revisionComparison={revisionComparison}
         explanation={whatsThisExplanation}
         liveDigest={liveViewportDigest}
         snapshotDataUrl={whatsThisSnapshotUrl}
         captureLiveWebp={() => liveCaptureFnRef.current?.() ?? null}
         nodesById={nodesById}
         initialQuestion={askPrefillQuestion}
+        onSessionMutated={() => {
+          void refreshInvestigationState(activeSessionId);
+        }}
+        onCorrectionAdded={handleCorrectionAdded}
+        onCompareRevisions={handleCompareRevisions}
         onRefreshFocus={() => {
           setActiveTab('3d');
           if (liveCaptureFnRef.current && activeSlug) {
-            fetchUiFocus.mutate(activeSlug, {
-              onSuccess: (exp) => setWhatsThisExplanation(exp),
-            });
+            fetchUiFocus.mutate(
+              {
+                targetSlug: activeSlug,
+                sessionId: activeSessionId,
+                clientId: tabClientId,
+                selectedEdgeId,
+                selectedFindingId,
+                followState: agentCamState.followMode,
+              },
+              {
+                onSuccess: (exp) => setWhatsThisExplanation(exp),
+              },
+            );
           } else {
             focusCaptureTargetRef.current = 'silent';
             setWhatsThisRequest((n) => n + 1);
@@ -2204,6 +3778,7 @@ export default function WytheWorkspacePage() {
           setSelectedNodeId(nodeId);
         }}
         onSelectFinding={(f) => {
+          setSelectedFindingId(f.id);
           if (f.node_id) {
             setSelectedNodeId(f.node_id);
           } else {
@@ -2212,8 +3787,7 @@ export default function WytheWorkspacePage() {
           }
         }}
         onSelectTarget={(slug) => {
-          setActiveSlug(slug);
-          setSelectedNodeId(null);
+          switchTargetCleanly(slug);
         }}
       />
     </div>

@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 from collections import Counter, deque
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Literal
 
 from app.schemas.atlas import (
+    AskChatTurn,
     AtlasEdge,
     AtlasNode,
     BoundaryFinding,
     ConeCompleteness,
     ConeEdgeSummary,
     ConeSectionCount,
+    ContextBudgetSummary,
+    EvidenceIdentityRead,
+    InvestigationCorrectionRead,
     LlmBriefRead,
     LlmContextConeReport,
     LlmNodePointer,
+    StratumDrilldownRead,
+    StratumZoom,
     TruthAtlasReport,
+    UiFocusExplainRead,
 )
+from app.services.stratum_service import build_node_stratum_drilldown
 
 DEFAULT_BRIEF_TOKENS = 2200
 DEFAULT_CONE_NODES = 40
@@ -80,7 +91,10 @@ def _bfs_cone_direction(
     while q:
         cur = q.popleft()
         cur_syms = active_syms.get(cur, {"*"})
-        for edge, nxt in edges_by_node.get(cur, ()):
+        out_items = edges_by_node.get(cur, ())
+        has_scoped = any(_parse_symbol_pairs(e.symbol_links) for e, _ in out_items)
+        eff_syms = cur_syms if has_scoped else {"*"}
+        for edge, nxt in out_items:
             if nxt not in valid_ids:
                 continue
             pairs = _parse_symbol_pairs(edge.symbol_links)
@@ -89,18 +103,18 @@ def _bfs_cone_direction(
                     next_syms = {
                         caller
                         for caller, callee in pairs
-                        if "*" in cur_syms or callee == "*" or callee in cur_syms
+                        if "*" in eff_syms or callee == "*" or callee in eff_syms
                     }
                 else:
                     next_syms = {
                         callee
                         for caller, callee in pairs
-                        if "*" in cur_syms or caller == "*" or caller in cur_syms
+                        if "*" in eff_syms or caller == "*" or caller in eff_syms
                     }
                 if not next_syms:
                     continue
             else:
-                if "*" not in cur_syms:
+                if "*" not in eff_syms:
                     continue
                 next_syms = {"*"}
             traversed_edge_ids.add(edge.id)
@@ -187,7 +201,11 @@ def build_llms_txt_brief(
         in_deg[e.target_id] += 1
 
     tables = sorted(
-        (n for n in report.nodes if n.tier == "truth" and n.subkind == "table"),
+        (
+            n
+            for n in report.nodes
+            if n.tier == "truth" and n.subkind in ("table", "entity_store", "entitlement_spec")
+        ),
         key=lambda n: (-(n.read_by_count + n.written_by_count), -in_deg[n.id], n.label),
     )
     guards = sorted(
@@ -199,16 +217,24 @@ def build_llms_txt_brief(
         key=lambda n: (-(n.read_by_count + n.written_by_count), n.label),
     )
     routes = sorted(
-        (n for n in report.nodes if n.tier == "manipulate" and n.subkind == "route"),
+        (n for n in report.nodes if n.tier == "manipulate" and n.subkind in ("route", "ipc_handler")),
         key=lambda n: (-(in_deg[n.id] + out_deg[n.id]), n.label),
     )
     services = sorted(
-        (n for n in report.nodes if n.tier == "manipulate" and n.subkind != "route"),
+        (
+            n
+            for n in report.nodes
+            if n.tier == "manipulate" and n.subkind not in ("route", "ipc_handler")
+        ),
         key=lambda n: (-(in_deg[n.id] + out_deg[n.id]), n.label),
     )
     displays = sorted(
         (n for n in report.nodes if n.tier == "display"),
-        key=lambda n: (0 if n.subkind == "page" else 1, -(in_deg[n.id] + out_deg[n.id]), n.label),
+        key=lambda n: (
+            0 if n.subkind in ("page", "cli") else 1,
+            -(in_deg[n.id] + out_deg[n.id]),
+            n.label,
+        ),
     )
 
     scale = 1.0 if max_tokens >= 1800 else max(0.4, max_tokens / 1800.0)
@@ -238,8 +264,9 @@ def build_llms_txt_brief(
     ]
     for t in tables[:lim_tbl]:
         cols = f" cols=[{', '.join(t.columns[:5])}]" if t.columns else ""
+        sk_tag = f"[{t.subkind}] " if t.subkind != "table" else ""
         lines.append(
-            f"- `{t.label}` (`{_ptr(t)}`) — status={t.status}, readers={t.read_by_count}, writers={t.written_by_count}{cols}"
+            f"- {sk_tag}`{t.label}` (`{_ptr(t)}`) — status={t.status}, readers={t.read_by_count}, writers={t.written_by_count}{cols}"
         )
     if len(tables) > lim_tbl:
         lines.append(f"- … +{len(tables) - lim_tbl} more SQL tables (query via `wythe context {report.target_slug} <table>`)")
@@ -258,8 +285,9 @@ def build_llms_txt_brief(
 
     lines.extend(["", "## Tier 2 — Backend Manipulation Entry Doors & Hubs"])
     for r in routes[:lim_rt]:
-        paths = ", ".join(r.http_paths[:3]) if r.http_paths else "router"
-        lines.append(f"- [route] `{r.label}` (`{_ptr(r)}`) — {paths}")
+        fallback_lbl = "ipc" if r.subkind == "ipc_handler" else "router"
+        paths = ", ".join(r.http_paths[:3]) if r.http_paths else fallback_lbl
+        lines.append(f"- [{r.subkind}] `{r.label}` (`{_ptr(r)}`) — {paths}")
     for sv in services[:lim_svc]:
         lines.append(
             f"- [{sv.subkind}] `{sv.label}` (`{_ptr(sv)}`) — status={sv.status}, in={in_deg[sv.id]}, out={out_deg[sv.id]}"
@@ -369,15 +397,106 @@ def _resolve_seed_nodes(report: TruthAtlasReport, raw_query: str) -> tuple[list[
     return [], suggestions
 
 
+def _slice_cone_strata(
+    report: TruthAtlasReport,
+    seed_ids: list[str],
+    cone_nodes: list[AtlasNode],
+    *,
+    zoom: Literal[2, 3],
+    unfiltered_ir: bool,
+    max_nodes: int,
+    full: bool,
+    local_plugin_modules: Sequence[str] | None = None,
+    allow_local_plugins: bool = False,
+) -> tuple[list[StratumDrilldownRead], ConeSectionCount, ConeSectionCount]:
+    repo_root = Path(report.repo_path).resolve()
+    ordered_parents = (
+        list(dict.fromkeys([*seed_ids, *(n.id for n in cone_nodes)]))
+        if full
+        else list(dict.fromkeys(seed_ids))
+    )
+
+    seed_lookup = set(seed_ids)
+    raw_drills: list[StratumDrilldownRead] = []
+    for idx, pid in enumerate(ordered_parents):
+        drill = build_node_stratum_drilldown(
+            repo_root,
+            report,
+            pid,
+            zoom=zoom,
+            unfiltered_ir=unfiltered_ir,
+            allow_local_plugins=allow_local_plugins,
+            local_plugin_modules=local_plugin_modules,
+        )
+        has_payload = bool(drill.nodes or drill.edges or drill.summary_badges)
+        if has_payload or (pid in seed_lookup and (idx == 0 or drill.active_plugins)):
+            raw_drills.append(drill)
+
+    eligible_nodes = sum(len(d.nodes) for d in raw_drills)
+    eligible_edges = sum(len(d.edges) for d in raw_drills)
+    if full:
+        return (
+            raw_drills,
+            _count_section(eligible_nodes, eligible_nodes),
+            _count_section(eligible_edges, eligible_edges),
+        )
+
+    rem_nodes = max(25, max_nodes)
+    rem_edges = 60
+    bounded_drills: list[StratumDrilldownRead] = []
+    inc_nodes = 0
+    inc_edges = 0
+    for drill in raw_drills:
+        ordered_d_edges = sorted(
+            drill.edges,
+            key=lambda e: (
+                0 if e.collapsed_count > 0 else 1,
+                0 if e.verification in ("unverified", "broken") else 1,
+                _verification_rank.get(e.verification, 9),
+                e.id,
+            ),
+        )
+        ordered_d_nodes = sorted(
+            drill.nodes,
+            key=lambda n: (
+                0 if n.verification in ("unverified", "broken") else 1,
+                _verification_rank.get(n.verification, 9),
+                n.id,
+            ),
+        )
+        kept_n = ordered_d_nodes[:rem_nodes]
+        kept_e = ordered_d_edges[:rem_edges]
+        rem_nodes = max(0, rem_nodes - len(kept_n))
+        rem_edges = max(0, rem_edges - len(kept_e))
+        inc_nodes += len(kept_n)
+        inc_edges += len(kept_e)
+        bounded_drills.append(drill.model_copy(update={"nodes": kept_n, "edges": kept_e}))
+
+    return (
+        bounded_drills,
+        _count_section(inc_nodes, eligible_nodes),
+        _count_section(inc_edges, eligible_edges),
+    )
+
+
 def build_lineage_cone_slice(
     report: TruthAtlasReport,
     query: str,
     *,
     max_nodes: int = DEFAULT_CONE_NODES,
     full: bool = False,
+    zoom: StratumZoom = 1,
+    unfiltered_ir: bool = False,
+    local_plugin_modules: Sequence[str] | None = None,
+    allow_local_plugins: bool = False,
 ) -> LlmContextConeReport:
     """Slice the directional upstream/downstream 3-tier Lineage Cone around `query`."""
-    full_hint = f'wythe context {report.target_slug} "{query}" --full'
+    zoom_flags = (
+        f" --zoom {zoom}" + (" --unfiltered-ir" if unfiltered_ir else "")
+        if zoom in (2, 3)
+        else ""
+    )
+    full_hint = f'wythe context {report.target_slug} "{query}"{zoom_flags} --full'
     seeds, suggestions = _resolve_seed_nodes(report, query)
     if not seeds:
         hint = (
@@ -391,6 +510,7 @@ def build_lineage_cone_slice(
             worktree_dirty=report.worktree_dirty,
             dirty_path_count=report.dirty_path_count,
             content_digest=report.content_digest,
+            zoom=zoom,
             suggestions=suggestions,
             completeness=ConeCompleteness(
                 is_complete=True,
@@ -478,6 +598,7 @@ def build_lineage_cone_slice(
         if ch.display_node_id in seed_set
         or ch.route_node_id in seed_set
         or ch.http_path in seed_paths
+        or ch.http_path in seed_labels
         or bool(seed_labels.intersection(ch.truth_table_labels))
         or bool(seed_set.intersection(ch.manipulator_node_ids))
         or bool(seed_set.intersection(ch.truth_table_ids))
@@ -509,6 +630,22 @@ def build_lineage_cone_slice(
     findings_cnt = _count_section(len(selected_findings), len(eligible_findings))
     seed_findings_cnt = _count_section(selected_seed_finding_count, len(eligible_seed_findings))
     chains_cnt = _count_section(len(selected_chains), len(eligible_chains))
+    if zoom in (2, 3):
+        stratum_drills, s_nodes_cnt, s_edges_cnt = _slice_cone_strata(
+            report,
+            seed_ids,
+            cone_nodes,
+            zoom=zoom,
+            unfiltered_ir=unfiltered_ir,
+            max_nodes=max_nodes,
+            full=full,
+            local_plugin_modules=local_plugin_modules,
+            allow_local_plugins=allow_local_plugins,
+        )
+    else:
+        stratum_drills = []
+        s_nodes_cnt = ConeSectionCount()
+        s_edges_cnt = ConeSectionCount()
 
     truncation_reasons: list[str] = []
     if nodes_cnt.omitted > 0:
@@ -529,6 +666,14 @@ def build_lineage_cone_slice(
         )
     if chains_cnt.omitted > 0:
         truncation_reasons.append(f"chains_capped:{chains_cnt.included}/{chains_cnt.eligible}")
+    if s_nodes_cnt.omitted > 0:
+        truncation_reasons.append(
+            f"stratum_nodes_capped:{s_nodes_cnt.included}/{s_nodes_cnt.eligible}"
+        )
+    if s_edges_cnt.omitted > 0:
+        truncation_reasons.append(
+            f"stratum_edges_capped:{s_edges_cnt.included}/{s_edges_cnt.eligible}"
+        )
 
     completeness = ConeCompleteness(
         is_complete=not truncation_reasons,
@@ -542,6 +687,8 @@ def build_lineage_cone_slice(
         findings=findings_cnt,
         seed_findings=seed_findings_cnt,
         chains=chains_cnt,
+        stratum_nodes=s_nodes_cnt,
+        stratum_edges=s_edges_cnt,
         truncation_reasons=truncation_reasons,
         full_export_hint=full_hint,
     )
@@ -650,6 +797,45 @@ def build_lineage_cone_slice(
                 f"`{cf.source_file}:{cf.line}`{writer_tag} — "
                 f"{cf.title} | Suggested remediation (unverified): {cf.remediation}"
             )
+        md.append("")
+
+    if zoom in (2, 3):
+        s_edge_counts = Counter(e.verification for d in stratum_drills for e in d.edges)
+        s_mode = "unfiltered" if unfiltered_ir else "compacted"
+        md.append(f"## Microscope Strata (Zoom {zoom} | {s_mode})")
+        md.append(
+            "> Stratum edge epistemics: "
+            f"verified={s_edge_counts['verified']}, declared={s_edge_counts['declared']}, "
+            f"unverified={s_edge_counts['unverified']}, broken={s_edge_counts['broken']} "
+            f"(micro_nodes={s_nodes_cnt.included}/{s_nodes_cnt.eligible}, "
+            f"micro_edges={s_edges_cnt.included}/{s_edges_cnt.eligible})."
+        )
+        for drill in stratum_drills:
+            badge_str = (
+                ", ".join(f"{b.key}={b.count}" for b in drill.summary_badges)
+                if drill.summary_badges
+                else "none"
+            )
+            plugins_str = ", ".join(drill.active_plugins) if drill.active_plugins else "none"
+            md.append(
+                f"### Parent `{drill.parent_node_id}` "
+                f"(plugins=[{plugins_str}], badges=[{badge_str}], "
+                f"raw_nodes={drill.raw_node_count}, compacted_nodes={drill.compacted_node_count}, "
+                f"collapsed_thunks={drill.collapsed_thunk_count})"
+            )
+            shown_mn = drill.nodes if full else drill.nodes[:20]
+            for mn in shown_mn:
+                loc = f" @ `{mn.source_file}:{mn.line or 1}`" if mn.source_file else ""
+                md.append(f"- [{mn.kind} | {mn.verification}] `{mn.label}` (`{mn.id}`){loc}")
+            shown_me = drill.edges if full else drill.edges[:25]
+            for me in shown_me:
+                note_part = me.label or me.evidence_note
+                suffix = f" — {note_part}" if note_part else ""
+                md.append(
+                    f"- `{me.source_id} --[{me.kind} | {me.verification}]--> {me.target_id}`{suffix}"
+                )
+            for nt in drill.notes:
+                md.append(f"- Note: {nt}")
 
     md_text = "\n".join(md).strip()
     return LlmContextConeReport(
@@ -659,6 +845,7 @@ def build_lineage_cone_slice(
         worktree_dirty=report.worktree_dirty,
         dirty_path_count=report.dirty_path_count,
         content_digest=report.content_digest,
+        zoom=zoom,
         matched_seed_ids=seed_ids,
         upstream_display_nodes=disp_ptrs,
         manipulator_nodes=manip_ptrs,
@@ -667,7 +854,267 @@ def build_lineage_cone_slice(
         cone_edge_items=cone_edge_items,
         matching_chains=selected_chains,
         cone_findings=selected_findings,
+        stratum_drilldowns=stratum_drills,
         completeness=completeness,
         approx_tokens=max(1, len(md_text) // 4),
         markdown=md_text,
     )
+
+
+def _fit_complete_items(
+    items: Sequence[str],
+    *,
+    remaining_chars: int,
+    max_items: int,
+) -> tuple[list[str], int]:
+    """Include whole markdown items up to `max_items` and `remaining_chars` without mid-line slicing."""
+    chosen: list[str] = []
+    used = 0
+    for item in items:
+        if len(chosen) >= max_items:
+            break
+        cost = len(item) + 1
+        if chosen and used + cost > remaining_chars:
+            break
+        if not chosen and len(item) > remaining_chars:
+            lines = item.splitlines()
+            head_lines: list[str] = []
+            acc = 0
+            for ln in lines:
+                if acc + len(ln) + 1 > max(180, remaining_chars):
+                    break
+                head_lines.append(ln)
+                acc += len(ln) + 1
+            if head_lines:
+                chosen.append("\n".join(head_lines))
+            break
+        chosen.append(item)
+        used += cost
+    return chosen, max(0, len(items) - len(chosen))
+
+
+def build_section_budgeted_ask_prompt(
+    *,
+    question: str,
+    focus: UiFocusExplainRead,
+    report: TruthAtlasReport | None,
+    cone: LlmContextConeReport | None,
+    evidence_identity: EvidenceIdentityRead | None,
+    corrections: Sequence[InvestigationCorrectionRead] = (),
+    live_viewport_brief: str | None = None,
+    history: Sequence[AskChatTurn] = (),
+    max_prompt_chars: int = 7200,
+) -> tuple[str, str, ContextBudgetSummary]:
+    """Build section-aware prompts (`local_prompt`, `apple_prompt`, `ContextBudgetSummary`)."""
+    included_counts: dict[str, int] = {}
+    omitted_counts: dict[str, int] = {}
+    truncated_sections: list[str] = []
+
+    ev_line = (
+        f"- Evidence Revision: `{evidence_identity.evidence_revision_id}` | "
+        f"Commit: `{evidence_identity.source_commit[:24]}` | "
+        f"Digest: `{evidence_identity.content_digest[:16]}` | "
+        f"Coverage Complete: `{evidence_identity.coverage_complete}`"
+        if evidence_identity is not None
+        else f"- Commit: `{focus.source_commit[:24]}`"
+    )
+    sel_lines = [
+        "## 1. Evidence & Selection Identity",
+        ev_line,
+        f"- Target: `{focus.target_name}` (`{focus.active_slug}`) | Session: `{focus.session_id or 'default'}` (focus_rev={focus.focus_revision})",
+        f"- Headline: {focus.headline}",
+        f"- Visual / Lineage Summary: {focus.color_reason}",
+    ]
+    if focus.focused_node is not None:
+        sel_lines.append(
+            f"- Selected Node: `{focus.focused_node.id}` (`{focus.focused_node.pointer}`, status=`{focus.focused_node.status}`)"
+        )
+        if report is not None:
+            fn_obj = next((n for n in report.nodes if n.id == focus.focused_node.id), None)
+            if fn_obj and fn_obj.policy_field_consumption:
+                pfc = fn_obj.policy_field_consumption
+                sel_lines.append(
+                    f"- Node PolicyFieldConsumption: state=`{pfc.state}` (`{pfc.mechanism}`), "
+                    f"consumed={pfc.consumed_columns}, unconsumed={pfc.unconsumed_policy_columns}, "
+                    f"substituted={pfc.substituted_constants}, fallbacks={pfc.fallback_constants} — {pfc.note}"
+                )
+    if focus.selected_edge_id:
+        sel_lines.append(f"- Selected Edge: `{focus.selected_edge_id}`")
+        if report is not None:
+            fe_obj = next((e for e in report.edges if e.id == focus.selected_edge_id), None)
+            if fe_obj and fe_obj.policy_field_consumption:
+                epfc = fe_obj.policy_field_consumption
+                sel_lines.append(
+                    f"- Edge PolicyFieldConsumption: state=`{epfc.state}` (`{epfc.mechanism}`), "
+                    f"consumed={epfc.consumed_columns}, unconsumed={epfc.unconsumed_policy_columns}, "
+                    f"substituted={epfc.substituted_constants}, fallbacks={epfc.fallback_constants} — {epfc.note}"
+                )
+    if focus.selected_finding_id:
+        sel_lines.append(f"- Selected Finding: `{focus.selected_finding_id}`")
+
+    sections: list[str] = ["\n".join(sel_lines)]
+    used_chars = len(sections[0]) + len(question) + 80
+
+    # Section 2: Active Human Investigation Corrections (high priority, never dropped silently)
+    corr_items = [
+        f"- [{c.kind}]"
+        + (f" on `{c.target_ref_id}`" if c.target_ref_id else "")
+        + f" (`{c.correction_id}`, promoted_to_ruling=False): {c.note}"
+        for c in corrections
+    ]
+    inc_corr, omit_corr = _fit_complete_items(
+        corr_items,
+        remaining_chars=max(600, max_prompt_chars - used_chars),
+        max_items=10,
+    )
+    included_counts["corrections"] = len(inc_corr)
+    omitted_counts["corrections"] = omit_corr
+    if omit_corr > 0:
+        truncated_sections.append("corrections")
+    if inc_corr:
+        sec_corr = "## 2. Human Investigation Corrections (Must Respect)\n" + "\n".join(inc_corr)
+        sections.append(sec_corr)
+        used_chars += len(sec_corr) + 2
+
+    # Section 3: Qualifying Findings
+    finding_pool = list(focus.active_findings)
+    if cone is not None:
+        seen_fids = {f.id for f in finding_pool}
+        for cf in cone.cone_findings:
+            if cf.id not in seen_fids:
+                seen_fids.add(cf.id)
+                finding_pool.append(cf)
+    finding_items = [
+        f"- `{f.id}` **{f.rule_code}** [{f.severity} | {f.confidence} | {f.evidence_strength}] "
+        f"`{f.source_file}:{f.line}` (node=`{f.node_id}`) — {f.title} | Detail: {f.detail} | "
+        f"Suggested remediation (unverified): {f.remediation}"
+        for f in finding_pool
+    ]
+    inc_f, omit_f = _fit_complete_items(
+        finding_items,
+        remaining_chars=max(500, (max_prompt_chars - used_chars) // 2),
+        max_items=8,
+    )
+    included_counts["findings"] = len(inc_f)
+    omitted_counts["findings"] = omit_f
+    if omit_f > 0:
+        truncated_sections.append("findings")
+    if inc_f:
+        sec_f = "## 3. Qualifying Findings & Causal Evidence\n" + "\n".join(inc_f)
+        sections.append(sec_f)
+        used_chars += len(sec_f) + 2
+
+    # Section 4: Lineage Cone Nodes & Policy-Annotated Edges
+    cone_node_items: list[str] = []
+    cone_edge_items: list[str] = []
+    if cone is not None:
+        for ptr in (*cone.downstream_truth_nodes, *cone.manipulator_nodes, *cone.upstream_display_nodes):
+            cone_node_items.append(
+                f"- [{ptr.tier}/{ptr.subkind}] `{ptr.id}` (`{ptr.pointer}`, label=`{ptr.label}`, status=`{ptr.status}`)"
+            )
+        for ce in cone.cone_edge_items:
+            pfc_tag = ""
+            if ce.policy_field_consumption is not None:
+                pfc = ce.policy_field_consumption
+                pfc_tag = (
+                    f" | policy_state=`{pfc.state}` (`{pfc.mechanism}`), "
+                    f"consumed={pfc.consumed_columns}, unconsumed={pfc.unconsumed_policy_columns}, "
+                    f"substituted={pfc.substituted_constants}, fallbacks={pfc.fallback_constants}"
+                )
+            cone_edge_items.append(
+                f"- `{ce.id}`: `{ce.source_id} --[{ce.kind} | {ce.verification}]--> {ce.target_id}`"
+                + (f" @ `{ce.evidence_path}`" if ce.evidence_path else "")
+                + (f" — {ce.evidence_note}" if ce.evidence_note else "")
+                + pfc_tag
+            )
+    else:
+        cone_edge_items = [f"- `{e_str}`" for e_str in focus.cone_edges]
+
+    inc_cn, omit_cn = _fit_complete_items(
+        cone_node_items,
+        remaining_chars=max(400, (max_prompt_chars - used_chars) // 2),
+        max_items=14,
+    )
+    included_counts["cone_nodes"] = len(inc_cn)
+    omitted_counts["cone_nodes"] = omit_cn
+    if omit_cn > 0:
+        truncated_sections.append("cone_nodes")
+    if inc_cn:
+        sec_cn = "## 4. 3-Tier Lineage Neighborhood Nodes\n" + "\n".join(inc_cn)
+        sections.append(sec_cn)
+        used_chars += len(sec_cn) + 2
+
+    inc_ce, omit_ce = _fit_complete_items(
+        cone_edge_items,
+        remaining_chars=max(400, max_prompt_chars - used_chars - 500),
+        max_items=14,
+    )
+    included_counts["cone_edges"] = len(inc_ce)
+    omitted_counts["cone_edges"] = omit_ce
+    if omit_ce > 0:
+        truncated_sections.append("cone_edges")
+    if inc_ce:
+        sec_ce = "## 5. Connected Lineage & Policy Consumption Edges\n" + "\n".join(inc_ce)
+        sections.append(sec_ce)
+        used_chars += len(sec_ce) + 2
+
+    # Section 5: Live Viewport Frustum Lines
+    vp_raw = (live_viewport_brief or "").strip()
+    vp_lines = [ln.strip() for ln in vp_raw.splitlines() if ln.strip()] if vp_raw else []
+    inc_vp, omit_vp = _fit_complete_items(
+        vp_lines,
+        remaining_chars=max(200, max_prompt_chars - used_chars - 240),
+        max_items=12,
+    )
+    included_counts["viewport_lines"] = len(inc_vp)
+    omitted_counts["viewport_lines"] = omit_vp
+    if omit_vp > 0:
+        truncated_sections.append("viewport_lines")
+    if inc_vp:
+        sec_vp = "## 6. Live Viewport Summary\n" + "\n".join(inc_vp)
+        sections.append(sec_vp)
+        used_chars += len(sec_vp) + 2
+
+    # History count tracking
+    hist_list = list(history)
+    inc_hist = hist_list[-8:]
+    included_counts["history_turns"] = len(inc_hist)
+    omitted_counts["history_turns"] = max(0, len(hist_list) - len(inc_hist))
+    if omitted_counts["history_turns"] > 0:
+        truncated_sections.append("history_turns")
+
+    q_clean = question.strip()
+    local_prompt = "\n\n".join([*sections, f"## User Question\n{q_clean}"])
+
+    apple_sections = sections[:3]
+    if inc_ce:
+        apple_sections.append("## Connected Edges\n" + "\n".join(inc_ce[:6]))
+    if inc_hist:
+        hist_tail = "\n".join(
+            f"{'User' if t.role == 'user' else 'Assistant'}: {t.content.splitlines()[0][:320]}"
+            for t in inc_hist[-4:]
+        )
+        apple_sections.append(f"## Recent Session Turns\n{hist_tail}")
+    apple_prompt = "\n\n".join([*apple_sections, f"## Question\n{q_clean}"])
+
+    seed_q = (
+        focus.focused_node.id
+        if focus.focused_node is not None
+        else (focus.selected_finding_id or focus.active_slug)
+    )
+    expand_hint = (
+        f"Truncated sections: {', '.join(truncated_sections)}. "
+        f"Expand with `wythe_lineage_cone(target='{focus.active_slug}', query='{seed_q}', full=True)` "
+        f"or `wythe_findings(target='{focus.active_slug}')`."
+        if truncated_sections
+        else "Complete: 0 items omitted across all context sections."
+    )
+    budget = ContextBudgetSummary(
+        included_counts=included_counts,
+        omitted_counts=omitted_counts,
+        truncated_sections=truncated_sections,
+        prompt_chars=len(local_prompt),
+        max_prompt_chars=max_prompt_chars,
+        expand_hint=expand_hint,
+    )
+    return local_prompt, apple_prompt, budget

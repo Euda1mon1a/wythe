@@ -25,8 +25,31 @@ DbSession = Annotated[Session, Depends(get_db)]
 
 
 def _plugin_source_label(spec: WythePluginSpec) -> str:
-    hook = spec.manipulator_hook or spec.post_scan_hook
-    mod_name = getattr(hook, "__module__", "") if hook is not None else ""
+    fallback_mcp = spec.mcp_tools[0].handler if spec.mcp_tools else None
+    fallback_cli = next(iter(spec.cli_subcommands.values()), None)
+    fallback_comp = next(iter(spec.companion_handlers.values()), None)
+    fallback_adapter = next(
+        iter((*spec.truth_adapters, *spec.manipulator_adapters, *spec.display_adapters)),
+        None,
+    )
+    hook = (
+        spec.manipulator_hook
+        or spec.post_scan_hook
+        or spec.stratum_badge_hook
+        or spec.stratum_expand_hook
+        or fallback_adapter
+        or fallback_mcp
+        or fallback_cli
+        or fallback_comp
+    )
+    mod_name = (
+        getattr(hook, "__module__", "")
+        or getattr(type(hook), "__module__", "")
+        if hook is not None
+        else ""
+    )
+    if mod_name == "builtins":
+        mod_name = ""
     if spec.origin == "builtin":
         return mod_name or f"builtin:{spec.name}"
     if spec.origin == "entry_point":
@@ -49,20 +72,43 @@ def get_registered_plugins() -> PluginListResponse:
         strict_plugins=False,
         notes_out=load_errors,
     )
-    items = [
-        PluginSpecItem(
-            name=spec.name,
-            kind=spec.kind,
-            source=_plugin_source_label(spec),
-            origin=spec.origin,
-            tier="manipulate" if spec.kind == "manipulator_augmenter" else "cross_tier",
-            version=spec.version or "unknown",
-            description=spec.description,
-            enabled_by_default=spec.enabled_by_default,
-            trusted=spec.origin in ("builtin", "entry_point"),
+    items = []
+    for spec in specs:
+        supported_caps, unsupported_caps = spec.resolved_interaction_capabilities()
+        items.append(
+            PluginSpecItem(
+                name=spec.name,
+                kind=spec.kind,
+                source=_plugin_source_label(spec),
+                origin=spec.origin,
+                tier="manipulate" if spec.kind == "manipulator_augmenter" else "cross_tier",
+                version=spec.version or "unknown",
+                description=spec.description,
+                enabled_by_default=spec.enabled_by_default,
+                supported_zooms=(
+                    list(spec.supported_zooms or (2, 3))
+                    if (
+                        spec.kind == "stratum_inspector"
+                        or spec.stratum_badge_hook is not None
+                        or spec.stratum_expand_hook is not None
+                    )
+                    else []
+                ),
+                rules=[r.rule_code for r in spec.rules],
+                mcp_tools=[t.name for t in spec.mcp_tools],
+                cli_subcommands=sorted(spec.cli_subcommands),
+                stack_profiles=[p.slug for p in spec.stack_profiles],
+                tier_adapters=[
+                    str(getattr(a, "name", ""))
+                    for a in (*spec.truth_adapters, *spec.manipulator_adapters, *spec.display_adapters)
+                    if getattr(a, "name", None)
+                ],
+                interaction_capabilities=supported_caps,
+                unsupported_interaction_capabilities=unsupported_caps,
+                evidence_source_kinds=spec.resolved_evidence_source_kinds(),
+                trusted=spec.origin in ("builtin", "entry_point"),
+            )
         )
-        for spec in specs
-    ]
     return PluginListResponse(
         plugins=items,
         local_plugins_allowed=False,

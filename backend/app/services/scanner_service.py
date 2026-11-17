@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 from collections import OrderedDict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +25,16 @@ from app.adapters.base import (
     TruthExtractionResult,
 )
 from app.adapters.legacy_snapshot_bridge import apply_legacy_snapshot_bridge
-from app.adapters.plugin_registry import run_manipulator_plugins, run_post_scan_plugins
+from app.adapters.plugin_registry import (
+    PluginStackProfileSpec,
+    collect_enabled_plugin_rules,
+    collect_enabled_plugin_stack_profiles,
+    discover_plugins,
+    get_active_stratum_artifacts,
+    register_plugin_tier_adapters,
+    run_manipulator_plugins,
+    run_post_scan_plugins,
+)
 from app.adapters.redis_ephemeral import augment_redis_ephemeral_lineage
 from app.adapters.typescript_nextjs import _skip_template_expr
 from app.core.clock import utc_now, valid_until_from
@@ -41,6 +51,7 @@ from app.services.gate_service import evaluate_findings_and_gate
 from app.services.governance_service import list_rulings
 from app.services.route_probe_service import apply_live_route_probe
 from app.services.ruling_metadata import apply_rulings_and_store_purpose_checks
+from app.services.stratum_service import attach_zoom1_stratum_badges
 
 _API_VERSION_PREFIX_RE = re.compile(r"^/api/v\d+(?=/|$)")
 _ROUTE_PARAM_SEG_RE = re.compile(r"^(?:\{[^/]*\}|:[\w$]+\??|<[^>]+>|\*.*)$")
@@ -325,6 +336,8 @@ def _solve_cross_tier_lineage(
     all_nodes: dict[str, AtlasNode] = {
         n.id: n for n in (*truth.nodes, *manip.nodes, *disp.nodes)
     }
+    manip_ids = {n.id for n in manip.nodes}
+    disp_ids = {n.id for n in disp.nodes}
 
     compiled_routes: list[tuple[RouteDescriptor, re.Pattern[str]]] = [
         (r, re.compile(r.path_regex)) for r in manip.routes
@@ -332,17 +345,59 @@ def _solve_cross_tier_lineage(
 
     # Build adjacency inside manipulate tier to find downstream services & tables per route
     manip_adj: dict[str, set[str]] = {}
+    manip_adj_edges: dict[str, list[AtlasEdge]] = {}
     manip_reads: dict[str, set[str]] = {}
     manip_writes: dict[str, set[str]] = {}
     for e in manip.edges:
-        if e.kind == "calls_helper" and e.verification != "declared":
+        if (e.kind == "calls_helper" and e.verification != "declared") or (
+            e.kind in ("queries_endpoint", "mutates_endpoint", "uses_client")
+            and e.verification == "verified"
+            and e.source_id in manip_ids
+            and e.target_id in manip_ids
+        ):
             manip_adj.setdefault(e.source_id, set()).add(e.target_id)
+            manip_adj_edges.setdefault(e.source_id, []).append(e)
         elif e.kind in ("reads_truth", "guards_truth"):
             manip_reads.setdefault(e.source_id, set()).add(e.target_id)
         elif e.kind == "writes_truth":
             manip_writes.setdefault(e.source_id, set()).add(e.target_id)
 
-    def downstream_from_route(route_nid: str) -> tuple[list[str], list[str], list[str]]:
+    def _symbol_pairs(links: list[str]) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for raw in links:
+            caller, sep, callee = raw.partition("->")
+            if sep and caller and callee:
+                out.append((caller, callee))
+        return out
+
+    def downstream_from_route(
+        route_nid: str,
+        seed_callees: set[str] | None = None,
+    ) -> tuple[list[str], list[str], list[str]]:
+        if seed_callees:
+            out_edges = manip_adj_edges.get(route_nid, [])
+            matching_targets = [
+                e.target_id
+                for e in out_edges
+                if any(caller in seed_callees for caller, _ in _symbol_pairs(e.symbol_links))
+            ]
+            if matching_targets:
+                visited_s: list[str] = []
+                r_tbls_s: set[str] = set(manip_reads.get(route_nid, set()))
+                w_tbls_s: set[str] = set(manip_writes.get(route_nid, set()))
+                seen_s = {route_nid, *matching_targets}
+                q_s: deque[str] = deque(sorted(set(matching_targets)))
+                while q_s:
+                    cur = q_s.popleft()
+                    visited_s.append(cur)
+                    r_tbls_s |= manip_reads.get(cur, set())
+                    w_tbls_s |= manip_writes.get(cur, set())
+                    for nxt in sorted(manip_adj.get(cur, set())):
+                        if nxt not in seen_s and len(seen_s) < 25:
+                            seen_s.add(nxt)
+                            q_s.append(nxt)
+                return visited_s, sorted(r_tbls_s), sorted(w_tbls_s)
+
         visited: list[str] = []
         r_tables: set[str] = set()
         w_tables: set[str] = set()
@@ -360,14 +415,15 @@ def _solve_cross_tier_lineage(
                     q.append(nxt)
         return visited, sorted(r_tables), sorted(w_tables)
 
-    # Reverse adjacency in display tier: which pages/components consume a hook or api_client?
+    # Reverse adjacency in display tier: which pages/CLIs consume a hook or api_client?
     disp_rev: dict[str, set[str]] = {}
     for e in disp.edges:
-        disp_rev.setdefault(e.target_id, set()).add(e.source_id)
+        if e.source_id in disp_ids and e.target_id in disp_ids:
+            disp_rev.setdefault(e.target_id, set()).add(e.source_id)
 
     def upstream_pages(caller_nid: str) -> list[tuple[str, list[str]]]:
         caller_node = all_nodes.get(caller_nid)
-        if caller_node and caller_node.subkind == "page":
+        if caller_node and caller_node.subkind in ("page", "cli"):
             return [(caller_nid, [])]
         found_pages: list[tuple[str, list[str]]] = []
         q: deque[tuple[str, list[str]]] = deque([(caller_nid, [caller_nid])])
@@ -379,7 +435,7 @@ def _solve_cross_tier_lineage(
                     continue
                 seen.add(parent)
                 pnode = all_nodes.get(parent)
-                if pnode and pnode.subkind == "page":
+                if pnode and pnode.subkind in ("page", "cli"):
                     found_pages.append((parent, list(reversed(trail))))
                 elif len(trail) < 4:
                     q.append((parent, [*trail, parent]))
@@ -495,6 +551,56 @@ def _solve_cross_tier_lineage(
                     )
                 )
 
+    # Synthesize native IPC / systems EndToEndChains from pre-wired display -> manipulate edges
+    for pre_edge in (*disp.edges, *manip.edges):
+        if pre_edge.verification != "verified":
+            continue
+        src_node = all_nodes.get(pre_edge.source_id)
+        route_node = all_nodes.get(pre_edge.target_id)
+        if (
+            src_node is None
+            or route_node is None
+            or src_node.tier != "display"
+            or route_node.tier != "manipulate"
+        ):
+            continue
+        seed_callees = {
+            callee
+            for _, callee in _symbol_pairs(pre_edge.symbol_links)
+            if callee and callee != "*"
+        }
+        svcs, r_tbls, w_tbls = downstream_from_route(
+            route_node.id,
+            seed_callees or None,
+        )
+        tbls = sorted(set(r_tbls) | set(w_tbls))
+        op = "write" if (pre_edge.kind == "mutates_endpoint" or w_tbls) else "read"
+        for root_disp_id, via_ids in upstream_pages(pre_edge.source_id):
+            ckey = (root_disp_id, "IPC", route_node.label, route_node.id)
+            if ckey in seen_chains or len(chains) >= 300:
+                continue
+            seen_chains.add(ckey)
+            dnode = all_nodes.get(root_disp_id)
+            chains.append(
+                EndToEndChain(
+                    id=f"chain:{len(chains) + 1}",
+                    display_node_id=root_disp_id,
+                    display_label=dnode.label if dnode else root_disp_id,
+                    via_node_ids=via_ids,
+                    http_method="IPC",
+                    http_path=route_node.label,
+                    route_node_id=route_node.id,
+                    route_label=route_node.label,
+                    manipulator_node_ids=svcs,
+                    truth_table_ids=tbls,
+                    truth_table_labels=[
+                        all_nodes[t].label if t in all_nodes else t for t in tbls
+                    ],
+                    operation=op,  # type: ignore[arg-type]
+                    verified=bool(tbls or svcs),
+                )
+            )
+
     return cross_edges, chains, extra_findings
 
 
@@ -557,6 +663,8 @@ def run_target_scan(
     persist_snapshot: bool = True,
     probe_url: str | None = None,
     probe_allow_remote: bool = False,
+    local_plugin_modules: Sequence[str] | None = None,
+    allow_local_plugins: bool = False,
 ) -> TruthAtlasReport:
     """Execute a 3-tier Truth Atlas scan for a registered TargetProject.
 
@@ -568,11 +676,66 @@ def run_target_scan(
         if target.stack_profile_slug.endswith("-native")
         else target.stack_profile_slug
     )
+    repo_root = Path(target.repo_path).resolve()
+    active_artifacts = get_active_stratum_artifacts()
+    strict_artifact_plugins = bool(active_artifacts)
+    plugin_load_notes: list[str] = []
+    discovered_specs = discover_plugins(
+        repo_root=repo_root,
+        allow_local_plugins=allow_local_plugins,
+        local_plugin_modules=local_plugin_modules,
+        strict_plugins=strict_artifact_plugins,
+        notes_out=plugin_load_notes,
+    )
+    registry = build_default_registry()
+    register_plugin_tier_adapters(
+        registry,
+        repo_root=repo_root,
+        plugins=discovered_specs,
+        allow_local_plugins=allow_local_plugins,
+        local_plugin_modules=local_plugin_modules,
+        strict_plugins=strict_artifact_plugins,
+        notes_out=plugin_load_notes,
+    )
+
     profile = session.scalar(
         select(StackProfile).where(StackProfile.slug == profile_slug)
     )
-    if profile is None:
-        raise ValueError(f"Missing StackProfile '{target.stack_profile_slug}'")
+    resolved_truth_adapter: str
+    resolved_manip_adapter: str
+    resolved_disp_adapter: str
+    resolved_maturity: str
+    if profile is not None:
+        resolved_truth_adapter = profile.truth_adapter
+        resolved_manip_adapter = profile.manipulator_adapter
+        resolved_disp_adapter = profile.display_adapter
+        resolved_maturity = profile.implementation_status
+    else:
+        plugin_profiles = collect_enabled_plugin_stack_profiles(
+            repo_root=repo_root,
+            plugins=discovered_specs,
+            allow_local_plugins=allow_local_plugins,
+            local_plugin_modules=local_plugin_modules,
+        )
+        plugin_prof: PluginStackProfileSpec | None = next(
+            (p for p in plugin_profiles if p.slug == profile_slug),
+            None,
+        )
+        if plugin_prof is None and profile_slug == "no-coverage-fallback":
+            plugin_prof = PluginStackProfileSpec(
+                slug="no-coverage-fallback",
+                name="Partial / Uninstalled Plugin Fallback",
+                truth_adapter="no-truth",
+                manipulator_adapter="no-manipulator",
+                display_adapter="no-display",
+                maturity_status="experimental",
+            )
+        if plugin_prof is None:
+            raise ValueError(f"Missing StackProfile '{target.stack_profile_slug}'")
+        resolved_truth_adapter = plugin_prof.truth_adapter
+        resolved_manip_adapter = plugin_prof.manipulator_adapter
+        resolved_disp_adapter = plugin_prof.display_adapter
+        resolved_maturity = plugin_prof.maturity_status
 
     enabled_tokens = tuple(
         session.scalars(
@@ -582,12 +745,29 @@ def run_target_scan(
         ).all()
     )
 
-    registry = build_default_registry()
-    t_adapter = registry.get_truth(profile.truth_adapter)
-    m_adapter = registry.get_manipulator(profile.manipulator_adapter)
-    d_adapter = registry.get_display(profile.display_adapter)
+    t_adapter = registry.get_truth(resolved_truth_adapter)
+    m_adapter = registry.get_manipulator(resolved_manip_adapter)
+    d_adapter = registry.get_display(resolved_disp_adapter)
 
-    repo_root = Path(target.repo_path).resolve()
+    plugin_rules = collect_enabled_plugin_rules(
+        repo_root=repo_root,
+        plugins=discovered_specs,
+        allow_local_plugins=allow_local_plugins,
+        local_plugin_modules=local_plugin_modules,
+        strict_plugins=strict_artifact_plugins,
+    )
+    artifact_sig = (
+        (tuple(sorted((k, tuple(v)) for k, v in active_artifacts.items())),)
+        if active_artifacts
+        else ()
+    )
+    plugin_cache_sig = (
+        tuple((s.name, s.origin, s.version) for s in discovered_specs),
+        bool(allow_local_plugins),
+        tuple(local_plugin_modules or ()),
+        tuple(plugin_load_notes),
+        *artifact_sig,
+    )
     git_fp = (
         _compute_git_worktree_fingerprint(repo_root)
         if pg_dsn is None and redis_dsn is None
@@ -598,11 +778,12 @@ def run_target_scan(
             str(repo_root),
             target.backend_subdir,
             target.frontend_subdir,
-            profile.truth_adapter,
-            profile.manipulator_adapter,
-            profile.display_adapter,
+            resolved_truth_adapter,
+            resolved_manip_adapter,
+            resolved_disp_adapter,
             enabled_tokens,
             git_fp[1],
+            plugin_cache_sig,
         )
         if git_fp is not None
         else None
@@ -623,7 +804,15 @@ def run_target_scan(
         with policy_tokens_scope(enabled_tokens):
             truth_res = t_adapter.extract(repo_root, target.backend_subdir, pg_dsn=pg_dsn)
             manip_res = m_adapter.extract(repo_root, target.backend_subdir, truth_res)
-            run_manipulator_plugins(repo_root, target.backend_subdir, manip_res)
+            run_manipulator_plugins(
+                repo_root,
+                target.backend_subdir,
+                manip_res,
+                plugins=discovered_specs,
+                allow_local_plugins=allow_local_plugins,
+                local_plugin_modules=local_plugin_modules,
+                strict_plugins=strict_artifact_plugins,
+            )
             _reconcile_post_plugin_node_states(manip_res)
             disp_res = d_adapter.extract(repo_root, target.frontend_subdir)
 
@@ -651,6 +840,27 @@ def run_target_scan(
             [*manip_res.edges, *disp_res.edges, *cross_edges],
             key=lambda e: e.id,
         )
+        for n in all_nodes:
+            if (
+                n.tier == "truth"
+                and n.subkind in ("entity_store", "entitlement_spec")
+                and n.read_by_count == 0
+                and n.written_by_count == 0
+            ):
+                n.read_by_count = len(
+                    {
+                        e.source_id
+                        for e in all_edges
+                        if e.target_id == n.id and e.kind in ("reads_truth", "guards_truth")
+                    }
+                )
+                n.written_by_count = len(
+                    {
+                        e.source_id
+                        for e in all_edges
+                        if e.target_id == n.id and e.kind == "writes_truth"
+                    }
+                )
         raw_findings = [
             *truth_res.findings,
             *manip_res.findings,
@@ -658,6 +868,17 @@ def run_target_scan(
             *cross_findings,
         ]
         scan_notes = [*truth_res.notes, *manip_res.notes, *disp_res.notes]
+        if (
+            profile_slug == "no-coverage-fallback"
+            and (repo_root / "Package.swift").is_file()
+            and not (repo_root / "Package.swift").is_symlink()
+        ):
+            swift_note = (
+                "Swift Package.swift detected; optional plugin 'wythe-plugin-apple-ipc' "
+                "is not installed (using partial no-coverage fallback)."
+            )
+            if swift_note not in scan_notes:
+                scan_notes.append(swift_note)
         commit_sha = git_fp[0] if git_fp is not None else _resolve_git_commit(repo_root)
         if cache_key is not None:
             _EXTRACTION_CACHE[cache_key] = _CachedStaticExtraction(
@@ -672,6 +893,10 @@ def run_target_scan(
             )
             while len(_EXTRACTION_CACHE) > _EXTRACTION_CACHE_MAX:
                 _EXTRACTION_CACHE.popitem(last=False)
+
+    for p_note in plugin_load_notes:
+        if p_note not in scan_notes:
+            scan_notes.append(p_note)
 
     if probe_url:
         raw_findings, probe_note = apply_live_route_probe(
@@ -697,6 +922,7 @@ def run_target_scan(
         target_id=target.id or None,
         strict=strict_gate,
         coverage_complete=coverage_complete,
+        extra_plugin_rules=plugin_rules,
     )
 
     observed = utc_now()
@@ -712,13 +938,27 @@ def run_target_scan(
     digest = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
 
     stats = AtlasSummaryStats(
-        truth_tables=sum(1 for n in all_nodes if n.tier == "truth" and n.subkind == "table"),
+        truth_tables=sum(
+            1
+            for n in all_nodes
+            if n.tier == "truth" and n.subkind in ("table", "entity_store", "entitlement_spec")
+        ),
         sql_functions=sum(1 for n in all_nodes if n.tier == "truth" and n.subkind == "sql_function"),
         ephemeral_stores=sum(1 for n in all_nodes if n.tier == "truth" and n.subkind == "cache_store"),
-        manipulator_routes=sum(1 for n in all_nodes if n.tier == "manipulate" and n.subkind == "route"),
-        manipulator_services=sum(1 for n in all_nodes if n.tier == "manipulate" and n.subkind != "route"),
-        display_pages=sum(1 for n in all_nodes if n.tier == "display" and n.subkind == "page"),
-        display_hooks_and_clients=sum(1 for n in all_nodes if n.tier == "display" and n.subkind != "page"),
+        manipulator_routes=sum(
+            1 for n in all_nodes if n.tier == "manipulate" and n.subkind in ("route", "ipc_handler")
+        ),
+        manipulator_services=sum(
+            1
+            for n in all_nodes
+            if n.tier == "manipulate" and n.subkind not in ("route", "ipc_handler")
+        ),
+        display_pages=sum(
+            1 for n in all_nodes if n.tier == "display" and n.subkind in ("page", "cli")
+        ),
+        display_hooks_and_clients=sum(
+            1 for n in all_nodes if n.tier == "display" and n.subkind not in ("page", "cli")
+        ),
         verified_edges=sum(1 for e in all_edges if e.verification == "verified"),
         end_to_end_chains=len(chains),
         clean_nodes=sum(1 for n in all_nodes if n.status == "clean"),
@@ -728,8 +968,8 @@ def run_target_scan(
     )
 
     profile_maturity = (
-        profile.implementation_status
-        if profile.implementation_status in ("implemented", "experimental", "planned")
+        resolved_maturity
+        if resolved_maturity in ("implemented", "experimental", "planned")
         else "experimental"
     )
     report = TruthAtlasReport(
@@ -757,7 +997,14 @@ def run_target_scan(
         rulings=rulings,
     )
 
-    post_exec = run_post_scan_plugins(repo_root, report)
+    post_exec = run_post_scan_plugins(
+        repo_root,
+        report,
+        plugins=discovered_specs,
+        allow_local_plugins=allow_local_plugins,
+        local_plugin_modules=local_plugin_modules,
+        strict_plugins=strict_artifact_plugins,
+    )
     if post_exec.findings:
         raw_findings = [*raw_findings, *post_exec.findings]
         findings, gate = evaluate_findings_and_gate(
@@ -766,6 +1013,7 @@ def run_target_scan(
             target_id=target.id or None,
             strict=strict_gate,
             coverage_complete=coverage_complete,
+            extra_plugin_rules=plugin_rules,
         )
         stats.blocking_findings = sum(1 for f in findings if f.blocks_gate)
         stats.warning_findings = sum(1 for f in findings if not f.blocks_gate)
@@ -782,6 +1030,15 @@ def run_target_scan(
         report.findings = findings
         report.gate = gate
         report.content_digest = digest
+
+    attach_zoom1_stratum_badges(
+        repo_root,
+        report,
+        plugins=discovered_specs,
+        allow_local_plugins=allow_local_plugins,
+        local_plugin_modules=local_plugin_modules,
+        strict_plugins=strict_artifact_plugins,
+    )
 
     if persist_snapshot and target.id:
         snap = ScanSnapshot(

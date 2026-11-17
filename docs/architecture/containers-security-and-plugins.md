@@ -1,4 +1,4 @@
-# Containers, Security Workflows & Plugin Architecture (`v0.2.2`)
+# Containers, Security Workflows & Plugin Architecture (`v0.2.3`)
 
 This document explains why Wythe inspects container and Kubernetes **source blueprints** (`Dockerfile`/`.docker/`, `.dockerignore`, `compose.yaml`/`docker-compose.*.yml`, and Kubernetes manifests) rather than sealed OCI image tarballs, how **Stage 1 (`tach` + Wythe)** hands off to **Stage 2 (`Syft` + `Trivy`)** in CI across Blue, Red, and Purple workflows, and how Wythe's extension system (`wythe.plugins`, `tach.toml` bridge, and OpenLineage export across CLI, HTTP, MCP, and WebGL UI) operates without executing untrusted repository code.
 
@@ -206,10 +206,95 @@ When an engineer or CI job runs `wythe scan /path/to/untrusted-checkout`, scanni
 
 ### Plugin Protocols, Fault Isolation & CLI / HTTP / MCP Inspection
 
-Plugins register a typed `WythePluginSpec` (`name`, `kind`, `origin`, `version`, `description`, `enabled_by_default`) implementing one of two protocols:
-- **`ManipulatorAugmenterPlugin` (`run_manipulator_plugins`)**: Augments `ManipulatorExtractionResult` (`nodes`, `edges`, `findings`, `notes`) after core tier extraction, indexing existing nodes by repo-relative `node.source_file` so rules work uniformly across `python-fastapi`, `python-django`, `python-services`, and polyglot profiles.
-- **`PostScanCheckPlugin` (`run_post_scan_plugins`)**: Inspects the assembled `TruthAtlasReport` for cross-tier post-checks or companion exports without mutating core extraction state.
-- **Fault isolation**: Plugins execute in deterministic name order. If an installed third-party plugin raises an exception, Wythe isolates the failure (rolling back partial list mutations) and appends a diagnostic scan note instead of crashing core `wythe scan` / `wythe gate` (unless strict plugin mode is requested).
+Plugins register a typed `WythePluginSpec` (`name`, `kind`, `origin`,
+`version`, `description`, `enabled_by_default`, `rules`, `mcp_tools`,
+`cli_subcommands`, `companion_handlers`) and may implement multiple
+protocols simultaneously on one plugin object:
+- **`ManipulatorAugmenterPlugin` (`run_manipulator_plugins`)**:
+  Augments `ManipulatorExtractionResult` (`nodes`, `edges`,
+  `findings`, `notes`) after core tier extraction, indexing existing
+  nodes by repo-relative `node.source_file` across stack profiles.
+- **`PostScanCheckPlugin` (`run_post_scan_plugins`)**: Inspects an
+  isolated copy of `TruthAtlasReport` for cross-tier checks without
+  mutating `Zoom 1` `content_digest`.
+- **`StratumPlugin` (`attach_zoom1_stratum_badges` /
+  `build_node_stratum_drilldown`)**: Attaches lightweight `Zoom 1`
+  `stratum_badges` and expands lazy `Zoom 2`/`Zoom 3` micro-nodes on
+  demand without inflating `TruthAtlasReport.nodes`, reading explicit
+  read-only CLI artifact paths via `stratum_artifacts_scope`.
+- **`stack_adapter` (`PluginStackProfileSpec` /
+  `register_plugin_tier_adapters`)**: Registers optional 3-tier
+  language/systems adapters and stack profiles (such as
+  `swift-systems-ipc`) without altering core's seeded DB
+  `StackProfile` catalog when uninstalled.
+- **Dynamic rules, MCP tools, CLI subcommands & companions**:
+  Plugins may declare `PluginRuleSpec` rows (honoring DB `RulePolicy`
+  overrides without altering core's 19 seeded rules), `full`-slice
+  `PluginMcpToolSpec` tools (never overriding core tools and never
+  expanding the 4-tool `< 2,000 B` `slm` slice), `cli_subcommands`
+  (`wythe watch-solver`), and `companion_handlers` (`wythe companion
+  --cp-model-proto ... --cp-solver-response ...`).
+- **Fault isolation**: Plugins execute in deterministic name order. If
+  an installed plugin raises an exception, Wythe isolates the failure
+  (rolling back partial list mutations) and appends a diagnostic scan
+  note instead of crashing core `wythe scan` / `wythe gate` (unless
+  strict plugin mode is requested).
+
+### Optional First-Party Companion Packages (`plugins/wythe-plugin-*`)
+
+Core `wythe` remains 100% domain-agnostic; domain-specific inspectors
+ship as separate optional `wythe.plugins` packages:
+- **`wythe-plugin-agent-harness`** (`AGENT-001..003`): Audits prompt
+  KV-cache prefix stability (`AGENT-001`), SLM/MCP tool-schema byte
+  budgets and Tier-1 registry parity (`AGENT-002`), and bounded
+  agent-loop termination (`AGENT-003`).
+- **`wythe-plugin-cpsat`**: Pure-Python OR-Tools CP-SAT AST extractor,
+  `Zoom 2` bipartite `Variable <-> Constraint` lattice, and read-only
+  `CpModelProto` / `CpSolverResponse` JSON, `.pbtxt`, and binary wire
+  companion correlator (requiring zero `ortools` runtime).
+- **`wythe-plugin-solver-chronicle`**: Synthesizes the 6-phase causal
+  3-tier solver chronicle (`[1.Load]` -> `[6.Render]`), classifies
+  `MODEL_INVALID`, `INFEASIBLE`, and scaling/presolve/stall forensics
+  back to `Z=0` `file:line` builders and `[1.Load]` Truth tables, and
+  serves passive `wythe watch-solver` + MCP `wythe_solver_chronicle`
+  with `#chronicle=<id>&phase=<idx>` `Live Follow` permalinks.
+- **`wythe-plugin-apple-ipc`** (`IPC-001`, `MANIP-006`): Registers
+  `swift-systems-ipc` (`cli` -> `ipc_handler`/`ffi_shim`/`service` ->
+  `entity_store`/`entitlement_spec`) across `Package.swift`,
+  `ArgumentParser`, XPC, `vsock`/gRPC, C FFI, OCI stores, and
+  `.entitlements`; uninstalled `Package.swift` repos report truthful
+  `no-truth`/`no-manipulator`/`no-display` partial coverage.
+- **`wythe-plugin-compiler-ir`** (`METAL-001..003`): Read-only
+  `Zoom 2` `IndexStoreDB`/`clangd` USR, Swift `.sil`, and LLVM `.ll`
+  resolver plus CPU <-> Metal `AIR` compute seam verifier (`--sil`,
+  `--llvm-ir`, `--index-store`, `--metallib`), distinguishing
+  `.metallib` `AIR` bitcode from driver-lowered `AGX` GPU ISA.
+- **`wythe-plugin-solver-internals`** (`SAT-INT-001..004`): Read-only
+  `Zoom 2` C++/Protobuf solver-engine inspector (`--proto-descriptor`,
+  `--compile-commands`) tracing the 7-stage `ConstraintProto` matrix,
+  `SatParameters` knob lineage, `Model::GetOrCreate<T>()` singleton
+  cycles, and Python/SWIG/pybind11/nanobind wrapper parity (reporting
+  structural stage asymmetries, never formal propagator soundness).
+- **`wythe-plugin-binary`** (`BIN-ENT-001`): 100% passive `Zoom 3`
+  Mach-O 64/Universal and Linux ELF64 inspector (`--binary`, zero
+  `ldd`/target execution) extracting dynamic libraries, Swift/ObjC
+  reflection, `unverified` `binary_string_witness` literals (never
+  promoted to `verified` call edges), and non-certifying signed
+  entitlement drift (`automated_security_audit: false`).
+- **`wythe-plugin-wiretap`** (`PORT-001`, `PORT-002`): Passive `Zoom 3`
+  OTLP/eBPF trace correlator (`corroborated`, `static_dark_matter`
+  `unexercised_in_sample`, `runtime_only`), `.memgraph`/`vmmap` heap
+  and Tarjan retain-cycle inspector, and host port occupancy verifier
+  (`--otel-traces`, `--ebpf-flows`, `--memgraph`, `--vmmap`,
+  `--port-listeners`, opt-in `--probe-local-ports`) with SQL/URL/auth/
+  heap redaction. Every plugin descriptor also advertises explicit
+  `interaction_capabilities` and `evidence_source_kinds`
+  (`source_static`, `compiled_artifact`, `runtime_capture`) via
+  `wythe plugins --json` and `GET /api/v1/adapters/plugins`.
+- **Passive non-execution & non-certification**: None of the eight
+  plugins imports target code, invokes `ldd`/CMake/Bazel/`swiftc`/
+  `xcrun`, executes a target binary or solver, or certifies security,
+  propagator soundness, or NP-hard global optimality.
 
 Register an environment plugin in your companion package's `pyproject.toml`:
 

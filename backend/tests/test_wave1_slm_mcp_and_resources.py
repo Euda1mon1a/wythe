@@ -143,10 +143,10 @@ def test_slm_slice_budget_and_tool_surface_stdio_cli_and_http(
         for prop_schema in props.values():
             assert prop_schema["type"] in ("string", "boolean", "integer", "number")
 
-    # Default signature `dispatch_mcp_request(session, msg)` preserves all 8 full tools
+    # Default signature `dispatch_mcp_request(session, msg)` preserves all full tools
     full_list = dispatch_mcp_request(db_session, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert full_list is not None
-    assert len(full_list["result"]["tools"]) == len(MCP_TOOLS) == 8
+    assert len(full_list["result"]["tools"]) == len(MCP_TOOLS) == 11
 
     slm_list = dispatch_mcp_request(
         db_session, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, slice_mode="slm"
@@ -195,7 +195,7 @@ def test_slm_slice_budget_and_tool_surface_stdio_cli_and_http(
 
         m_full = client.get("/api/v1/mcp").json()
         assert m_full["slice"] == "full"
-        assert len(m_full["tools"]) == 8
+        assert len(m_full["tools"]) == len(MCP_TOOLS) == 11
 
         m_slm = client.get("/api/v1/mcp?slice=slm").json()
         assert m_slm["slice"] == "slm"
@@ -326,6 +326,7 @@ def test_actionable_steering_hints_and_passive_mcp_resources(
         "wythe://{slug}/ui-focus",
         "wythe://{slug}/findings",
         "wythe://{slug}/cone/{node_id}",
+        "wythe://{slug}/investigation/{session_id}",
     }
 
     # 5. `resources/read` across llms, ui-focus, findings, cone/{node_id}, and unknown slug

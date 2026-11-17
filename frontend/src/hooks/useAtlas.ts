@@ -29,6 +29,10 @@ export const atlasKeys = {
   rulings: (slug: string) => ['rulings', slug] as const,
   source: (slug: string, relPath: string, line: number) =>
     ['source', slug, relPath, line] as const,
+  nodeStrata: (slug: string, nodeId: string, zoom: 2 | 3, unfilteredIr: boolean) =>
+    ['node-strata', slug, nodeId, zoom, unfilteredIr] as const,
+  viewportState: (slug: string, sessionId?: string | null) =>
+    ['viewport-state', slug, sessionId ?? ''] as const,
   slots: ['adapter-slots'] as const,
   plugins: ['adapter-plugins'] as const,
   profiles: ['stack-profiles'] as const,
@@ -263,6 +267,50 @@ export function useSourceSnippet(slug: string, relPath: string, line: number, en
   });
 }
 
+export function useNodeStrata(
+  slug: string,
+  nodeId: string | null,
+  zoom: 2 | 3,
+  unfilteredIr = false,
+  enabled = false,
+) {
+  return useQuery({
+    queryKey: atlasKeys.nodeStrata(slug, nodeId ?? '', zoom, unfilteredIr),
+    queryFn: () => atlasApi.getNodeStrata(slug, nodeId!, zoom, unfilteredIr),
+    enabled: Boolean(slug && nodeId && enabled),
+    retry: false,
+  });
+}
+
+export function useViewportState(
+  slug: string,
+  enabled = true,
+  sessionId?: string | null,
+  options?: {
+    clientId?: string;
+    selectedEdgeId?: string | null;
+    selectedFindingId?: string | null;
+    followState?: 'following' | 'paused';
+  },
+) {
+  return useQuery({
+    queryKey: atlasKeys.viewportState(slug, sessionId),
+    queryFn: () =>
+      atlasApi.getViewportState(slug, {
+        ...(sessionId ? { sessionId } : {}),
+        ...(options?.clientId ? { clientId: options.clientId } : {}),
+        actor: 'human',
+        ...(options?.selectedEdgeId ? { selectedEdgeId: options.selectedEdgeId } : {}),
+        ...(options?.selectedFindingId
+          ? { selectedFindingId: options.selectedFindingId }
+          : {}),
+        ...(options?.followState ? { followState: options.followState } : {}),
+      }),
+    enabled: Boolean(slug && enabled),
+    retry: false,
+  });
+}
+
 export function useSyncUiFocus() {
   return useMutation({
     mutationFn: (payload: UiFocusStatePayload) => atlasApi.syncUiFocus(payload),
@@ -271,7 +319,30 @@ export function useSyncUiFocus() {
 
 export function useFetchUiFocus() {
   return useMutation({
-    mutationFn: (targetSlug?: string) => atlasApi.getUiFocus(targetSlug),
+    mutationFn: (
+      input?:
+        | string
+        | {
+            targetSlug?: string;
+            sessionId?: string | null;
+            clientId?: string | null;
+            selectedEdgeId?: string | null;
+            selectedFindingId?: string | null;
+            followState?: 'following' | 'paused' | null;
+          },
+    ) => {
+      if (!input || typeof input === 'string') {
+        return atlasApi.getUiFocus(input);
+      }
+      return atlasApi.getUiFocus(input.targetSlug, {
+        sessionId: input.sessionId,
+        clientId: input.clientId,
+        actor: 'human',
+        selectedEdgeId: input.selectedEdgeId,
+        selectedFindingId: input.selectedFindingId,
+        followState: input.followState,
+      });
+    },
   });
 }
 

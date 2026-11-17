@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.adapters.base import RawCandidateFinding
+from app.adapters.plugin_registry import PluginRuleSpec
 from app.core.clock import utc_now, utc_today
 from app.models import RatchetBaseline, RulePolicy, ScanSnapshot
 from app.schemas.atlas import (
@@ -28,11 +31,15 @@ _valid_strengths: tuple[EvidenceStrength, ...] = ("ast_exact", "structural_match
 
 def _derive_finding_epistemics(
     cand: RawCandidateFinding,
+    plugin_rule: PluginRuleSpec | None = None,
 ) -> tuple[FindingConfidence, EvidenceStrength]:
     """Separate confirmed/candidate status and evidence strength from rule severity."""
     default_confidence: FindingConfidence
     default_strength: EvidenceStrength
-    if cand.rule_code in _confirmed_ast_rules:
+    if plugin_rule is not None:
+        default_confidence = plugin_rule.confidence
+        default_strength = plugin_rule.evidence_strength
+    elif cand.rule_code in _confirmed_ast_rules:
         default_confidence = "confirmed"
         default_strength = "ast_exact"
     elif cand.rule_code in _confirmed_structural_rules:
@@ -78,9 +85,18 @@ def evaluate_findings_and_gate(
     target_id: int | None = None,
     strict: bool = False,
     coverage_complete: bool = True,
+    extra_plugin_rules: Sequence[PluginRuleSpec] = (),
 ) -> tuple[list[BoundaryFinding], GateEvaluation]:
-    """Bind candidate findings to persisted RulePolicy rows and compute gate verdict."""
+    """Bind candidate findings to persisted RulePolicy rows (plus enabled plugin rules) and compute gate verdict."""
     rules_by_code = load_effective_rules(session)
+    effective_policies: dict[str, RulePolicy | PluginRuleSpec] = dict(rules_by_code)
+    plugin_rules_by_code: dict[str, PluginRuleSpec] = {}
+    for p_rule in extra_plugin_rules:
+        if p_rule.rule_code not in plugin_rules_by_code:
+            plugin_rules_by_code[p_rule.rule_code] = p_rule
+        if p_rule.rule_code not in effective_policies:
+            effective_policies[p_rule.rule_code] = p_rule
+
     baselines: dict[str, int] = {}
     if target_id is not None and not strict:
         b_rows = session.scalars(
@@ -89,14 +105,17 @@ def evaluate_findings_and_gate(
         baselines = {b.rule_code: b.max_allowed_count for b in b_rows}
 
     materialized: list[BoundaryFinding] = []
-    counts_by_rule: dict[str, int] = {code: 0 for code in rules_by_code}
+    counts_by_rule: dict[str, int] = {code: 0 for code in effective_policies}
 
     for idx, cand in enumerate(raw_findings, start=1):
-        policy = rules_by_code.get(cand.rule_code)
+        policy = effective_policies.get(cand.rule_code)
         if policy is None or not policy.enabled:
             continue
         counts_by_rule[cand.rule_code] = counts_by_rule.get(cand.rule_code, 0) + 1
-        confidence, evidence_strength = _derive_finding_epistemics(cand)
+        confidence, evidence_strength = _derive_finding_epistemics(
+            cand,
+            plugin_rule=plugin_rules_by_code.get(cand.rule_code),
+        )
         materialized.append(
             BoundaryFinding(
                 id=f"f:{cand.rule_code}:{idx}",
@@ -122,7 +141,7 @@ def evaluate_findings_and_gate(
     exceeded: list[str] = []
     blocking_total = 0
 
-    for code, policy in sorted(rules_by_code.items()):
+    for code, policy in sorted(effective_policies.items()):
         obs = counts_by_rule.get(code, 0)
         b_max = baselines.get(code) if use_ratchet else None
         if not policy.enabled:
