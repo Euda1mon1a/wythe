@@ -171,6 +171,10 @@ _ORM_CHAIN_ATTRS = frozenset(
         "one",
         "one_or_none",
         "all",
+        "fetchone",
+        "fetchall",
+        "fetchmany",
+        "partitions",
         "unique",
         "where",
         "filter",
@@ -179,9 +183,6 @@ _ORM_CHAIN_ATTRS = frozenset(
         "limit",
         "offset",
         "options",
-        "join",
-        "outerjoin",
-        "select_from",
         "execution_options",
         "with_for_update",
         "objects",
@@ -194,11 +195,88 @@ _ORM_CHAIN_ATTRS = frozenset(
     }
 )
 _TRANSPARENT_WRAPPERS = frozenset(
-    {"list", "tuple", "set", "frozenset", "iter", "reversed", "sorted", "next"}
+    {"list", "tuple", "set", "frozenset", "iter", "reversed", "sorted", "next", "text", "aliased"}
 )
 _WHOLE_ROW_SERIALIZERS = frozenset({"model_validate", "from_orm", "asdict"})
 _TELEMETRY_RECEIVERS = frozenset({"logger", "log", "logging"})
 _TELEMETRY_FUNCS = frozenset({"print"})
+_STRUCTURAL_TABLE_COLS = frozenset(
+    {
+        "id",
+        "uuid",
+        "guid",
+        "pk",
+        "rowid",
+        "oid",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "created_by",
+        "updated_by",
+        "version",
+    }
+)
+_GENERIC_POLICY_MODIFIER_STEMS = frozenset(
+    {
+        "MAX",
+        "MAXIMUM",
+        "MIN",
+        "MINIMUM",
+        "LIMIT",
+        "LIMITS",
+        "CAP",
+        "CAPS",
+        "DEFAULT",
+        "DEFAULTS",
+        "FALLBACK",
+        "OVERRIDE",
+        "THRESHOLD",
+        "THRESHOLDS",
+        "VALUE",
+        "VALUES",
+        "ALLOWED",
+        "ENABLED",
+        "IS",
+        "PER",
+        "BY",
+        "FOR",
+        "IN",
+        "OF",
+        "TO",
+        "HARD",
+        "SOFT",
+        "GLOBAL",
+        "LOCAL",
+        "BASE",
+        "EXTRA",
+    }
+)
+
+
+def _is_structural_col(col: str) -> bool:
+    low = col.strip().lower()
+    return low in _STRUCTURAL_TABLE_COLS or low.endswith(("_id", "_uuid", "_guid", "_pk", "_fk"))
+
+
+def _singular_stem(part: str) -> str:
+    if len(part) > 4 and part.endswith("IES"):
+        return part[:-3] + "Y"
+    if len(part) > 3 and part.endswith("ES") and part[:-2].endswith(("SH", "CH", "X", "Z", "S")):
+        return part[:-2]
+    if len(part) > 3 and part.endswith("S") and not part.endswith("SS"):
+        return part[:-1]
+    return part
+
+
+def _meaningful_domain_stems(raw_name: str) -> frozenset[str]:
+    norm = _normalize_ident_upper(raw_name)
+    if not norm:
+        return frozenset()
+    return frozenset(
+        _singular_stem(p)
+        for p in norm.split("_")
+        if p and p not in _GENERIC_POLICY_MODIFIER_STEMS and not p.isdigit()
+    )
 
 
 def _normalize_ident_upper(raw: str) -> str:
@@ -338,8 +416,12 @@ def _const_bool(node: ast.AST, const_truth: dict[str, bool] | None = None) -> bo
 class _Val:
     row: bool = False
     row_map: bool = False
+    col_ns: bool = False
+    existence_only: bool = False
+    from_query: bool = False
     cols: frozenset[str] = frozenset()
     tuple_cols: tuple[str, ...] = ()
+    tuple_items: tuple[_Val, ...] = ()
     dict_items: tuple[tuple[str, _Val], ...] = ()
     consts: frozenset[str] = frozenset()
     num_lits: frozenset[str] = frozenset()
@@ -353,6 +435,9 @@ class _Val:
         return _Val(
             row=self.row or other.row,
             row_map=self.row_map or other.row_map,
+            col_ns=self.col_ns or other.col_ns,
+            existence_only=self.existence_only or other.existence_only,
+            from_query=self.from_query or other.from_query,
             cols=self.cols | other.cols,
             consts=self.consts | other.consts,
             num_lits=(self.num_lits | other.num_lits) if keep_num_lits else frozenset(),
@@ -395,40 +480,175 @@ class ScopePolicyReadAnalysis:
     note: str = ""
 
 
-_SQL_SELECT_RE = re.compile(
-    r"\bSELECT\s+(?:DISTINCT\s+)?(?P<proj>.+?)\s+FROM\s+(?:ONLY\s+)?"
-    r'(?:"?[A-Za-z_][A-Za-z0-9_]*"?\.)?"?(?P<tbl>[A-Za-z_][A-Za-z0-9_]*)"?\b',
+_SQL_ALIAS_SKIP_WORDS = frozenset(
+    {
+        "where",
+        "join",
+        "left",
+        "right",
+        "inner",
+        "outer",
+        "full",
+        "cross",
+        "natural",
+        "on",
+        "using",
+        "limit",
+        "offset",
+        "order",
+        "group",
+        "having",
+        "union",
+        "intersect",
+        "except",
+        "for",
+        "window",
+        "fetch",
+        "as",
+    }
+)
+_SQL_FROM_OR_JOIN_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+(?:ONLY\s+)?"
+    r'(?:"?[A-Za-z_][A-Za-z0-9_]*"?\.)?"?(?P<tbl>[A-Za-z_][A-Za-z0-9_]*)"?'
+    r'(?:\s+AS\s+"?(?P<alias1>[A-Za-z_][A-Za-z0-9_]*)"?|\s+"?(?P<alias2>[A-Za-z_][A-Za-z0-9_]*)"?)?',
+    re.IGNORECASE,
+)
+_SQL_SELECT_CLAUSE_RE = re.compile(
+    r"\bSELECT\s+(?:DISTINCT\s+(?:ON\s*\([^)]*\)\s+)?)?(?P<proj>.+?)\s+FROM\b",
     re.IGNORECASE | re.DOTALL,
+)
+_SQL_QUAL_COL_RE = re.compile(
+    r'"?(?P<qual>[A-Za-z_][A-Za-z0-9_]*)"?\s*\.\s*"?(?P<col>[A-Za-z_][A-Za-z0-9_]*|\*)"?'
 )
 
 
-def _sql_projection_for_table(sql_text: str, sql_table_names: set[str]) -> _Val | None:
-    """Extract projected columns for `SELECT <proj> FROM <tbl>` when `<tbl>` matches target."""
-    for match in _SQL_SELECT_RE.finditer(sql_text):
-        tbl = match.group("tbl").lower()
+def _split_top_level_sql_commas(proj: str) -> list[str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    quote: str | None = None
+    for ch in proj:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            cur.append(ch)
+        elif ch == "(":
+            depth += 1
+            cur.append(ch)
+        elif ch == ")" and depth > 0:
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur))
+    return parts
+
+
+def _sql_projection_for_table(
+    sql_text: str,
+    sql_table_names: set[str],
+    all_table_cols: frozenset[str] = frozenset(),
+) -> _Val | None:
+    """Extract projected columns for `SELECT <proj> FROM/JOIN <tbl>` when `<tbl>` matches target."""
+    from_hits = list(_SQL_FROM_OR_JOIN_RE.finditer(sql_text))
+    if not from_hits:
+        return None
+    target_quals: set[str] = set()
+    total_tables = 0
+    for fh in from_hits:
+        tbl = fh.group("tbl").lower()
+        total_tables += 1
         if tbl not in sql_table_names:
             continue
+        target_quals.add(tbl)
+        raw_al = fh.group("alias1") or fh.group("alias2")
+        if raw_al and raw_al.lower() not in _SQL_ALIAS_SKIP_WORDS:
+            target_quals.add(raw_al.lower())
+    if not target_quals:
+        return None
+
+    known_lower = {c.lower(): c for c in all_table_cols}
+    for match in _SQL_SELECT_CLAUSE_RE.finditer(sql_text):
         proj = match.group("proj").strip()
-        if proj == "*" or proj.endswith(".*"):
-            return _Val(row=True)
+        if proj == "*":
+            return _Val(row=True, from_query=True)
         cols: list[str] = []
-        for raw_part in proj.split(","):
+        slots: list[str] = []
+        saw_agg_or_const = False
+        for raw_part in _split_top_level_sql_commas(proj):
             seg = raw_part.strip()
-            seg = re.split(r"\s+AS\s+|\s+", seg, maxsplit=1, flags=re.IGNORECASE)[0]
-            col = seg.rpartition(".")[2] or seg
-            col = col.strip('"').strip("`")
-            if col == "*":
-                return _Val(row=True)
-            if col.isidentifier():
-                cols.append(col)
+            seg = re.split(r"\s+AS\s+", seg, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+            if ")" not in seg:
+                seg = seg.split()[0] if seg else ""
+            if seg == "*" or any(seg.lower() == f"{q}.*" for q in target_quals):
+                return _Val(row=True, from_query=True)
+            upper_seg = seg.upper()
+            if (
+                upper_seg.startswith(("COUNT(", "EXISTS("))
+                or seg.isdigit()
+                or upper_seg in {"TRUE", "FALSE", "NULL"}
+            ):
+                saw_agg_or_const = True
+                slots.append("")
+                continue
+            if "(" in seg:
+                expr_cols: list[str] = []
+                for qm in _SQL_QUAL_COL_RE.finditer(seg):
+                    q_low = qm.group("qual").lower()
+                    c_raw = qm.group("col")
+                    if q_low in target_quals:
+                        if c_raw == "*":
+                            return _Val(row=True, from_query=True)
+                        if c_raw.isidentifier():
+                            expr_cols.append(known_lower.get(c_raw.lower(), c_raw))
+                if not expr_cols and total_tables == 1 and known_lower:
+                    for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", seg):
+                        if tok.lower() in known_lower:
+                            expr_cols.append(known_lower[tok.lower()])
+                if expr_cols:
+                    cols.extend(expr_cols)
+                    slots.append(expr_cols[0])
+                else:
+                    saw_agg_or_const = True
+                    slots.append("")
+                continue
+            qual_part, dot, col_part = seg.rpartition(".")
+            qual_clean = qual_part.strip('"').strip("`").lower()
+            col = col_part.strip('"').strip("`")
+            if dot:
+                if qual_clean not in target_quals:
+                    slots.append("")
+                    continue
+                if col == "*":
+                    return _Val(row=True, from_query=True)
+            if col.isidentifier() and (dot or total_tables == 1 or col.lower() in known_lower):
+                canon = known_lower.get(col.lower(), col)
+                cols.append(canon)
+                slots.append(canon)
+            else:
+                slots.append("")
         if cols:
-            return _Val(cols=frozenset(cols), tuple_cols=tuple(cols))
-        return _Val(dynamic=True)
+            return _Val(cols=frozenset(cols), tuple_cols=tuple(slots), from_query=True)
+        if saw_agg_or_const or total_tables > 1:
+            return _Val(existence_only=True, from_query=True)
+        return _Val(dynamic=True, from_query=True)
     return None
 
 
-def _null_guard_polarity(test: ast.AST, env: dict[str, _Val]) -> str | None:
-    """Return `'null_true'` when `test` holds on None/empty row, `'null_false'` when present."""
+def _null_guard_polarity(
+    test: ast.AST,
+    env: dict[str, _Val],
+    policy_cols: frozenset[str] = frozenset(),
+) -> str | None:
+    """Return `'null_true'` when `test` holds on None/invalid value, `'null_false'` when present."""
     if isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
         op = test.ops[0]
         comp = test.comparators[0]
@@ -437,22 +657,31 @@ def _null_guard_polarity(test: ast.AST, env: dict[str, _Val]) -> str | None:
                 return "null_true"
             if isinstance(op, (ast.IsNot, ast.NotEq)):
                 return "null_false"
-    if isinstance(test, ast.Name) and test.id in env and env[test.id].row and not env[test.id].cols:
-        return "null_false"
     if (
-        isinstance(test, ast.UnaryOp)
-        and isinstance(test.op, ast.Not)
-        and isinstance(test.operand, ast.Name)
-        and test.operand.id in env
-        and env[test.operand.id].row
-        and not env[test.operand.id].cols
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == "isinstance"
+        and len(test.args) >= 2
+        and isinstance(test.args[0], ast.Name)
+        and test.args[0].id in env
+        and (env[test.args[0].id].row or env[test.args[0].id].cols)
     ):
-        return "null_true"
-    if isinstance(test, ast.BoolOp):
-        subs = [_null_guard_polarity(v, env) for v in test.values]
-        if isinstance(test.op, ast.And) and all(s == "null_false" for s in subs):
+        return "null_false"
+    if isinstance(test, ast.Name) and test.id in env:
+        ev = env[test.id]
+        if (ev.row and not ev.cols) or (ev.cols and not (ev.cols & policy_cols)):
             return "null_false"
-        if isinstance(test.op, ast.Or) and all(s == "null_true" for s in subs):
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        inner = _null_guard_polarity(test.operand, env, policy_cols)
+        if inner == "null_false":
+            return "null_true"
+        if inner == "null_true":
+            return "null_false"
+    if isinstance(test, ast.BoolOp):
+        subs = [_null_guard_polarity(v, env, policy_cols) for v in test.values]
+        if isinstance(test.op, ast.And) and any(s == "null_false" for s in subs) and "null_true" not in subs:
+            return "null_false"
+        if isinstance(test.op, ast.Or) and any(s == "null_true" for s in subs) and "null_false" not in subs:
             return "null_true"
     return None
 
@@ -466,6 +695,7 @@ class _ScopeAccum:
     return_consts: set[str] = field(default_factory=set)
     sink_consts: set[str] = field(default_factory=set)
     enforced_num_consts: set[str] = field(default_factory=set)
+    explicit_pol_overrides: set[str] = field(default_factory=set)
     overwritten_consts: set[str] = field(default_factory=set)
     overwritten_pol_cols: set[str] = field(default_factory=set)
     overwritten_vars: list[tuple[str, tuple[str, ...], tuple[str, ...], int]] = field(
@@ -477,8 +707,10 @@ class _ScopeAccum:
     sink_dynamic: bool = False
     any_dynamic: bool = False
     mutates_row: bool = False
+    saw_existence_query: bool = False
     primary_return_line: int = 0
     first_query_line: int = 0
+    first_helper_call_line: int = 0
     causal_overwrite_line: int = 0
     causal_enforcement_line: int = 0
 
@@ -488,6 +720,17 @@ _SESSION_MUTATION_METHODS = frozenset(
 )
 _NON_CONSUMING_ROW_BUILTINS = frozenset(
     {"len", "bool", "isinstance", "id", "type", "repr", "str", "enumerate", "zip"}
+)
+_TRIVIAL_NUM_LITS = frozenset({"0", "1", "-1", "0.0", "1.0", "-1.0"})
+_NON_POLICY_COUNTER_SUFFIXES = (
+    "_COUNT",
+    "_COUNTS",
+    "_TOTAL",
+    "_INDEX",
+    "_IDX",
+    "_OFFSET",
+    "_PAGE",
+    "_SIZE",
 )
 
 
@@ -499,22 +742,29 @@ class _FlowRunner:
         *,
         all_table_cols: frozenset[str],
         policy_cols: frozenset[str],
+        is_pure_policy_schema: bool = False,
         model_symbols: frozenset[str],
         sql_table_names: set[str],
         policy_consts: frozenset[str],
         const_truth: dict[str, bool],
         aliases: dict[str, str],
         helpers: dict[str, _HelperSummary],
+        local_data_classes: frozenset[str] = frozenset(),
         excluded: set[int],
     ) -> None:
         self.all_table_cols = all_table_cols
         self.policy_cols = policy_cols
+        self.is_pure_policy_schema = is_pure_policy_schema
+        self.policy_domain_stems = frozenset().union(
+            *(_meaningful_domain_stems(c) for c in policy_cols)
+        )
         self.model_symbols = model_symbols
         self.sql_table_names = sql_table_names
         self.policy_consts = policy_consts
         self.const_truth = const_truth
         self.aliases = aliases
         self.helpers = helpers
+        self.local_data_classes = local_data_classes
         self.excluded = excluded
         self.acc = _ScopeAccum()
 
@@ -550,10 +800,28 @@ class _FlowRunner:
             return False
         if raw_name in self.policy_cols:
             return True
+        if norm.endswith(_NON_POLICY_COUNTER_SUFFIXES):
+            return False
         return bool(set(norm.split("_")) & _POLICY_COLUMN_STEMS)
 
+    def _usable_override_tokens(self, key_name: str, tok_set: frozenset[str]) -> frozenset[str]:
+        if self.is_pure_policy_schema or key_name in self.policy_cols:
+            return tok_set
+        if _normalize_ident_upper(key_name).endswith(_NON_POLICY_COUNTER_SUFFIXES):
+            return frozenset()
+        return frozenset(tok_set - _TRIVIAL_NUM_LITS)
+
+    def _record_explicit_pol_override(self, key_name: str, tok_set: frozenset[str]) -> None:
+        filtered = self._usable_override_tokens(key_name, tok_set)
+        if not filtered:
+            return
+        if key_name in self.policy_cols or bool(
+            _meaningful_domain_stems(key_name) & self.policy_domain_stems
+        ):
+            self.acc.explicit_pol_overrides.update(filtered)
+
     def _truthy_pol_cols(self, test: ast.AST, env: dict[str, _Val]) -> tuple[str | None, frozenset[str]]:
-        if _null_guard_polarity(test, env) is not None:
+        if _null_guard_polarity(test, env, self.policy_cols) is not None:
             return None, frozenset()
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
             sub_pol, sub_cols = self._truthy_pol_cols(test.operand, env)
@@ -606,21 +874,54 @@ class _FlowRunner:
             return val
         if isinstance(node, ast.Name):
             if node.id in env:
-                return env[node.id]
+                ev = env[node.id]
+                if not dead and ev.from_query:
+                    self._note_query(node)
+                    self.acc.touched_cols.update(ev.cols)
+                    if ev.existence_only:
+                        self.acc.saw_existence_query = True
+                return ev
             if self._is_model_expr(node):
                 if not dead:
                     self._note_query(node)
-                return _Val(row=True)
+                return _Val(row=True, from_query=True)
             if node.id in self.policy_consts:
                 return _Val(consts=frozenset({node.id})) if not dead else _Val()
             return _Val()
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, str) and self.sql_table_names:
-                proj = _sql_projection_for_table(node.value, self.sql_table_names)
+        if isinstance(node, ast.JoinedStr):
+            parts_txt: list[str] = []
+            merged_js = _Val()
+            for part in node.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    parts_txt.append(part.value)
+                elif isinstance(part, ast.FormattedValue):
+                    parts_txt.append("__expr__")
+                    merged_js = merged_js.merge(self.eval_expr(part.value, env, dead=dead))
+            if self.sql_table_names and parts_txt:
+                proj = _sql_projection_for_table(
+                    "".join(parts_txt), self.sql_table_names, self.all_table_cols
+                )
                 if proj is not None:
                     if not dead:
                         self._note_query(node)
                         self.acc.touched_cols.update(proj.cols)
+                        if proj.existence_only:
+                            self.acc.saw_existence_query = True
+                    else:
+                        self.acc.dead_cols.update(proj.cols)
+                    return proj.merge(merged_js, keep_num_lits=False) if not dead else _Val()
+            return merged_js
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str) and self.sql_table_names:
+                proj = _sql_projection_for_table(
+                    node.value, self.sql_table_names, self.all_table_cols
+                )
+                if proj is not None:
+                    if not dead:
+                        self._note_query(node)
+                        self.acc.touched_cols.update(proj.cols)
+                        if proj.existence_only:
+                            self.acc.saw_existence_query = True
                     else:
                         self.acc.dead_cols.update(proj.cols)
                     return proj if not dead else _Val()
@@ -657,7 +958,7 @@ class _FlowRunner:
                     for lit in side.num_lits:
                         if lit not in {"0", "1", "-1"}:
                             bound_lits.add(lit)
-                if bound_lits and not (merged.cols & self.policy_cols):
+                if bound_lits and not merged.cols:
                     merged = _Val(
                         row=merged.row,
                         row_map=merged.row_map,
@@ -675,28 +976,44 @@ class _FlowRunner:
             if self._is_model_expr(node):
                 if not dead:
                     self._note_query(node)
-                return _Val(row=True)
+                return _Val(row=True, from_query=True)
             if self._is_model_expr(node.value):
                 if not dead:
                     self._note_query(node)
                 if node.attr == "objects":
-                    return _Val(row=True)
+                    return _Val(row=True, from_query=True)
+                if node.attr in {"__table__", "__mapper__"}:
+                    return _Val(col_ns=True, from_query=True)
                 if not node.attr.startswith("__"):
                     if dead:
                         self.acc.dead_cols.add(node.attr)
                         return _Val()
                     self.acc.touched_cols.add(node.attr)
-                    return _Val(cols=frozenset({node.attr}), tuple_cols=(node.attr,))
+                    return _Val(
+                        cols=frozenset({node.attr}),
+                        tuple_cols=(node.attr,),
+                        from_query=True,
+                    )
             base = self.eval_expr(node.value, env, dead=dead)
+            if base.col_ns and node.attr in {"c", "columns"}:
+                return _Val(row=True, from_query=True)
             if base.row and not base.row_map:
                 if node.attr in _ORM_CHAIN_ATTRS:
                     return base
+                if node.attr in {"__table__", "__mapper__"}:
+                    return _Val(col_ns=True, from_query=True)
                 if not node.attr.startswith("_"):
                     if dead:
                         self.acc.dead_cols.add(node.attr)
                         return _Val()
                     self.acc.touched_cols.add(node.attr)
-                    return _Val(cols=frozenset({node.attr}))
+                    return _Val(cols=frozenset({node.attr}), from_query=base.from_query)
+            if not base.row and base.tuple_cols and node.attr in base.cols:
+                if dead:
+                    self.acc.dead_cols.add(node.attr)
+                    return _Val()
+                self.acc.touched_cols.add(node.attr)
+                return _Val(cols=frozenset({node.attr}), from_query=base.from_query)
             return _Val(
                 cols=base.cols,
                 consts=base.consts,
@@ -704,24 +1021,48 @@ class _FlowRunner:
                 zero_clobbers=base.zero_clobbers,
                 overwrite_line=base.overwrite_line,
                 overwritten_cols=base.overwritten_cols,
+                existence_only=base.existence_only,
+                from_query=base.from_query,
                 dynamic=base.dynamic,
             )
         if isinstance(node, ast.Subscript):
             base = self.eval_expr(node.value, env, dead=dead)
             slc = node.slice
+            if isinstance(slc, ast.Slice):
+                for s_part in (slc.lower, slc.upper, slc.step):
+                    self.eval_expr(s_part, env, dead=dead)
+                return base
             if base.dict_items and isinstance(slc, ast.Constant) and isinstance(slc.value, str):
                 for d_k, d_v in reversed(base.dict_items):
                     if d_k == slc.value:
                         return d_v
+            if base.tuple_items and isinstance(slc, ast.Constant) and isinstance(slc.value, int):
+                idx = slc.value
+                if 0 <= idx < len(base.tuple_items):
+                    return base.tuple_items[idx]
             if base.tuple_cols and isinstance(slc, ast.Constant) and isinstance(slc.value, int):
                 idx = slc.value
                 if 0 <= idx < len(base.tuple_cols):
                     col = base.tuple_cols[idx]
+                    if not col:
+                        return _Val()
                     if dead:
                         self.acc.dead_cols.add(col)
                         return _Val()
                     self.acc.touched_cols.add(col)
-                    return _Val(cols=frozenset({col}))
+                    return _Val(cols=frozenset({col}), from_query=base.from_query)
+            if (
+                not base.row
+                and base.tuple_cols
+                and isinstance(slc, ast.Constant)
+                and isinstance(slc.value, str)
+                and slc.value in base.cols
+            ):
+                if dead:
+                    self.acc.dead_cols.add(slc.value)
+                    return _Val()
+                self.acc.touched_cols.add(slc.value)
+                return _Val(cols=frozenset({slc.value}), from_query=base.from_query)
             if base.row_map:
                 sl_val = self.eval_expr(slc, env, dead=dead)
                 if not dead:
@@ -734,10 +1075,8 @@ class _FlowRunner:
                         self.acc.dead_cols.add(col)
                         return _Val()
                     self.acc.touched_cols.add(col)
-                    return _Val(cols=frozenset({col}))
-                if isinstance(slc, ast.Slice) or (
-                    isinstance(slc, ast.Constant) and isinstance(slc.value, int)
-                ):
+                    return _Val(cols=frozenset({col}), from_query=base.from_query)
+                if isinstance(slc, ast.Constant) and isinstance(slc.value, int):
                     return base
                 if not dead:
                     self.acc.any_dynamic = True
@@ -774,8 +1113,9 @@ class _FlowRunner:
                     seen_live = True
                     primary = val
                     cur = val
-                elif (primary.cols & self.policy_cols) or primary.row:
-                    fb_items = val.consts | val.num_lits | val.fallbacks
+                elif bool(primary.cols) or primary.row:
+                    is_pol_primary = bool(primary.cols & self.policy_cols) or primary.row
+                    fb_items = val.consts | val.fallbacks | (val.num_lits if is_pol_primary else frozenset())
                     clobbers = set(cur.zero_clobbers) | set(val.zero_clobbers)
                     if not primary.row:
                         for pcol in primary.cols & self.policy_cols:
@@ -815,7 +1155,7 @@ class _FlowRunner:
         if cb is False:
             self.eval_expr(node.body, env, dead=True)
             return self.eval_expr(node.orelse, env, dead=dead)
-        pol = _null_guard_polarity(node.test, env)
+        pol = _null_guard_polarity(node.test, env, self.policy_cols)
         truthy_pol, truthy_cols = self._truthy_pol_cols(node.test, env)
         if pol is None and truthy_pol is None:
             t_val = self.eval_expr(node.test, env, dead=dead)
@@ -823,21 +1163,25 @@ class _FlowRunner:
                 self._consume_sink_val(t_val, lineno=getattr(node.test, "lineno", 0))
         b_val = self.eval_expr(node.body, env, dead=dead)
         o_val = self.eval_expr(node.orelse, env, dead=dead)
-        if pol == "null_false" and ((b_val.cols & self.policy_cols) or b_val.row):
+        if pol == "null_false" and (bool(b_val.cols) or b_val.row):
+            is_pol_b = bool(b_val.cols & self.policy_cols) or b_val.row
+            fb_b = o_val.consts | o_val.fallbacks | (o_val.num_lits if is_pol_b else frozenset())
             return _Val(
                 row=b_val.row or o_val.row,
                 cols=b_val.cols | o_val.cols,
                 consts=b_val.consts,
-                fallbacks=b_val.fallbacks | o_val.consts | o_val.num_lits | o_val.fallbacks,
+                fallbacks=b_val.fallbacks | fb_b,
                 zero_clobbers=b_val.zero_clobbers | o_val.zero_clobbers,
                 dynamic=b_val.dynamic or o_val.dynamic,
             )
-        if pol == "null_true" and ((o_val.cols & self.policy_cols) or o_val.row):
+        if pol == "null_true" and (bool(o_val.cols) or o_val.row):
+            is_pol_o = bool(o_val.cols & self.policy_cols) or o_val.row
+            fb_o = b_val.consts | b_val.fallbacks | (b_val.num_lits if is_pol_o else frozenset())
             return _Val(
                 row=b_val.row or o_val.row,
                 cols=b_val.cols | o_val.cols,
                 consts=o_val.consts,
-                fallbacks=o_val.fallbacks | b_val.consts | b_val.num_lits | b_val.fallbacks,
+                fallbacks=o_val.fallbacks | fb_o,
                 zero_clobbers=b_val.zero_clobbers | o_val.zero_clobbers,
                 dynamic=b_val.dynamic or o_val.dynamic,
             )
@@ -886,12 +1230,19 @@ class _FlowRunner:
             elif isinstance(k_node, ast.Constant) and isinstance(k_node.value, str):
                 k_str = k_node.value
                 if not dead and self._is_policy_like_key(k_str):
-                    if v_val.num_lits and not v_val.cols and not v_val.consts:
+                    eff_lits = self._usable_override_tokens(k_str, v_val.num_lits)
+                    key_matches_table = (
+                        self.is_pure_policy_schema
+                        or k_str in self.policy_cols
+                        or bool(_meaningful_domain_stems(k_str) & self.policy_domain_stems)
+                    )
+                    if eff_lits and key_matches_table and not v_val.cols and not v_val.consts:
                         self._note_enforcement(getattr(v_node, "lineno", 0))
+                        self._record_explicit_pol_override(k_str, eff_lits)
                         v_val = _Val(
                             row=v_val.row,
                             cols=v_val.cols,
-                            consts=v_val.num_lits,
+                            consts=eff_lits,
                             fallbacks=v_val.fallbacks,
                             zero_clobbers=v_val.zero_clobbers,
                             overwrite_line=v_val.overwrite_line,
@@ -900,11 +1251,31 @@ class _FlowRunner:
                         )
                     elif (
                         k_str in self.policy_cols
+                        and v_val.consts
+                        and not (v_val.cols & self.policy_cols)
+                        and not v_val.row
+                    ):
+                        self._record_explicit_pol_override(k_str, v_val.consts)
+                    elif (
+                        k_str in self.policy_cols
                         and isinstance(v_node, ast.Constant)
                         and isinstance(v_node.value, bool)
                     ):
-                        v_val = v_val.merge(
-                            _Val(consts=frozenset({f"{k_str}={v_node.value!r}"}))
+                        override_tok = f"{k_str}={v_node.value!r}"
+                        self.acc.explicit_pol_overrides.add(override_tok)
+                        v_val = v_val.merge(_Val(consts=frozenset({override_tok})))
+                    else:
+                        v_val = _Val(
+                            row=v_val.row,
+                            row_map=v_val.row_map,
+                            cols=v_val.cols,
+                            dict_items=v_val.dict_items,
+                            consts=v_val.consts,
+                            fallbacks=v_val.fallbacks,
+                            zero_clobbers=v_val.zero_clobbers,
+                            overwrite_line=v_val.overwrite_line,
+                            overwritten_cols=v_val.overwritten_cols,
+                            dynamic=v_val.dynamic,
                         )
                 else:
                     v_val = _Val(
@@ -949,14 +1320,22 @@ class _FlowRunner:
     ) -> None:
         if isinstance(target, ast.Name):
             prev = env.get(target.id)
+            repl = val.consts | val.num_lits
             prev_pol = (
                 (prev.cols & self.policy_cols)
                 if prev is not None and not prev.row
-                else (self.policy_cols if prev is not None and prev.row else frozenset())
+                else (
+                    self.policy_cols
+                    if prev is not None and prev.row and bool(val.consts)
+                    else frozenset()
+                )
             )
-            killed_pol = prev_pol - (val.cols & self.policy_cols) if not val.row else frozenset()
-            if killed_pol:
-                repl = val.consts | val.num_lits
+            killed_pol = (
+                (prev_pol - (val.cols & self.policy_cols))
+                if not val.row and (repl or not (prev and prev.row))
+                else frozenset()
+            )
+            if killed_pol and (repl or (prev is not None and not prev.row)):
                 if lineno:
                     self.acc.causal_overwrite_line = lineno
                 self.acc.overwritten_pol_cols.update(killed_pol)
@@ -969,6 +1348,7 @@ class _FlowRunner:
                     row_map=val.row_map,
                     cols=val.cols,
                     tuple_cols=val.tuple_cols,
+                    tuple_items=val.tuple_items,
                     dict_items=val.dict_items,
                     consts=repl,
                     fallbacks=val.fallbacks,
@@ -982,13 +1362,15 @@ class _FlowRunner:
                 and not val.cols
                 and not val.consts
                 and self._is_policy_like_key(target.id)
+                and bool(self._usable_override_tokens(target.id, val.num_lits))
             ):
+                eff_t_lits = self._usable_override_tokens(target.id, val.num_lits)
                 if lineno:
                     self._note_enforcement(lineno)
                 val = _Val(
                     cols=val.cols,
-                    consts=val.num_lits,
-                    num_lits=val.num_lits,
+                    consts=eff_t_lits,
+                    num_lits=eff_t_lits,
                     fallbacks=val.fallbacks,
                     zero_clobbers=val.zero_clobbers,
                     overwrite_line=val.overwrite_line,
@@ -998,10 +1380,15 @@ class _FlowRunner:
             env[target.id] = val
         elif isinstance(target, (ast.Tuple, ast.List)):
             for idx, elt in enumerate(target.elts):
-                if val.tuple_cols and idx < len(val.tuple_cols):
+                if val.tuple_items and idx < len(val.tuple_items):
+                    self._bind_target(elt, val.tuple_items[idx], env, lineno=lineno)
+                elif val.tuple_cols and idx < len(val.tuple_cols):
                     col = val.tuple_cols[idx]
-                    self.acc.touched_cols.add(col)
-                    self._bind_target(elt, _Val(cols=frozenset({col})), env, lineno=lineno)
+                    if col:
+                        self.acc.touched_cols.add(col)
+                        self._bind_target(elt, _Val(cols=frozenset({col})), env, lineno=lineno)
+                    else:
+                        self._bind_target(elt, _Val(), env, lineno=lineno)
                 else:
                     self._bind_target(elt, val, env, lineno=lineno)
         elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
@@ -1124,18 +1511,84 @@ class _FlowRunner:
                 return _Val(dynamic=not dead)
             return base.merge(fb_val)
 
+        if short in {"count", "exists"} and (
+            isinstance(func, ast.Name)
+            or recv_name == "func"
+            or dotted.endswith((".func.count", ".func.exists"))
+        ):
+            for a in node.args:
+                self.eval_expr(a, env, dead=dead)
+            if not dead:
+                self.acc.saw_existence_query = True
+            return _Val(existence_only=not dead, from_query=not dead)
+
+        if short == "coalesce" and node.args:
+            arg_vals = [self.eval_expr(a, env, dead=dead) for a in node.args]
+            primary = arg_vals[0]
+            if bool(primary.cols) or primary.row:
+                fb = frozenset().union(
+                    *(av.consts | av.num_lits | av.fallbacks for av in arg_vals[1:])
+                )
+                return _Val(
+                    row=primary.row,
+                    cols=frozenset().union(*(av.cols for av in arg_vals)),
+                    tuple_cols=primary.tuple_cols,
+                    fallbacks=primary.fallbacks | fb,
+                    from_query=primary.from_query,
+                )
+
+        if short == "inspect" and node.args:
+            a0 = self.eval_expr(node.args[0], env, dead=dead)
+            if a0.row:
+                return _Val(col_ns=True, from_query=True)
+
         if short in {"select", "query"}:
             arg_vals = [self.eval_expr(a, env, dead=dead) for a in node.args]
+            t_items = tuple(arg_vals) if len(arg_vals) > 1 else ()
+            t_cols = tuple(
+                av.tuple_cols[0] if len(av.tuple_cols) == 1 else "" for av in arg_vals
+            )
             if any(av.row and not av.cols for av in arg_vals):
-                return _Val(row=True)
+                return _Val(row=True, tuple_items=t_items, from_query=True)
             cols_union = frozenset().union(*(av.cols for av in arg_vals))
-            t_cols = tuple(c for av in arg_vals for c in av.tuple_cols)
             if cols_union:
-                return _Val(cols=cols_union, tuple_cols=t_cols)
+                return _Val(
+                    cols=cols_union,
+                    tuple_cols=t_cols,
+                    tuple_items=t_items,
+                    from_query=True,
+                )
+            if any(av.existence_only for av in arg_vals):
+                return _Val(existence_only=True, from_query=True)
 
         recv_seed = _Val()
         if isinstance(func, ast.Attribute):
+            if short in {"text", "aliased"} and node.args:
+                return self.eval_expr(node.args[0], env, dead=dead)
             recv_val = self.eval_expr(func.value, env, dead=dead)
+            if short in {"count", "exists"} and (recv_val.row or recv_val.cols or recv_val.from_query):
+                for a in (*node.args, *(kw.value for kw in node.keywords)):
+                    self.eval_expr(a, env, dead=dead)
+                if not dead:
+                    self.acc.saw_existence_query = True
+                return _Val(existence_only=not dead, from_query=not dead)
+            if short in {"join", "outerjoin"}:
+                if node.args:
+                    self.eval_expr(node.args[0], env, dead=dead)
+                for pred in (*node.args[1:], *(kw.value for kw in node.keywords)):
+                    pv = self.eval_expr(pred, env, dead=dead)
+                    if not dead:
+                        self.acc.sink_cols.update(pv.cols)
+                return recv_val
+            if short == "select_from":
+                arg_vals = [self.eval_expr(a, env, dead=dead) for a in node.args]
+                if recv_val.row or recv_val.cols or recv_val.existence_only or recv_val.dynamic:
+                    return recv_val
+                if any(av.row or av.from_query for av in arg_vals):
+                    if not dead:
+                        self.acc.saw_existence_query = True
+                    return _Val(existence_only=not dead, from_query=not dead)
+                return recv_val
             if short in {"where", "filter", "filter_by", "having"}:
                 for pred in (*node.args, *(kw.value for kw in node.keywords)):
                     pv = self.eval_expr(pred, env, dead=dead)
@@ -1183,9 +1636,9 @@ class _FlowRunner:
                     if not dead:
                         self.acc.any_dynamic = True
                     return _Val(dynamic=not dead, fallbacks=fb)
-                if not (recv_val.row or recv_val.cols):
+                if not (recv_val.row or recv_val.cols or recv_val.existence_only):
                     for av in arg_vals:
-                        if av.row or av.cols or av.dynamic:
+                        if av.row or av.cols or av.dynamic or av.existence_only:
                             return av
                 return recv_val
             if (
@@ -1236,8 +1689,39 @@ class _FlowRunner:
         if isinstance(func, ast.Name) and short in _TRANSPARENT_WRAPPERS and node.args:
             return self.eval_expr(node.args[0], env, dead=dead)
 
+        if isinstance(func, ast.Name) and short in self.local_data_classes:
+            dc_out = _Val()
+            call_ln = getattr(node, "lineno", 0)
+            for a in node.args:
+                av = self.eval_expr(a, env, dead=dead)
+                if not dead and not av.row:
+                    self._consume_sink_val(av, lineno=call_ln)
+                dc_out = dc_out.merge(av, keep_num_lits=False)
+            for kw in node.keywords:
+                kv = self.eval_expr(kw.value, env, dead=dead)
+                if not dead and not kv.row:
+                    self._consume_sink_val(kv, lineno=call_ln)
+                    if kw.arg and self._is_policy_like_key(kw.arg) and kv.num_lits and not kv.cols:
+                        eff_dc_lits = self._usable_override_tokens(kw.arg, kv.num_lits)
+                        if eff_dc_lits:
+                            self.acc.enforced_num_consts.update(eff_dc_lits)
+                            self._record_explicit_pol_override(kw.arg, eff_dc_lits)
+                            self._note_enforcement(getattr(kw.value, "lineno", call_ln))
+                dc_out = dc_out.merge(kv, keep_num_lits=False)
+            return dc_out
+
         helper = self.helpers.get(short) or self.helpers.get(self.aliases.get(short, ""))
         if helper is not None:
+            if (
+                not dead
+                and self.acc.first_helper_call_line == 0
+                and (
+                    helper.returns_tid_row
+                    or bool(helper.returned_cols & self.policy_cols)
+                    or bool(helper.guard_cols & self.policy_cols)
+                )
+            ):
+                self.acc.first_helper_call_line = getattr(node, "lineno", 0)
             pos_vals = [self.eval_expr(a, env, dead=dead) for a in node.args]
             by_idx: dict[int, _Val] = dict(enumerate(pos_vals))
             for kw in node.keywords:
@@ -1283,7 +1767,7 @@ class _FlowRunner:
             av = self.eval_expr(a, env, dead=dead)
             if not dead:
                 self._consume_sink_val(av, lineno=call_line)
-                if isinstance(a, ast.Compare) and av.num_lits and not (av.cols & self.policy_cols):
+                if isinstance(a, ast.Compare) and av.num_lits and not av.cols:
                     self.acc.enforced_num_consts.update(av.num_lits)
                     self._note_enforcement(getattr(a, "lineno", call_line))
                 if av.row and short not in _NON_CONSUMING_ROW_BUILTINS:
@@ -1295,8 +1779,18 @@ class _FlowRunner:
             if not dead:
                 self._consume_sink_val(kv, lineno=call_line)
                 if kw.arg and self._is_policy_like_key(kw.arg) and kv.num_lits and not kv.cols:
-                    self.acc.enforced_num_consts.update(kv.num_lits)
-                    self._note_enforcement(getattr(kw.value, "lineno", call_line))
+                    eff_kw_lits = self._usable_override_tokens(kw.arg, kv.num_lits)
+                    if eff_kw_lits:
+                        self.acc.enforced_num_consts.update(eff_kw_lits)
+                        self._record_explicit_pol_override(kw.arg, eff_kw_lits)
+                        self._note_enforcement(getattr(kw.value, "lineno", call_line))
+                elif (
+                    kw.arg
+                    and kv.consts
+                    and not (kv.cols & self.policy_cols)
+                    and not kv.row
+                ):
+                    self._record_explicit_pol_override(kw.arg, kv.consts)
                 if kw.arg is None and (kv.row or kv.dynamic):
                     self.acc.any_dynamic = True
                     res_dyn = True
@@ -1365,7 +1859,7 @@ class _FlowRunner:
                 tv = self.eval_expr(stmt.test, env, dead=cur_dead)
                 if not cur_dead:
                     self._consume_sink_val(tv, lineno=stmt.lineno)
-                    if isinstance(stmt.test, ast.Compare) and tv.num_lits and not (tv.cols & self.policy_cols):
+                    if isinstance(stmt.test, ast.Compare) and tv.num_lits and not tv.cols:
                         self.acc.enforced_num_consts.update(tv.num_lits)
                         self._note_enforcement(stmt.lineno)
                 continue
@@ -1439,17 +1933,19 @@ class _FlowRunner:
                     if not cur_dead and term_f:
                         terminated = True
                     continue
-                pol = _null_guard_polarity(stmt.test, env)
+                pol = _null_guard_polarity(stmt.test, env, self.policy_cols)
                 truthy_pol, truthy_cols = self._truthy_pol_cols(stmt.test, env)
+                tv = _Val()
                 if pol is None:
                     tv = self.eval_expr(stmt.test, env, dead=cur_dead)
                     if not cur_dead:
                         self._consume_sink_val(tv, lineno=stmt.lineno)
-                        if isinstance(stmt.test, ast.Compare) and tv.num_lits and not (tv.cols & self.policy_cols):
+                        if isinstance(stmt.test, ast.Compare) and tv.num_lits and not tv.cols:
                             self.acc.enforced_num_consts.update(tv.num_lits)
                             self._note_enforcement(stmt.lineno)
                 env_b = dict(env)
                 env_o = dict(env)
+                ret_cols_before = set(self.acc.return_cols)
                 term_b = self.run_stmts(
                     stmt.body,
                     env_b,
@@ -1457,6 +1953,7 @@ class _FlowRunner:
                     null_fallback=null_fallback or (pol == "null_true") or (truthy_pol == "falsy_missing"),
                     returned_whole_flag=returned_whole_flag,
                 )
+                body_added_ret_cols = bool(self.acc.return_cols - ret_cols_before)
                 term_o = self.run_stmts(
                     stmt.orelse,
                     env_o,
@@ -1471,7 +1968,7 @@ class _FlowRunner:
                 elif term_b:
                     env.clear()
                     env.update(env_o)
-                    if pol == "null_false":
+                    if pol == "null_false" or (bool(tv.cols) and body_added_ret_cols):
                         null_fallback = True
                 elif term_o:
                     env.clear()
@@ -1484,9 +1981,12 @@ class _FlowRunner:
                         vb = env_b.get(k, _Val())
                         vo = env_o.get(k, _Val())
                         if (pol == "null_false" or truthy_pol == "truthy_present") and (
-                            (vb.cols & self.policy_cols) or vb.row
+                            bool(vb.cols) or vb.row
                         ):
-                            fb_add = vo.consts | vo.num_lits | vo.fallbacks
+                            is_pol_vb = bool(vb.cols & self.policy_cols) or vb.row
+                            fb_add = vo.consts | vo.fallbacks | (
+                                vo.num_lits if is_pol_vb else frozenset()
+                            )
                             clob = set(vb.zero_clobbers) | set(vo.zero_clobbers)
                             if truthy_pol == "truthy_present":
                                 for c in truthy_cols:
@@ -1501,9 +2001,12 @@ class _FlowRunner:
                                 dynamic=vb.dynamic or vo.dynamic,
                             )
                         elif (pol == "null_true" or truthy_pol == "falsy_missing") and (
-                            (vo.cols & self.policy_cols) or vo.row
+                            bool(vo.cols) or vo.row
                         ):
-                            fb_add = vb.consts | vb.num_lits | vb.fallbacks
+                            is_pol_vo = bool(vo.cols & self.policy_cols) or vo.row
+                            fb_add = vb.consts | vb.fallbacks | (
+                                vb.num_lits if is_pol_vo else frozenset()
+                            )
                             clob = set(vb.zero_clobbers) | set(vo.zero_clobbers)
                             if truthy_pol == "falsy_missing":
                                 for c in truthy_cols:
@@ -1585,12 +2088,16 @@ def _collect_module_context(
     declared_policy_consts: Sequence[str],
 ) -> tuple[
     dict[str, tuple[int, list[ast.stmt], tuple[str, ...]]],
+    dict[str, tuple[int, list[ast.stmt]]],
+    frozenset[str],
     list[ast.stmt],
     dict[str, str],
     frozenset[str],
     dict[str, bool],
 ]:
     scopes: dict[str, tuple[int, list[ast.stmt], tuple[str, ...]]] = {}
+    class_scopes: dict[str, tuple[int, list[ast.stmt]]] = {}
+    local_data_classes: set[str] = set()
     top_stmts: list[ast.stmt] = []
     aliases: dict[str, str] = {}
     policy_consts: set[str] = set(declared_policy_consts)
@@ -1616,16 +2123,34 @@ def _collect_module_context(
         if id(stmt) in excluded:
             continue
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            pnames = tuple(a.arg for a in (*stmt.args.posonlyargs, *stmt.args.args))
+            pnames = tuple(
+                a.arg
+                for a in (*stmt.args.posonlyargs, *stmt.args.args, *stmt.args.kwonlyargs)
+            )
             scopes[stmt.name] = (stmt.lineno, stmt.body, pnames)
         elif isinstance(stmt, ast.ClassDef):
-            scopes[stmt.name] = (stmt.lineno, stmt.body, ())
+            cls_stmts: list[ast.stmt] = []
+            has_custom_init = False
             for member in stmt.body:
                 if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    raw_p = [a.arg for a in (*member.args.posonlyargs, *member.args.args)]
+                    if member.name == "__init__":
+                        has_custom_init = True
+                    raw_p = [
+                        a.arg
+                        for a in (
+                            *member.args.posonlyargs,
+                            *member.args.args,
+                            *member.args.kwonlyargs,
+                        )
+                    ]
                     if raw_p and raw_p[0] in {"self", "cls"}:
                         raw_p = raw_p[1:]
                     scopes[member.name] = (member.lineno, member.body, tuple(raw_p))
+                else:
+                    cls_stmts.append(member)
+            class_scopes[stmt.name] = (stmt.lineno, cls_stmts)
+            if not has_custom_init:
+                local_data_classes.add(stmt.name)
         else:
             top_stmts.append(stmt)
             t_name: str | None = None
@@ -1645,7 +2170,15 @@ def _collect_module_context(
                 if cb is not None and t_name.isupper():
                     const_truth[t_name] = cb
 
-    return scopes, top_stmts, aliases, frozenset(policy_consts), const_truth
+    return (
+        scopes,
+        class_scopes,
+        frozenset(local_data_classes),
+        top_stmts,
+        aliases,
+        frozenset(policy_consts),
+        const_truth,
+    )
 
 
 def _build_helper_summaries(
@@ -1653,66 +2186,76 @@ def _build_helper_summaries(
     *,
     all_table_cols: frozenset[str],
     policy_cols: frozenset[str],
+    is_pure_policy_schema: bool,
     model_symbols: frozenset[str],
     sql_table_names: set[str],
     policy_consts: frozenset[str],
     const_truth: dict[str, bool],
     aliases: dict[str, str],
+    local_data_classes: frozenset[str],
+    module_env: dict[str, _Val],
     excluded: set[int],
 ) -> dict[str, _HelperSummary]:
     summaries: dict[str, _HelperSummary] = {}
-    for fn_name, (_lineno, body, pnames) in scopes.items():
-        consumed_by_param: dict[int, frozenset[str]] = {}
-        returned_whole: set[int] = set()
-        dyn_params: set[int] = set()
-        for idx, pname in enumerate(pnames):
-            runner = _FlowRunner(
+    for _pass_idx in range(2):
+        next_summaries: dict[str, _HelperSummary] = {}
+        for fn_name, (_lineno, body, pnames) in scopes.items():
+            consumed_by_param: dict[int, frozenset[str]] = {}
+            returned_whole: set[int] = set()
+            dyn_params: set[int] = set()
+            for idx, pname in enumerate(pnames):
+                runner = _FlowRunner(
+                    all_table_cols=all_table_cols,
+                    policy_cols=policy_cols,
+                    is_pure_policy_schema=is_pure_policy_schema,
+                    model_symbols=frozenset(),
+                    sql_table_names=set(),
+                    policy_consts=policy_consts,
+                    const_truth=const_truth,
+                    aliases=aliases,
+                    helpers=summaries,
+                    local_data_classes=local_data_classes,
+                    excluded=excluded,
+                )
+                whole_flag: list[str] = []
+                runner.run_stmts(body, {pname: _Val(row=True)}, returned_whole_flag=whole_flag)
+                if whole_flag:
+                    returned_whole.add(idx)
+                    consumed_by_param[idx] = frozenset(runner.acc.touched_cols)
+                elif runner.acc.sink_cols:
+                    consumed_by_param[idx] = frozenset(runner.acc.sink_cols)
+                if runner.acc.any_dynamic or runner.acc.opaque_callees:
+                    dyn_params.add(idx)
+
+            base_runner = _FlowRunner(
                 all_table_cols=all_table_cols,
                 policy_cols=policy_cols,
-                model_symbols=frozenset(),
-                sql_table_names=set(),
+                is_pure_policy_schema=is_pure_policy_schema,
+                model_symbols=model_symbols,
+                sql_table_names=sql_table_names,
                 policy_consts=policy_consts,
                 const_truth=const_truth,
                 aliases=aliases,
-                helpers={},
+                helpers=summaries,
+                local_data_classes=local_data_classes,
                 excluded=excluded,
             )
-            whole_flag: list[str] = []
-            runner.run_stmts(body, {pname: _Val(row=True)}, returned_whole_flag=whole_flag)
-            if whole_flag:
-                returned_whole.add(idx)
-                consumed_by_param[idx] = frozenset(runner.acc.touched_cols)
-            elif runner.acc.sink_cols:
-                consumed_by_param[idx] = frozenset(runner.acc.sink_cols)
-            if runner.acc.any_dynamic or runner.acc.opaque_callees:
-                dyn_params.add(idx)
-
-        base_runner = _FlowRunner(
-            all_table_cols=all_table_cols,
-            policy_cols=policy_cols,
-            model_symbols=model_symbols,
-            sql_table_names=sql_table_names,
-            policy_consts=policy_consts,
-            const_truth=const_truth,
-            aliases=aliases,
-            helpers={},
-            excluded=excluded,
-        )
-        ret_tid_whole: list[str] = []
-        base_runner.run_stmts(body, {}, returned_whole_flag=ret_tid_whole)
-        ret_cols = frozenset(base_runner.acc.return_cols)
-        summaries[fn_name] = _HelperSummary(
-            param_names=pnames,
-            param_consumed_attrs=consumed_by_param,
-            param_returned_whole=frozenset(returned_whole),
-            param_dynamic=frozenset(dyn_params),
-            returned_cols=ret_cols,
-            guard_cols=frozenset(base_runner.acc.sink_cols - ret_cols),
-            returned_consts=frozenset(base_runner.acc.return_consts),
-            returns_tid_row=bool(ret_tid_whole),
-            returns_tid_row_map=("map" in ret_tid_whole),
-            has_direct_query=(base_runner.acc.first_query_line > 0),
-        )
+            ret_tid_whole: list[str] = []
+            base_runner.run_stmts(body, dict(module_env), returned_whole_flag=ret_tid_whole)
+            ret_cols = frozenset(base_runner.acc.return_cols)
+            next_summaries[fn_name] = _HelperSummary(
+                param_names=pnames,
+                param_consumed_attrs=consumed_by_param,
+                param_returned_whole=frozenset(returned_whole),
+                param_dynamic=frozenset(dyn_params),
+                returned_cols=ret_cols,
+                guard_cols=frozenset(base_runner.acc.sink_cols - ret_cols),
+                returned_consts=frozenset(base_runner.acc.return_consts),
+                returns_tid_row=bool(ret_tid_whole),
+                returns_tid_row_map=("map" in ret_tid_whole),
+                has_direct_query=(base_runner.acc.first_query_line > 0),
+            )
+        summaries = next_summaries
     return summaries
 
 
@@ -1740,33 +2283,114 @@ def analyze_module_policy_table_read(
 
     tokens = tuple(active_tokens) if active_tokens is not None else get_active_policy_tokens()
     excluded = _excluded_type_checking_ids(tree)
-    scopes, top_stmts, aliases, policy_consts, const_truth = _collect_module_context(
-        tree, excluded, tokens, declared_policy_consts
-    )
+    (
+        scopes,
+        class_scopes,
+        local_data_classes,
+        top_stmts,
+        aliases,
+        policy_consts,
+        const_truth,
+    ) = _collect_module_context(tree, excluded, tokens, declared_policy_consts)
     all_cols_set = frozenset(table_columns) | frozenset(policy_columns)
     policy_col_set = frozenset(policy_columns)
     norm_sql_names = {s.rpartition(".")[2].lower() or s.lower() for s in sql_table_names}
     norm_sql_names.add(table_label.rpartition(".")[2].lower() or table_label.lower())
 
-    helpers = _build_helper_summaries(
-        scopes,
+    tbl_norm = _normalize_ident_upper(table_label.rpartition(".")[2] or table_label)
+    tbl_parts = set(tbl_norm.split("_")) if tbl_norm else set()
+    non_structural_table_cols = {c for c in all_cols_set if not _is_structural_col(c)}
+    is_pure_policy_schema = bool(
+        non_structural_table_cols and non_structural_table_cols <= policy_col_set
+    )
+    is_policy_named_table = bool(tbl_parts & _POLICY_TABLE_STEMS)
+    pol_domain_stems = frozenset().union(*(_meaningful_domain_stems(c) for c in policy_columns))
+
+    top_seed_runner = _FlowRunner(
         all_table_cols=all_cols_set,
         policy_cols=policy_col_set,
+        is_pure_policy_schema=is_pure_policy_schema,
         model_symbols=frozenset(model_symbols),
         sql_table_names=norm_sql_names,
         policy_consts=policy_consts,
         const_truth=const_truth,
         aliases=aliases,
+        helpers={},
+        local_data_classes=local_data_classes,
+        excluded=excluded,
+    )
+    raw_top_env: dict[str, _Val] = {}
+    top_seed_runner.run_stmts(top_stmts, raw_top_env)
+    module_env: dict[str, _Val] = {
+        k: v
+        for k, v in raw_top_env.items()
+        if v.row or v.cols or v.existence_only or v.from_query
+    }
+
+    helpers = _build_helper_summaries(
+        scopes,
+        all_table_cols=all_cols_set,
+        policy_cols=policy_col_set,
+        is_pure_policy_schema=is_pure_policy_schema,
+        model_symbols=frozenset(model_symbols),
+        sql_table_names=norm_sql_names,
+        policy_consts=policy_consts,
+        const_truth=const_truth,
+        aliases=aliases,
+        local_data_classes=local_data_classes,
+        module_env=module_env,
         excluded=excluded,
     )
 
+    trans_calls: dict[str, set[str]] = {k: set(v) for k, v in func_calls.items()}
+    scope_names_set = set(scopes)
+    for fn_name, (_ln, fn_body, _pnames) in scopes.items():
+        s_set = trans_calls.setdefault(fn_name, set())
+        for st in fn_body:
+            for nd in ast.walk(st):
+                if isinstance(nd, ast.Call) and id(nd) not in excluded:
+                    cal_s = (
+                        nd.func.id
+                        if isinstance(nd.func, ast.Name)
+                        else nd.func.attr
+                        if isinstance(nd.func, ast.Attribute)
+                        else ""
+                    )
+                    if cal_s in scope_names_set and cal_s != fn_name:
+                        s_set.add(cal_s)
+    for _ in range(6):
+        changed_tc = False
+        for sc_k, c_set in list(trans_calls.items()):
+            for cal_k in list(c_set & scope_names_set):
+                extra = trans_calls.get(cal_k, set()) - c_set - {sc_k}
+                if extra:
+                    c_set.update(extra)
+                    changed_tc = True
+        if not changed_tc:
+            break
+
     active_set = set(active_scopes) or {"*"}
+    if "*" in active_set and module_env and not top_seed_runner.acc.sink_cols:
+        mod_q_vars = set(module_env)
+        consuming_fn_scopes = {
+            fn_name
+            for fn_name, (_ln, fn_body, _pnames) in scopes.items()
+            if any(
+                isinstance(nd, ast.Name) and isinstance(nd.ctx, ast.Load) and nd.id in mod_q_vars
+                for st in fn_body
+                for nd in ast.walk(st)
+                if id(nd) not in excluded
+            )
+        }
+        if consuming_fn_scopes:
+            active_set = (active_set - {"*"}) | consuming_fn_scopes
+
     internal_loaders_with_caller = {
         sc
         for sc in active_set
         if sc in helpers
         and helpers[sc].returns_tid_row
-        and any(sc in func_calls.get(other, ()) for other in (active_set - {sc}))
+        and any(sc in trans_calls.get(other, ()) for other in (active_set - {sc}))
     }
     target_scopes = sorted(active_set - internal_loaders_with_caller) or sorted(active_set)
 
@@ -1775,54 +2399,47 @@ def analyze_module_policy_table_read(
         if sc == "*":
             sc_line = 1
             body = top_stmts
+            init_env: dict[str, _Val] = {}
         elif sc in scopes:
             sc_line, body, _ = scopes[sc]
+            init_env = dict(module_env)
+        elif sc in class_scopes:
+            sc_line, body = class_scopes[sc]
+            init_env = dict(module_env)
         else:
             continue
 
         runner = _FlowRunner(
             all_table_cols=all_cols_set,
             policy_cols=policy_col_set,
+            is_pure_policy_schema=is_pure_policy_schema,
             model_symbols=frozenset(model_symbols),
             sql_table_names=norm_sql_names,
             policy_consts=policy_consts,
             const_truth=const_truth,
             aliases=aliases,
             helpers=helpers,
+            local_data_classes=local_data_classes,
             excluded=excluded,
         )
-        runner.run_stmts(body, {})
+        runner.run_stmts(body, init_env)
         acc = runner.acc
-        known_cols = set(table_columns) | set(policy_columns)
-        consumed_cols = sorted(acc.sink_cols & known_cols) if known_cols else sorted(acc.sink_cols)
-        consumed_pol = acc.sink_cols & policy_col_set
-        unconsumed_pol = sorted(policy_col_set - consumed_pol)
-        overwritten_unconsumed = acc.overwritten_pol_cols & set(unconsumed_pol)
-        cand_subst = (
-            set(acc.overwritten_consts)
-            | set(acc.return_consts)
-            | set(acc.sink_consts)
-            | (set(acc.enforced_num_consts) if not consumed_pol else set())
-        )
-        raw_return_consts = sorted(cand_subst)
-        if unconsumed_pol and (not consumed_pol or overwritten_unconsumed):
-            subst_consts = sorted(acc.overwritten_consts) if overwritten_unconsumed and acc.overwritten_consts else raw_return_consts
-        else:
-            subst_consts = []
-        fb_consts = sorted(acc.fallback_consts - set(subst_consts))
-        dead_pol = bool(acc.dead_cols & policy_col_set)
-        ev_line = (
-            (acc.causal_overwrite_line if overwritten_unconsumed else 0)
-            or (acc.causal_enforcement_line if subst_consts and not consumed_pol else 0)
-            or acc.primary_return_line
-            or acc.first_query_line
-            or sc_line
-        )
         called_direct_helpers = [
             cal
-            for cal in func_calls.get(sc, ())
-            if cal != sc and cal in target_scopes and cal in helpers and helpers[cal].has_direct_query
+            for cal in trans_calls.get(sc, ())
+            if cal != sc and cal in helpers and helpers[cal].has_direct_query
         ]
+        if (
+            acc.first_query_line == 0
+            and not called_direct_helpers
+            and not acc.touched_cols
+            and not acc.sink_cols
+            and not acc.dead_cols
+            and not acc.saw_existence_query
+            and not acc.opaque_callees
+            and not acc.any_dynamic
+        ):
+            continue
         if (
             acc.first_query_line == 0
             and called_direct_helpers
@@ -1834,6 +2451,77 @@ def analyze_module_policy_table_read(
             )
         ):
             continue
+
+        known_cols = set(table_columns) | set(policy_columns)
+        consumed_cols = sorted(acc.sink_cols & known_cols) if known_cols else sorted(acc.sink_cols)
+        consumed_non_structural_cols = {c for c in consumed_cols if not _is_structural_col(c)}
+        consumed_pol = acc.sink_cols & policy_col_set
+        unconsumed_pol = sorted(policy_col_set - consumed_pol)
+        overwritten_unconsumed = acc.overwritten_pol_cols & set(unconsumed_pol)
+        dead_pol = bool(acc.dead_cols & policy_col_set)
+        touched_or_overwrote_pol = (
+            bool((acc.touched_cols | acc.overwritten_pol_cols | acc.dead_cols) & policy_col_set)
+            or bool(acc.explicit_pol_overrides)
+        )
+
+        if is_pure_policy_schema or touched_or_overwrote_pol:
+            cand_subst = (
+                set(acc.overwritten_consts)
+                | set(acc.return_consts)
+                | set(acc.sink_consts)
+                | set(acc.explicit_pol_overrides)
+                | (set(acc.enforced_num_consts) if not consumed_pol else set())
+            )
+        elif is_policy_named_table:
+            named_pool = (
+                set(acc.overwritten_consts)
+                | set(acc.return_consts)
+                | set(acc.sink_consts)
+            )
+            filtered_named = {
+                k
+                for k in named_pool
+                if (
+                    not consumed_non_structural_cols
+                    or not any(ch.isalpha() for ch in k)
+                    or bool(_meaningful_domain_stems(k) & pol_domain_stems)
+                )
+            }
+            enforced_pool = (
+                (set(acc.enforced_num_consts) - _TRIVIAL_NUM_LITS)
+                if not consumed_pol
+                else set()
+            )
+            cand_subst = filtered_named | enforced_pool
+        else:
+            cand_subst = {
+                k
+                for k in (
+                    set(acc.overwritten_consts)
+                    | set(acc.return_consts)
+                    | set(acc.sink_consts)
+                )
+                if any(ch.isalpha() for ch in k)
+                and bool(_meaningful_domain_stems(k) & pol_domain_stems)
+            }
+        raw_return_consts = sorted(cand_subst)
+        if unconsumed_pol and (not consumed_pol or overwritten_unconsumed):
+            subst_consts = (
+                sorted(acc.overwritten_consts)
+                if overwritten_unconsumed and acc.overwritten_consts
+                else raw_return_consts
+            )
+        else:
+            subst_consts = []
+        fb_consts = sorted(acc.fallback_consts - set(subst_consts))
+        ev_line = (
+            (acc.causal_overwrite_line if overwritten_unconsumed else 0)
+            or (acc.causal_enforcement_line if subst_consts and not consumed_pol else 0)
+            or acc.primary_return_line
+            or acc.first_query_line
+            or acc.first_helper_call_line
+            or sc_line
+        )
         is_w_lookup = (
             ((sc in write_scopes) or acc.mutates_row)
             and not consumed_pol
@@ -1843,6 +2531,10 @@ def analyze_module_policy_table_read(
         state: PolicyConsumptionState
         mech: PolicyConsumptionMechanism
         if is_w_lookup:
+            if not is_pure_policy_schema and not touched_or_overwrote_pol and (
+                consumed_non_structural_cols or not is_policy_named_table
+            ):
+                continue
             state = "consumed"
             mech = "field_controls_result"
             note = f"`{sc}()` reads `{table_label}` keys/rows for an audited write/upsert path."
@@ -1891,6 +2583,11 @@ def analyze_module_policy_table_read(
             )
             note = f"`{sc}()` accesses `{table_label}` via {via}; field selection is unresolved statically."
         else:
+            if not touched_or_overwrote_pol and not dead_pol:
+                if consumed_non_structural_cols:
+                    continue
+                if not is_pure_policy_schema and not is_policy_named_table:
+                    continue
             state = "bypassed"
             mech = "constant_or_fallback_wins"
             dead_tag = " (policy column referenced only in dead code)" if dead_pol else ""

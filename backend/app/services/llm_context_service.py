@@ -606,8 +606,15 @@ def build_lineage_cone_slice(
     ]
     selected_chains = eligible_chains if full else eligible_chains[:15]
 
+    def _cone_finding_in_scope(f: BoundaryFinding, scope_ids: set[str]) -> bool:
+        if f.node_id in seed_set or f.target_node_id in seed_set:
+            return True
+        if f.node_id in scope_ids:
+            return True
+        return bool(f.rule_code.startswith("TRUTH-") and f.target_node_id in scope_ids)
+
     eligible_findings = [
-        f for f in report.findings if f.node_id in full_cone_ids or f.target_node_id in full_cone_ids
+        f for f in report.findings if _cone_finding_in_scope(f, full_cone_ids)
     ]
     eligible_seed_findings = [
         f for f in eligible_findings if f.node_id in seed_set or f.target_node_id in seed_set
@@ -616,7 +623,7 @@ def build_lineage_cone_slice(
     in_cone_non_seed_findings = [
         f
         for f in eligible_findings
-        if f.id not in seed_finding_ids and (f.node_id in cone_ids or f.target_node_id in cone_ids)
+        if f.id not in seed_finding_ids and _cone_finding_in_scope(f, cone_ids)
     ]
     ordered_findings: list[BoundaryFinding] = eligible_seed_findings + in_cone_non_seed_findings
     selected_findings = ordered_findings if full else ordered_findings[:25]

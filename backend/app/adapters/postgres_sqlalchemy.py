@@ -202,7 +202,7 @@ def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
                     elif isinstance(target, ast.Name) and isinstance(stmt.value, ast.Call):
                         fn = stmt.value.func
                         fn_name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
-                        if fn_name in ("Column", "mapped_column"):
+                        if fn_name in ("Column", "mapped_column", "deferred", "column_property"):
                             columns.append(target.id)
             elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
                 col_name = stmt.target.id
@@ -211,7 +211,7 @@ def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
                 if isinstance(stmt.value, ast.Call):
                     fn = stmt.value.func
                     fn_name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
-                    if fn_name in ("Column", "mapped_column") or (
+                    if fn_name in ("Column", "mapped_column", "deferred", "column_property") or (
                         (uses_sqlmodel or fn_name == "Field") and fn_name != "Relationship"
                     ):
                         columns.append(col_name)
@@ -405,7 +405,7 @@ def _extract_create_columns_at(cleaned_sql: str, pos: int) -> list[str]:
         first_tok = _clean_sql_name(first_raw)
         if first_tok and first_tok not in _SQL_COL_SKIP_HEADS and re.match(r"^[a-z_]\w*$", first_tok):
             cols.append(first_tok)
-    return cols[:40]
+    return cols
 
 
 def _clean_sql_name(raw: str | None) -> str:
@@ -3939,7 +3939,11 @@ class PostgresSqlAlchemyAdapter:
                 else:
                     orm_tables[key][4].append(cls_name)
         for key, (_rel, _ln, cols, _sum, cls_names) in orm_tables.items():
-            resolved_cols = _resolve_class_columns(cls_names[0], class_bases, class_columns)
+            resolved_cols: list[str] = []
+            for cname in cls_names:
+                for col in _resolve_class_columns(cname, class_bases, class_columns):
+                    if col not in resolved_cols:
+                        resolved_cols.append(col)
             if resolved_cols:
                 cols[:] = resolved_cols
 
@@ -4066,6 +4070,11 @@ class PostgresSqlAlchemyAdapter:
             node_id = f"t:{tbl_key}"
             if tbl_key in orm_tables:
                 src_file, lineno, cols, summary, cls_names = orm_tables[tbl_key]
+                if tbl_key in table_origin:
+                    cols = list(cols)
+                    for ddl_col in table_origin[tbl_key][2]:
+                        if ddl_col not in cols:
+                            cols.append(ddl_col)
                 for cls_name in cls_names:
                     table_symbol_map[cls_name] = node_id
                 if tbl_key in separate:
@@ -4098,7 +4107,7 @@ class PostgresSqlAlchemyAdapter:
                     role=_infer_table_role(tbl_key),
                     cluster=cluster,
                     summary=summary,
-                    columns=cols[:40],
+                    columns=list(cols),
                 )
             )
 
