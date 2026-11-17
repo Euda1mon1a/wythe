@@ -9,7 +9,7 @@ own use; it is not a supported product (see [SUPPORT.md](SUPPORT.md)).
   no security SLA, and no promised fix, patch, release, compatibility, or
   response timeline.
 - **Pin and fork:** Downstream users who depend on Wythe should pin an exact
-  version (`wythe==0.2.3`, or `Euda1mon1a/wythe@v0.2.3` in GitHub Actions) and
+  version (`wythe==0.2.4`, or `Euda1mon1a/wythe@v0.2.4` in GitHub Actions) and
   fork the repository whenever immediate fixes or changes are needed.
 - **Vulnerability reporting:** Per [SUPPORT.md](SUPPORT.md), there is no formal
   security response process. If GitHub Private Vulnerability Reporting or

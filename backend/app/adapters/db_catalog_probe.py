@@ -122,7 +122,7 @@ def parse_sql_ddl_objects(
             first_tok = clean_sql_ident(stripped.split()[0])
             if first_tok and first_tok not in _COL_SKIP_HEADS and re.match(r"^[a-z_]\w*$", first_tok):
                 cols.append(first_tok)
-        tables[key] = (lineno, cols[:40])
+        tables[key] = (lineno, cols)
 
     for m in _CREATE_TABLE_HEAD_RE.finditer(sql_text):
         schema = clean_sql_ident(m.group("schema")) or "public"
