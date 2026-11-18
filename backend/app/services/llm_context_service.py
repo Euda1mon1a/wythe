@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter, deque
 from collections.abc import Sequence
 from pathlib import Path
@@ -732,10 +733,13 @@ def build_lineage_cone_slice(
             md.append(f"- [{p.subkind}] `{p.label}` (`{p.pointer}`) status={p.status}{hp}")
         md.append("")
     if manip_ptrs:
+        manip_by_id = {n.id: n for n in cone_nodes if n.tier == "manipulate"}
         md.append(f"## Tier 2 — Backend Manipulation ({len(manip_ptrs)})")
         for p in manip_ptrs:
             hp = f" routes={p.http_paths}" if p.http_paths else ""
-            md.append(f"- [{p.subkind}] `{p.label}` (`{p.pointer}`) status={p.status}{hp}")
+            mn = manip_by_id.get(p.id)
+            vnote = f" | verification={mn.verification_note}" if (mn and mn.verification_note) else ""
+            md.append(f"- [{p.subkind}] `{p.label}` (`{p.pointer}`) status={p.status}{hp}{vnote}")
         md.append("")
     if truth_ptrs:
         truth_by_id = {n.id: n for n in cone_nodes if n.tier == "truth"}
@@ -900,6 +904,21 @@ def _fit_complete_items(
     return chosen, max(0, len(items) - len(chosen))
 
 
+_plain_english_prompt_re = re.compile(
+    r"(?:"
+    r"\bplain[- ]english\b"
+    r"|\blaym[ae]n(?:'?s)?\b"
+    r"|\bsimple\s+terms\b"
+    r"|\bsimply\b"
+    r"|\beli5\b"
+    r"|\bnon[- ]technical\b"
+    r"|\bin\s+short\b"
+    r"|\btl;?dr\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def build_section_budgeted_ask_prompt(
     *,
     question: str,
@@ -911,8 +930,14 @@ def build_section_budgeted_ask_prompt(
     live_viewport_brief: str | None = None,
     history: Sequence[AskChatTurn] = (),
     max_prompt_chars: int = 7200,
+    plain_english: bool | None = None,
 ) -> tuple[str, str, ContextBudgetSummary]:
     """Build section-aware prompts (`local_prompt`, `apple_prompt`, `ContextBudgetSummary`)."""
+    eff_plain = (
+        bool(_plain_english_prompt_re.search(question))
+        if plain_english is None
+        else bool(plain_english)
+    )
     included_counts: dict[str, int] = {}
     omitted_counts: dict[str, int] = {}
     truncated_sections: list[str] = []
@@ -927,7 +952,7 @@ def build_section_budgeted_ask_prompt(
     )
     sel_lines = [
         "## 1. Evidence & Selection Identity",
-        ev_line,
+        *(() if eff_plain else (ev_line,)),
         f"- Target: `{focus.target_name}` (`{focus.active_slug}`) | Session: `{focus.session_id or 'default'}` (focus_rev={focus.focus_revision})",
         f"- Headline: {focus.headline}",
         f"- Visual / Lineage Summary: {focus.color_reason}",
@@ -938,6 +963,8 @@ def build_section_budgeted_ask_prompt(
         )
         if report is not None:
             fn_obj = next((n for n in report.nodes if n.id == focus.focused_node.id), None)
+            if fn_obj and fn_obj.verification_note:
+                sel_lines.append(f"- Node Verification Note: {fn_obj.verification_note}")
             if fn_obj and fn_obj.policy_field_consumption:
                 pfc = fn_obj.policy_field_consumption
                 sel_lines.append(
@@ -991,12 +1018,19 @@ def build_section_budgeted_ask_prompt(
             if cf.id not in seen_fids:
                 seen_fids.add(cf.id)
                 finding_pool.append(cf)
-    finding_items = [
-        f"- `{f.id}` **{f.rule_code}** [{f.severity} | {f.confidence} | {f.evidence_strength}] "
-        f"`{f.source_file}:{f.line}` (node=`{f.node_id}`) — {f.title} | Detail: {f.detail} | "
-        f"Suggested remediation (unverified): {f.remediation}"
-        for f in finding_pool
-    ]
+    finding_items = (
+        [
+            f"- {f.title} (`{f.source_file}:{f.line}`): {f.detail} What to check before changing/deleting: {f.remediation}"
+            for f in finding_pool
+        ]
+        if eff_plain
+        else [
+            f"- `{f.id}` **{f.rule_code}** [{f.severity} | {f.confidence} | {f.evidence_strength}] "
+            f"`{f.source_file}:{f.line}` (node=`{f.node_id}`) — {f.title} | Detail: {f.detail} | "
+            f"Suggested remediation (unverified): {f.remediation}"
+            for f in finding_pool
+        ]
+    )
     inc_f, omit_f = _fit_complete_items(
         finding_items,
         remaining_chars=max(500, (max_prompt_chars - used_chars) // 2),
@@ -1091,7 +1125,14 @@ def build_section_budgeted_ask_prompt(
         truncated_sections.append("history_turns")
 
     q_clean = question.strip()
-    local_prompt = "\n\n".join([*sections, f"## User Question\n{q_clean}"])
+    plain_cue = (
+        "\n(Answer directly to 'you' in 2–4 plain everyday sentences without rigid section headers; "
+        "explain what this does, why it is highlighted, and what happens in practice if changed or deleted. "
+        "Never write 'The user is...'.)"
+        if eff_plain
+        else ""
+    )
+    local_prompt = "\n\n".join([*sections, f"## User Question\n{q_clean}{plain_cue}"])
 
     apple_sections = sections[:3]
     if inc_ce:
@@ -1102,7 +1143,7 @@ def build_section_budgeted_ask_prompt(
             for t in inc_hist[-4:]
         )
         apple_sections.append(f"## Recent Session Turns\n{hist_tail}")
-    apple_prompt = "\n\n".join([*apple_sections, f"## Question\n{q_clean}"])
+    apple_prompt = "\n\n".join([*apple_sections, f"## Question\n{q_clean}{plain_cue}"])
 
     seed_q = (
         focus.focused_node.id

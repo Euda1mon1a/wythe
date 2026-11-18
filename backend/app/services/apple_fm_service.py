@@ -141,30 +141,46 @@ def check_apple_engine_status() -> OnDeviceEngineStatus:
     )
 
 
-def run_apple_engine_ask(instructions: str, prompt: str) -> tuple[str, list[str]]:
+def run_apple_engine_ask(
+    instructions: str,
+    prompt: str,
+    *,
+    plain_english: bool = False,
+) -> tuple[str, list[str]]:
     """Serialize Apple FM calls with 250ms spacing & modelmanagerd rate-limit backoff."""
     global _last_apple_finish_mono
     binary, build_note = _ensure_apple_helper_binary()
     if binary is None:
         raise RuntimeError(build_note)
 
+    req_payload: dict[str, Any] = {
+        "type": "ask",
+        "instructions": instructions,
+        "prompt": prompt,
+    }
+    if plain_english:
+        req_payload["plainEnglish"] = True
+
     with _apple_lock:
         for attempt in range(4):
             wait_gap = (_last_apple_finish_mono + _apple_gap_sec) - time.monotonic()
             if wait_gap > 0:
                 time.sleep(wait_gap)
-            res = _invoke_apple_helper(
-                binary,
-                {"type": "ask", "instructions": instructions, "prompt": prompt},
-            )
+            res = _invoke_apple_helper(binary, req_payload)
             _last_apple_finish_mono = time.monotonic()
             if res.get("ok"):
                 if isinstance(res.get("plainText"), str) and res["plainText"].strip():
-                    return res["plainText"].strip(), []
+                    refs_plain = [
+                        str(x) for x in (res.get("referencedNodes") or []) if str(x).strip()
+                    ]
+                    return res["plainText"].strip(), refs_plain
                 summary = str(res.get("summary") or "").strip()
                 cause = str(res.get("rootCauseOrRole") or "").strip()
                 step = str(res.get("safeNextStep") or "").strip()
                 refs = [str(x) for x in (res.get("referencedNodes") or []) if str(x).strip()]
+                if plain_english:
+                    prose_parts = [p for p in (summary, cause, step) if p]
+                    return " ".join(prose_parts), refs
                 md_parts = [p for p in [summary] if p]
                 if cause:
                     md_parts.append(f"**Why / Architectural Role:** {cause}")

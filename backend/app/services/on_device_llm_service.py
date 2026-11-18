@@ -58,8 +58,43 @@ _default_local_seats = (
     "http://127.0.0.1:1234/v1",
     "http://127.0.0.1:11434/v1",
 )
-_non_chat_tokens = ("whisper", "embed", "minilm", "bge-", "rerank", "tts", "piper", "kokoro", "ocr", "flux")
-_vision_tokens = ("vl", "vision", "gemma-3", "gemma-4", "pixtral", "llava", "minicpm-v", "internvl")
+_non_chat_tokens = (
+    "ocr",
+    "paddleocr",
+    "whisper",
+    "asr",
+    "vad",
+    "silero",
+    "embed",
+    "minilm",
+    "bge-",
+    "rerank",
+    "tts",
+    "piper",
+    "kokoro",
+    "flux",
+)
+_vision_tokens = (
+    "qwen3.6",
+    "qwen3.5",
+    "qwen2.5-vl",
+    "qwen2-vl",
+    "gemma-4",
+    "gemma-3",
+    "vl",
+    "vlm",
+    "vision",
+    "pixtral",
+    "llava",
+    "minicpm-v",
+    "internvl",
+)
+_helper_model_re = re.compile(
+    r"(?:router|classifier|guard|draft|speculative|\bd1-\d|\blfm2)",
+    re.IGNORECASE,
+)
+_total_param_scale_re = re.compile(r"(?<![a-z])(\d+(?:\.\d+)?)b\b", re.IGNORECASE)
+_any_param_scale_re = re.compile(r"(\d+(?:\.\d+)?)b\b", re.IGNORECASE)
 _no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _ask_mcp_tool_names = (
     "wythe_focus_camera",
@@ -86,8 +121,23 @@ _mcp_tool_intent_re = re.compile(
     r"mcp|wythe_[a-z0-9_]+|atlas_[a-z0-9_]+"
     r"|tools?|camera|viewport|focus|fly|move|steer|pan|orbit|tour|walkthrough|chronicle"
     r"|lens|layout|zoom|strat(?:um|a)|frustum|unshown|off[- ]?screen|outside"
-    r"|blast[- _]radius|lineage[- _]cone|plugins?"
+    r"|blast(?:\s+|[-_])radius|lineage(?:\s+|[-_])cone|plugins?"
+    r"|show\s+me|delet(?:e|ed|ing|ion)|remov(?:e|ed|ing)|affect(?:s|ed)?"
+    r"|break(?:s|ing)?|broken|callers?|who\s+calls|used\s+by"
     r")\b",
+    re.IGNORECASE,
+)
+_plain_english_intent_re = re.compile(
+    r"(?:"
+    r"\bplain[- ]english\b"
+    r"|\blaym[ae]n(?:'?s)?\b"
+    r"|\bsimple\s+terms\b"
+    r"|\bsimply\b"
+    r"|\beli5\b"
+    r"|\bnon[- ]technical\b"
+    r"|\bin\s+short\b"
+    r"|\btl;?dr\b"
+    r")",
     re.IGNORECASE,
 )
 _semantic_ref_re = re.compile(r"`((?:t|m|d|e|f):[A-Za-z0-9_.:/-]+)`")
@@ -121,6 +171,20 @@ def _question_requests_mcp_or_camera(question: str | None) -> bool:
     if not question or not question.strip():
         return False
     return bool(_mcp_tool_intent_re.search(question))
+
+
+def _question_requests_plain_english(question: str | None) -> bool:
+    if not question or not question.strip():
+        return False
+    return bool(_plain_english_intent_re.search(question))
+
+
+def _extract_param_billions(model_id: str) -> float:
+    total_hits = [float(val) for val in _total_param_scale_re.findall(model_id)]
+    if total_hits:
+        return max(total_hits)
+    any_hits = [float(val) for val in _any_param_scale_re.findall(model_id)]
+    return max(any_hits) if any_hits else 0.0
 
 
 def _normalize_private_v1_url(raw_url: str) -> str:
@@ -158,14 +222,43 @@ def _select_safe_seat_model(
     raw_items: list[dict[str, Any]],
     preferred_model: str | None,
     server_header: str = "",
+    *,
+    prefer_vision: bool = False,
 ) -> tuple[str, str] | None:
     """Return `(request_model_id, display_label)` without triggering mlx_lm/mlx_vlm weight swaps."""
     raw_ids = [str(it.get("id")) for it in raw_items if it.get("id")]
-    chat_ids = [m for m in raw_ids if not any(bad in m.lower() for bad in _non_chat_tokens)]
+    chat_items = [
+        it
+        for it in raw_items
+        if it.get("id") and not any(bad in str(it.get("id")).lower() for bad in _non_chat_tokens)
+    ]
+    chat_ids = [str(it.get("id")) for it in chat_items]
     if not chat_ids:
         return None
     if preferred_model and (preferred_model == "default_model" or preferred_model in raw_ids):
         return preferred_model, preferred_model
+
+    loaded_chat_ids = [str(it.get("id")) for it in chat_items if it.get("loaded") is True]
+    if loaded_chat_ids:
+        def _loaded_rank(pair: tuple[int, str]) -> tuple[int, int, float, int, int]:
+            idx, mid = pair
+            slug = _extract_snapshot_slug(mid) or mid
+            is_helper = bool(_helper_model_re.search(mid) or _helper_model_re.search(slug))
+            is_vis = _looks_vision_capable(slug) or _looks_vision_capable(mid)
+            scale_b = max(_extract_param_billions(slug), _extract_param_billions(mid))
+            return (
+                0 if is_helper else 1,
+                1 if (prefer_vision and is_vis) else 0,
+                scale_b,
+                1 if is_vis else 0,
+                -idx,
+            )
+
+        _, best_loaded_id = max(enumerate(loaded_chat_ids), key=_loaded_rank)
+        return best_loaded_id, (_extract_snapshot_slug(best_loaded_id) or best_loaded_id)
+
+    if any(isinstance(it.get("loaded"), bool) for it in raw_items):
+        return None
 
     if len(raw_items) == 1 or "pinned" in str(raw_items[0].get("owned_by") or "").lower():
         pinned = chat_ids[0]
@@ -216,7 +309,9 @@ def probe_local_openai_engine(
                 candidates.append(seat)
 
     last_note = "No loopback OpenAI-compatible /v1 seat detected (:8080, :8084, :8083, :8085, :8093, :8081, :1234, :11434)."
-    fallback_text_seat: OnDeviceEngineStatus | None = None
+    fallback_pinned_text_seat: OnDeviceEngineStatus | None = None
+    fallback_default_vision_seat: OnDeviceEngineStatus | None = None
+    fallback_default_seat: OnDeviceEngineStatus | None = None
     for base in candidates:
         req = urllib.request.Request(f"{base}/models", method="GET")
         try:
@@ -233,7 +328,12 @@ def probe_local_openai_engine(
         raw_items = [
             item for item in (payload.get("data") or []) if isinstance(item, dict) and item.get("id")
         ]
-        selected = _select_safe_seat_model(raw_items, preferred_model, server_header=srv_hdr)
+        selected = _select_safe_seat_model(
+            raw_items,
+            preferred_model,
+            server_header=srv_hdr,
+            prefer_vision=prefer_vision,
+        )
         if selected is None:
             last_note = f"{base} has no chat-capable `/v1/models` entries."
             continue
@@ -251,15 +351,30 @@ def probe_local_openai_engine(
         explicit_model_match = bool(
             preferred_model
             and preferred_model.strip()
-            and preferred_model.strip() in {str(item.get("id")) for item in raw_items}
+            and (
+                preferred_model.strip() == "default_model"
+                or preferred_model.strip() in {str(item.get("id")) for item in raw_items}
+            )
         )
-        if explicit_custom_base == base or explicit_model_match or has_vision or not prefer_vision:
+        if explicit_custom_base == base or explicit_model_match:
             return seat_status
-        if fallback_text_seat is None:
-            fallback_text_seat = seat_status
+        if req_model != "default_model":
+            if has_vision or not prefer_vision:
+                return seat_status
+            if fallback_pinned_text_seat is None:
+                fallback_pinned_text_seat = seat_status
+            continue
+        if has_vision and fallback_default_vision_seat is None:
+            fallback_default_vision_seat = seat_status
+        if fallback_default_seat is None:
+            fallback_default_seat = seat_status
 
-    if fallback_text_seat is not None:
-        return fallback_text_seat
+    if fallback_pinned_text_seat is not None:
+        return fallback_pinned_text_seat
+    if prefer_vision and fallback_default_vision_seat is not None:
+        return fallback_default_vision_seat
+    if fallback_default_seat is not None:
+        return fallback_default_seat
 
     return OnDeviceEngineStatus(
         engine="local",
@@ -279,7 +394,7 @@ def resolve_auto_backend_cascade(
     question: str | None = None,
     prefer_mcp_tools: bool = False,
 ) -> list[Literal["apple", "local"]]:
-    """Select backend engine priority; prefer ready local `/v1` for images or MCP tool/camera requests."""
+    """Select backend engine priority; prefer pinned/loaded local `/v1` or MCP/multimodal seats."""
     if backend == "apple":
         return ["apple"]
     if backend == "local":
@@ -292,12 +407,19 @@ def resolve_auto_backend_cascade(
         and local_status.base_url
         and local_status.model_id
     )
+    local_pinned_or_loaded = bool(
+        local_ready and local_status and local_status.model_id != "default_model"
+    )
     local_vlm_ready = bool(local_ready and local_status and local_status.supports_vision)
     multimodal_attached = bool((image_data_url and image_data_url.strip()) or has_screenshot)
     needs_mcp_tools = prefer_mcp_tools or _question_requests_mcp_or_camera(question)
 
     order: list[Literal["apple", "local"]] = []
-    if (multimodal_attached and local_vlm_ready) or (local_ready and needs_mcp_tools):
+    if (
+        local_pinned_or_loaded
+        or (multimodal_attached and local_vlm_ready)
+        or (local_ready and needs_mcp_tools)
+    ):
         order.append("local")
         if apple_ready:
             order.append("apple")
@@ -500,6 +622,84 @@ def _execute_inprocess_mcp_tool_call(
     return json.dumps(args_dict), _cap_tool_output(out_str)
 
 
+_TOOL_FALLBACK_REASON = (
+    "Local endpoint rejected OpenAI tools payload; answered in text-only mode without live MCP tool execution."
+)
+
+
+def build_ask_instructions(
+    tools_enabled: bool = True,
+    *,
+    plain_english: bool = False,
+    has_corrections: bool = False,
+) -> str:
+    """Build capability-honest system instructions for Ask Wythe (`tools_enabled` & `plain_english`)."""
+    corr_sys_note = (
+        " Respect active Human Investigation Corrections in Section 2 as authoritative working "
+        "clarifications for this session, while noting they remain conversation context until "
+        "deliberately promoted to a governance ruling."
+        if has_corrections
+        else ""
+    )
+    direct_address = (
+        "Speak directly to the user in second person ('you'); "
+        "NEVER narrate about the user in third person (never write 'The user is...'). "
+    )
+    if tools_enabled:
+        capability_block = (
+            "Ground all repository, node, color, rule, and lineage statements strictly in the Live 3D Camera & X-Ray "
+            "facts below and in any bound Wythe MCP tool outputs (SQL Truth, Backend Manipulate, Frontend Display). "
+            "You have live Wythe MCP tools bound directly in this chat (`wythe_focus_camera`, `wythe_camera_tour`, "
+            "`wythe_lineage_cone`, `wythe_blast_radius`, `wythe_findings`, `wythe_what_is_this`, `wythe_overview`, "
+            "`wythe_plugins`, `wythe_investigation`), and external MCP clients can also connect via `/api/v1/mcp` "
+            "or `wythe mcp`. Yes, you CAN directly control and steer the user's live 3D browser camera, lens, "
+            "layout mode, Z-wythe slice, and zoom stratum via `wythe_focus_camera` and `wythe_camera_tour`, and you "
+            "can inspect architecture evidence outside the current camera frustum via `wythe_lineage_cone`, "
+            "`wythe_findings`, `wythe_what_is_this`, `wythe_blast_radius`, `wythe_overview`, `wythe_plugins`, and "
+            "`wythe_investigation`. When asked whether you can control the camera or what MCP tools are exposed, "
+            "confirm accurately that you can control the live 3D camera via `wythe_focus_camera` and "
+            "`wythe_camera_tour` and name the exposed Wythe MCP tools rather than claiming you cannot control a "
+            "camera. When asked to focus, move, fly, frame, or tour the 3D camera, switch lens/layout/zoom stratum, "
+            "or inspect unshown nodes outside the current frustum, you MUST call the corresponding MCP tool and "
+            "ground your answer in the returned tool payload (including honest `delivery_state`). "
+        )
+    else:
+        capability_block = (
+            "Ground all repository, node, color, rule, and lineage statements strictly in the supplied Live 3D Camera "
+            "& X-Ray facts below (SQL Truth, Backend Manipulate, Frontend Display). "
+            "Live MCP tool execution and direct 3D camera steering are NOT available on this text-only completion path "
+            "(external MCP clients can connect separately via `/api/v1/mcp` or `wythe mcp`). "
+            "Do NOT claim that you can steer or move the live 3D camera here, NEVER invent or hallucinate tool names "
+            "(such as `wythe_backend_manipulate`), and if asked to move the camera or run a live MCP tool, state "
+            "honestly that live MCP tool execution is unavailable on this text-only completion path while answering "
+            "from the supplied X-Ray context. "
+        )
+
+    if plain_english:
+        style_block = (
+            "Plain-English mode: Explain clearly in 2 to 4 short everyday sentences without rigid section headers "
+            "(do NOT output forced headings and do NOT dump raw internal severity/confidence/evidence tags). "
+            "Explain plainly what this code or data store does, why it has a warning or color, and what happens in "
+            "practice if you change or delete it (including any package `__init__.py` re-export import-crash trap), "
+            "staying strictly grounded in the provided facts without inventing files, tables, or callers. "
+            "Never treat a warning color alone as proof that a file or store is unused or safe to delete."
+        )
+    else:
+        style_block = (
+            "Cite exact rule codes (e.g. TRUTH-002, MANIP-001, DISP-005), node names, on-screen colors, and "
+            "`file:line` pointers, and never invent files or tables. Never treat a node's color or status (such as "
+            "`gray_zone` or `duplicated_truth`) as standalone proof of duplicate contents, authoritative ownership, "
+            "or safe deletion. Keep declared store purpose distinct from observed verification, distinguish a node's "
+            "discovery coordinate from causal writer operation lines, preserve uncertainty when expiration or "
+            "invalidation is unknown, and present remediations as suggested changes rather than verified fixes."
+        )
+
+    return (
+        "You are Wythe's embedded real-time 3-tier software architecture & lineage verifier assistant. "
+        f"{direct_address}{capability_block}{style_block}{corr_sys_note}"
+    )
+
+
 def _run_local_chat_completion(
     base_url: str,
     model_id: str,
@@ -507,6 +707,7 @@ def _run_local_chat_completion(
     user_text: str,
     snap_path: Path | None,
     *,
+    toolless_instructions: str | None = None,
     inline_data_url: str | None = None,
     history: list[AskChatTurn] | None = None,
     supports_vision: bool | None = None,
@@ -518,8 +719,9 @@ def _run_local_chat_completion(
     hinted_refs_out: list[str] | None = None,
     max_rounds: int = _ask_mcp_max_rounds,
     max_calls_per_round: int = _ask_mcp_max_calls_per_round,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, str | None]:
     used_vision = False
+    tool_fallback_note: str | None = None
     user_content: Any = user_text
     can_vision = supports_vision if supports_vision is not None else _looks_vision_capable(model_id)
     img_url = _sniff_image_data_url(snap_path, inline_data_url) if can_vision else None
@@ -576,11 +778,16 @@ def _run_local_chat_completion(
         round_idx: int,
         req_tools: list[dict[str, Any]] | None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]] | None]:
-        nonlocal used_vision
+        nonlocal used_vision, tool_fallback_note
         try:
             return _post_chat_message(messages, req_tools), req_tools
         except urllib.error.HTTPError as exc:
             if round_idx == 0 and req_tools and exc.code in (400, 404, 422, 501):
+                messages[0] = {
+                    "role": "system",
+                    "content": toolless_instructions or build_ask_instructions(tools_enabled=False),
+                }
+                tool_fallback_note = _TOOL_FALLBACK_REASON
                 try:
                     return _post_chat_message(messages, None), None
                 except urllib.error.HTTPError as inner_http:
@@ -620,7 +827,7 @@ def _run_local_chat_completion(
         if not valid_calls:
             text = str(msg.get("content") or "").strip()
             if text:
-                return text, used_vision
+                return text, used_vision, tool_fallback_note
             if ran_any_tools:
                 break
             raise RuntimeError(f"Local model `{model_id}` returned an empty completion.")
@@ -676,11 +883,12 @@ def _run_local_chat_completion(
     synth_msg, _ = _send_round(max_rounds, None)
     synth_text = str(synth_msg.get("content") or "").strip()
     if synth_text:
-        return synth_text, used_vision
+        return synth_text, used_vision, tool_fallback_note
     if executed_tools_out:
         return (
             f"Executed Wythe MCP tool(s): {', '.join(f'`{t}`' for t in executed_tools_out)}.",
             used_vision,
+            tool_fallback_note,
         )
     raise RuntimeError(f"Local model `{model_id}` returned an empty completion.")
 
@@ -773,37 +981,16 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                         AskChatTurn(role="assistant", content=prior_t.answer_markdown[:4000])
                     )
 
-    corr_sys_note = (
-        " Respect active Human Investigation Corrections in Section 2 as authoritative working "
-        "clarifications for this session, while noting they remain conversation context until "
-        "deliberately promoted to a governance ruling."
-        if corrections
-        else ""
+    is_plain_english = _question_requests_plain_english(payload.question)
+    instructions = build_ask_instructions(
+        tools_enabled=True,
+        plain_english=is_plain_english,
+        has_corrections=bool(corrections),
     )
-    instructions = (
-        "You are Wythe's embedded real-time 3-tier software architecture & lineage verifier assistant. "
-        "Ground all repository, node, color, rule, and lineage statements strictly in the Live 3D Camera & X-Ray "
-        "facts below and in any bound Wythe MCP tool outputs (SQL Truth, Backend Manipulate, Frontend Display). "
-        "You have live Wythe MCP tools bound directly in this chat (`wythe_focus_camera`, `wythe_camera_tour`, "
-        "`wythe_lineage_cone`, `wythe_blast_radius`, `wythe_findings`, `wythe_what_is_this`, `wythe_overview`, "
-        "`wythe_plugins`, `wythe_investigation`), and external MCP clients can also connect via `/api/v1/mcp` "
-        "or `wythe mcp`. Yes, you CAN directly control and steer the user's live 3D browser camera, lens, "
-        "layout mode, Z-wythe slice, and zoom stratum via `wythe_focus_camera` and `wythe_camera_tour`, and you "
-        "can inspect architecture evidence outside the current camera frustum via `wythe_lineage_cone`, "
-        "`wythe_findings`, `wythe_what_is_this`, `wythe_blast_radius`, `wythe_overview`, `wythe_plugins`, and "
-        "`wythe_investigation`. When asked whether you can control the camera or what MCP tools are exposed, "
-        "confirm accurately that you can control the live 3D camera via `wythe_focus_camera` and "
-        "`wythe_camera_tour` and name the exposed Wythe MCP tools rather than claiming you cannot control a "
-        "camera. When asked to focus, move, fly, frame, or tour the 3D camera, switch lens/layout/zoom stratum, "
-        "or inspect unshown nodes outside the current frustum, you MUST call the corresponding MCP tool and "
-        "ground your answer in the returned tool payload (including honest `delivery_state`). "
-        "Cite exact rule codes (e.g. TRUTH-002, MANIP-001, DISP-005), node names, on-screen colors, and "
-        "`file:line` pointers, and never invent files or tables. Never treat a node's color or status (such as "
-        "`gray_zone` or `duplicated_truth`) as standalone proof of duplicate contents, authoritative ownership, "
-        "or safe deletion. Keep declared store purpose distinct from observed verification, distinguish a node's "
-        "discovery coordinate from causal writer operation lines, preserve uncertainty when expiration or "
-        "invalidation is unknown, and present remediations as suggested changes rather than verified fixes."
-        f"{corr_sys_note}"
+    toolless_instructions = build_ask_instructions(
+        tools_enabled=False,
+        plain_english=is_plain_english,
+        has_corrections=bool(corrections),
     )
 
     full_prompt, apple_prompt, budget = build_section_budgeted_ask_prompt(
@@ -815,6 +1002,7 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         corrections=corrections,
         live_viewport_brief=payload.live_viewport_brief,
         history=eff_history,
+        plain_english=is_plain_english,
     )
 
     snap_path = (
@@ -902,7 +1090,17 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         has_fallback = idx + 1 < len(cascade)
         if candidate_engine == "apple":
             try:
-                answer_md, hinted_refs = run_apple_engine_ask(instructions, apple_prompt)
+                try:
+                    answer_md, hinted_refs = run_apple_engine_ask(
+                        toolless_instructions,
+                        apple_prompt,
+                        plain_english=is_plain_english,
+                    )
+                except TypeError:
+                    answer_md, hinted_refs = run_apple_engine_ask(
+                        toolless_instructions,
+                        apple_prompt,
+                    )
                 engine_used = "apple"
                 model_used = "apple-foundation-models-on-device"
                 used_vision = False
@@ -929,12 +1127,13 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                     continue
                 break
             try:
-                answer_md, used_vision = _run_local_chat_completion(
+                chat_res = _run_local_chat_completion(
                     local_status.base_url,
                     local_status.model_id,
                     instructions,
                     full_prompt,
                     snap_path,
+                    toolless_instructions=toolless_instructions,
                     inline_data_url=inline_snap,
                     history=eff_history,
                     supports_vision=local_status.supports_vision,
@@ -944,6 +1143,11 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                     executed_tools_out=executed_tools,
                     hinted_refs_out=hinted_refs,
                 )
+                if len(chat_res) == 3:
+                    answer_md, used_vision, tool_fallback_note = chat_res
+                else:
+                    answer_md, used_vision = chat_res  # type: ignore[misc]
+                    tool_fallback_note = None
                 engine_used = "local"
                 if (
                     local_status.model_id == "default_model"
@@ -954,7 +1158,12 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                 else:
                     model_used = local_status.model_id
                 if prior_fail_note:
-                    fallback_reason = f"{prior_fail_note}; answered via fallback `local` ({model_used})."
+                    base_fb = f"{prior_fail_note}; answered via fallback `local` ({model_used})."
+                    fallback_reason = (
+                        f"{base_fb} {tool_fallback_note}" if tool_fallback_note else base_fb
+                    )
+                elif tool_fallback_note:
+                    fallback_reason = tool_fallback_note
                 elif has_multimodal_image and not used_vision:
                     fallback_reason = "Viewport image available, but selected local model ran in text-only mode."
                 break

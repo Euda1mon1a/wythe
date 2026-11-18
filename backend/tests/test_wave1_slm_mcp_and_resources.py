@@ -609,21 +609,27 @@ def test_vision_aware_auto_cascade_prefers_vlm_with_image_and_apple_for_text(
             assert body_img["used_vision_snapshot"] is True
             assert len(apple_calls) == 0
 
-            # 2. Text-only query (`include_vision_snapshot=False`) + `engine="auto"` -> Apple FM runs FIRST!
-            res_txt = client.post(
-                "/api/v1/ask",
-                json={
-                    "question": "Summarize the rule policy table.",
-                    "engine": "auto",
-                    "target_slug": "wythe",
-                    "include_vision_snapshot": False,
-                },
-            )
-            assert res_txt.status_code == 200
-            body_txt = res_txt.json()
-            assert body_txt["engine_used"] == "apple"
-            assert body_txt["used_vision_snapshot"] is False
-            assert len(apple_calls) == 1
+            # 2. Text-only non-tool query on an unpinned `default_model` seat -> Apple FM runs FIRST!
+            unpinned_srv, unpinned_url = _make_openai_server("default_model")
+            try:
+                monkeypatch.setattr(on_device_llm_service, "_default_local_seats", (unpinned_url,))
+                res_txt = client.post(
+                    "/api/v1/ask",
+                    json={
+                        "question": "Summarize the rule policy table.",
+                        "engine": "auto",
+                        "target_slug": "wythe",
+                        "include_vision_snapshot": False,
+                    },
+                )
+                assert res_txt.status_code == 200
+                body_txt = res_txt.json()
+                assert body_txt["engine_used"] == "apple"
+                assert body_txt["used_vision_snapshot"] is False
+                assert len(apple_calls) == 1
+            finally:
+                unpinned_srv.shutdown()
+                unpinned_srv.server_close()
 
             # 3. Failing VLM (`fail_chat=True` HTTP 500) AND `TimeoutError` during completion -> falls back to Apple FM cleanly!
             fail_srv, fail_url = _make_openai_server("mlx-community/qwen-vl-7b-4bit", fail_chat=True)

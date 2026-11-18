@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path, PurePosixPath
 
@@ -11,7 +12,7 @@ from app.adapters.base import (
     RouteDescriptor,
     TruthExtractionResult,
 )
-from app.adapters.python_ast_inspect import ParsedPythonModule, parse_python_module
+from app.adapters.python_ast_inspect import ParsedPythonModule, _excluded_ids, parse_python_module
 from app.adapters.python_layout import discover_python_app
 from app.adapters.python_policy_consumption import (
     analyze_module_policy_table_read,
@@ -317,6 +318,79 @@ class _ImportResolver:
         return hits
 
 
+def _collect_runtime_import_sites(
+    source: str,
+    module_name: str,
+    rel_repo: str,
+    package_name: str,
+) -> list[tuple[str, str, int]]:
+    """Return `(target_module, importer_rel_path, lineno)` for runtime imports and PEP 562 exports."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    skip = _excluded_ids(tree)
+    own_pkg = module_name if rel_repo.endswith("__init__.py") else module_name.rpartition(".")[0]
+    out: list[tuple[str, str, int]] = []
+    for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
+        if isinstance(node, ast.ImportFrom):
+            src_mod = node.module or ""
+            if node.level:
+                base_pkg = own_pkg
+                for _ in range(node.level - 1):
+                    base_pkg = base_pkg.rpartition(".")[0]
+                src_mod = ".".join(p for p in (base_pkg, src_mod) if p)
+            cand_srcs = [src_mod]
+            if node.level == 0 and src_mod and not src_mod.startswith(f"{package_name}."):
+                cand_srcs.append(f"{package_name}.{src_mod}")
+            for cand_src in cand_srcs:
+                if cand_src:
+                    out.append((cand_src, rel_repo, node.lineno))
+                for alias in node.names:
+                    if alias.name != "*":
+                        ln = getattr(alias, "lineno", None) or node.lineno
+                        qual = f"{cand_src}.{alias.name}" if cand_src else alias.name
+                        out.append((qual, rel_repo, ln))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                ln = getattr(alias, "lineno", None) or node.lineno
+                cand_imps = [alias.name]
+                if not alias.name.startswith(f"{package_name}."):
+                    cand_imps.append(f"{package_name}.{alias.name}")
+                for cand_imp in cand_imps:
+                    parts = cand_imp.split(".")
+                    for k in range(2, len(parts) + 1):
+                        out.append((".".join(parts[:k]), rel_repo, ln))
+
+    if rel_repo.endswith("__init__.py") and any(
+        isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == "__getattr__"
+        for s in tree.body
+    ):
+        for stmt in tree.body:
+            val_node = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+            if not isinstance(val_node, ast.Dict):
+                continue
+            for val in val_node.values:
+                mod_str: str | None = None
+                if (
+                    isinstance(val, ast.Tuple)
+                    and len(val.elts) == 2
+                    and all(isinstance(e, ast.Constant) for e in val.elts)
+                    and isinstance(val.elts[0].value, str)
+                ):
+                    mod_str = val.elts[0].value
+                elif isinstance(val, ast.Constant) and isinstance(val.value, str):
+                    mod_str = val.value
+                if mod_str:
+                    ln = getattr(val, "lineno", None) or stmt.lineno
+                    out.append((mod_str, rel_repo, ln))
+                    if not mod_str.startswith(f"{package_name}."):
+                        out.append((f"{package_name}.{mod_str}", rel_repo, ln))
+    return out
+
+
 class PythonFastApiAdapter:
     """Extracts FastAPI routes, Python services/solvers, ORM/SQL links, and MANIP findings."""
 
@@ -345,6 +419,7 @@ class PythonFastApiAdapter:
         parsed_modules: dict[str, ParsedPythonModule] = {}
         source_by_rel: dict[str, str] = {}
         all_parsed: list[tuple[str, ParsedPythonModule]] = []
+        scanned_sources: list[tuple[str, str, str]] = []
 
         for py_file in sorted(app_dir.rglob("*.py")):
             rel_app = py_file.relative_to(app_dir).as_posix()
@@ -367,6 +442,7 @@ class PythonFastApiAdapter:
             parsed = parse_python_module(text, rel_repo, mod_name)
             if parsed is None:
                 continue
+            scanned_sources.append((rel_repo, mod_name, text))
             all_parsed.append((Path(rel_app).stem, parsed))
             if any(p in _CALLER_ONLY_PARTS for p in Path(rel_app).parts) and not (
                 parsed.has_session_reads or parsed.has_session_writes or parsed.sql_reads or parsed.sql_writes
@@ -1038,6 +1114,14 @@ class PythonFastApiAdapter:
                             prefix_m = ".".join(parts_t[:k])
                             mod_to_test_files.setdefault(prefix_m, []).append(t_rel)
 
+        passive_importers_by_mod: dict[str, list[tuple[str, int]]] = {}
+        if unwired_rels:
+            for s_rel_repo, s_mod_name, s_text in scanned_sources:
+                for tgt_mod, imp_rel, imp_line in _collect_runtime_import_sites(
+                    s_text, s_mod_name, s_rel_repo, package_name
+                ):
+                    passive_importers_by_mod.setdefault(tgt_mod, []).append((imp_rel, imp_line))
+
         for rel_app in unwired_rels:
             node = nodes_by_rel[rel_app]
             pm_u = parsed_modules.get(rel_app)
@@ -1056,6 +1140,33 @@ class PythonFastApiAdapter:
                 if test_hits
                 else ""
             )
+            passive_sites = sorted(
+                {(imp_rel, ln) for imp_rel, ln in passive_importers_by_mod.get(mod_full, ()) if imp_rel != node.source_file},
+                key=lambda item: (0 if item[0].endswith("__init__.py") else 1, item[0], item[1]),
+            )
+            reexport_note = ""
+            remediation_text = "Check dynamic and external callers before wiring, refactoring, or removing the module."
+            if passive_sites:
+                ptr_list = ", ".join(f"`{p}:{ln}`" for p, ln in passive_sites[:4])
+                more_ptrs = f" (+{len(passive_sites) - 4} more)" if len(passive_sites) > 4 else ""
+                has_pkg_init = any(p.endswith("__init__.py") for p, _ in passive_sites)
+                reexport_prefix = "Passively re-exported by" if has_pkg_init else "Passively imported by"
+                target_noun = "the package" if has_pkg_init else "those module(s)"
+                reexport_note = (
+                    f"{reexport_prefix} {ptr_list}{more_ptrs}; deleting `{node.source_file}` "
+                    f"without removing that re-export/import will raise `ImportError`/`ModuleNotFoundError` "
+                    f"when importing {target_noun}."
+                )
+                node.verification_note = (
+                    f"{node.verification_note} | {reexport_note}"
+                    if node.verification_note
+                    else reexport_note
+                )
+                remediation_text = (
+                    f"Remove or update the passive re-export/import in {ptr_list}{more_ptrs} before "
+                    f"deleting or moving `{node.source_file}` (otherwise importing {target_noun} raises "
+                    "`ImportError`/`ModuleNotFoundError`), and check dynamic or external callers."
+                )
             findings.append(
                 RawCandidateFinding(
                     rule_code="MANIP-003",
@@ -1065,10 +1176,12 @@ class PythonFastApiAdapter:
                     title=f"Manipulator `{node.label}` has no discovered inbound callers{title_suffix}",
                     detail=(
                         f"No static route, CLI, task, or peer service reference to `{node.source_file}` "
-                        f"was resolved.{test_note} Dynamic registration and external entry points may be unobserved; "
+                        f"was resolved.{test_note}"
+                        f"{' ' + reexport_note if reexport_note else ''} "
+                        "Dynamic registration and external entry points may be unobserved; "
                         "this is not proof that the module is unused or safe to delete."
                     ),
-                    remediation="Check dynamic and external callers before wiring, refactoring, or removing the module.",
+                    remediation=remediation_text,
                 )
             )
 
