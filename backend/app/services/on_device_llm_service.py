@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import copy
 import ipaddress
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -43,6 +45,7 @@ from app.services.llm_context_service import (
     build_lineage_cone_slice,
     build_section_budgeted_ask_prompt,
 )
+from app.services.mcp_service import MCP_TOOLS, dispatch_mcp_request
 from app.services.ui_focus_service import explain_ui_focus
 
 _default_local_seats = (
@@ -58,6 +61,66 @@ _default_local_seats = (
 _non_chat_tokens = ("whisper", "embed", "minilm", "bge-", "rerank", "tts", "piper", "kokoro", "ocr", "flux")
 _vision_tokens = ("vl", "vision", "gemma-3", "gemma-4", "pixtral", "llava", "minicpm-v", "internvl")
 _no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_ask_mcp_tool_names = (
+    "wythe_focus_camera",
+    "wythe_camera_tour",
+    "wythe_lineage_cone",
+    "wythe_blast_radius",
+    "wythe_findings",
+    "wythe_what_is_this",
+    "wythe_overview",
+    "wythe_plugins",
+    "wythe_investigation",
+)
+_session_scoped_mcp_tools = (
+    "wythe_focus_camera",
+    "wythe_camera_tour",
+    "wythe_investigation",
+    "wythe_what_is_this",
+)
+_ask_mcp_max_rounds = 3
+_ask_mcp_max_calls_per_round = 4
+_ask_mcp_max_tool_chars = 6000
+_mcp_tool_intent_re = re.compile(
+    r"\b(?:"
+    r"mcp|wythe_[a-z0-9_]+|atlas_[a-z0-9_]+"
+    r"|tools?|camera|viewport|focus|fly|move|steer|pan|orbit|tour|walkthrough|chronicle"
+    r"|lens|layout|zoom|strat(?:um|a)|frustum|unshown|off[- ]?screen|outside"
+    r"|blast[- _]radius|lineage[- _]cone|plugins?"
+    r")\b",
+    re.IGNORECASE,
+)
+_semantic_ref_re = re.compile(r"`((?:t|m|d|e|f):[A-Za-z0-9_.:/-]+)`")
+
+
+def build_ask_openai_tools() -> list[dict[str, Any]]:
+    """Build OpenAI `/v1/chat/completions` function definitions from Wythe's core `MCP_TOOLS`."""
+    by_name = {str(spec["name"]): spec for spec in MCP_TOOLS if spec.get("name")}
+    tools_out: list[dict[str, Any]] = []
+    for tool_name in _ask_mcp_tool_names:
+        spec = by_name.get(tool_name)
+        if spec is None:
+            continue
+        params_schema = copy.deepcopy(
+            spec.get("inputSchema") or {"type": "object", "properties": {}}
+        )
+        tools_out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "description": str(spec.get("description") or ""),
+                    "parameters": params_schema,
+                },
+            }
+        )
+    return tools_out
+
+
+def _question_requests_mcp_or_camera(question: str | None) -> bool:
+    if not question or not question.strip():
+        return False
+    return bool(_mcp_tool_intent_re.search(question))
 
 
 def _normalize_private_v1_url(raw_url: str) -> str:
@@ -213,8 +276,10 @@ def resolve_auto_backend_cascade(
     local_status: OnDeviceEngineStatus | None,
     image_data_url: str | None = None,
     has_screenshot: bool = False,
+    question: str | None = None,
+    prefer_mcp_tools: bool = False,
 ) -> list[Literal["apple", "local"]]:
-    """Select backend engine priority; prefer ready local `/v1` VLMs when a viewport image is attached."""
+    """Select backend engine priority; prefer ready local `/v1` for images or MCP tool/camera requests."""
     if backend == "apple":
         return ["apple"]
     if backend == "local":
@@ -229,9 +294,10 @@ def resolve_auto_backend_cascade(
     )
     local_vlm_ready = bool(local_ready and local_status and local_status.supports_vision)
     multimodal_attached = bool((image_data_url and image_data_url.strip()) or has_screenshot)
+    needs_mcp_tools = prefer_mcp_tools or _question_requests_mcp_or_camera(question)
 
     order: list[Literal["apple", "local"]] = []
-    if multimodal_attached and local_vlm_ready:
+    if (multimodal_attached and local_vlm_ready) or (local_ready and needs_mcp_tools):
         order.append("local")
         if apple_ready:
             order.append("apple")
@@ -283,6 +349,157 @@ def _sniff_image_data_url(snap_path: Path | None, inline_data_url: str | None) -
     return None
 
 
+def _cap_tool_output(raw_text: str) -> str:
+    if len(raw_text) <= _ask_mcp_max_tool_chars:
+        return raw_text
+    suffix = "\n...[truncated]"
+    return raw_text[: _ask_mcp_max_tool_chars - len(suffix)] + suffix
+
+
+def _collect_tool_refs(
+    args_dict: dict[str, Any],
+    raw_text: str,
+    refs_out: list[str] | None,
+) -> None:
+    if refs_out is None:
+        return
+    candidates: list[str] = []
+    raw_focus = args_dict.get("focus_node_ids")
+    if isinstance(raw_focus, list):
+        candidates.extend(str(item).strip() for item in raw_focus if isinstance(item, str) and item.strip())
+    for fenced in re.findall(r"```json\s*(\{.*?\})\s*```", raw_text, re.DOTALL):
+        try:
+            parsed_block = json.loads(fenced)
+        except ValueError:
+            continue
+        if isinstance(parsed_block, dict):
+            blk_focus = parsed_block.get("focus_node_ids")
+            if isinstance(blk_focus, list):
+                candidates.extend(
+                    str(item).strip() for item in blk_focus if isinstance(item, str) and item.strip()
+                )
+    candidates.extend(_semantic_ref_re.findall(raw_text)[:10])
+    for ref_item in candidates:
+        if ref_item and ref_item not in refs_out:
+            refs_out.append(ref_item)
+
+
+def _execute_inprocess_mcp_tool_call(
+    db_session: Session,
+    *,
+    tc_id: str,
+    fn_name: str,
+    raw_arguments: Any,
+    tool_schemas_by_name: dict[str, dict[str, Any]],
+    target_slug: str | None,
+    session_id: str | None,
+    executed_tools_out: list[str] | None,
+    hinted_refs_out: list[str] | None,
+) -> tuple[str, str]:
+    if raw_arguments is None or (isinstance(raw_arguments, str) and not raw_arguments.strip()):
+        args_dict: dict[str, Any] = {}
+    elif isinstance(raw_arguments, dict):
+        args_dict = dict(raw_arguments)
+    elif isinstance(raw_arguments, str):
+        try:
+            loaded = json.loads(raw_arguments)
+        except ValueError as exc:
+            err_json = json.dumps(
+                {
+                    "ok": False,
+                    "isError": True,
+                    "tool": fn_name or "unknown",
+                    "error": f"Malformed JSON arguments: {exc}",
+                }
+            )
+            return "{}", _cap_tool_output(err_json)
+        if not isinstance(loaded, dict):
+            err_json = json.dumps(
+                {
+                    "ok": False,
+                    "isError": True,
+                    "tool": fn_name or "unknown",
+                    "error": "Tool arguments must be a JSON object.",
+                }
+            )
+            return "{}", _cap_tool_output(err_json)
+        args_dict = dict(loaded)
+    else:
+        err_json = json.dumps(
+            {
+                "ok": False,
+                "isError": True,
+                "tool": fn_name or "unknown",
+                "error": "Tool arguments must be a JSON object string.",
+            }
+        )
+        return "{}", _cap_tool_output(err_json)
+
+    canonical_fn = (
+        fn_name.replace("atlas_", "wythe_", 1) if fn_name.startswith("atlas_") else fn_name
+    )
+    spec = tool_schemas_by_name.get(fn_name) or tool_schemas_by_name.get(canonical_fn)
+    if not fn_name or spec is None:
+        err_json = json.dumps(
+            {
+                "ok": False,
+                "isError": True,
+                "tool": fn_name or "unknown",
+                "error": f"Unknown Wythe MCP tool `{fn_name}`. Available tools: {list(_ask_mcp_tool_names)}.",
+            }
+        )
+        return json.dumps(args_dict), _cap_tool_output(err_json)
+
+    props = (spec.get("inputSchema") or {}).get("properties") or {}
+    if "target" in props and target_slug and not str(args_dict.get("target") or "").strip():
+        args_dict["target"] = target_slug
+    if canonical_fn in _session_scoped_mcp_tools and session_id:
+        raw_sid = str(args_dict.get("session_id") or "").strip()
+        if not raw_sid or raw_sid == "default":
+            args_dict["session_id"] = session_id
+
+    rpc_msg = {
+        "jsonrpc": "2.0",
+        "id": tc_id,
+        "method": "tools/call",
+        "params": {"name": canonical_fn, "arguments": args_dict},
+    }
+    try:
+        rpc_res = dispatch_mcp_request(
+            db_session, rpc_msg, slice_mode="full", local_viewport_only=True
+        )
+    except TypeError:
+        rpc_res = dispatch_mcp_request(db_session, rpc_msg, slice_mode="full")
+
+    if executed_tools_out is not None and canonical_fn not in executed_tools_out:
+        executed_tools_out.append(canonical_fn)
+
+    rpc_err = (rpc_res or {}).get("error")
+    res_obj = (rpc_res or {}).get("result") or {}
+    blocks = res_obj.get("content") if isinstance(res_obj.get("content"), list) else []
+    joined_text = "\n\n".join(
+        str(b.get("text") or "")
+        for b in blocks
+        if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+    ).strip()
+    if rpc_err:
+        err_msg = rpc_err.get("message") if isinstance(rpc_err, dict) else str(rpc_err)
+        out_str = json.dumps({"ok": False, "isError": True, "tool": canonical_fn, "error": err_msg})
+    elif res_obj.get("isError"):
+        out_str = json.dumps(
+            {
+                "ok": False,
+                "isError": True,
+                "tool": canonical_fn,
+                "error": joined_text or "MCP tool returned an error.",
+            }
+        )
+    else:
+        _collect_tool_refs(args_dict, joined_text, hinted_refs_out)
+        out_str = joined_text or json.dumps(res_obj)
+    return json.dumps(args_dict), _cap_tool_output(out_str)
+
+
 def _run_local_chat_completion(
     base_url: str,
     model_id: str,
@@ -293,6 +510,14 @@ def _run_local_chat_completion(
     inline_data_url: str | None = None,
     history: list[AskChatTurn] | None = None,
     supports_vision: bool | None = None,
+    db_session: Session | None = None,
+    target_slug: str | None = None,
+    session_id: str | None = None,
+    openai_tools: list[dict[str, Any]] | None = None,
+    executed_tools_out: list[str] | None = None,
+    hinted_refs_out: list[str] | None = None,
+    max_rounds: int = _ask_mcp_max_rounds,
+    max_calls_per_round: int = _ask_mcp_max_calls_per_round,
 ) -> tuple[str, bool]:
     used_vision = False
     user_content: Any = user_text
@@ -309,18 +534,30 @@ def _run_local_chat_completion(
         {"role": turn.role, "content": turn.content[:2400]}
         for turn in (history or [])[-8:]
     ]
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": instructions},
+        *prior_msgs,
+        {"role": "user", "content": user_content},
+    ]
+    active_tools: list[dict[str, Any]] | None = (
+        openai_tools
+        if openai_tools is not None
+        else (build_ask_openai_tools() if db_session is not None else None)
+    )
+    tool_schemas_by_name = {str(spec["name"]): spec for spec in MCP_TOOLS if spec.get("name")}
 
-    def _post_chat(content_payload: Any) -> str:
+    def _post_chat_message(
+        req_messages: list[dict[str, Any]],
+        req_tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": model_id,
             "temperature": 0.2,
             "max_tokens": 900,
-            "messages": [
-                {"role": "system", "content": instructions},
-                *prior_msgs,
-                {"role": "user", "content": content_payload},
-            ],
+            "messages": req_messages,
         }
+        if req_tools:
+            body["tools"] = req_tools
         if "qwen" in model_id.lower() or model_id == "default_model":
             body["chat_template_kwargs"] = {"enable_thinking": False}
         req = urllib.request.Request(
@@ -332,29 +569,120 @@ def _run_local_chat_completion(
         with _no_proxy_opener.open(req, timeout=60.0) as resp:
             parsed = json.loads(resp.read().decode("utf-8", errors="replace"))
         choice = (parsed.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
-        text = str(msg.get("content") or "").strip()
-        if not text:
-            raise RuntimeError(f"Local model `{model_id}` returned an empty completion.")
-        return text
+        msg = choice.get("message")
+        return msg if isinstance(msg, dict) else {}
 
-    try:
-        return _post_chat(user_content), used_vision
-    except urllib.error.HTTPError as exc:
-        if used_vision and exc.code in (400, 415, 422, 500):
-            try:
-                return _post_chat(user_text), False
-            except (TimeoutError, OSError, ValueError) as inner_exc:
-                raise RuntimeError(
-                    f"Local model text fallback at {base_url} failed ({type(inner_exc).__name__}: {inner_exc})."
-                ) from inner_exc
-        raise RuntimeError(f"Local model server at {base_url} answered HTTP {exc.code}.") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not reach local model server at {base_url} ({exc.reason}).") from exc
-    except (TimeoutError, OSError, ValueError) as exc:
-        raise RuntimeError(
-            f"Local model server at {base_url} failed during completion ({type(exc).__name__}: {exc})."
-        ) from exc
+    def _send_round(
+        round_idx: int,
+        req_tools: list[dict[str, Any]] | None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]] | None]:
+        nonlocal used_vision
+        try:
+            return _post_chat_message(messages, req_tools), req_tools
+        except urllib.error.HTTPError as exc:
+            if round_idx == 0 and req_tools and exc.code in (400, 404, 422, 501):
+                try:
+                    return _post_chat_message(messages, None), None
+                except urllib.error.HTTPError as inner_http:
+                    if used_vision and inner_http.code in (400, 415, 422, 500):
+                        messages[len(prior_msgs) + 1] = {"role": "user", "content": user_text}
+                        used_vision = False
+                        return _post_chat_message(messages, None), None
+                    raise RuntimeError(
+                        f"Local model server at {base_url} answered HTTP {inner_http.code}."
+                    ) from inner_http
+            if round_idx == 0 and used_vision and exc.code in (400, 415, 422, 500):
+                messages[len(prior_msgs) + 1] = {"role": "user", "content": user_text}
+                used_vision = False
+                try:
+                    return _post_chat_message(messages, req_tools), req_tools
+                except (TimeoutError, OSError, ValueError) as inner_exc:
+                    raise RuntimeError(
+                        f"Local model text fallback at {base_url} failed ({type(inner_exc).__name__}: {inner_exc})."
+                    ) from inner_exc
+            raise RuntimeError(f"Local model server at {base_url} answered HTTP {exc.code}.") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Could not reach local model server at {base_url} ({exc.reason}).") from exc
+        except (TimeoutError, OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"Local model server at {base_url} failed during completion ({type(exc).__name__}: {exc})."
+            ) from exc
+
+    ran_any_tools = False
+    for round_idx in range(max(1, max_rounds)):
+        msg, active_tools = _send_round(round_idx, active_tools)
+        raw_calls = msg.get("tool_calls")
+        valid_calls = (
+            [tc for tc in raw_calls[:max_calls_per_round] if isinstance(tc, dict)]
+            if isinstance(raw_calls, list) and db_session is not None and active_tools
+            else []
+        )
+        if not valid_calls:
+            text = str(msg.get("content") or "").strip()
+            if text:
+                return text, used_vision
+            if ran_any_tools:
+                break
+            raise RuntimeError(f"Local model `{model_id}` returned an empty completion.")
+
+        ran_any_tools = True
+        sanitized_calls: list[dict[str, Any]] = []
+        tool_reply_msgs: list[dict[str, Any]] = []
+        for call_idx, tc in enumerate(valid_calls):
+            raw_id = tc.get("id")
+            tc_id = (
+                str(raw_id).strip()
+                if isinstance(raw_id, str) and raw_id.strip()
+                else f"call_{round_idx}_{call_idx}"
+            )
+            fn_obj = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            fn_name = str(fn_obj.get("name") or "").strip()
+            safe_fn_name = fn_name or "unknown_tool"
+            args_json_str, tool_result_str = _execute_inprocess_mcp_tool_call(
+                db_session,
+                tc_id=tc_id,
+                fn_name=fn_name,
+                raw_arguments=fn_obj.get("arguments"),
+                tool_schemas_by_name=tool_schemas_by_name,
+                target_slug=target_slug,
+                session_id=session_id,
+                executed_tools_out=executed_tools_out,
+                hinted_refs_out=hinted_refs_out,
+            )
+            sanitized_calls.append(
+                {
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {"name": safe_fn_name, "arguments": args_json_str},
+                }
+            )
+            tool_reply_msgs.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": safe_fn_name,
+                    "content": tool_result_str,
+                }
+            )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": str(msg.get("content") or ""),
+                "tool_calls": sanitized_calls,
+            }
+        )
+        messages.extend(tool_reply_msgs)
+
+    synth_msg, _ = _send_round(max_rounds, None)
+    synth_text = str(synth_msg.get("content") or "").strip()
+    if synth_text:
+        return synth_text, used_vision
+    if executed_tools_out:
+        return (
+            f"Executed Wythe MCP tool(s): {', '.join(f'`{t}`' for t in executed_tools_out)}.",
+            used_vision,
+        )
+    raise RuntimeError(f"Local model `{model_id}` returned an empty completion.")
 
 
 def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> AskWytheResponse:
@@ -455,13 +783,27 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
     instructions = (
         "You are Wythe's embedded real-time 3-tier software architecture & lineage verifier assistant. "
         "Ground all repository, node, color, rule, and lineage statements strictly in the Live 3D Camera & X-Ray "
-        "facts below (SQL Truth, Backend Manipulate, Frontend Display). Cite exact rule codes (e.g. TRUTH-002, "
-        "MANIP-001, DISP-005), node names, on-screen colors, and `file:line` pointers, and never invent files or "
-        "tables. Never treat a node's color or status (such as `gray_zone` or `duplicated_truth`) as standalone "
-        "proof of duplicate contents, authoritative ownership, or safe deletion. Keep declared store purpose "
-        "distinct from observed verification, distinguish a node's discovery coordinate from causal writer "
-        "operation lines, preserve uncertainty when expiration or invalidation is unknown, and present "
-        f"remediations as suggested changes rather than verified fixes.{corr_sys_note}"
+        "facts below and in any bound Wythe MCP tool outputs (SQL Truth, Backend Manipulate, Frontend Display). "
+        "You have live Wythe MCP tools bound directly in this chat (`wythe_focus_camera`, `wythe_camera_tour`, "
+        "`wythe_lineage_cone`, `wythe_blast_radius`, `wythe_findings`, `wythe_what_is_this`, `wythe_overview`, "
+        "`wythe_plugins`, `wythe_investigation`), and external MCP clients can also connect via `/api/v1/mcp` "
+        "or `wythe mcp`. Yes, you CAN directly control and steer the user's live 3D browser camera, lens, "
+        "layout mode, Z-wythe slice, and zoom stratum via `wythe_focus_camera` and `wythe_camera_tour`, and you "
+        "can inspect architecture evidence outside the current camera frustum via `wythe_lineage_cone`, "
+        "`wythe_findings`, `wythe_what_is_this`, `wythe_blast_radius`, `wythe_overview`, `wythe_plugins`, and "
+        "`wythe_investigation`. When asked whether you can control the camera or what MCP tools are exposed, "
+        "confirm accurately that you can control the live 3D camera via `wythe_focus_camera` and "
+        "`wythe_camera_tour` and name the exposed Wythe MCP tools rather than claiming you cannot control a "
+        "camera. When asked to focus, move, fly, frame, or tour the 3D camera, switch lens/layout/zoom stratum, "
+        "or inspect unshown nodes outside the current frustum, you MUST call the corresponding MCP tool and "
+        "ground your answer in the returned tool payload (including honest `delivery_state`). "
+        "Cite exact rule codes (e.g. TRUTH-002, MANIP-001, DISP-005), node names, on-screen colors, and "
+        "`file:line` pointers, and never invent files or tables. Never treat a node's color or status (such as "
+        "`gray_zone` or `duplicated_truth`) as standalone proof of duplicate contents, authoritative ownership, "
+        "or safe deletion. Keep declared store purpose distinct from observed verification, distinguish a node's "
+        "discovery coordinate from causal writer operation lines, preserve uncertainty when expiration or "
+        "invalidation is unknown, and present remediations as suggested changes rather than verified fixes."
+        f"{corr_sys_note}"
     )
 
     full_prompt, apple_prompt, budget = build_section_budgeted_ask_prompt(
@@ -501,6 +843,7 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
     used_vision = False
     fallback_reason: str | None = None
     hinted_refs: list[str] = []
+    executed_tools: list[str] = []
 
     apple_status = check_apple_engine_status() if engine_choice in ("auto", "apple") else None
     local_status = probe_local_openai_engine(
@@ -515,6 +858,7 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         local_status=local_status,
         image_data_url=inline_snap,
         has_screenshot=has_multimodal_image,
+        question=payload.question,
     )
 
     def _preserve_unresolved_question(reason: str) -> str | None:
@@ -594,6 +938,11 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                     inline_data_url=inline_snap,
                     history=eff_history,
                     supports_vision=local_status.supports_vision,
+                    db_session=session,
+                    target_slug=target.slug if target is not None else focus.active_slug,
+                    session_id=eff_sid,
+                    executed_tools_out=executed_tools,
+                    hinted_refs_out=hinted_refs,
                 )
                 engine_used = "local"
                 if (
@@ -693,9 +1042,13 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         fallback_reason=fallback_reason,
         context_headline=focus.headline,
         answer_markdown=answer_md,
+        executed_tools=executed_tools,
         referenced_node_ids=matched_node_ids[:6],
         validated_references=val_refs,
         evidence_identity=ev_identity,
         context_budget=budget,
         observed_at=utc_now(),
     )
+
+
+answer_ask_request = ask_wythe_with_live_context
