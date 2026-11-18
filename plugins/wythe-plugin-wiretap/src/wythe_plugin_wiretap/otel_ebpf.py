@@ -58,13 +58,32 @@ _BEARER_INLINE_RE = re.compile(r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*", re.IG
 MAX_SQL_STATEMENT_CHARS = 65536
 _SQL_OMITTED_MARKER = "[sql_statement_omitted_unparsed]"
 _SAFE_SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,127}$")
+_STRICT_ANSI_DQ_IDENT_DIALECTS: frozenset[str] = frozenset(
+    {
+        "postgresql",
+        "postgres",
+        "pg",
+        "oracle",
+        "mssql",
+        "sqlserver",
+        "db2",
+        "trino",
+        "presto",
+        "snowflake",
+    }
+)
+_KNOWN_DQ_STRING_DIALECTS: frozenset[str] = frozenset(
+    {"mysql", "mariadb", "sqlite", "sqlite3"}
+)
 _SQL_ATTR_KEYS: frozenset[str] = frozenset(
     {
         "db.statement",
+        "db.sql.statement",
         "db.query.text",
         "db.query",
         "sql",
         "sql.query",
+        "sql.statement",
         "query",
         "statement",
         "db.query.summary",
@@ -415,11 +434,21 @@ def _matches_unquoted_uuid(raw_sql: str, pos: int, n: int) -> bool:
     return True
 
 
-def _sanitize_sql_op_and_table(op: str, tbl: str) -> tuple[str, str]:
+def _sanitize_sql_op_and_table(
+    op: str,
+    tbl: str,
+    *,
+    allow_quoted_ident: bool = True,
+) -> tuple[str, str]:
     clean_op = op.strip().upper()
     if clean_op not in _RECOGNIZED_SQL_VERBS:
         clean_op = ""
-    raw_tbl = tbl.strip().strip('"').strip("`").strip("[]")
+    stripped_tbl = tbl.strip()
+    if not stripped_tbl or any(tok in stripped_tbl for tok in ("'", "\\", ";", "--", "/*", "#")):
+        return clean_op, ""
+    if not allow_quoted_ident and any(q in stripped_tbl for q in ('"', "`", "[", "]")):
+        return clean_op, ""
+    raw_tbl = stripped_tbl.strip('"').strip("`").strip("[]")
     if "." in raw_tbl:
         raw_tbl = raw_tbl.rpartition(".")[2]
     clean_tbl = raw_tbl.strip().strip('"').strip("`").strip("[]")
@@ -428,8 +457,13 @@ def _sanitize_sql_op_and_table(op: str, tbl: str) -> tuple[str, str]:
     return clean_op, clean_tbl
 
 
-def _format_omitted_sql(op: str, tbl: str) -> str:
-    c_op, c_tbl = _sanitize_sql_op_and_table(op, tbl)
+def _format_omitted_sql(
+    op: str,
+    tbl: str,
+    *,
+    allow_quoted_ident: bool = True,
+) -> str:
+    c_op, c_tbl = _sanitize_sql_op_and_table(op, tbl, allow_quoted_ident=allow_quoted_ident)
     prefix = " ".join(part for part in (c_op, c_tbl) if part)
     return f"{prefix} {_SQL_OMITTED_MARKER}" if prefix else _SQL_OMITTED_MARKER
 
@@ -440,6 +474,7 @@ def _consume_single_quoted(
     n: int,
     *,
     allow_backslash_escape: bool = False,
+    fail_on_backslash_before_quote: bool = False,
 ) -> int | None:
     j = quote_idx + 1
     while j < n:
@@ -457,7 +492,11 @@ def _consume_single_quoted(
             if j >= n:
                 return None
             if raw_sql[j] == "'":
-                if (bs_len % 2) == 1 or (j + 1 < n and raw_sql[j + 1] == "'"):
+                if (
+                    fail_on_backslash_before_quote
+                    or (bs_len % 2) == 1
+                    or (j + 1 < n and raw_sql[j + 1] == "'")
+                ):
                     return None
                 return j + 1
             continue
@@ -530,25 +569,36 @@ def _scan_sql_statement(
     max_chars: int = MAX_SQL_STATEMENT_CHARS,
 ) -> tuple[str, bool, str, str]:
     """Single-pass lexical SQL redactor/normalizer failing closed on ambiguous or unclosed syntax."""
+    db_low = db_system.strip().lower()
+    is_mysql = db_low in ("mysql", "mariadb")
+    uses_dq_strings = db_low in _KNOWN_DQ_STRING_DIALECTS
+    is_ambiguous_dialect = db_low not in (
+        _STRICT_ANSI_DQ_IDENT_DIALECTS | _KNOWN_DQ_STRING_DIALECTS
+    )
+    allow_quoted_tbl = not is_ambiguous_dialect
+
     if not raw_sql or not raw_sql.strip():
-        c_op, c_tbl = _sanitize_sql_op_and_table(explicit_op, explicit_table)
+        c_op, c_tbl = _sanitize_sql_op_and_table(
+            explicit_op, explicit_table, allow_quoted_ident=allow_quoted_tbl
+        )
         return "", False, c_op, c_tbl
 
     detected_op = ""
     detected_tbl = ""
 
     def _fail() -> tuple[str, bool, str, str]:
-        f_op, f_tbl = _sanitize_sql_op_and_table(explicit_op or detected_op, explicit_table or detected_tbl)
-        return _format_omitted_sql(f_op, f_tbl), True, f_op, f_tbl
+        f_op, f_tbl = _sanitize_sql_op_and_table(
+            explicit_op or detected_op,
+            explicit_table or detected_tbl,
+            allow_quoted_ident=allow_quoted_tbl,
+        )
+        return _format_omitted_sql(f_op, f_tbl, allow_quoted_ident=allow_quoted_tbl), True, f_op, f_tbl
 
     if len(raw_sql) > max_chars or any(
         (ord(c) < 32 and c not in ("\t", "\n", "\r")) or ord(c) == 0x7F for c in raw_sql
     ):
         return _fail()
 
-    db_low = db_system.strip().lower()
-    is_mysql = db_low in ("mysql", "mariadb")
-    uses_dq_strings = is_mysql or db_low in ("sqlite", "sqlite3")
     out: list[str] = []
     changed = False
     need_stmt_verb = True
@@ -562,6 +612,9 @@ def _scan_sql_statement(
     paren_clause_stack: list[str] = []
     i = 0
     n = len(raw_sql)
+
+    def _in_table_clause() -> bool:
+        return expecting_table or table_dot_chain or prev_sig_tok in _SQL_TABLE_PREPOSITIONS
 
     def _append_space() -> None:
         if out and out[-1] not in (" ", "(", "["):
@@ -586,7 +639,7 @@ def _scan_sql_statement(
             i += 1
             continue
 
-        # Line comments: `-- ...` or MySQL `# ...`
+        # Line comments: `-- ...` or MySQL `# ...`; fail closed on `#` when dialect is ambiguous/SQLite
         if (ch == "-" and i + 1 < n and raw_sql[i + 1] == "-") or (ch == "#" and is_mysql):
             changed = True
             _append_space()
@@ -594,6 +647,8 @@ def _scan_sql_statement(
             while i < n and raw_sql[i] not in ("\n", "\r"):
                 i += 1
             continue
+        if ch == "#" and (is_ambiguous_dialect or db_low in ("sqlite", "sqlite3")):
+            return _fail()
 
         # Block comments: `/* ... */` including nested PostgreSQL comments; stray `*/` fails closed
         if ch == "*" and i + 1 < n and raw_sql[i + 1] == "/":
@@ -691,7 +746,10 @@ def _scan_sql_statement(
                 raw_sql,
                 q_pos,
                 n,
-                allow_backslash_escape=is_pg_escape_str,
+                allow_backslash_escape=(
+                    is_pg_escape_str and db_low in ("postgresql", "postgres", "pg")
+                ),
+                fail_on_backslash_before_quote=is_ambiguous_dialect,
             )
             if end_q is None:
                 return _fail()
@@ -703,7 +761,7 @@ def _scan_sql_statement(
             i = end_q
             continue
 
-        # Double-quoted identifiers (`"ident"`) & MySQL/SQLite/value-position `"..."` literals
+        # Double-quoted identifiers (`"ident"`) & MySQL/SQLite/ambiguous/value-position `"..."` literals
         if ch == '"':
             j = i + 1
             closed_end: int | None = None
@@ -711,15 +769,21 @@ def _scan_sql_statement(
                 c = raw_sql[j]
                 if c == "\\":
                     if not is_mysql:
+                        if _in_table_clause():
+                            detected_tbl = ""
                         return _fail()
                     bs_start = j
                     while j < n and raw_sql[j] == "\\":
                         j += 1
                     bs_len = j - bs_start
                     if j >= n:
+                        if _in_table_clause():
+                            detected_tbl = ""
                         return _fail()
                     if raw_sql[j] == '"':
                         if (bs_len % 2) == 1 or (j + 1 < n and raw_sql[j + 1] == '"'):
+                            if _in_table_clause():
+                                detected_tbl = ""
                             return _fail()
                         closed_end = j + 1
                         break
@@ -732,6 +796,11 @@ def _scan_sql_statement(
                     break
                 j += 1
             if closed_end is None:
+                if _in_table_clause():
+                    detected_tbl = ""
+                return _fail()
+            if is_ambiguous_dialect and _in_table_clause():
+                detected_tbl = ""
                 return _fail()
             peek = closed_end
             while peek < n and raw_sql[peek] in (" ", "\t", "\n", "\r"):
@@ -740,10 +809,13 @@ def _scan_sql_statement(
             in_val_paren = ("VALUES" in paren_clause_stack) or ("IN" in paren_clause_stack)
             in_val_pos = in_val_paren or (prev_sig_tok in _VALUE_PREV_TOKENS and next_ch != ".")
             keep_ident = (
-                (prev_sig_tok in _SQL_TABLE_PREPOSITIONS or prev_sig_tok == "." or next_ch == ".")
-                and not in_val_paren
-                if uses_dq_strings
-                else not in_val_pos
+                False
+                if is_ambiguous_dialect
+                else (
+                    (prev_sig_tok in _SQL_TABLE_PREPOSITIONS or prev_sig_tok == "." or next_ch == ".")
+                    and not in_val_paren
+                    and (uses_dq_strings or not in_val_pos)
+                )
             )
             if keep_ident:
                 inner_ident = raw_sql[i + 1 : closed_end - 1].replace('""', '"')
@@ -765,6 +837,8 @@ def _scan_sql_statement(
             closed_bt: int | None = None
             while j < n:
                 if raw_sql[j] == "\\":
+                    if _in_table_clause():
+                        detected_tbl = ""
                     return _fail()
                 if raw_sql[j] == "`":
                     if j + 1 < n and raw_sql[j + 1] == "`":
@@ -774,7 +848,20 @@ def _scan_sql_statement(
                     break
                 j += 1
             if closed_bt is None:
+                if _in_table_clause():
+                    detected_tbl = ""
                 return _fail()
+            if is_ambiguous_dialect:
+                if _in_table_clause():
+                    detected_tbl = ""
+                    return _fail()
+                changed = True
+                out.append("'?'")
+                prev_sig_tok = "LIT"
+                expecting_table = False
+                table_dot_chain = False
+                i = closed_bt
+                continue
             _record_ident(raw_sql[i + 1 : closed_bt - 1].replace("``", "`"))
             out.append(raw_sql[i:closed_bt])
             prev_sig_tok = "IDENT"
@@ -786,6 +873,12 @@ def _scan_sql_statement(
             if prev_sig_tok not in ("IDENT", ")", "]", "ARRAY"):
                 close_b = raw_sql.find("]", i + 1)
                 if close_b == -1:
+                    if _in_table_clause():
+                        detected_tbl = ""
+                    return _fail()
+                if is_ambiguous_dialect:
+                    if _in_table_clause():
+                        detected_tbl = ""
                     return _fail()
                 inner_b = raw_sql[i + 1 : close_b]
                 if _SAFE_SQL_IDENT_RE.match(inner_b):
@@ -861,6 +954,7 @@ def _scan_sql_statement(
                         j,
                         n,
                         allow_backslash_escape=False,
+                        fail_on_backslash_before_quote=is_ambiguous_dialect,
                     )
                     if end_cs is None:
                         return _fail()
@@ -1020,7 +1114,11 @@ def _scan_sql_statement(
     if need_stmt_verb and prev_sig_tok != ";":
         return _fail()
 
-    c_op, c_tbl = _sanitize_sql_op_and_table(explicit_op or detected_op, explicit_table or detected_tbl)
+    c_op, c_tbl = _sanitize_sql_op_and_table(
+        explicit_op or detected_op,
+        explicit_table or detected_tbl,
+        allow_quoted_ident=allow_quoted_tbl,
+    )
     normalized = "".join(out).strip()
     if normalized != raw_sql:
         changed = True
@@ -1117,7 +1215,7 @@ def _looks_like_inline_sql(text: str) -> bool:
     if v_end == idx or v_end >= n:
         return False
     verb = s[idx:v_end].upper()
-    return verb in _RECOGNIZED_SQL_VERBS and s[v_end] in (
+    if verb not in _RECOGNIZED_SQL_VERBS or s[v_end] not in (
         " ",
         "\t",
         "\n",
@@ -1131,6 +1229,13 @@ def _looks_like_inline_sql(text: str) -> bool:
         "$",
         "/",
         "-",
+        "#",
+    ):
+        return False
+    rest = s[v_end:].lstrip()
+    return not (
+        (rest.startswith("/") and not rest.startswith("/*"))
+        or rest.lower().startswith(("http://", "https://"))
     )
 
 
@@ -1151,6 +1256,10 @@ def redact_attributes(
         or inherited_db_system
         or ""
     ).strip()
+    db_low_hint = db_sys_hint.lower()
+    allow_quoted_tbl_hint = db_low_hint in (
+        _STRICT_ANSI_DQ_IDENT_DIALECTS | _KNOWN_DQ_STRING_DIALECTS
+    )
     op_hint = str(
         raw_attrs.get("db.operation")
         or raw_attrs.get("db.operation.name")
@@ -1168,7 +1277,16 @@ def redact_attributes(
     def _scrub_str(k_low: str, val_s: str) -> tuple[str, int]:
         cnt = 0
         is_url_key = k_low in ("url.full", "http.url", "http.target", "url", "path", "http.route", "url.path")
-        if k_low in _SQL_ATTR_KEYS or (not is_url_key and _looks_like_inline_sql(val_s)):
+        if k_low in ("db.sql.table", "db.collection.name", "table"):
+            _op_chk, safe_tbl = _sanitize_sql_op_and_table(
+                "SELECT", val_s, allow_quoted_ident=allow_quoted_tbl_hint
+            )
+            if not safe_tbl:
+                return "[REDACTED]", 1
+            if safe_tbl != val_s.strip():
+                cnt += 1
+            val_s = safe_tbl
+        elif k_low in _SQL_ATTR_KEYS or (not is_url_key and _looks_like_inline_sql(val_s)):
             val_s, was_sql = _redact_sql_statement(
                 val_s,
                 db_system=db_sys_hint,
@@ -1347,37 +1465,69 @@ def _transition_from_attr_dict(
     ).strip()
     raw_sql = str(
         raw_attrs.get("db.statement")
+        or raw_attrs.get("db.sql.statement")
         or raw_attrs.get("db.query.text")
         or raw_attrs.get("db.query")
         or raw_attrs.get("sql")
         or raw_attrs.get("sql.query")
+        or raw_attrs.get("sql.statement")
         or raw_attrs.get("query")
         or raw_attrs.get("statement")
         or ""
     ).strip()
+    explicit_op_str = str(raw_attrs.get("db.operation") or raw_attrs.get("db.operation.name") or "")
+    explicit_tbl_str = str(
+        raw_attrs.get("db.sql.table")
+        or raw_attrs.get("db.collection.name")
+        or raw_attrs.get("table")
+        or ""
+    )
     db_op, db_tbl = _extract_sql_table_and_op(
         raw_sql,
-        str(raw_attrs.get("db.operation") or raw_attrs.get("db.operation.name") or ""),
-        str(
-            raw_attrs.get("db.sql.table")
-            or raw_attrs.get("db.collection.name")
-            or raw_attrs.get("table")
-            or ""
-        ),
+        explicit_op_str,
+        explicit_tbl_str,
         db_system=db_sys,
     )
+    raw_span_name = span_name.strip()
+    inline_span_redacted = ""
+    if (
+        not raw_sql
+        and not clean_route
+        and not http_method
+        and raw_span_name
+        and _looks_like_inline_sql(raw_span_name)
+    ):
+        sp_red, sp_was_red, sp_op, sp_tbl = _scan_sql_statement(
+            raw_span_name,
+            db_system=db_sys,
+            explicit_op=explicit_op_str,
+            explicit_table=explicit_tbl_str,
+        )
+        inline_span_redacted = sp_red
+        if sp_was_red:
+            red_cnt += 1
+        if sp_op and not db_op:
+            db_op = sp_op
+        if sp_tbl and not db_tbl:
+            db_tbl = sp_tbl
+
     def _scrub_free_field(val: str) -> str:
         nonlocal red_cnt
         if not val:
             return ""
         cur = val
-        if _looks_like_inline_sql(cur):
-            cur, was_sql = _redact_sql_statement(cur, db_system=db_sys)
-            if was_sql:
-                red_cnt += 1
-        elif ("?" in cur or "@" in cur) and ("://" in cur or cur.startswith("/")):
+        if ("?" in cur or "@" in cur) and ("://" in cur or cur.startswith("/")):
             _p, cur, was_u = redact_url_target(cur)
             if was_u:
+                red_cnt += 1
+        elif _looks_like_inline_sql(cur):
+            cur, was_sql = _redact_sql_statement(
+                cur,
+                db_system=db_sys,
+                explicit_op=explicit_op_str,
+                explicit_table=explicit_tbl_str,
+            )
+            if was_sql:
                 red_cnt += 1
         scrubbed = _BEARER_INLINE_RE.sub(r"\1 [REDACTED]", cur)
         if scrubbed != cur:
@@ -1385,7 +1535,11 @@ def _transition_from_attr_dict(
         return scrubbed[:256]
 
     service_name = _scrub_free_field(service_name.strip()) or "service"
-    span_name = _scrub_free_field(span_name.strip())
+    span_name = (
+        _BEARER_INLINE_RE.sub(r"\1 [REDACTED]", inline_span_redacted)[:256]
+        if inline_span_redacted
+        else _scrub_free_field(raw_span_name)
+    )
     rpc_sys = str(raw_attrs.get("rpc.system") or "").strip().lower()
     rpc_svc = _scrub_free_field(str(raw_attrs.get("rpc.service") or "").strip())
     rpc_mth = _scrub_free_field(str(raw_attrs.get("rpc.method") or "").strip())
@@ -1393,15 +1547,18 @@ def _transition_from_attr_dict(
     code_fp = _scrub_free_field(str(raw_attrs.get("code.filepath") or "").strip())
     code_fn = _scrub_free_field(str(raw_attrs.get("code.function") or "").strip())
 
-    if db_tbl or db_op or db_sys or raw_sql:
+    if db_tbl or db_op or db_sys or raw_sql or inline_span_redacted:
         red_sql = str(
             redacted_map.get("db.statement")
+            or redacted_map.get("db.sql.statement")
             or redacted_map.get("db.query.text")
             or redacted_map.get("db.query")
             or redacted_map.get("sql")
             or redacted_map.get("sql.query")
+            or redacted_map.get("sql.statement")
             or redacted_map.get("query")
             or redacted_map.get("statement")
+            or inline_span_redacted
             or f"{db_op} {db_tbl}"
         ).strip()
         return (

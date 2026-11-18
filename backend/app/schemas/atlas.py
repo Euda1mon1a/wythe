@@ -925,6 +925,7 @@ class AskWytheResponse(StrictSchema):
     fallback_reason: str | None = None
     context_headline: str
     answer_markdown: str
+    executed_tools: list[str] = Field(default_factory=list)
     referenced_node_ids: list[str] = Field(default_factory=list)
     validated_references: list[ValidatedReferenceRead] = Field(default_factory=list)
     evidence_identity: EvidenceIdentityRead | None = None

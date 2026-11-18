@@ -1632,6 +1632,132 @@ _EXPLICIT_RECEIPT_BOOL_KEYS: tuple[str, ...] = (
     "authoritative_receipt",
     "reconciliation_receipt",
 )
+_NEGATIVE_SETTLEMENT_VALUES: frozenset[str] = frozenset(
+    {
+        "not_found",
+        "not-found",
+        "notfound",
+        "missing",
+        "none",
+        "null",
+        "nil",
+        "unknown",
+        "pending",
+        "in_progress",
+        "unresolved",
+        "indeterminate",
+        "unavailable",
+        "unreachable",
+        "failed",
+        "failure",
+        "error",
+        "timeout",
+        "timed_out",
+        "lost_reply",
+        "unverified",
+        "unreconciled",
+        "unsettled",
+        "unacknowledged",
+        "committed_unacknowledged",
+        "not_applicable",
+        "n/a",
+        "na",
+        "false",
+        "no",
+        "0",
+    }
+)
+_POSITIVE_SETTLED_RECEIPT_STATUSES: frozenset[str] = frozenset(
+    {
+        "settled",
+        "committed",
+        "accepted",
+        "settled_committed",
+        "settled_aborted",
+        "rolled_back",
+        "aborted",
+        "reconciled",
+        "verified",
+        "confirmed",
+    }
+)
+_RECEIPT_MAPPING_KEYS: tuple[str, ...] = (
+    "settlement_receipt",
+    "authoritative_settlement_receipt",
+    "lock_settlement_receipt",
+    "lock_receipt",
+    "authoritative_receipt",
+    "reconciliation_receipt",
+    "settlement_evidence",
+    "receipt",
+)
+_RECEIPT_ID_SCALAR_KEYS: tuple[str, ...] = (
+    "settlement_receipt_id",
+    "settlement_lock_id",
+    "publication_lock_id",
+)
+_INNER_RECEIPT_ID_KEYS: tuple[str, ...] = (
+    "receipt_id",
+    "settlement_receipt_id",
+    "lock_id",
+    "settlement_lock_id",
+    "publication_lock_id",
+    "id",
+)
+_RECEIPT_BOOL_POSITIVE_KEYS: frozenset[str] = frozenset(
+    {
+        "found",
+        "exists",
+        "verified",
+        "settled",
+        "reconciled",
+        "ok",
+        "valid",
+        "matched",
+        "acknowledged",
+        "authoritative",
+    }
+)
+_RECEIPT_BOOL_NEGATIVE_KEYS: frozenset[str] = frozenset(
+    {
+        "not_found",
+        "missing",
+        "failed",
+        "error",
+        "timed_out",
+        "lost_reply",
+        "indeterminate",
+        "unverified",
+        "conflict",
+    }
+)
+_RECEIPT_STATUS_KEYS: frozenset[str] = frozenset(
+    {
+        "status",
+        "state",
+        "outcome",
+        "result",
+        "verdict",
+        "settlement_state",
+        "terminal_state",
+        "authoritative_terminal_state",
+        "final_state",
+        "outcome_status",
+        "settlement_status",
+        "reconciliation_status",
+        "receipt_status",
+        "lock_status",
+    }
+)
+
+
+def _is_valid_settlement_id_value(val: Any) -> str | None:
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if not s or s.lower() in _NEGATIVE_SETTLEMENT_VALUES:
+        return None
+    return s
 
 
 def _is_nonempty_settlement_value(val: Any) -> bool:
@@ -1640,18 +1766,7 @@ def _is_nonempty_settlement_value(val: Any) -> bool:
     if isinstance(val, (int, float)):
         return False
     if isinstance(val, str):
-        s = val.strip()
-        return bool(s) and s.lower() not in (
-            "none",
-            "null",
-            "unknown",
-            "pending",
-            "unresolved",
-            "indeterminate",
-            "not_applicable",
-            "false",
-            "0",
-        )
+        return _is_valid_settlement_id_value(val) is not None
     if isinstance(val, Mapping):
         return any(_is_nonempty_settlement_value(v) for v in val.values())
     if isinstance(val, Sequence) and not isinstance(val, (bytes, bytearray)):
@@ -1659,15 +1774,463 @@ def _is_nonempty_settlement_value(val: Any) -> bool:
     return False
 
 
-def _terminal_polarity(raw_tok: Any) -> Literal["positive", "negative"] | None:
-    if raw_tok is None:
+def _terminal_polarity(raw_val: Any) -> Literal["positive", "negative"] | None:
+    if raw_val is None:
         return None
-    low = str(raw_tok).strip().lower()
+    low = str(raw_val).strip().lower()
     if low in ("committed", "accepted", "settled_committed", "delivered_to_human"):
         return "positive"
     if low in ("rejected", "rolled_back", "aborted", "settled_aborted", "failed"):
         return "negative"
     return None
+
+
+_BENIGN_FALSE_RECEIPT_KEYS: frozenset[str] = frozenset(
+    {
+        "lost_reply",
+        "transport_timeout_or_lost_reply",
+        "timed_out",
+        "blind_retry_prohibited",
+        "error",
+        "failed",
+        "conflict",
+        "missing",
+        "not_found",
+        "indeterminate",
+        "unverified",
+        "content_equality_only",
+        "temporal_proximity_only",
+    }
+)
+_ERROR_LIKE_RECEIPT_KEYS: frozenset[str] = frozenset(
+    {
+        "error",
+        "error_code",
+        "err",
+        "failure",
+        "failure_code",
+        "failure_reason",
+        "rejection_reason",
+        "timeout_reason",
+    }
+)
+
+
+def _inspect_receipt_tree(
+    node: Any,
+    *,
+    settled_terminal: str | None,
+    structured_maps: list[Mapping[str, Any]],
+    receipt_ids: set[str],
+    lock_ids: set[str],
+    receipt_polarities: set[str],
+    allow_positive_capture: bool = True,
+) -> bool:
+    """Walk a receipt value/mapping recursively; return True if any negative/invalid state is seen."""
+    neg = False
+    if node is None or node is False:
+        if node is False and settled_terminal in _POSITIVE_TERMINAL_STATES:
+            receipt_polarities.add("negative")
+        return True
+    if node is True:
+        return False
+    if isinstance(node, (int, float)):
+        return True
+    if isinstance(node, str):
+        pol = _terminal_polarity(node)
+        if pol is not None:
+            receipt_polarities.add(pol)
+        return _is_valid_settlement_id_value(node) is None
+    if isinstance(node, Sequence) and not isinstance(node, (bytes, bytearray)):
+        if len(node) == 0:
+            return True
+        for elem in node:
+            if _inspect_receipt_tree(
+                elem,
+                settled_terminal=settled_terminal,
+                structured_maps=structured_maps,
+                receipt_ids=receipt_ids,
+                lock_ids=lock_ids,
+                receipt_polarities=receipt_polarities,
+                allow_positive_capture=allow_positive_capture,
+            ):
+                neg = True
+        return neg
+    if isinstance(node, Mapping):
+        if len(node) == 0:
+            return True
+        if allow_positive_capture:
+            structured_maps.append(node)
+        for raw_k, raw_v in node.items():
+            kl = str(raw_k).strip().lower()
+            if raw_v is False:
+                if kl not in _BENIGN_FALSE_RECEIPT_KEYS:
+                    neg = True
+                    if kl in _RECEIPT_BOOL_POSITIVE_KEYS and settled_terminal in _POSITIVE_TERMINAL_STATES:
+                        receipt_polarities.add("negative")
+            elif raw_v is True and (kl in _RECEIPT_BOOL_NEGATIVE_KEYS or kl in _ERROR_LIKE_RECEIPT_KEYS):
+                neg = True
+            elif isinstance(raw_v, str):
+                s_clean = raw_v.strip()
+                s_low = s_clean.lower()
+                if kl in _RECEIPT_BOOL_POSITIVE_KEYS and s_low in ("false", "0", "no"):
+                    neg = True
+                    if settled_terminal in _POSITIVE_TERMINAL_STATES:
+                        receipt_polarities.add("negative")
+                elif (kl in _RECEIPT_BOOL_NEGATIVE_KEYS and s_low in ("true", "1", "yes")) or (
+                    kl in _ERROR_LIKE_RECEIPT_KEYS
+                    and s_clean
+                    and s_low not in ("none", "null", "0", "false", "ok")
+                ) or (kl not in _ERROR_LIKE_RECEIPT_KEYS and _is_valid_settlement_id_value(raw_v) is None):
+                    neg = True
+            if kl == "stage" and raw_v is not None and (
+                not isinstance(raw_v, str)
+                or raw_v.strip().lower()
+                not in (_POSITIVE_SETTLED_RECEIPT_STATUSES | {"authoritatively_settled"})
+            ):
+                neg = True
+            if kl in _RECEIPT_STATUS_KEYS and raw_v is not None:
+                pol = _terminal_polarity(raw_v)
+                if pol is not None:
+                    receipt_polarities.add(pol)
+                if (
+                    not isinstance(raw_v, str)
+                    or raw_v.strip().lower() not in _POSITIVE_SETTLED_RECEIPT_STATUSES
+                ):
+                    neg = True
+            if kl in _INNER_RECEIPT_ID_KEYS and not isinstance(raw_v, Mapping):
+                cid = _is_valid_settlement_id_value(raw_v)
+                if cid is None:
+                    neg = True
+                elif allow_positive_capture:
+                    if kl in ("lock_id", "settlement_lock_id", "publication_lock_id"):
+                        lock_ids.add(cid)
+                    else:
+                        receipt_ids.add(cid)
+            if (
+                isinstance(raw_v, Mapping)
+                or (isinstance(raw_v, Sequence) and not isinstance(raw_v, (str, bytes, bytearray)))
+            ) and _inspect_receipt_tree(
+                raw_v,
+                settled_terminal=settled_terminal,
+                structured_maps=structured_maps,
+                receipt_ids=receipt_ids,
+                lock_ids=lock_ids,
+                receipt_polarities=receipt_polarities,
+                allow_positive_capture=allow_positive_capture,
+            ):
+                neg = True
+        return neg
+    return True
+
+
+def _validate_post_loss_settlement(
+    raw_item: Mapping[str, Any],
+    *,
+    raw_transition_maps: Sequence[Mapping[str, Any]],
+    raw_transition_stages: Sequence[str],
+    transitions: Sequence[OutcomeTransitionRecord],
+    last_loss_idx: int,
+    settled_terminal: str | None,
+    top_term_digests: set[str],
+    settlement_commit_digests: set[str],
+) -> tuple[bool, bool]:
+    """Return `(is_valid_settlement, has_receipt_conflict)` for post-loss write reconciliation."""
+    structured_maps: list[Mapping[str, Any]] = []
+    receipt_ids: set[str] = set()
+    lock_ids: set[str] = set()
+    receipt_polarities: set[str] = set()
+    has_negative = False
+
+    post_loss_sources: list[Mapping[str, Any]] = [raw_item]
+    non_post_loss_transitions: list[Mapping[str, Any]] = []
+    for t_idx, (st_l, rt) in enumerate(zip(raw_transition_stages, raw_transition_maps, strict=False)):
+        rt_lost = bool(_pick(rt, "transport_timeout_or_lost_reply", "lost_reply", default=False))
+        if t_idx > last_loss_idx and not rt_lost and st_l in (
+            "authoritatively_settled",
+            "settled_committed",
+            "settled_aborted",
+        ):
+            post_loss_sources.append(rt)
+        else:
+            non_post_loss_transitions.append(rt)
+
+    for src_m in post_loss_sources:
+        for rk in _RECEIPT_MAPPING_KEYS:
+            if rk in src_m and _inspect_receipt_tree(
+                src_m[rk],
+                settled_terminal=settled_terminal,
+                structured_maps=structured_maps,
+                receipt_ids=receipt_ids,
+                lock_ids=lock_ids,
+                receipt_polarities=receipt_polarities,
+                allow_positive_capture=(rk != "receipt"),
+            ):
+                has_negative = True
+
+    for pre_rt in non_post_loss_transitions:
+        for rk in _RECEIPT_MAPPING_KEYS:
+            if rk in pre_rt:
+                pre_neg = _inspect_receipt_tree(
+                    pre_rt[rk],
+                    settled_terminal=settled_terminal,
+                    structured_maps=structured_maps,
+                    receipt_ids=receipt_ids,
+                    lock_ids=lock_ids,
+                    receipt_polarities=receipt_polarities,
+                    allow_positive_capture=False,
+                )
+                if rk != "receipt" and pre_neg:
+                    has_negative = True
+
+    for src_m in post_loss_sources:
+        for ik in _RECEIPT_ID_SCALAR_KEYS:
+            if ik in src_m:
+                cid = _is_valid_settlement_id_value(src_m[ik])
+                if cid is None:
+                    has_negative = True
+                elif ik in ("settlement_lock_id", "publication_lock_id"):
+                    lock_ids.add(cid)
+                else:
+                    receipt_ids.add(cid)
+        for bk in _RECEIPT_BOOL_POSITIVE_KEYS:
+            if src_m.get(bk) is False or (
+                isinstance(src_m.get(bk), str)
+                and str(src_m[bk]).strip().lower() in ("false", "0", "no")
+            ):
+                has_negative = True
+                if settled_terminal in _POSITIVE_TERMINAL_STATES:
+                    receipt_polarities.add("negative")
+        for nk in _RECEIPT_BOOL_NEGATIVE_KEYS:
+            if nk in ("lost_reply", "timed_out") and src_m is raw_item:
+                continue
+            if src_m.get(nk) is True:
+                has_negative = True
+        for ek in _ERROR_LIKE_RECEIPT_KEYS | {"settlement_error", "reconciliation_error"}:
+            ev_err = src_m.get(ek)
+            if ev_err is True or (
+                isinstance(ev_err, str)
+                and ev_err.strip()
+                and ev_err.strip().lower() not in ("none", "null", "0", "false", "ok")
+            ):
+                has_negative = True
+        status_keys = _RECEIPT_STATUS_KEYS - ({"state"} if src_m is raw_item else set())
+        for sk in status_keys:
+            if sk in src_m and src_m[sk] is not None:
+                pol = _terminal_polarity(src_m[sk])
+                if pol is not None:
+                    receipt_polarities.add(pol)
+                if (
+                    not isinstance(src_m[sk], str)
+                    or src_m[sk].strip().lower() not in _POSITIVE_SETTLED_RECEIPT_STATUSES
+                ):
+                    has_negative = True
+
+    has_scalar_receipt_id = any(
+        _is_valid_settlement_id_value(src_m.get(sk)) is not None
+        for src_m in post_loss_sources
+        for sk in _RECEIPT_ID_SCALAR_KEYS
+    )
+    if structured_maps and not has_scalar_receipt_id and not any(
+        isinstance(rm.get(sk), str)
+        and str(rm[sk]).strip().lower() in _POSITIVE_SETTLED_RECEIPT_STATUSES
+        for rm in structured_maps
+        for sk in _RECEIPT_STATUS_KEYS
+    ):
+        has_negative = True
+
+    term_pol = _terminal_polarity(settled_terminal)
+    has_conflict = bool(
+        ("positive" in receipt_polarities and "negative" in receipt_polarities)
+        or (term_pol == "positive" and "negative" in receipt_polarities)
+        or (term_pol == "negative" and "positive" in receipt_polarities)
+    )
+    if len(receipt_ids) > 1 or len(lock_ids) > 1:
+        has_conflict = True
+        has_negative = True
+
+    settled_stages = ("authoritatively_settled", "settled_committed", "settled_aborted", "delivered_to_human")
+    anchor_maps: list[Mapping[str, Any]] = [raw_item] + [
+        rt
+        for idx, (st_l, rt) in enumerate(zip(raw_transition_stages, raw_transition_maps, strict=False))
+        if idx <= last_loss_idx or st_l not in settled_stages
+    ]
+    evidence_maps: list[Mapping[str, Any]] = list(structured_maps) + [
+        rt
+        for idx, (st_l, rt) in enumerate(zip(raw_transition_stages, raw_transition_maps, strict=False))
+        if idx > last_loss_idx and st_l in ("authoritatively_settled", "settled_committed", "settled_aborted")
+    ]
+    all_maps = [*anchor_maps, *evidence_maps]
+
+    for corr_key in ("operation_id", "request_id", "attempt_id", "idempotency_key"):
+        seen_vals: set[str] = set()
+        for m in all_maps:
+            if corr_key in m and m[corr_key] is not None:
+                cv = _is_valid_settlement_id_value(m[corr_key])
+                if cv is None:
+                    has_negative = True
+                else:
+                    seen_vals.add(cv)
+        if len(seen_vals) > 1:
+            has_negative = True
+
+    req_or_att_vals: set[str] = set()
+    for m in all_maps:
+        if "request_or_attempt_id" in m and m["request_or_attempt_id"] is not None:
+            rv = _is_valid_settlement_id_value(m["request_or_attempt_id"])
+            if rv is None:
+                has_negative = True
+            else:
+                req_or_att_vals.add(rv)
+    if len(req_or_att_vals) > 1:
+        has_negative = True
+    for m in all_maps:
+        for rk_cmp in ("request_id", "attempt_id"):
+            rv_cmp = _is_valid_settlement_id_value(m.get(rk_cmp))
+            if rv_cmp is not None and req_or_att_vals and rv_cmp not in req_or_att_vals:
+                # Allow distinct request_id vs attempt_id only when request_or_attempt_id matches at least one
+                sibling = _is_valid_settlement_id_value(
+                    m.get("attempt_id" if rk_cmp == "request_id" else "request_id")
+                )
+                if sibling is None or sibling not in req_or_att_vals:
+                    has_negative = True
+
+    explicit_out_id = _is_valid_settlement_id_value(_pick(raw_item, "outcome_id", "id", "journey_id"))
+    for em in evidence_maps:
+        if "outcome_id" in em and em["outcome_id"] is not None:
+            ev_oid = _is_valid_settlement_id_value(em["outcome_id"])
+            if ev_oid is None or (explicit_out_id is not None and ev_oid != explicit_out_id):
+                has_negative = True
+
+    rcpt_term_digests: set[str] = set()
+    for rm in structured_maps:
+        for dk in ("settlement_digest", "after_image_digest", "terminal_digest", "state_digest"):
+            if dk in rm and rm[dk] is not None:
+                dv = _is_valid_settlement_id_value(rm[dk])
+                if dv is None:
+                    has_negative = True
+                else:
+                    rcpt_term_digests.add(dv)
+    combined_term = top_term_digests | settlement_commit_digests | rcpt_term_digests
+    if len(combined_term) > 1:
+        has_conflict = True
+        has_negative = True
+
+    all_pre_loss_digests = {
+        t.state_digest
+        for idx, (st_l, t) in enumerate(zip(raw_transition_stages, transitions, strict=False))
+        if (idx <= last_loss_idx or st_l not in settled_stages)
+        and _is_valid_settlement_id_value(t.state_digest) is not None
+        and t.state_digest is not None
+    }
+    pre_top_dig = _is_valid_settlement_id_value(raw_item.get("pre_loss_state_digest"))
+    if pre_top_dig is not None:
+        all_pre_loss_digests.add(pre_top_dig)
+    if not transitions and not top_term_digests:
+        raw_st_dig = _is_valid_settlement_id_value(raw_item.get("state_digest"))
+        if raw_st_dig is not None:
+            all_pre_loss_digests.add(raw_st_dig)
+
+    for rm in structured_maps:
+        rm_state_digs = {
+            dv
+            for dk in ("settlement_digest", "after_image_digest", "terminal_digest", "state_digest")
+            if (dv := _is_valid_settlement_id_value(rm.get(dk))) is not None
+        }
+        rm_pred_digs: set[str] = set()
+        for pk in ("predecessor_state_digest", "predecessor_digest"):
+            if pk in rm and rm[pk] is not None:
+                pv = _is_valid_settlement_id_value(rm[pk])
+                if pv is None or (all_pre_loss_digests and pv not in all_pre_loss_digests):
+                    has_negative = True
+                elif pv is not None:
+                    rm_pred_digs.add(pv)
+        if settled_terminal in _POSITIVE_TERMINAL_STATES and (
+            rm_state_digs & (rm_pred_digs | all_pre_loss_digests)
+        ):
+            has_negative = True
+
+    if has_negative or has_conflict or not (receipt_ids or lock_ids):
+        return False, has_conflict
+
+    anchor_ops = {
+        v for m in anchor_maps if (v := _is_valid_settlement_id_value(m.get("operation_id"))) is not None
+    }
+    anchor_reqs = {
+        v
+        for m in anchor_maps
+        if (v := _is_valid_settlement_id_value(_pick(m, "request_id", "request_or_attempt_id"))) is not None
+    }
+    anchor_atts = {
+        v
+        for m in anchor_maps
+        if (v := _is_valid_settlement_id_value(_pick(m, "attempt_id", "request_or_attempt_id"))) is not None
+    }
+    anchor_idems = {
+        v for m in anchor_maps if (v := _is_valid_settlement_id_value(m.get("idempotency_key"))) is not None
+    }
+
+    path_a_ok = False
+    for t_idx, (st_l, rt, t) in enumerate(
+        zip(raw_transition_stages, raw_transition_maps, transitions, strict=False)
+    ):
+        rt_lost = bool(_pick(rt, "transport_timeout_or_lost_reply", "lost_reply", default=False))
+        if (
+            t_idx <= last_loss_idx
+            or rt_lost
+            or st_l not in ("authoritatively_settled", "settled_committed", "settled_aborted")
+            or _is_valid_settlement_id_value(t.state_digest) is None
+        ):
+            continue
+        prior_digs = {
+            pt.state_digest
+            for pt in transitions[:t_idx]
+            if _is_valid_settlement_id_value(pt.state_digest) is not None and pt.state_digest is not None
+        }
+        if pre_top_dig is not None:
+            prior_digs.add(pre_top_dig)
+        if settled_terminal in _POSITIVE_TERMINAL_STATES and (
+            t.state_digest in prior_digs or t.state_digest == t.predecessor_state_digest
+        ):
+            continue
+        pred_ok = (
+            _is_valid_settlement_id_value(t.predecessor_state_digest) is not None
+            and t.predecessor_state_digest in prior_digs
+        )
+        id_ok = (
+            _is_valid_settlement_id_value(rt.get("operation_id")) in anchor_ops
+            or _is_valid_settlement_id_value(_pick(rt, "request_id", "request_or_attempt_id")) in anchor_reqs
+            or _is_valid_settlement_id_value(_pick(rt, "attempt_id", "request_or_attempt_id")) in anchor_atts
+            or _is_valid_settlement_id_value(rt.get("idempotency_key")) in anchor_idems
+        )
+        if pred_ok or id_ok:
+            path_a_ok = True
+            break
+
+    path_b_ok = False
+    for rm in structured_maps:
+        has_rm_id = bool(
+            any(_is_valid_settlement_id_value(rm.get(ik)) is not None for ik in _INNER_RECEIPT_ID_KEYS)
+            or any(_is_valid_settlement_id_value(raw_item.get(sk)) is not None for sk in _RECEIPT_ID_SCALAR_KEYS)
+        )
+        has_pos_status = any(
+            isinstance(rm.get(sk), str)
+            and str(rm[sk]).strip().lower() in _POSITIVE_SETTLED_RECEIPT_STATUSES
+            for sk in _RECEIPT_STATUS_KEYS
+        )
+        rm_linked = (
+            _is_valid_settlement_id_value(rm.get("operation_id")) in anchor_ops
+            or _is_valid_settlement_id_value(_pick(rm, "request_id", "request_or_attempt_id")) in anchor_reqs
+            or _is_valid_settlement_id_value(_pick(rm, "attempt_id", "request_or_attempt_id")) in anchor_atts
+            or _is_valid_settlement_id_value(rm.get("idempotency_key")) in anchor_idems
+            or _is_valid_settlement_id_value(_pick(rm, "predecessor_state_digest", "predecessor_digest"))
+            in all_pre_loss_digests
+        )
+        if has_rm_id and has_pos_status and rm_linked:
+            path_b_ok = True
+            break
+
+    return bool(path_a_ok or path_b_ok), has_conflict
 
 
 def explain_outcome_lifecycle(
@@ -1864,25 +2427,20 @@ def explain_outcome_lifecycle(
     ):
         terminal_conflict = True
 
-    has_top_settlement_meta = (
-        raw_item.get("authenticated_writer_receipt") is True
-        or any(_is_nonempty_settlement_value(raw_item.get(k)) for k in _SETTLEMENT_METADATA_KEYS)
+    validated_post_loss_settlement, receipt_conflict = _validate_post_loss_settlement(
+        raw_item,
+        raw_transition_maps=raw_transition_maps,
+        raw_transition_stages=raw_transition_stages,
+        transitions=transitions,
+        last_loss_idx=last_loss_idx,
+        settled_terminal=settled_terminal,
+        top_term_digests=top_term_digests,
+        settlement_commit_digests=settlement_commit_digests,
     )
-    has_post_loss_settled_transition = any(
-        t_idx > last_loss_idx
-        and not bool(_pick(rt, "transport_timeout_or_lost_reply", "lost_reply", default=False))
-        and st_low in ("authoritatively_settled", "settled_committed", "settled_aborted")
-        and (
-            _is_nonempty_settlement_value(t.state_digest)
-            or rt.get("authenticated_writer_receipt") is True
-            or any(_is_nonempty_settlement_value(rt.get(k)) for k in _SETTLEMENT_METADATA_KEYS)
-        )
-        for t_idx, (st_low, rt, t) in enumerate(
-            zip(raw_transition_stages, raw_transition_maps, transitions, strict=False)
-        )
-    )
+    if receipt_conflict:
+        terminal_conflict = True
     has_settlement_metadata = bool(
-        (has_top_settlement_meta or has_post_loss_settled_transition)
+        validated_post_loss_settlement
         and not bool(_pick(raw_item, "content_equality_only", default=False))
         and not proximity_rejected
         and predecessor_ok

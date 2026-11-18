@@ -102,7 +102,7 @@ def test_f1_sql_lexical_redactor_dialects_and_fail_closed_guards() -> None:
         "(22222, 'tok_b', -0.75, 4.5e+6, 0b101101, 'str_uuid', ARRAY[8765432]); "
         "SELECT id FROM items WHERE qty BETWEEN 12345 AND 67890 LIMIT 777 OFFSET 888"
     )
-    red_num, _ = _redact_sql_statement(numeric_sql)
+    red_num, _ = _redact_sql_statement(numeric_sql, db_system="sqlite")
     assert "[items]" in red_num and "`id`" in red_num
     for forbidden in (
         "11111",

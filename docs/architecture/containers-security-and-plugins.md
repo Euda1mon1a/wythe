@@ -1,4 +1,4 @@
-# Containers, Security Workflows & Plugin Architecture (`v0.2.4`)
+# Containers, Security Workflows & Plugin Architecture (`v0.2.5`)
 
 This document explains why Wythe inspects container and Kubernetes **source blueprints** (`Dockerfile`/`.docker/`, `.dockerignore`, `compose.yaml`/`docker-compose.*.yml`, and Kubernetes manifests) rather than sealed OCI image tarballs, how **Stage 1 (`tach` + Wythe)** hands off to **Stage 2 (`Syft` + `Trivy`)** in CI across Blue, Red, and Purple workflows, and how Wythe's extension system (`wythe.plugins`, `tach.toml` bridge, and OpenLineage export across CLI, HTTP, MCP, and WebGL UI) operates without executing untrusted repository code.
 

@@ -966,6 +966,8 @@ export interface components {
             context_headline: string;
             /** Answer Markdown */
             answer_markdown: string;
+            /** Executed Tools */
+            executed_tools?: string[];
             /** Referenced Node Ids */
             referenced_node_ids?: string[];
             /** Validated References */

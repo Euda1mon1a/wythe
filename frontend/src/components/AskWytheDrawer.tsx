@@ -27,6 +27,7 @@ import { useAskEngines, useAskWythe } from '@/hooks/useAtlas';
 import { post } from '@/lib/api';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { useDialogFocusTrap } from '@/lib/wytheDialogFocus';
+import { resolveTabInvestigationIdentity } from '@/lib/wytheInvestigationSession';
 import type { LiveViewportDigest } from '@/lib/wytheVisionBridge';
 import {
   bumpViewportCameraRevision,
@@ -43,6 +44,13 @@ let monotonicDrawerCameraRevision = 0;
 
 export type SelectedEngineChoice = 'auto' | 'apple' | 'chrome' | 'local';
 
+const MCP_TOOL_INTENT_RE =
+  /\b(?:mcp|wythe_[a-z0-9_]+|atlas_[a-z0-9_]+|tools?|camera|viewport|focus|fly|move|steer|pan|orbit|tour|walkthrough|chronicle|lens|layout|zoom|strat(?:um|a)|frustum|unshown|off[- ]?screen|outside|blast[- _]radius|lineage[- _]cone|plugins?)\b/i;
+
+function questionRequestsMcpTools(question: string): boolean {
+  return MCP_TOOL_INTENT_RE.test(question.trim());
+}
+
 interface QaTurn {
   id: string;
   question: string;
@@ -50,6 +58,7 @@ interface QaTurn {
   status: 'answered' | 'unresolved';
   authoredBy: 'model' | 'scanner_brief' | 'none';
   engineBadge: string;
+  executedTools: string[];
   usedVision: boolean;
   imageSupplied: boolean;
   fallbackReason: string | null;
@@ -109,6 +118,7 @@ function mapStoredTurnToQaTurn(
     status: isUnresolved ? 'unresolved' : 'answered',
     authoredBy: t.authored_by ?? (isUnresolved ? 'none' : 'model'),
     engineBadge,
+    executedTools: [],
     usedVision: Boolean(t.used_vision),
     imageSupplied: Boolean(t.image_supplied),
     fallbackReason: t.fallback_reason ?? null,
@@ -283,6 +293,13 @@ export function AskWytheDrawer({
     if (initialQuestion) setQuestion(initialQuestion);
   }, [initialQuestion]);
 
+  const fallbackIdentity =
+    (!sessionId || !clientId) && activeSlug && typeof window !== 'undefined'
+      ? resolveTabInvestigationIdentity({ targetSlug: activeSlug })
+      : null;
+  const effectiveSessionId = sessionId || fallbackIdentity?.sessionId || null;
+  const effectiveClientId = clientId || fallbackIdentity?.clientId || null;
+
   useEffect(() => {
     if (!sessionData) return;
     const latestRev = sessionData.latest_evidence?.evidence_revision_id ?? null;
@@ -294,7 +311,20 @@ export function AskWytheDrawer({
         seenIds.add(unres.turn_id);
       }
     }
-    setTurns([...combined].reverse().map((t) => mapStoredTurnToQaTurn(t, latestRev)));
+    setTurns((prev) => {
+      const prevById = new Map(prev.map((item) => [item.id, item]));
+      return [...combined].reverse().map((t) => {
+        const mapped = mapStoredTurnToQaTurn(t, latestRev);
+        const existing = prevById.get(t.turn_id);
+        if (!existing) return mapped;
+        return {
+          ...mapped,
+          executedTools:
+            existing.executedTools.length > 0 ? existing.executedTools : mapped.executedTools,
+          contextBudget: existing.contextBudget ?? mapped.contextBudget,
+        };
+      });
+    });
   }, [sessionData]);
 
   const syncCapturedWebpToUiFocus = async (webpDataUrl: string | null): Promise<void> => {
@@ -308,8 +338,8 @@ export function AskWytheDrawer({
       snapshot_data_url: string;
     } = {
       active_slug: activeSlug,
-      session_id: sessionId,
-      client_id: clientId,
+      session_id: effectiveSessionId,
+      client_id: effectiveClientId,
       actor: 'human',
       selected_edge_id: selectedEdgeId,
       selected_finding_id: selectedFindingId,
@@ -386,10 +416,10 @@ export function AskWytheDrawer({
     failureReason?: string | null;
     referencedIds?: string[];
   }) => {
-    if (!sessionId) return;
+    if (!effectiveSessionId) return;
     try {
-      await atlasApi.recordInvestigationTurn(sessionId, {
-        client_id: clientId ?? undefined,
+      await atlasApi.recordInvestigationTurn(effectiveSessionId, {
+        client_id: effectiveClientId ?? undefined,
         actor: 'human',
         question: payload.question,
         answer_markdown: payload.answerMarkdown,
@@ -425,6 +455,7 @@ export function AskWytheDrawer({
         status: 'answered',
         authoredBy: 'scanner_brief',
         engineBadge: 'Scanner Brief (no model running)',
+        executedTools: [],
         usedVision: false,
         imageSupplied: false,
         fallbackReason: 'Generated directly from deterministic scanner facts without a running LLM.',
@@ -485,9 +516,13 @@ export function AskWytheDrawer({
       (browserLocalProbe.state === 'ready' && browserLocalProbe.supportsVision) ||
       Boolean(localSt?.state === 'ready' && localSt.supports_vision);
 
+    const prefersServerMcp =
+      Boolean(localSt?.state === 'ready') && questionRequestsMcpTools(trimmed);
+
     const useChrome =
       engineChoice === 'chrome' ||
       (engineChoice === 'auto' &&
+        !prefersServerMcp &&
         chromeProbe.state === 'ready' &&
         ((hasAttachedFrame && chromeProbe.supportsVision) ||
           (!anyVlmReady && appleSt?.state !== 'ready')));
@@ -510,6 +545,7 @@ export function AskWytheDrawer({
             status: 'answered',
             authoredBy: 'model',
             engineBadge: 'chrome · gemini-nano-in-browser',
+            executedTools: [],
             usedVision: out.usedVision,
             imageSupplied: hasAttachedFrame,
             fallbackReason:
@@ -559,7 +595,8 @@ export function AskWytheDrawer({
     }
 
     const useBrowserLocal =
-      !sessionId &&
+      !effectiveSessionId &&
+      localSt?.state !== 'ready' &&
       !customLocalUrl.trim() &&
       browserLocalProbe.state === 'ready' &&
       (engineChoice === 'local' ||
@@ -587,6 +624,7 @@ export function AskWytheDrawer({
             status: 'answered',
             authoredBy: 'model',
             engineBadge: `local · ${dispModel}`,
+            executedTools: [],
             usedVision: out.usedVision,
             imageSupplied: hasAttachedFrame,
             fallbackReason:
@@ -640,8 +678,8 @@ export function AskWytheDrawer({
         question: trimmed,
         engine: engineChoice,
         target_slug: activeSlug || undefined,
-        session_id: sessionId ?? undefined,
-        client_id: clientId ?? undefined,
+        session_id: effectiveSessionId ?? undefined,
+        client_id: effectiveClientId ?? undefined,
         selected_node_id: focusedNodeId ?? undefined,
         selected_finding_id: selectedFindingId ?? undefined,
         selected_edge_id: selectedEdgeId ?? undefined,
@@ -664,6 +702,7 @@ export function AskWytheDrawer({
               engineBadge: isScanner
                 ? 'Scanner Brief (no model running)'
                 : `${res.engine_used} · ${res.model_id}`,
+              executedTools: res.executed_tools ?? [],
               usedVision: res.used_vision_snapshot,
               imageSupplied: Boolean(res.image_supplied ?? hasAttachedFrame),
               fallbackReason: res.fallback_reason ?? null,
@@ -925,8 +964,8 @@ export function AskWytheDrawer({
         )}
 
         <ChallengeCorrectionBox
-          sessionId={sessionId}
-          clientId={clientId}
+          sessionId={effectiveSessionId}
+          clientId={effectiveClientId}
           targetRefId={selectedFindingId ?? selectedEdgeId ?? selectedNodeId}
           turnId={turns[0]?.id ?? null}
           corrections={sessionData?.corrections ?? explanation?.corrections ?? []}
@@ -939,7 +978,7 @@ export function AskWytheDrawer({
 
         {onCompareRevisions && (
           <RevisionComparisonPanel
-            sessionId={sessionId}
+            sessionId={effectiveSessionId}
             evidenceDrifted={Boolean(sessionData?.evidence_drifted)}
             comparison={revisionComparison}
             nodesById={nodesById}
@@ -950,7 +989,7 @@ export function AskWytheDrawer({
 
         <UnderstandingChainPanel
           activeSlug={activeSlug}
-          sessionId={sessionId}
+          sessionId={effectiveSessionId}
           subjectId={selectedNodeId ?? explanation?.focused_node?.id ?? null}
           selectedFindingId={selectedFindingId}
           selectedEdgeId={selectedEdgeId}
@@ -981,6 +1020,14 @@ export function AskWytheDrawer({
                     >
                       {t.engineBadge}
                     </span>
+                    {t.executedTools.length > 0 && (
+                      <span
+                        data-testid="mcp-executed-tools-badge"
+                        className="border border-sky-500/40 bg-sky-950/60 px-1.5 py-0.5 text-sky-200"
+                      >
+                        · MCP: {t.executedTools.join(', ')}
+                      </span>
+                    )}
                     <span className="border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-slate-200">
                       {t.usedVision ? 'Vision: WebP' : 'Text-only'}
                     </span>

@@ -260,6 +260,7 @@ export type AskWytheResponse = Omit<
   | 'authored_by'
   | 'image_supplied'
   | 'fallback_reason'
+  | 'executed_tools'
   | 'validated_references'
   | 'evidence_identity'
   | 'context_budget'
@@ -269,6 +270,7 @@ export type AskWytheResponse = Omit<
   authored_by?: 'model' | 'scanner_brief';
   image_supplied?: boolean;
   fallback_reason?: string | null;
+  executed_tools?: string[];
   validated_references?: ValidatedReferenceRead[];
   evidence_identity?: EvidenceIdentityRead | null;
   context_budget?: ContextBudgetSummary | null;
