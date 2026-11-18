@@ -11,16 +11,19 @@ import threading
 import uuid
 from collections import OrderedDict
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
+from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.adapters.plugin_registry import discover_plugins, get_active_stratum_artifacts
 from app.core.clock import utc_now
 from app.core.config import load_settings
-from app.models import TargetProject
+from app.models import ScanSnapshot, TargetProject
 from app.schemas.atlas import (
     EpistemicKind,
     EvidenceIdentityRead,
@@ -315,6 +318,17 @@ def _init_investigation_tables(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_inv_events_session_rev "
         "ON investigation_events (session_id, revision ASC)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS scan_snapshot_stamps ("
+        "db_identity TEXT NOT NULL, "
+        "snapshot_id INTEGER NOT NULL, "
+        "target_id INTEGER NOT NULL, "
+        "content_digest TEXT NOT NULL, "
+        "cache_key_sha256 TEXT NOT NULL, "
+        "recorded_at TEXT NOT NULL, "
+        "PRIMARY KEY (db_identity, snapshot_id)"
+        ")"
+    )
 
 
 def _read_git_head_identity(git_marker: Path) -> bytes:
@@ -353,8 +367,8 @@ def _read_git_head_identity(git_marker: Path) -> bytes:
         return b""
 
 
-def compute_repo_tree_fingerprint(repo_root: Path) -> tuple[str, bool]:
-    """Compute a fast, deterministic SHA-256 content/stat tree fingerprint without spawning git."""
+def _compute_repo_tree_fingerprint_and_mtime(repo_root: Path) -> tuple[str, bool, int]:
+    """Compute SHA-256 content/stat tree fingerprint plus max observed mtime_ns without spawning git."""
     resolved = repo_root.resolve()
     git_marker = resolved / ".git"
     is_git = git_marker.exists()
@@ -363,6 +377,12 @@ def compute_repo_tree_fingerprint(repo_root: Path) -> tuple[str, bool]:
         head_bytes = _read_git_head_identity(git_marker)
         if head_bytes:
             hasher.update(b"GIT_HEAD|" + head_bytes + b"\n")
+
+    max_mtime_ns = 0
+    try:
+        max_mtime_ns = max(max_mtime_ns, resolved.stat().st_mtime_ns)
+    except OSError:
+        pass
 
     bytes_read = 0
     max_inline_bytes = 2_000_000
@@ -379,11 +399,16 @@ def compute_repo_tree_fingerprint(repo_root: Path) -> tuple[str, bool]:
                 continue
             if entry.is_dir(follow_symlinks=False):
                 if entry.name not in _SKIP_WALK_DIRS:
+                    try:
+                        max_mtime_ns = max(max_mtime_ns, entry.stat(follow_symlinks=False).st_mtime_ns)
+                    except OSError:
+                        pass
                     stack.append(Path(entry.path))
                 continue
             if entry.is_file(follow_symlinks=False):
                 try:
                     st = entry.stat(follow_symlinks=False)
+                    max_mtime_ns = max(max_mtime_ns, st.st_mtime_ns)
                     rel = Path(entry.path).relative_to(resolved).as_posix()
                     files.append((rel, Path(entry.path), st))
                 except OSError:
@@ -401,7 +426,13 @@ def compute_repo_tree_fingerprint(repo_root: Path) -> tuple[str, bool]:
             except OSError:
                 pass
         hasher.update(f"{st.st_mtime_ns}".encode())
-    return hasher.hexdigest(), is_git
+    return hasher.hexdigest(), is_git, max_mtime_ns
+
+
+def compute_repo_tree_fingerprint(repo_root: Path) -> tuple[str, bool]:
+    """Compute a fast, deterministic SHA-256 content/stat tree fingerprint without spawning git."""
+    tree_sha, is_git, _ = _compute_repo_tree_fingerprint_and_mtime(repo_root)
+    return tree_sha, is_git
 
 
 def _governance_db_signature(session: Session, target_id: int | None) -> tuple[object, ...]:
@@ -427,19 +458,24 @@ def _governance_db_signature(session: Session, target_id: int | None) -> tuple[o
     return (rules, vocabs, ruling_sig, ratchet_sig)
 
 
-def get_or_run_cached_scan(
-    session: Session,
+def _session_db_identity(session: Session) -> str:
+    try:
+        bind = session.get_bind()
+        url_str = str(bind.url)
+        return f"{url_str}#{id(bind)}" if ":memory:" in url_str else url_str
+    except (AttributeError, SQLAlchemyError):
+        return "default_db"
+
+
+def _build_scan_cache_key(
     target: TargetProject,
-    *,
-    strict_gate: bool = True,
-    force_rescan: bool = False,
-) -> TruthAtlasReport:
-    """Return cached `TruthAtlasReport` when worktree & governance state match (`< 5ms`)."""
-    repo_root = Path(target.repo_path).expanduser().resolve()
-    tree_sha, _ = compute_repo_tree_fingerprint(repo_root)
-    gov_sig = _governance_db_signature(session, target.id or None)
-    active_artifacts = tuple(sorted((k, tuple(v)) for k, v in get_active_stratum_artifacts().items()))
-    cache_key = (
+    repo_root: Path,
+    strict_gate: bool,
+    gov_sig: tuple[object, ...],
+    tree_sha: str,
+    active_artifacts: tuple[object, ...],
+) -> tuple[object, ...]:
+    return (
         target.slug,
         str(repo_root),
         target.stack_profile_slug,
@@ -451,6 +487,270 @@ def get_or_run_cached_scan(
         tree_sha,
         active_artifacts,
     )
+
+
+def _hash_scan_cache_key(cache_key: tuple[object, ...]) -> str:
+    encoded = json.dumps(cache_key, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _as_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _build_snapshot_state_key(
+    target: TargetProject,
+    repo_root: Path,
+    gov_sig: tuple[object, ...],
+    tree_sha: str,
+    active_artifacts: tuple[object, ...],
+) -> tuple[object, ...]:
+    return (
+        target.slug,
+        str(repo_root),
+        target.stack_profile_slug,
+        target.backend_subdir,
+        target.frontend_subdir,
+        target.legacy_snapshot_relpath or "",
+        gov_sig,
+        tree_sha,
+        active_artifacts,
+    )
+
+
+def _rebind_persisted_gate_mode(
+    persisted: TruthAtlasReport,
+    *,
+    strict_gate: bool,
+    baselines: dict[str, int],
+) -> TruthAtlasReport:
+    use_ratchet = bool(baselines) and not strict_gate
+    desired_mode = "ratchet" if use_ratchet else "strict"
+    if persisted.gate.mode == desired_mode:
+        return persisted
+    from app.schemas.atlas import GateEvaluation, RuleGateRow
+
+    new_rows: list[RuleGateRow] = []
+    exceeded: list[str] = []
+    blocking_total = 0
+    for rc in persisted.gate.rule_counts:
+        b_max = baselines.get(rc.rule_code) if use_ratchet else None
+        if not rc.enabled:
+            row_st = "disabled"
+        elif not rc.blocks_gate or rc.observed_count == 0:
+            row_st = "pass"
+        else:
+            blocking_total += rc.observed_count
+            if use_ratchet and b_max is not None and rc.observed_count <= b_max:
+                row_st = "ratcheted"
+            else:
+                row_st = "exceeded"
+                exceeded.append(rc.rule_code)
+        new_rows.append(rc.model_copy(update={"baseline_max": b_max, "status": row_st}))
+    if exceeded:
+        verdict = "FAIL"
+    elif not persisted.coverage_complete:
+        verdict = "INCOMPLETE"
+    elif blocking_total > 0 and use_ratchet:
+        verdict = "RATCHET_PASS"
+    else:
+        verdict = "PASS"
+    new_gate = GateEvaluation(
+        verdict=verdict,  # type: ignore[arg-type]
+        mode=desired_mode,  # type: ignore[arg-type]
+        blocking_violations=blocking_total,
+        coverage_complete=persisted.coverage_complete,
+        ratchet_exceeded_rules=exceeded,
+        rule_counts=new_rows,
+        evaluated_at=persisted.gate.evaluated_at,
+    )
+    return persisted.model_copy(update={"gate": new_gate})
+
+
+def record_persisted_snapshot_stamp(
+    session: Session,
+    target: TargetProject,
+    *,
+    strict_gate: bool,
+    snapshot_id: int,
+    report: TruthAtlasReport,
+) -> None:
+    """Record exact `(tree_sha, gov_sig)` state stamp for a persisted `ScanSnapshot`."""
+    _ = strict_gate
+    if not target.id or snapshot_id <= 0:
+        return
+    try:
+        repo_root = Path(target.repo_path).expanduser().resolve()
+        tree_sha, _ = compute_repo_tree_fingerprint(repo_root)
+        gov_sig = _governance_db_signature(session, target.id)
+        active_artifacts = tuple(
+            sorted((k, tuple(v)) for k, v in get_active_stratum_artifacts().items())
+        )
+        state_key = _build_snapshot_state_key(
+            target, repo_root, gov_sig, tree_sha, active_artifacts
+        )
+        key_sha = _hash_scan_cache_key(state_key)
+        db_id = _session_db_identity(session)
+        conn = open_investigation_connection(create=True)
+        if conn is not None:
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO scan_snapshot_stamps "
+                    "(db_identity, snapshot_id, target_id, content_digest, cache_key_sha256, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        db_id,
+                        int(snapshot_id),
+                        int(target.id),
+                        report.content_digest,
+                        key_sha,
+                        utc_now().isoformat(),
+                    ),
+                )
+            finally:
+                conn.close()
+    except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error, SQLAlchemyError):
+        return
+
+
+def _try_hydrate_persisted_snapshot(
+    session: Session,
+    target: TargetProject,
+    *,
+    repo_root: Path,
+    strict_gate: bool,
+    is_git: bool,
+    max_mtime_ns: int,
+    active_artifacts: tuple[object, ...],
+    cache_key: tuple[object, ...],
+) -> TruthAtlasReport | None:
+    """Hydrate latest SQLite `ScanSnapshot` when gate mode, repo tree, and governance match."""
+    if not target.id or target.id <= 0:
+        return None
+    snap = session.scalars(
+        select(ScanSnapshot)
+        .where(ScanSnapshot.target_id == target.id)
+        .order_by(ScanSnapshot.id.desc())
+        .limit(1)
+    ).first()
+    if snap is None:
+        return None
+    try:
+        persisted = TruthAtlasReport.model_validate_json(snap.payload_json)
+    except (ValidationError, ValueError, TypeError):
+        return None
+    if persisted.snapshot_id is None:
+        persisted.snapshot_id = snap.id
+
+    if (
+        persisted.content_digest != snap.content_digest
+        or persisted.target_slug != target.slug
+        or Path(persisted.repo_path).expanduser().resolve() != repo_root
+        or persisted.stack_profile != target.stack_profile_slug
+        or "+http_probe" in persisted.observation_source
+    ):
+        return None
+
+    db_ratchets = {
+        rb.rule_code: rb.max_allowed_count for rb in list_ratchet_baselines(session, target.id)
+    }
+    state_key = (
+        cache_key[0],
+        cache_key[1],
+        cache_key[2],
+        cache_key[3],
+        cache_key[4],
+        cache_key[5],
+        cache_key[7],
+        cache_key[8],
+        cache_key[9],
+    )
+    key_sha = _hash_scan_cache_key(state_key)
+    db_id = _session_db_identity(session)
+    stamp_row: tuple[Any, ...] | None = None
+    try:
+        conn = open_investigation_connection(create=False)
+        if conn is not None:
+            try:
+                stamp_row = conn.execute(
+                    "SELECT target_id, content_digest, cache_key_sha256 "
+                    "FROM scan_snapshot_stamps WHERE db_identity = ? AND snapshot_id = ?",
+                    (db_id, int(snap.id)),
+                ).fetchone()
+            finally:
+                conn.close()
+    except sqlite3.Error:
+        stamp_row = None
+
+    if stamp_row is not None:
+        st_tid, st_digest, st_key_sha = int(stamp_row[0]), str(stamp_row[1]), str(stamp_row[2])
+        if st_tid == target.id and st_digest == snap.content_digest:
+            if st_key_sha != key_sha:
+                return None
+            return _rebind_persisted_gate_mode(
+                persisted, strict_gate=strict_gate, baselines=db_ratchets
+            )
+
+    # Fallback validation for pre-existing unstamped `ScanSnapshot` rows in SQLite
+    if active_artifacts or bool(target.legacy_snapshot_relpath) != persisted.legacy_bridge.present:
+        return None
+    db_rules = {
+        (r.rule_code, r.severity, r.enabled, r.blocks_gate) for r in list_rule_policies(session)
+    }
+    snap_rules = {
+        (rc.rule_code, rc.severity, rc.enabled, rc.blocks_gate)
+        for rc in persisted.gate.rule_counts
+    }
+    if not (db_rules <= snap_rules):
+        return None
+    if persisted.gate.mode == "ratchet":
+        snap_ratchets = {
+            rc.rule_code: rc.baseline_max
+            for rc in persisted.gate.rule_counts
+            if rc.baseline_max is not None
+        }
+        if db_ratchets != snap_ratchets:
+            return None
+    db_rulings = tuple(
+        (r.id, r.node_id, r.disposition, r.summary) for r in list_rulings(session, target.id)
+    )
+    snap_rulings = tuple(
+        (r.id, r.node_id, r.disposition, r.summary) for r in persisted.rulings
+    )
+    if db_rulings != snap_rulings:
+        return None
+    snap_utc = _as_utc(snap.observed_at)
+    for voc in list_policy_vocabularies(session):
+        if _as_utc(voc.created_at) > snap_utc:
+            return None
+    snap_obs_ns = int(snap_utc.timestamp() * 1_000_000_000)
+    if max_mtime_ns > snap_obs_ns:
+        return None
+    if is_git:
+        head_raw = _read_git_head_identity(repo_root / ".git")
+        head_sha = head_raw.split(b"|")[-1].decode("utf-8", errors="replace").strip() if head_raw else ""
+        if head_sha and persisted.source_commit != head_sha:
+            return None
+    return _rebind_persisted_gate_mode(
+        persisted, strict_gate=strict_gate, baselines=db_ratchets
+    )
+
+
+def get_or_run_cached_scan(
+    session: Session,
+    target: TargetProject,
+    *,
+    strict_gate: bool = True,
+    force_rescan: bool = False,
+) -> TruthAtlasReport:
+    """Return cached `TruthAtlasReport` when worktree & governance state match (`< 5ms`)."""
+    repo_root = Path(target.repo_path).expanduser().resolve()
+    tree_sha, is_git, max_mtime_ns = _compute_repo_tree_fingerprint_and_mtime(repo_root)
+    gov_sig = _governance_db_signature(session, target.id or None)
+    active_artifacts = tuple(sorted((k, tuple(v)) for k, v in get_active_stratum_artifacts().items()))
+    cache_key = _build_scan_cache_key(
+        target, repo_root, strict_gate, gov_sig, tree_sha, active_artifacts
+    )
     if not force_rescan:
         with _INVESTIGATION_LOCK:
             hit = _SCAN_REUSE_CACHE.get(cache_key)
@@ -458,6 +758,23 @@ def get_or_run_cached_scan(
                 _SCAN_REUSE_CACHE.move_to_end(cache_key)
                 _SCAN_CACHE_STATS["hits"] += 1
                 return hit.model_copy(deep=True)
+        hydrated = _try_hydrate_persisted_snapshot(
+            session,
+            target,
+            repo_root=repo_root,
+            strict_gate=strict_gate,
+            is_git=is_git,
+            max_mtime_ns=max_mtime_ns,
+            active_artifacts=active_artifacts,
+            cache_key=cache_key,
+        )
+        if hydrated is not None:
+            with _INVESTIGATION_LOCK:
+                _SCAN_REUSE_CACHE[cache_key] = hydrated.model_copy(deep=True)
+                while len(_SCAN_REUSE_CACHE) > _SCAN_CACHE_MAX:
+                    _SCAN_REUSE_CACHE.popitem(last=False)
+                _SCAN_CACHE_STATS["hits"] += 1
+            return hydrated.model_copy(deep=True)
 
     report = run_target_scan(
         session,

@@ -170,7 +170,28 @@ def test_openai_tool_schemas_and_auto_cascade_tool_awareness() -> None:
         apple_status=apple_ready,
         local_status=local_ready,
         question="Summarize the rule policy table.",
+    ) == ["local", "apple"]
+
+    local_default_unpinned = OnDeviceEngineStatus(
+        engine="local",
+        label="Local /v1",
+        state="ready",
+        base_url="http://127.0.0.1:8081/v1",
+        model_id="default_model",
+        supports_vision=False,
+    )
+    assert resolve_auto_backend_cascade(
+        backend="auto",
+        apple_status=apple_ready,
+        local_status=local_default_unpinned,
+        question="Summarize the rule policy table.",
     ) == ["apple", "local"]
+    assert resolve_auto_backend_cascade(
+        backend="auto",
+        apple_status=apple_ready,
+        local_status=local_default_unpinned,
+        question="What happens if this module was deleted?",
+    ) == ["local", "apple"]
 
 
 def test_multiturn_focus_camera_publishes_scoped_viewport_command(

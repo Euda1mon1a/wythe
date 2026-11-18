@@ -45,7 +45,7 @@ let monotonicDrawerCameraRevision = 0;
 export type SelectedEngineChoice = 'auto' | 'apple' | 'chrome' | 'local';
 
 const MCP_TOOL_INTENT_RE =
-  /\b(?:mcp|wythe_[a-z0-9_]+|atlas_[a-z0-9_]+|tools?|camera|viewport|focus|fly|move|steer|pan|orbit|tour|walkthrough|chronicle|lens|layout|zoom|strat(?:um|a)|frustum|unshown|off[- ]?screen|outside|blast[- _]radius|lineage[- _]cone|plugins?)\b/i;
+  /\b(?:mcp|wythe_[a-z0-9_]+|atlas_[a-z0-9_]+|tools?|camera|viewport|focus|fly|move|steer|pan|orbit|tour|walkthrough|chronicle|lens|layout|zoom|strat(?:um|a)|frustum|unshown|off[- ]?screen|outside|blast(?:\s+|[-_])radius|lineage(?:\s+|[-_])cone|plugins?|show\s+me|delet(?:e|ed|ing|ion)|remov(?:e|ed|ing)|affect(?:s|ed)?|break(?:s|ing)?|broken|callers?|who\s+calls|used\s+by)\b/i;
 
 function questionRequestsMcpTools(question: string): boolean {
   return MCP_TOOL_INTENT_RE.test(question.trim());
@@ -516,8 +516,12 @@ export function AskWytheDrawer({
       (browserLocalProbe.state === 'ready' && browserLocalProbe.supportsVision) ||
       Boolean(localSt?.state === 'ready' && localSt.supports_vision);
 
+    const localServerPinned = Boolean(
+      localSt?.state === 'ready' && localSt.model_id && localSt.model_id !== 'default_model',
+    );
     const prefersServerMcp =
-      Boolean(localSt?.state === 'ready') && questionRequestsMcpTools(trimmed);
+      Boolean(localSt?.state === 'ready') &&
+      (localServerPinned || questionRequestsMcpTools(trimmed));
 
     const useChrome =
       engineChoice === 'chrome' ||

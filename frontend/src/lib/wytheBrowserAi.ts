@@ -133,14 +133,14 @@ export async function runChromeBuiltInAsk(params: {
   const api = getChromeLanguageModelApi();
   if (!api) throw new Error('Chrome built-in LanguageModel API is unavailable.');
 
+  const isPlain = PLAIN_ENGLISH_RE.test(params.question);
   const instructions =
-    "You are Wythe's in-browser real-time 3-tier architecture assistant. Ground all repository, node, color, " +
-    'rule, and lineage claims strictly in the Live 3D Camera & X-Ray facts (SQL Truth, Backend Manipulate, ' +
-    'Frontend Display). Cite exact rule codes, node names, on-screen colors, store purpose vs verification ' +
-    'status, and causal writer file:line pointers (not just node discovery lines). Never invent files or tables, ' +
-    'never treat declared copy/cache intent as proof of synchronization or recovery safety, and treat ' +
-    'gray_zone/duplicated_truth as static risk indicators requiring evidence rather than proof of duplicate data. ' +
-    'Answer general architecture or Wythe workflow questions directly.';
+    "You are Wythe's in-browser real-time 3-tier architecture assistant. " +
+    "Speak directly to the user in second person ('you'); NEVER narrate about the user in third person (never write 'The user is...'). " +
+    'Ground all repository, node, color, rule, and lineage claims strictly in the Live 3D Camera & X-Ray facts (SQL Truth, Backend Manipulate, Frontend Display). ' +
+    (isPlain
+      ? 'Explain clearly in 2 to 4 short everyday sentences without rigid section headers or internal tag dumps what this code does, why it is highlighted, and what happens in practice if changed or deleted.'
+      : 'Cite exact rule codes, node names, on-screen colors, store purpose vs verification status, and causal writer file:line pointers (not just node discovery lines). Never invent files or tables, never treat declared copy/cache intent as proof of synchronization or recovery safety, and treat gray_zone/duplicated_truth as static risk indicators requiring evidence rather than proof of duplicate data.');
 
   const priorTurns = (params.history ?? []).slice(-6);
   const textBody = `## Live 3D Wythe Camera & X-Ray\n${params.xrayBrief.slice(0, 3200)}\n\n## Question\n${params.question.trim()}`;
@@ -223,8 +223,48 @@ const CLIENT_LOCAL_SEATS = [
   'http://127.0.0.1:11434/v1',
 ];
 
-const NON_CHAT_MODEL_TOKENS = ['whisper', 'embed', 'minilm', 'bge-', 'rerank', 'tts', 'piper', 'kokoro', 'ocr', 'flux'];
-const VISION_MODEL_TOKENS = ['vl', 'vision', 'gemma-3', 'gemma-4', 'pixtral', 'llava', 'minicpm-v', 'internvl'];
+const NON_CHAT_MODEL_TOKENS = [
+  'ocr',
+  'paddleocr',
+  'whisper',
+  'asr',
+  'vad',
+  'silero',
+  'embed',
+  'minilm',
+  'bge-',
+  'rerank',
+  'tts',
+  'piper',
+  'kokoro',
+  'flux',
+];
+const VISION_MODEL_TOKENS = [
+  'qwen3.6',
+  'qwen3.5',
+  'qwen2.5-vl',
+  'qwen2-vl',
+  'gemma-4',
+  'gemma-3',
+  'vl',
+  'vlm',
+  'vision',
+  'pixtral',
+  'llava',
+  'minicpm-v',
+  'internvl',
+];
+const HELPER_MODEL_RE = /(?:router|classifier|guard|draft|speculative|\bd1-\d|\blfm2)/i;
+const PARAM_SCALE_RE = /(?<![a-z])(\d+(?:\.\d+)?)b\b/gi;
+const PLAIN_ENGLISH_RE =
+  /(?:\bplain[- ]english\b|\blaym[ae]n(?:'?s)?\b|\bsimple\s+terms\b|\bsimply\b|\beli5\b|\bnon[- ]technical\b|\bin\s+short\b|\btl;?dr\b)/i;
+
+function extractParamBillions(id: string): number {
+  const matches = Array.from(id.matchAll(PARAM_SCALE_RE), (m) => Number.parseFloat(m[1] ?? '0')).filter(
+    (v) => Number.isFinite(v) && v > 0,
+  );
+  return matches.length > 0 ? Math.max(...matches) : 0;
+}
 
 function extractSnapshotSlug(id: string): string | null {
   if (id.includes('models--') && id.includes('/snapshots/')) {
@@ -249,36 +289,61 @@ export async function probeBrowserLocalOpenAi(
   const candidates = customUrl?.trim()
     ? [normalizeClientV1Url(customUrl), ...CLIENT_LOCAL_SEATS]
     : CLIENT_LOCAL_SEATS;
-  let firstReadyTextFallback: BrowserLocalOpenAiProbe | null = null;
+  let fallbackPinnedTextSeat: BrowserLocalOpenAiProbe | null = null;
+  let fallbackDefaultSeat: BrowserLocalOpenAiProbe | null = null;
 
   for (const base of candidates) {
     try {
       const res = await fetch(`${base}/models`, { signal: AbortSignal.timeout(2500) });
       if (!res.ok) continue;
       const body = (await res.json()) as {
-        data?: Array<{ id?: string; owned_by?: string; created?: number }>;
+        data?: Array<{ id?: string; owned_by?: string; created?: number; loaded?: boolean }>;
       };
       const items = (body.data ?? []).filter((m) => m && typeof m.id === 'string' && m.id.length > 0);
-      const chatIds = items
-        .map((m) => m.id as string)
-        .filter((id) => !NON_CHAT_MODEL_TOKENS.some((bad) => id.toLowerCase().includes(bad)));
+      const chatItems = items.filter(
+        (m) => !NON_CHAT_MODEL_TOKENS.some((bad) => (m.id as string).toLowerCase().includes(bad)),
+      );
+      const chatIds = chatItems.map((m) => m.id as string);
       if (chatIds.length === 0) continue;
 
-      const isPinnedProxy =
-        items.length === 1 || (items[0]?.owned_by ?? '').toLowerCase().includes('pinned');
-      const isMlxMulti = items.some((m) => (m.id ?? '').startsWith('mlx-community/') || (m.id ?? '').includes('/models--'));
+      const loadedChatIds = chatItems.filter((m) => m.loaded === true).map((m) => m.id as string);
       let reqModel = chatIds[0];
       let dispModel = extractSnapshotSlug(reqModel) ?? reqModel;
-      if (!isPinnedProxy && isMlxMulti) {
-        const srvHdr = (res.headers.get('server') ?? '').toLowerCase();
-        const createdSet = new Set(items.map((m) => m.created).filter((c) => typeof c === 'number'));
-        const hasOwner = items.some((m) => Boolean(m.owned_by));
-        if (srvHdr.includes('mlx_vlm') || (createdSet.size > 1 && !hasOwner)) {
-          continue;
+      if (loadedChatIds.length > 0) {
+        const sortedLoaded = [...loadedChatIds].sort((a, b) => {
+          const slugA = extractSnapshotSlug(a) ?? a;
+          const slugB = extractSnapshotSlug(b) ?? b;
+          const nonHelperA = HELPER_MODEL_RE.test(a) || HELPER_MODEL_RE.test(slugA) ? 0 : 1;
+          const nonHelperB = HELPER_MODEL_RE.test(b) || HELPER_MODEL_RE.test(slugB) ? 0 : 1;
+          if (nonHelperA !== nonHelperB) return nonHelperB - nonHelperA;
+          const visA = VISION_MODEL_TOKENS.some((tok) => slugA.toLowerCase().includes(tok)) ? 1 : 0;
+          const visB = VISION_MODEL_TOKENS.some((tok) => slugB.toLowerCase().includes(tok)) ? 1 : 0;
+          if (preferVision && visA !== visB) return visB - visA;
+          const scaleDiff = extractParamBillions(slugB) - extractParamBillions(slugA);
+          if (scaleDiff !== 0) return scaleDiff;
+          return visB - visA;
+        });
+        reqModel = sortedLoaded[0] ?? chatIds[0];
+        dispModel = extractSnapshotSlug(reqModel) ?? reqModel;
+      } else if (items.some((m) => typeof m.loaded === 'boolean')) {
+        continue;
+      } else {
+        const isPinnedProxy =
+          items.length === 1 || (items[0]?.owned_by ?? '').toLowerCase().includes('pinned');
+        const isMlxMulti = items.some(
+          (m) => (m.id ?? '').startsWith('mlx-community/') || (m.id ?? '').includes('/models--'),
+        );
+        if (!isPinnedProxy && isMlxMulti) {
+          const srvHdr = (res.headers.get('server') ?? '').toLowerCase();
+          const createdSet = new Set(items.map((m) => m.created).filter((c) => typeof c === 'number'));
+          const hasOwner = items.some((m) => Boolean(m.owned_by));
+          if (srvHdr.includes('mlx_vlm') || (createdSet.size > 1 && !hasOwner)) {
+            continue;
+          }
+          const snap = items.map((m) => extractSnapshotSlug(m.id ?? '')).find(Boolean);
+          reqModel = 'default_model';
+          dispModel = snap ?? 'default_model (mlx_lm)';
         }
-        const snap = items.map((m) => extractSnapshotSlug(m.id ?? '')).find(Boolean);
-        reqModel = 'default_model';
-        dispModel = snap ?? 'default_model (mlx_lm)';
       }
       const supportsVision = VISION_MODEL_TOKENS.some((tok) => dispModel.toLowerCase().includes(tok));
       const candidateProbe: BrowserLocalOpenAiProbe = {
@@ -289,16 +354,25 @@ export async function probeBrowserLocalOpenAi(
         supportsVision,
         note: `${dispModel} ready on this browser host (${base})`,
       };
-      if (!preferVision || supportsVision) {
-        return candidateProbe;
+      if (reqModel !== 'default_model') {
+        if (!preferVision || supportsVision) {
+          return candidateProbe;
+        }
+        fallbackPinnedTextSeat ??= candidateProbe;
+        continue;
       }
-      firstReadyTextFallback ??= candidateProbe;
+      if (!fallbackDefaultSeat || (preferVision && supportsVision && !fallbackDefaultSeat.supportsVision)) {
+        fallbackDefaultSeat = candidateProbe;
+      }
     } catch {
       // Try next loopback port on viewer workstation
     }
   }
-  if (firstReadyTextFallback) {
-    return firstReadyTextFallback;
+  if (fallbackPinnedTextSeat) {
+    return fallbackPinnedTextSeat;
+  }
+  if (fallbackDefaultSeat) {
+    return fallbackDefaultSeat;
   }
   return {
     state: 'unavailable',
@@ -320,12 +394,15 @@ export async function runBrowserLocalOpenAiAsk(params: {
   if (!params.probe.baseUrl || !params.probe.requestModelId) {
     throw new Error('Browser-local /v1 seat is not ready.');
   }
+  const isPlain = PLAIN_ENGLISH_RE.test(params.question);
   const instructions =
-    "You are Wythe's real-time 3-tier software architecture & lineage verifier assistant. Ground all " +
-    'repository, node, on-screen color, rule, and lineage statements strictly in the Live 3D Camera & X-Ray ' +
-    'facts below (SQL Truth, Backend Manipulate, Frontend Display). Cite exact rule codes, node names, ' +
-    'rendered colors, and file:line pointers, and never invent files or tables. If the user asks a general ' +
-    'architecture, workflow, or Wythe UI question, answer it directly and concisely.';
+    "You are Wythe's real-time 3-tier software architecture & lineage verifier assistant. " +
+    "Speak directly to the user in second person ('you'); NEVER narrate about the user in third person (never write 'The user is...'). " +
+    'Ground all repository, node, on-screen color, rule, and lineage statements strictly in the Live 3D Camera & X-Ray facts below (SQL Truth, Backend Manipulate, Frontend Display). ' +
+    'Live MCP tool execution and direct 3D camera steering are NOT available on this browser-direct text completion path; do NOT invent tool names. ' +
+    (isPlain
+      ? 'Explain clearly in 2 to 4 short everyday sentences without rigid section headers or internal tag dumps what this code does, why it is highlighted, and what happens in practice if changed or deleted.'
+      : 'Cite exact rule codes, node names, rendered colors, and file:line pointers, and never invent files or tables.');
   const textPrompt = `## Live 3D Wythe Camera & X-Ray\n${params.xrayBrief.slice(0, 3400)}\n\n## User Question\n${params.question.trim()}`;
   const priorMsgs = (params.history ?? [])
     .slice(-8)

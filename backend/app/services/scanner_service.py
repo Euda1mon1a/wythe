@@ -1060,5 +1060,14 @@ def run_target_scan(
         session.commit()
         session.refresh(snap)
         report.snapshot_id = snap.id
+        from app.services.investigation_service import record_persisted_snapshot_stamp
+
+        record_persisted_snapshot_stamp(
+            session,
+            target,
+            strict_gate=strict_gate,
+            snapshot_id=snap.id,
+            report=report,
+        )
 
     return report

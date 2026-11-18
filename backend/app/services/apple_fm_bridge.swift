@@ -117,8 +117,17 @@ func explainError(_ error: Error) -> [String: Any] {
       emit(state.merging(["ok": false, "error": "Apple Intelligence is not available."]) { cur, _ in cur })
       return
     }
+    let plainEnglish = (msg["plainEnglish"] as? Bool) == true
     do {
       let session = LanguageModelSession(instructions: instructions)
+      if plainEnglish {
+        let plain = try await session.respond(
+          to: prompt,
+          options: GenerationOptions(sampling: nil, temperature: 0.35, maximumResponseTokens: 450)
+        )
+        emit(["ok": true, "plainText": plain.content])
+        return
+      }
       let res = try await session.respond(
         to: prompt,
         generating: WytheArchitectureAnswer.self,

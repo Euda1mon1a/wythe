@@ -1355,7 +1355,11 @@ def read_mcp_resource(session: Session, uri: str) -> list[dict[str, Any]]:
                 )
         return items
 
-    report = run_target_scan(session, target, strict_gate=True, persist_snapshot=False)
+    report = (
+        get_or_run_cached_scan(session, target, strict_gate=True)
+        if target.id is not None and target.id > 0
+        else run_target_scan(session, target, strict_gate=True, persist_snapshot=False)
+    )
     if resource_path == "llms":
         text = build_llms_txt_brief(report, max_tokens=DEFAULT_BRIEF_TOKENS).markdown
         return [{"uri": cleaned, "mimeType": "text/markdown", "text": text}]
@@ -2062,7 +2066,11 @@ def _execute_tool(
         raise ValueError("Missing required parameter `target` (slug or directory path).")
     profile = str(args.get("profile") or "auto")
     target = _resolve_readonly_target(session, raw_target, profile=profile)
-    report = run_target_scan(session, target, strict_gate=True, persist_snapshot=False)
+    report = (
+        get_or_run_cached_scan(session, target, strict_gate=True)
+        if target.id is not None and target.id > 0
+        else run_target_scan(session, target, strict_gate=True, persist_snapshot=False)
+    )
 
     if canonical == "wythe_overview":
         max_tok = int(args.get("max_tokens") or DEFAULT_BRIEF_TOKENS)
