@@ -60,7 +60,10 @@ export type StratumSummaryBadge = components['schemas']['StratumSummaryBadge'];
 export type StratumMicroNode = components['schemas']['StratumMicroNode'];
 export type StratumMicroEdge = components['schemas']['StratumMicroEdge'];
 export type StratumDrilldownRead = components['schemas']['StratumDrilldownRead'];
-export type TourKeyframe = components['schemas']['TourKeyframe'];
+export type BaseTourKeyframe = components['schemas']['TourKeyframe'];
+export type TourKeyframe = Omit<BaseTourKeyframe, 'reset_filters'> & {
+  reset_filters?: boolean;
+};
 export type ChronicleFrame = components['schemas']['ChronicleFrame'];
 export type ChronicleTimeline = components['schemas']['ChronicleTimeline'];
 
@@ -173,6 +176,12 @@ export type UiFocusStatePayload = Omit<
   | 'follow_state'
   | 'focus_revision'
   | 'evidence_revision_id'
+  | 'working_set_only'
+  | 'compact_visible'
+  | 'flatten_2d'
+  | 'group_by'
+  | 'z_wythe_slice'
+  | 'zoom_stratum'
 > & {
   session_id?: string | null;
   client_id?: string | null;
@@ -182,6 +191,12 @@ export type UiFocusStatePayload = Omit<
   follow_state?: FollowState | null;
   focus_revision?: number | null;
   evidence_revision_id?: string | null;
+  working_set_only?: boolean;
+  compact_visible?: boolean;
+  flatten_2d?: boolean;
+  group_by?: string;
+  z_wythe_slice?: string;
+  zoom_stratum?: 1 | 2 | 3;
 };
 
 export type UiFocusSyncAck = Omit<
@@ -282,19 +297,30 @@ export type ViewportCommand = Omit<
   | 'command_id'
   | 'correlation_id'
   | 'session_id'
+  | 'refresh_session_id'
   | 'expected_evidence_revision'
   | 'expires_at'
   | 'delivery_state'
   | 'applied_by_client_ids'
+  | 'reset_filters'
+  | 'tour_keyframes'
 > & {
   command_id?: string;
   correlation_id?: string | null;
   session_id?: string | null;
+  refresh_session_id?: string | null;
   expected_evidence_revision?: string | null;
   expires_at?: string | null;
   delivery_state?: ViewportDeliveryState;
   applied_by_client_ids?: string[];
+  reset_filters?: boolean;
+  tour_keyframes?: TourKeyframe[];
 };
+
+export type TierFilterChoice = NonNullable<BaseViewportCommand['tier_filter']>;
+export type BlastModeChoice = NonNullable<BaseViewportCommand['blast_mode']>;
+export type ViewportGroupByChoice = NonNullable<BaseViewportCommand['group_by']>;
+export type ViewportTabChoice = NonNullable<BaseViewportCommand['active_tab']>;
 
 export type ViewportCommandAck = Omit<
   components['schemas']['ViewportCommandAck'],

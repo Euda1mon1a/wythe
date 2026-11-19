@@ -3,7 +3,7 @@
   "info": {
     "title": "Wythe API",
     "description": "Why -> Therefore: 3-tier architecture & lineage verifier. PostgreSQL holds truth, Backend manipulates truth, UI displays truth.",
-    "version": "0.2.6"
+    "version": "0.2.7"
   },
   "paths": {
     "/api/v1/adapters/slots": {
@@ -10433,6 +10433,30 @@
             "maxItems": 80,
             "title": "Highlight Edge Ids"
           },
+          "selected_node_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Node Id"
+          },
+          "selected_edge_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Edge Id"
+          },
           "finding_id": {
             "anyOf": [
               {
@@ -10482,6 +10506,220 @@
               }
             ],
             "title": "Layout Mode"
+          },
+          "tier_filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "all",
+                  "truth",
+                  "manipulate",
+                  "display"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tier Filter"
+          },
+          "subkind_filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subkind Filter"
+          },
+          "edge_filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edge Filter"
+          },
+          "only_flagged": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Only Flagged"
+          },
+          "isolate_cone": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Isolate Cone"
+          },
+          "connected_only": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connected Only"
+          },
+          "neighborhood_hops": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "enum": [
+                  0,
+                  1,
+                  2
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Neighborhood Hops"
+          },
+          "search_query": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Query"
+          },
+          "blast_mode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "git",
+                  "snapshot"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blast Mode"
+          },
+          "diff_base_ref": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diff Base Ref"
+          },
+          "working_set_only": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Working Set Only"
+          },
+          "compact_visible": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compact Visible"
+          },
+          "flatten_2d": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flatten 2D"
+          },
+          "group_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "cluster",
+                  "subkind"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group By"
+          },
+          "active_tab": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "3d",
+                  "index",
+                  "governance",
+                  "understanding",
+                  "lineage",
+                  "gate"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Tab"
+          },
+          "open_drawer": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open Drawer"
+          },
+          "reset_filters": {
+            "type": "boolean",
+            "title": "Reset Filters",
+            "default": false
           },
           "z_wythe_slice": {
             "anyOf": [
@@ -10796,6 +11034,96 @@
             "type": "string",
             "title": "Diff Base Ref"
           },
+          "tier_filter": {
+            "type": "string",
+            "title": "Tier Filter",
+            "default": "all"
+          },
+          "subkind_filter": {
+            "type": "string",
+            "title": "Subkind Filter",
+            "default": "all"
+          },
+          "edge_filter": {
+            "type": "string",
+            "title": "Edge Filter",
+            "default": "all"
+          },
+          "only_flagged": {
+            "type": "boolean",
+            "title": "Only Flagged",
+            "default": false
+          },
+          "isolate_cone": {
+            "type": "boolean",
+            "title": "Isolate Cone",
+            "default": false
+          },
+          "connected_only": {
+            "type": "boolean",
+            "title": "Connected Only",
+            "default": false
+          },
+          "neighborhood_hops": {
+            "type": "integer",
+            "enum": [
+              0,
+              1,
+              2
+            ],
+            "title": "Neighborhood Hops",
+            "default": 0
+          },
+          "search_query": {
+            "type": "string",
+            "title": "Search Query",
+            "default": ""
+          },
+          "working_set_only": {
+            "type": "boolean",
+            "title": "Working Set Only",
+            "default": false
+          },
+          "compact_visible": {
+            "type": "boolean",
+            "title": "Compact Visible",
+            "default": false
+          },
+          "flatten_2d": {
+            "type": "boolean",
+            "title": "Flatten 2D",
+            "default": false
+          },
+          "group_by": {
+            "type": "string",
+            "title": "Group By",
+            "default": "none"
+          },
+          "z_wythe_slice": {
+            "type": "string",
+            "title": "Z Wythe Slice",
+            "default": "all"
+          },
+          "zoom_stratum": {
+            "type": "integer",
+            "enum": [
+              1,
+              2,
+              3
+            ],
+            "title": "Zoom Stratum",
+            "default": 1
+          },
+          "visible_node_count": {
+            "type": "integer",
+            "title": "Visible Node Count",
+            "default": 0
+          },
+          "in_frustum_count": {
+            "type": "integer",
+            "title": "In Frustum Count",
+            "default": 0
+          },
           "headline": {
             "type": "string",
             "title": "Headline"
@@ -10813,6 +11141,17 @@
                 "type": "null"
               }
             ]
+          },
+          "selected_node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Node Id"
           },
           "selected_edge_id": {
             "anyOf": [
@@ -11201,6 +11540,43 @@
             "maxLength": 200,
             "title": "Search Query",
             "default": ""
+          },
+          "working_set_only": {
+            "type": "boolean",
+            "title": "Working Set Only",
+            "default": false
+          },
+          "compact_visible": {
+            "type": "boolean",
+            "title": "Compact Visible",
+            "default": false
+          },
+          "flatten_2d": {
+            "type": "boolean",
+            "title": "Flatten 2D",
+            "default": false
+          },
+          "group_by": {
+            "type": "string",
+            "maxLength": 24,
+            "title": "Group By",
+            "default": "none"
+          },
+          "z_wythe_slice": {
+            "type": "string",
+            "maxLength": 24,
+            "title": "Z Wythe Slice",
+            "default": "all"
+          },
+          "zoom_stratum": {
+            "type": "integer",
+            "enum": [
+              1,
+              2,
+              3
+            ],
+            "title": "Zoom Stratum",
+            "default": 1
           },
           "active_trace_route": {
             "anyOf": [
@@ -12310,6 +12686,18 @@
             ],
             "title": "Session Id"
           },
+          "refresh_session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refresh Session Id"
+          },
           "expected_evidence_revision": {
             "anyOf": [
               {
@@ -12372,6 +12760,30 @@
             "maxItems": 80,
             "title": "Highlight Edge Ids"
           },
+          "selected_node_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Node Id"
+          },
+          "selected_edge_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Edge Id"
+          },
           "finding_id": {
             "anyOf": [
               {
@@ -12421,6 +12833,220 @@
               }
             ],
             "title": "Layout Mode"
+          },
+          "tier_filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "all",
+                  "truth",
+                  "manipulate",
+                  "display"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tier Filter"
+          },
+          "subkind_filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subkind Filter"
+          },
+          "edge_filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edge Filter"
+          },
+          "only_flagged": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Only Flagged"
+          },
+          "isolate_cone": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Isolate Cone"
+          },
+          "connected_only": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connected Only"
+          },
+          "neighborhood_hops": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "enum": [
+                  0,
+                  1,
+                  2
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Neighborhood Hops"
+          },
+          "search_query": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Query"
+          },
+          "blast_mode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "git",
+                  "snapshot"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blast Mode"
+          },
+          "diff_base_ref": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diff Base Ref"
+          },
+          "working_set_only": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Working Set Only"
+          },
+          "compact_visible": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compact Visible"
+          },
+          "flatten_2d": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flatten 2D"
+          },
+          "group_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "cluster",
+                  "subkind"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group By"
+          },
+          "active_tab": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "3d",
+                  "index",
+                  "governance",
+                  "understanding",
+                  "lineage",
+                  "gate"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Tab"
+          },
+          "open_drawer": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open Drawer"
+          },
+          "reset_filters": {
+            "type": "boolean",
+            "title": "Reset Filters",
+            "default": false
           },
           "z_wythe_slice": {
             "anyOf": [

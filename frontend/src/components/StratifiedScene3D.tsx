@@ -78,6 +78,7 @@ interface StratifiedScene3DProps {
   workingSetIds?: Set<string>;
   workingSetActive?: boolean;
   groupBy?: 'none' | 'subkind' | 'cluster';
+  zoomStratum?: 1 | 2 | 3;
   collapsedGroups?: Set<string>;
   pinnedPositions?: Record<string, [number, number, number]>;
   diffOverlay?: DiffOverlaySet | null;
@@ -272,6 +273,7 @@ export function StratifiedScene3D({
   workingSetIds,
   workingSetActive = false,
   groupBy = 'none',
+  zoomStratum = 1,
   collapsedGroups,
   pinnedPositions,
   diffOverlay = null,
@@ -1534,9 +1536,17 @@ export function StratifiedScene3D({
       layoutMode,
       tierFilter,
       subkindFilter,
+      edgeFilter,
       onlyFlagged,
+      isolateCone,
       connectedOnly,
       neighborhoodHops,
+      workingSetOnly: workingSetActive,
+      compactVisible,
+      flatten2D,
+      groupBy,
+      zWytheSlice,
+      zoomStratum,
       renderedNodeIds: nodeBatchRef.current?.renderedNodeIds,
       overviewNodeIds: nodeBatchRef.current?.overviewNodeIds,
       traceIds: traceHopSet,
@@ -1563,9 +1573,17 @@ export function StratifiedScene3D({
     layoutMode,
     tierFilter,
     subkindFilter,
+    edgeFilter,
     onlyFlagged,
+    isolateCone,
     connectedOnly,
     neighborhoodHops,
+    workingSetActive,
+    compactVisible,
+    flatten2D,
+    groupBy,
+    zWytheSlice,
+    zoomStratum,
     traceHopSet,
     visibleEdges,
     searchQuery,

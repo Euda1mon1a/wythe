@@ -45,7 +45,7 @@ let monotonicDrawerCameraRevision = 0;
 export type SelectedEngineChoice = 'auto' | 'apple' | 'chrome' | 'local';
 
 const MCP_TOOL_INTENT_RE =
-  /\b(?:mcp|wythe_[a-z0-9_]+|atlas_[a-z0-9_]+|tools?|camera|viewport|focus|fly|move|steer|pan|orbit|tour|walkthrough|chronicle|lens|layout|zoom|strat(?:um|a)|frustum|unshown|off[- ]?screen|outside|blast(?:\s+|[-_])radius|lineage(?:\s+|[-_])cone|plugins?|show\s+me|delet(?:e|ed|ing|ion)|remov(?:e|ed|ing)|affect(?:s|ed)?|break(?:s|ing)?|broken|callers?|who\s+calls|used\s+by)\b/i;
+  /\b(?:mcp|wythe_[a-z0-9_]+|atlas_[a-z0-9_]+|tools?|camera|viewport|focus|fly|move|steer|pan|orbit|tour|walkthrough|chronicle|lens|layout|filter(?:s|ed|ing)?|flagged|only[-_ ]?flagged|flagged[-_ ]?only|isolat(?:e|ed|ing|ion)|cone|salien(?:ce|t)|tier|subkind|working[-_ ]?set|compact|flatten|flat\s*2d|group[-_ ]?by|reset(?:\s+filters?)?|select|highlight|zoom|strat(?:um|a)|frustum|unshown|off[- ]?screen|outside|blast(?:\s+|[-_])radius|lineage(?:\s+|[-_])cone|plugins?|show\s+me|delet(?:e|ed|ing|ion)|remov(?:e|ed|ing)|affect(?:s|ed)?|break(?:s|ing)?|broken|callers?|who\s+calls|used\s+by)\b/i;
 
 function questionRequestsMcpTools(question: string): boolean {
   return MCP_TOOL_INTENT_RE.test(question.trim());
@@ -174,6 +174,17 @@ function renderFormattedAnswer(md: string) {
       return (
         <div key={idx} className="pt-1 font-mono text-xs font-semibold text-teal-300">
           {renderInlineMarkdown(heading)}
+        </div>
+      );
+    }
+    if (trimmed.startsWith('>')) {
+      const quoteText = trimmed.replace(/^>\s*/, '');
+      return (
+        <div
+          key={idx}
+          className="border-l-2 border-amber-400/80 bg-amber-950/35 px-2.5 py-1.5 text-amber-100"
+        >
+          {renderInlineMarkdown(quoteText)}
         </div>
       );
     }

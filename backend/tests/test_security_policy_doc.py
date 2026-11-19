@@ -21,8 +21,8 @@ def test_security_policy_exists_and_covers_posture_blue_team_and_boundaries() ->
     required_terms = (
         "SUPPORT.md",
         "MIT License",
-        "wythe==0.2.6",
-        "Euda1mon1a/wythe@v0.2.6",
+        "wythe==0.2.7",
+        "Euda1mon1a/wythe@v0.2.7",
         "Private Vulnerability Reporting",
         "Security Advisories",
         "wythe security ownership",
@@ -68,6 +68,6 @@ def test_security_policy_pointer_links_in_readme_and_user_guide() -> None:
 
     assert "### Record ownership (experimental)" in readme
     assert "[SECURITY.md](SECURITY.md)" in readme
-    assert "Euda1mon1a/wythe@v0.2.6" in readme
-    assert "wythe==0.2.6" in support
+    assert "Euda1mon1a/wythe@v0.2.7" in readme
+    assert "wythe==0.2.7" in support
     assert "[SECURITY.md](../SECURITY.md)" in user_guide

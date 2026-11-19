@@ -262,9 +262,17 @@ export function buildLiveViewportDigest(params: {
   layoutMode: SceneLayoutMode;
   tierFilter: string;
   subkindFilter: string;
+  edgeFilter?: string;
   onlyFlagged: boolean;
+  isolateCone?: boolean;
   connectedOnly?: boolean;
   neighborhoodHops?: 0 | 1 | 2;
+  workingSetOnly?: boolean;
+  compactVisible?: boolean;
+  flatten2D?: boolean;
+  groupBy?: string;
+  zWytheSlice?: string;
+  zoomStratum?: 1 | 2 | 3;
   renderedNodeIds?: Set<string>;
   overviewNodeIds?: Set<string>;
   traceIds?: Set<string>;
@@ -290,9 +298,17 @@ export function buildLiveViewportDigest(params: {
     layoutMode,
     tierFilter,
     subkindFilter,
+    edgeFilter = 'all',
     onlyFlagged,
+    isolateCone = false,
     connectedOnly = false,
     neighborhoodHops = 0,
+    workingSetOnly = false,
+    compactVisible = false,
+    flatten2D = false,
+    groupBy = 'none',
+    zWytheSlice = 'all',
+    zoomStratum = 1,
     renderedNodeIds,
     overviewNodeIds,
     traceIds,
@@ -381,7 +397,7 @@ export function buildLiveViewportDigest(params: {
   const lines: string[] = [
     `### Live 3D Camera Frustum & Exact Screen Colors (${activeSlug} @ ${sourceCommit.slice(0, 10)})`,
     `- **Camera Frustum**: **${frustumEntries.length}** nodes within camera bounds (out of ${visibleNodes.length} represented nodes; ${overviewNodeIds?.size ?? 0} overview dots).`,
-    `- **Active Controls**: Lens=\`${lens}\` (${SCENE_LENS_LABELS[lens]}) | Layout=\`${layoutMode}\` | Tier=\`${tierFilter}\` | Subkind=\`${subkindFilter}\` | FlaggedOnly=\`${onlyFlagged}\` | ConnectedOnly=\`${connectedOnly}\` | NeighborhoodHops=\`${neighborhoodHops}\`${searchQuery ? ` | Search=\`${searchQuery}\`` : ''}${diffOverlay ? ` | 3D Blast=\`${diffOverlay.label}\`` : ' | 3D Blast=`off`'}`,
+    `- **Active Controls**: Lens=\`${lens}\` (${SCENE_LENS_LABELS[lens]}) | Layout=\`${layoutMode}\` | Tier=\`${tierFilter}\` | Subkind=\`${subkindFilter}\` | EdgeFilter=\`${edgeFilter}\` | FlaggedOnly=\`${onlyFlagged}\` | IsolateCone=\`${isolateCone}\` | ConnectedOnly=\`${connectedOnly}\` | NeighborhoodHops=\`${neighborhoodHops}\` | WorkingSet=\`${workingSetOnly}\` | Compact=\`${compactVisible}\` | Flat2D=\`${flatten2D}\` | GroupBy=\`${groupBy}\` | ZSlice=\`${zWytheSlice}\` | ZoomStratum=\`${zoomStratum}\`${searchQuery ? ` | Search=\`${searchQuery}\`` : ''}${diffOverlay ? ` | 3D Blast=\`${diffOverlay.label}\`` : ' | 3D Blast=`off`'}`,
     `- **Active Color Legend**: ${legend.map((it) => `${it.label} (${it.color})`).join(' · ')}`,
   ];
 

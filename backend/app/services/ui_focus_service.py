@@ -303,10 +303,21 @@ def record_ui_focus(
                 or _eff_field("camera_position") != prev.get("camera_position")
                 or _eff_field("camera_target") != prev.get("camera_target")
                 or _eff_field("tier_filter") != prev.get("tier_filter", "all")
+                or _eff_field("subkind_filter") != prev.get("subkind_filter", "all")
+                or _eff_field("edge_filter") != prev.get("edge_filter", "all")
                 or _eff_field("only_flagged") != prev.get("only_flagged", False)
                 or _eff_field("isolate_cone") != prev.get("isolate_cone", False)
                 or _eff_field("connected_only") != prev.get("connected_only", False)
                 or _eff_field("neighborhood_hops") != prev.get("neighborhood_hops", 0)
+                or _eff_field("search_query") != prev.get("search_query", "")
+                or _eff_field("blast_mode") != prev.get("blast_mode", "off")
+                or _eff_field("diff_base_ref") != prev.get("diff_base_ref", "HEAD~1")
+                or _eff_field("working_set_only") != prev.get("working_set_only", False)
+                or _eff_field("compact_visible") != prev.get("compact_visible", False)
+                or _eff_field("flatten_2d") != prev.get("flatten_2d", False)
+                or _eff_field("group_by") != prev.get("group_by", "none")
+                or _eff_field("z_wythe_slice") != prev.get("z_wythe_slice", "all")
+                or _eff_field("zoom_stratum") != prev.get("zoom_stratum", 1)
             )
             snap_stale = already_stale or newer_cam or scene_changed
 
@@ -356,6 +367,20 @@ def record_ui_focus(
                         (base_dir / f"ui_focus_latest{other_ext}").unlink(missing_ok=True)
             tmp_json = state_file.with_suffix(".json.tmp")
             tmp_json.write_text(json.dumps(serialized, indent=2), encoding="utf-8")
+            tmp_json.replace(state_file)
+        else:
+            # Update `active_slug` without leaking per-tab selection or shared snapshot files
+            tmp_json = state_file.with_suffix(".json.tmp")
+            tmp_json.write_text(
+                json.dumps(
+                    {
+                        "active_slug": payload.active_slug,
+                        "observed_at": now.isoformat(),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             tmp_json.replace(state_file)
         snap_f_rev = serialized.get("snapshot_focus_revision")
         snap_ev_rev = serialized.get("snapshot_evidence_revision")
@@ -697,6 +722,25 @@ def explain_ui_focus(
         bool(saved.get("snapshot_stale", False)) or (bool(saved_slug) and saved_slug != target.slug)
     ) if has_snap else False
 
+    tier_filter = str(saved.get("tier_filter") or "all")
+    subkind_filter = str(saved.get("subkind_filter") or "all")
+    edge_filter = str(saved.get("edge_filter") or "all")
+    only_flagged = bool(saved.get("only_flagged", False))
+    isolate_cone = bool(saved.get("isolate_cone", False))
+    connected_only = bool(saved.get("connected_only", False))
+    raw_hops = saved.get("neighborhood_hops", 0)
+    neighborhood_hops = raw_hops if raw_hops in (0, 1, 2) and not isinstance(raw_hops, bool) else 0
+    search_query = str(saved.get("search_query") or "")
+    working_set_only = bool(saved.get("working_set_only", False))
+    compact_visible = bool(saved.get("compact_visible", False))
+    flatten_2d = bool(saved.get("flatten_2d", False))
+    group_by = str(saved.get("group_by") or "none")
+    z_wythe_slice = str(saved.get("z_wythe_slice") or "all")
+    raw_zoom = saved.get("zoom_stratum", 1)
+    zoom_stratum = raw_zoom if raw_zoom in (1, 2, 3) and not isinstance(raw_zoom, bool) else 1
+    visible_node_count = max(0, int(saved.get("visible_node_count") or 0))
+    in_frustum_count = max(0, int(saved.get("in_frustum_count") or 0))
+
     md_lines = [
         f"# Wythe Live Focus X-Ray :: `{target.slug}` @ `{ev_identity.source_commit[:16]}`",
         (
@@ -704,7 +748,16 @@ def explain_ui_focus(
             f"Evidence: `{ev_identity.evidence_revision_id}` | Follow: `{follow_state}`"
         ),
         f"> Tab: `{active_tab}` | Lens: `{lens}` | Layout: `{layout_mode}` | Blast: `{blast_mode}` ({diff_base_ref})",
-        f"> Connected only: `{saved.get('connected_only', False)}` | Neighborhood hops: `{saved.get('neighborhood_hops', 0)}`",
+        (
+            f"> Connected only: `{connected_only}` | Neighborhood hops: `{neighborhood_hops}` | "
+            f"tier=`{tier_filter}` | subkind=`{subkind_filter}` | edge=`{edge_filter}` | "
+            f"only_flagged=`{only_flagged}` | isolate_cone=`{isolate_cone}` | search=`{search_query}`"
+        ),
+        (
+            f"> Scene Controls: working_set_only=`{working_set_only}` | compact_visible=`{compact_visible}` | "
+            f"flatten_2d=`{flatten_2d}` | group_by=`{group_by}` | z_wythe_slice=`{z_wythe_slice}` | "
+            f"zoom_stratum=`{zoom_stratum}` | visible_nodes=`{visible_node_count}` (in_frustum=`{in_frustum_count}`)"
+        ),
         f"> **Headline**: {headline}",
         f"> **Why It Looks Like This**: {color_reason}",
     ]
@@ -848,9 +901,26 @@ def explain_ui_focus(
         layout_mode=layout_mode,
         blast_mode=blast_mode,
         diff_base_ref=diff_base_ref,
+        tier_filter=tier_filter,
+        subkind_filter=subkind_filter,
+        edge_filter=edge_filter,
+        only_flagged=only_flagged,
+        isolate_cone=isolate_cone,
+        connected_only=connected_only,
+        neighborhood_hops=neighborhood_hops,  # type: ignore[arg-type]
+        search_query=search_query,
+        working_set_only=working_set_only,
+        compact_visible=compact_visible,
+        flatten_2d=flatten_2d,
+        group_by=group_by,
+        z_wythe_slice=z_wythe_slice,
+        zoom_stratum=zoom_stratum,  # type: ignore[arg-type]
+        visible_node_count=visible_node_count,
+        in_frustum_count=in_frustum_count,
         headline=headline,
         color_reason=color_reason,
         focused_node=ptr,
+        selected_node_id=str(selected_nid) if selected_nid else None,
         selected_edge_id=selected_edge_id,
         selected_finding_id=selected_finding_id,
         focused_district=dist_summary,

@@ -27,7 +27,9 @@ import {
   applyIncomingViewportEvent,
   buildViewportPermalinkHash,
   computeCameraTransition,
+  computeSmartDenseSalience,
   createInitialAgentCameraState,
+  isPureDrawerRefreshCommand,
   normalizeViewportTimeline,
   parseViewportPermalinkHash,
   resumeAgentCameraFollow,
@@ -1647,4 +1649,117 @@ test('Wave 5: target-scoped URL hash never leaks prior target session_id onto sw
   });
   assert.equal(tab3Bare.sessionId, 'inv_shared_tab1');
   assert.equal(tab3Bare.sharedFromUrl, true);
+});
+
+test('v0.2.7: 1:1 viewport parity permalinks, smart dense-graph salience, and pure drawer wakeup guard', () => {
+  // 1. Smart dense-graph salience (>120 nodes) auto-enables isolateCone for 1 node and workingSet+compact for >=2 nodes
+  const singleSalience = computeSmartDenseSalience({
+    totalNodeCount: 450,
+    resolvedFocus: ['table:quota_records'],
+  });
+  assert.equal(singleSalience.mode, 'auto_isolate_cone');
+  assert.equal(singleSalience.selectedNodeId, 'table:quota_records');
+  assert.equal(singleSalience.isolateCone, true);
+  assert.equal(singleSalience.workingSetActive, false);
+  assert.equal(singleSalience.compactVisible, false);
+
+  const multiSalience = computeSmartDenseSalience({
+    totalNodeCount: 450,
+    resolvedFocus: ['table:quota_records', 'service:enforce_quota', 'route:post_quota'],
+    highlightEdgeIds: ['edge:1'],
+    allEdges: [{ id: 'edge:1', source_id: 'route:post_quota', target_id: 'ui:QuotaCard' }],
+  });
+  assert.equal(multiSalience.mode, 'auto_working_set_compact');
+  assert.equal(multiSalience.selectedNodeId, 'table:quota_records');
+  assert.equal(multiSalience.isolateCone, false);
+  assert.equal(multiSalience.workingSetActive, true);
+  assert.equal(multiSalience.compactVisible, true);
+  assert.deepEqual(multiSalience.workingSetIds, [
+    'table:quota_records',
+    'service:enforce_quota',
+    'route:post_quota',
+    'ui:QuotaCard',
+  ]);
+
+  // Explicit filter suppresses auto-salience override
+  const explicitOverride = computeSmartDenseSalience({
+    totalNodeCount: 450,
+    resolvedFocus: ['table:quota_records'],
+    onlyFlagged: true,
+  });
+  assert.equal(explicitOverride.mode, 'none');
+
+  // Small graph (<=120 nodes) leaves salience mode untouched
+  const smallGraph = computeSmartDenseSalience({
+    totalNodeCount: 80,
+    resolvedFocus: ['table:quota_records'],
+  });
+  assert.equal(smallGraph.mode, 'none');
+
+  // 2. Pure drawer refresh command is detected without clobbering camera or filters
+  assert.equal(
+    isPureDrawerRefreshCommand({
+      target_slug: 'wythe',
+      session_id: 'inv_1',
+      refresh_session_id: 'inv_1',
+      open_drawer: true,
+    }),
+    true,
+  );
+  assert.equal(
+    isPureDrawerRefreshCommand({
+      target_slug: 'wythe',
+      refresh_session_id: 'inv_1',
+      open_drawer: true,
+      focus_node_ids: ['table:quota_records'],
+    }),
+    false,
+  );
+  assert.equal(
+    isPureDrawerRefreshCommand({
+      target_slug: 'wythe',
+      refresh_session_id: 'inv_1',
+      only_flagged: true,
+    }),
+    false,
+  );
+
+  // 3. Parity filter permalink round-tripping
+  const parityHash = buildViewportPermalinkHash({
+    target_slug: 'wythe',
+    session_id: 'inv_parity',
+    focus_node_ids: ['table:quota_records'],
+    tier_filter: 'truth',
+    subkind_filter: 'db_table',
+    edge_filter: 'writes_truth',
+    only_flagged: true,
+    isolate_cone: true,
+    connected_only: true,
+    neighborhood_hops: 2,
+    search_query: 'quota',
+    blast_mode: 'git',
+    diff_base_ref: 'HEAD~2',
+    working_set_only: true,
+    compact_visible: true,
+    flatten_2d: true,
+    group_by: 'cluster',
+    active_tab: 'governance',
+  });
+  const parsedParity = parseViewportPermalinkHash(parityHash);
+  assert.ok(parsedParity);
+  assert.equal(parsedParity.tier_filter, 'truth');
+  assert.equal(parsedParity.subkind_filter, 'db_table');
+  assert.equal(parsedParity.edge_filter, 'writes_truth');
+  assert.equal(parsedParity.only_flagged, true);
+  assert.equal(parsedParity.isolate_cone, true);
+  assert.equal(parsedParity.connected_only, true);
+  assert.equal(parsedParity.neighborhood_hops, 2);
+  assert.equal(parsedParity.search_query, 'quota');
+  assert.equal(parsedParity.blast_mode, 'git');
+  assert.equal(parsedParity.diff_base_ref, 'HEAD~2');
+  assert.equal(parsedParity.working_set_only, true);
+  assert.equal(parsedParity.compact_visible, true);
+  assert.equal(parsedParity.flatten_2d, true);
+  assert.equal(parsedParity.group_by, 'cluster');
+  assert.equal(parsedParity.active_tab, 'governance');
 });

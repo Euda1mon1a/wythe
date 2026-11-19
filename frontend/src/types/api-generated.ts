@@ -3724,12 +3724,53 @@ export interface components {
             focus_node_ids?: string[];
             /** Highlight Edge Ids */
             highlight_edge_ids?: string[];
+            /** Selected Node Id */
+            selected_node_id?: string | null;
+            /** Selected Edge Id */
+            selected_edge_id?: string | null;
             /** Finding Id */
             finding_id?: string | null;
             /** Lens */
             lens?: ("status" | "contention" | "gravity" | "subkind" | "cluster" | "containers") | null;
             /** Layout Mode */
             layout_mode?: ("cluster" | "grid" | "subkind" | "connected" | "lifecycle_z" | "temporal_z") | null;
+            /** Tier Filter */
+            tier_filter?: ("all" | "truth" | "manipulate" | "display") | null;
+            /** Subkind Filter */
+            subkind_filter?: string | null;
+            /** Edge Filter */
+            edge_filter?: string | null;
+            /** Only Flagged */
+            only_flagged?: boolean | null;
+            /** Isolate Cone */
+            isolate_cone?: boolean | null;
+            /** Connected Only */
+            connected_only?: boolean | null;
+            /** Neighborhood Hops */
+            neighborhood_hops?: (0 | 1 | 2) | null;
+            /** Search Query */
+            search_query?: string | null;
+            /** Blast Mode */
+            blast_mode?: ("off" | "git" | "snapshot") | null;
+            /** Diff Base Ref */
+            diff_base_ref?: string | null;
+            /** Working Set Only */
+            working_set_only?: boolean | null;
+            /** Compact Visible */
+            compact_visible?: boolean | null;
+            /** Flatten 2D */
+            flatten_2d?: boolean | null;
+            /** Group By */
+            group_by?: ("none" | "cluster" | "subkind") | null;
+            /** Active Tab */
+            active_tab?: ("3d" | "index" | "governance" | "understanding" | "lineage" | "gate") | null;
+            /** Open Drawer */
+            open_drawer?: boolean | null;
+            /**
+             * Reset Filters
+             * @default false
+             */
+            reset_filters: boolean;
             /** Z Wythe Slice */
             z_wythe_slice?: ("all" | "z0_blueprint" | "z1_built" | "z2_runtime" | "z_base" | "z_head") | null;
             /**
@@ -3855,11 +3896,95 @@ export interface components {
             blast_mode: string;
             /** Diff Base Ref */
             diff_base_ref: string;
+            /**
+             * Tier Filter
+             * @default all
+             */
+            tier_filter: string;
+            /**
+             * Subkind Filter
+             * @default all
+             */
+            subkind_filter: string;
+            /**
+             * Edge Filter
+             * @default all
+             */
+            edge_filter: string;
+            /**
+             * Only Flagged
+             * @default false
+             */
+            only_flagged: boolean;
+            /**
+             * Isolate Cone
+             * @default false
+             */
+            isolate_cone: boolean;
+            /**
+             * Connected Only
+             * @default false
+             */
+            connected_only: boolean;
+            /**
+             * Neighborhood Hops
+             * @default 0
+             * @enum {integer}
+             */
+            neighborhood_hops: 0 | 1 | 2;
+            /**
+             * Search Query
+             * @default
+             */
+            search_query: string;
+            /**
+             * Working Set Only
+             * @default false
+             */
+            working_set_only: boolean;
+            /**
+             * Compact Visible
+             * @default false
+             */
+            compact_visible: boolean;
+            /**
+             * Flatten 2D
+             * @default false
+             */
+            flatten_2d: boolean;
+            /**
+             * Group By
+             * @default none
+             */
+            group_by: string;
+            /**
+             * Z Wythe Slice
+             * @default all
+             */
+            z_wythe_slice: string;
+            /**
+             * Zoom Stratum
+             * @default 1
+             * @enum {integer}
+             */
+            zoom_stratum: 1 | 2 | 3;
+            /**
+             * Visible Node Count
+             * @default 0
+             */
+            visible_node_count: number;
+            /**
+             * In Frustum Count
+             * @default 0
+             */
+            in_frustum_count: number;
             /** Headline */
             headline: string;
             /** Color Reason */
             color_reason: string;
             focused_node?: components["schemas"]["LlmNodePointer"] | null;
+            /** Selected Node Id */
+            selected_node_id?: string | null;
             /** Selected Edge Id */
             selected_edge_id?: string | null;
             /** Selected Finding Id */
@@ -3994,6 +4119,37 @@ export interface components {
              * @default
              */
             search_query: string;
+            /**
+             * Working Set Only
+             * @default false
+             */
+            working_set_only: boolean;
+            /**
+             * Compact Visible
+             * @default false
+             */
+            compact_visible: boolean;
+            /**
+             * Flatten 2D
+             * @default false
+             */
+            flatten_2d: boolean;
+            /**
+             * Group By
+             * @default none
+             */
+            group_by: string;
+            /**
+             * Z Wythe Slice
+             * @default all
+             */
+            z_wythe_slice: string;
+            /**
+             * Zoom Stratum
+             * @default 1
+             * @enum {integer}
+             */
+            zoom_stratum: 1 | 2 | 3;
             /** Active Trace Route */
             active_trace_route?: string | null;
             /** Camera Position */
@@ -4370,6 +4526,8 @@ export interface components {
             target_slug: string;
             /** Session Id */
             session_id?: string | null;
+            /** Refresh Session Id */
+            refresh_session_id?: string | null;
             /** Expected Evidence Revision */
             expected_evidence_revision?: string | null;
             /** Expires At */
@@ -4386,12 +4544,53 @@ export interface components {
             focus_node_ids?: string[];
             /** Highlight Edge Ids */
             highlight_edge_ids?: string[];
+            /** Selected Node Id */
+            selected_node_id?: string | null;
+            /** Selected Edge Id */
+            selected_edge_id?: string | null;
             /** Finding Id */
             finding_id?: string | null;
             /** Lens */
             lens?: ("status" | "contention" | "gravity" | "subkind" | "cluster" | "containers") | null;
             /** Layout Mode */
             layout_mode?: ("cluster" | "grid" | "subkind" | "connected" | "lifecycle_z" | "temporal_z") | null;
+            /** Tier Filter */
+            tier_filter?: ("all" | "truth" | "manipulate" | "display") | null;
+            /** Subkind Filter */
+            subkind_filter?: string | null;
+            /** Edge Filter */
+            edge_filter?: string | null;
+            /** Only Flagged */
+            only_flagged?: boolean | null;
+            /** Isolate Cone */
+            isolate_cone?: boolean | null;
+            /** Connected Only */
+            connected_only?: boolean | null;
+            /** Neighborhood Hops */
+            neighborhood_hops?: (0 | 1 | 2) | null;
+            /** Search Query */
+            search_query?: string | null;
+            /** Blast Mode */
+            blast_mode?: ("off" | "git" | "snapshot") | null;
+            /** Diff Base Ref */
+            diff_base_ref?: string | null;
+            /** Working Set Only */
+            working_set_only?: boolean | null;
+            /** Compact Visible */
+            compact_visible?: boolean | null;
+            /** Flatten 2D */
+            flatten_2d?: boolean | null;
+            /** Group By */
+            group_by?: ("none" | "cluster" | "subkind") | null;
+            /** Active Tab */
+            active_tab?: ("3d" | "index" | "governance" | "understanding" | "lineage" | "gate") | null;
+            /** Open Drawer */
+            open_drawer?: boolean | null;
+            /**
+             * Reset Filters
+             * @default false
+             */
+            reset_filters: boolean;
             /** Z Wythe Slice */
             z_wythe_slice?: ("all" | "z0_blueprint" | "z1_built" | "z2_runtime" | "z_base" | "z_head") | null;
             /**
