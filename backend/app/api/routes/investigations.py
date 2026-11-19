@@ -20,6 +20,7 @@ from app.schemas.atlas import (
     InvestigationSessionRead,
     InvestigationTurnCreate,
     InvestigationTurnRead,
+    ViewportCommand,
 )
 from app.services.investigation_service import (
     add_investigation_correction,
@@ -34,6 +35,7 @@ from app.services.investigation_service import (
     reset_investigation_session,
     update_investigation_follow,
 )
+from app.services.viewport_service import publish_viewport_command
 
 router = APIRouter()
 DbSession = Annotated[Session, Depends(get_db)]
@@ -104,11 +106,25 @@ def post_investigation_turn_route(
     db: DbSession,
 ) -> InvestigationTurnRead:
     try:
-        return record_investigation_turn(db, session_id, payload)
+        turn = record_investigation_turn(db, session_id, payload)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if payload.actor == "agent":
+        inv = get_investigation_session(session_id)
+        if inv is not None:
+            publish_viewport_command(
+                ViewportCommand(
+                    target_slug=inv.target_slug,
+                    session_id=session_id,
+                    refresh_session_id=session_id,
+                    open_drawer=True,
+                ),
+                local_only=True,
+                current_evidence_revision=turn.evidence_revision_id,
+            )
+    return turn
 
 
 @router.get("/{session_id}/events", response_model=InvestigationDeltaEventsResponse)

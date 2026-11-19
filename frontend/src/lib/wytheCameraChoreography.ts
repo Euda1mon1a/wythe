@@ -1,13 +1,17 @@
 import * as THREE from 'three';
 import type {
   AtlasEdge,
+  BlastModeChoice,
   ChronicleFrame,
   ChronicleTimeline,
   FramingPreset,
+  TierFilterChoice,
   TourKeyframe,
   ViewportCommand,
   ViewportCommandEvent,
+  ViewportGroupByChoice,
   ViewportLayoutChoice,
+  ViewportTabChoice,
   ZWytheSliceChoice,
 } from '@/api/atlas';
 import type { SceneLayoutMode, SceneLens } from '@/lib/wytheSceneLenses';
@@ -362,14 +366,164 @@ export interface NormalizedTimelineItem {
   status: 'ok' | 'warning' | 'failed' | 'pending';
   focusNodeIds: string[];
   highlightEdgeIds: string[];
+  selectedNodeId?: string | null;
+  selectedEdgeId?: string | null;
   findingId: string | null;
   lens: SceneLens | null;
   layoutMode: SceneLayoutMode | null;
+  tierFilter?: TierFilterChoice | null;
+  subkindFilter?: string | null;
+  edgeFilter?: string | null;
+  onlyFlagged?: boolean | null;
+  isolateCone?: boolean | null;
+  connectedOnly?: boolean | null;
+  neighborhoodHops?: 0 | 1 | 2 | null;
+  searchQuery?: string | null;
+  blastMode?: BlastModeChoice | null;
+  diffBaseRef?: string | null;
+  workingSetOnly?: boolean | null;
+  compactVisible?: boolean | null;
+  flatten2d?: boolean | null;
+  groupBy?: ViewportGroupByChoice | null;
+  activeTab?: ViewportTabChoice | null;
+  openDrawer?: boolean | null;
+  resetFilters?: boolean;
   zWytheSlice: ZWytheSliceChoice | null;
   zoomStratum: 1 | 2 | 3;
   framingPreset: FramingPreset;
   caption: string;
   substeps: string[];
+}
+
+export interface SmartDenseSalienceInput {
+  totalNodeCount: number;
+  resolvedFocus: ReadonlyArray<string>;
+  highlightEdgeIds?: ReadonlyArray<string>;
+  allEdges?: ReadonlyArray<Pick<AtlasEdge, 'id' | 'source_id' | 'target_id'>>;
+  selectedNodeId?: string | null;
+  isolateCone?: boolean | null;
+  neighborhoodHops?: 0 | 1 | 2 | null;
+  workingSetOnly?: boolean | null;
+  onlyFlagged?: boolean | null;
+  tierFilter?: string | null;
+  subkindFilter?: string | null;
+  searchQuery?: string | null;
+  resetFilters?: boolean;
+}
+
+export interface SmartDenseSalienceResult {
+  mode: 'none' | 'auto_isolate_cone' | 'auto_working_set_compact';
+  selectedNodeId: string | null;
+  isolateCone?: boolean;
+  workingSetIds?: string[];
+  workingSetActive?: boolean;
+  compactVisible?: boolean;
+}
+
+export function isPureDrawerRefreshCommand(
+  cmd: Partial<ViewportCommand> | null | undefined,
+): boolean {
+  if (!cmd) return false;
+  const hasDrawerWakeup = Boolean(cmd.refresh_session_id) || cmd.open_drawer === true;
+  if (!hasDrawerWakeup) return false;
+  return (
+    (cmd.focus_node_ids?.length ?? 0) === 0 &&
+    (cmd.highlight_edge_ids?.length ?? 0) === 0 &&
+    (cmd.tour_keyframes?.length ?? 0) === 0 &&
+    (cmd.chronicle_frames?.length ?? 0) === 0 &&
+    !cmd.chronicle_timeline &&
+    !cmd.selected_node_id &&
+    !cmd.selected_edge_id &&
+    !cmd.finding_id &&
+    !cmd.reset_filters &&
+    cmd.lens == null &&
+    cmd.layout_mode == null &&
+    cmd.z_wythe_slice == null &&
+    cmd.tier_filter == null &&
+    cmd.subkind_filter == null &&
+    cmd.edge_filter == null &&
+    cmd.only_flagged == null &&
+    cmd.isolate_cone == null &&
+    cmd.connected_only == null &&
+    cmd.neighborhood_hops == null &&
+    !cmd.search_query &&
+    cmd.blast_mode == null &&
+    cmd.diff_base_ref == null &&
+    cmd.working_set_only == null &&
+    cmd.compact_visible == null &&
+    cmd.flatten_2d == null &&
+    cmd.group_by == null &&
+    cmd.active_tab == null
+  );
+}
+
+export function computeSmartDenseSalience(
+  input: SmartDenseSalienceInput,
+): SmartDenseSalienceResult {
+  const {
+    totalNodeCount,
+    resolvedFocus,
+    highlightEdgeIds = [],
+    allEdges = [],
+    selectedNodeId = null,
+    isolateCone = null,
+    neighborhoodHops = null,
+    workingSetOnly = null,
+    onlyFlagged = null,
+    tierFilter = null,
+    subkindFilter = null,
+    searchQuery = null,
+    resetFilters = false,
+  } = input;
+
+  const fallbackSelected =
+    selectedNodeId ?? (resolvedFocus.length > 0 ? resolvedFocus[0] : null);
+  const explicitFilterSet =
+    isolateCone != null ||
+    neighborhoodHops != null ||
+    workingSetOnly != null ||
+    onlyFlagged != null ||
+    tierFilter != null ||
+    subkindFilter != null ||
+    Boolean(searchQuery) ||
+    Boolean(resetFilters);
+
+  if (totalNodeCount <= 120 || resolvedFocus.length === 0 || explicitFilterSet) {
+    return {
+      mode: 'none',
+      selectedNodeId: fallbackSelected,
+    };
+  }
+
+  if (resolvedFocus.length === 1) {
+    return {
+      mode: 'auto_isolate_cone',
+      selectedNodeId: fallbackSelected,
+      isolateCone: true,
+      workingSetActive: false,
+      compactVisible: false,
+    };
+  }
+
+  const salientIds = new Set<string>(resolvedFocus);
+  if (highlightEdgeIds.length > 0 && allEdges.length > 0) {
+    const wantedEdges = new Set<string>(highlightEdgeIds);
+    for (const edge of allEdges) {
+      if (wantedEdges.has(edge.id)) {
+        salientIds.add(edge.source_id);
+        salientIds.add(edge.target_id);
+      }
+    }
+  }
+
+  return {
+    mode: 'auto_working_set_compact',
+    selectedNodeId: fallbackSelected,
+    isolateCone: false,
+    workingSetIds: [...salientIds],
+    workingSetActive: true,
+    compactVisible: true,
+  };
 }
 
 export interface AgentCameraFollowState {
@@ -444,9 +598,28 @@ export function normalizeViewportTimeline(
       status: 'ok',
       focusNodeIds: kf.focus_node_ids ?? [],
       highlightEdgeIds: kf.highlight_edge_ids ?? [],
+      selectedNodeId: kf.selected_node_id ?? cmd.selected_node_id ?? null,
+      selectedEdgeId: kf.selected_edge_id ?? cmd.selected_edge_id ?? null,
       findingId: kf.finding_id ?? cmd.finding_id ?? null,
       lens: (kf.lens ?? cmd.lens ?? null) as SceneLens | null,
       layoutMode: (kf.layout_mode ?? cmd.layout_mode ?? null) as SceneLayoutMode | null,
+      tierFilter: kf.tier_filter ?? cmd.tier_filter ?? null,
+      subkindFilter: kf.subkind_filter ?? cmd.subkind_filter ?? null,
+      edgeFilter: kf.edge_filter ?? cmd.edge_filter ?? null,
+      onlyFlagged: kf.only_flagged ?? cmd.only_flagged ?? null,
+      isolateCone: kf.isolate_cone ?? cmd.isolate_cone ?? null,
+      connectedOnly: kf.connected_only ?? cmd.connected_only ?? null,
+      neighborhoodHops: kf.neighborhood_hops ?? cmd.neighborhood_hops ?? null,
+      searchQuery: kf.search_query ?? cmd.search_query ?? null,
+      blastMode: kf.blast_mode ?? cmd.blast_mode ?? null,
+      diffBaseRef: kf.diff_base_ref ?? cmd.diff_base_ref ?? null,
+      workingSetOnly: kf.working_set_only ?? cmd.working_set_only ?? null,
+      compactVisible: kf.compact_visible ?? cmd.compact_visible ?? null,
+      flatten2d: kf.flatten_2d ?? cmd.flatten_2d ?? null,
+      groupBy: kf.group_by ?? cmd.group_by ?? null,
+      activeTab: kf.active_tab ?? cmd.active_tab ?? null,
+      openDrawer: kf.open_drawer ?? cmd.open_drawer ?? null,
+      resetFilters: Boolean(kf.reset_filters ?? cmd.reset_filters),
       zWytheSlice: kf.z_wythe_slice ?? cmd.z_wythe_slice ?? null,
       zoomStratum: kf.zoom_stratum ?? cmd.zoom_stratum ?? 1,
       framingPreset: kf.framing_preset ?? cmd.framing_preset ?? 'iso_overview',
@@ -468,9 +641,28 @@ export function normalizeViewportTimeline(
       status: cf.status ?? 'ok',
       focusNodeIds: cf.focus_node_ids ?? [],
       highlightEdgeIds: cf.highlight_edge_ids ?? [],
+      selectedNodeId: cmd.selected_node_id ?? null,
+      selectedEdgeId: cmd.selected_edge_id ?? null,
       findingId: cmd.finding_id ?? null,
       lens: (cmd.lens ?? null) as SceneLens | null,
       layoutMode: (cmd.layout_mode ?? null) as SceneLayoutMode | null,
+      tierFilter: cmd.tier_filter ?? null,
+      subkindFilter: cmd.subkind_filter ?? null,
+      edgeFilter: cmd.edge_filter ?? null,
+      onlyFlagged: cmd.only_flagged ?? null,
+      isolateCone: cmd.isolate_cone ?? null,
+      connectedOnly: cmd.connected_only ?? null,
+      neighborhoodHops: cmd.neighborhood_hops ?? null,
+      searchQuery: cmd.search_query ?? null,
+      blastMode: cmd.blast_mode ?? null,
+      diffBaseRef: cmd.diff_base_ref ?? null,
+      workingSetOnly: cmd.working_set_only ?? null,
+      compactVisible: cmd.compact_visible ?? null,
+      flatten2d: cmd.flatten_2d ?? null,
+      groupBy: cmd.group_by ?? null,
+      activeTab: cmd.active_tab ?? null,
+      openDrawer: cmd.open_drawer ?? null,
+      resetFilters: Boolean(cmd.reset_filters),
       zWytheSlice: cmd.z_wythe_slice ?? null,
       zoomStratum: cmd.zoom_stratum ?? 1,
       framingPreset: cmd.framing_preset ?? 'corridor_trace',
@@ -652,6 +844,17 @@ const VALID_Z_SLICES = new Set<ZWytheSliceChoice>([
   'z_base',
   'z_head',
 ]);
+const VALID_TIERS = new Set<TierFilterChoice>(['all', 'truth', 'manipulate', 'display']);
+const VALID_BLAST_MODES = new Set<BlastModeChoice>(['off', 'git', 'snapshot']);
+const VALID_GROUP_BY = new Set<ViewportGroupByChoice>(['none', 'cluster', 'subkind']);
+const VALID_TABS = new Set<ViewportTabChoice>([
+  '3d',
+  'index',
+  'governance',
+  'understanding',
+  'lineage',
+  'gate',
+]);
 
 export function buildViewportPermalinkHash(cmd: Partial<ViewportCommand>): string {
   const parts: string[] = [];
@@ -691,6 +894,60 @@ export function buildViewportPermalinkHash(cmd: Partial<ViewportCommand>): strin
       Math.min(64, Math.trunc(cmd.chronicle_timeline.active_phase_index ?? 0)),
     );
     parts.push(`phase=${phaseIdx}`);
+  }
+  if (cmd.finding_id) {
+    parts.push(`finding=${encodeURIComponent(cmd.finding_id)}`);
+  }
+  if (cmd.selected_node_id) {
+    parts.push(`selected_node=${encodeURIComponent(cmd.selected_node_id)}`);
+  }
+  if (cmd.selected_edge_id) {
+    parts.push(`selected_edge=${encodeURIComponent(cmd.selected_edge_id)}`);
+  }
+  if (cmd.tier_filter && cmd.tier_filter !== 'all' && VALID_TIERS.has(cmd.tier_filter)) {
+    parts.push(`tier=${encodeURIComponent(cmd.tier_filter)}`);
+  }
+  if (cmd.subkind_filter && cmd.subkind_filter !== 'all') {
+    parts.push(`subkind=${encodeURIComponent(cmd.subkind_filter)}`);
+  }
+  if (cmd.edge_filter && cmd.edge_filter !== 'all') {
+    parts.push(`edge_filter=${encodeURIComponent(cmd.edge_filter)}`);
+  }
+  if (cmd.only_flagged === true) {
+    parts.push('only_flagged=1');
+  }
+  if (cmd.isolate_cone === true) {
+    parts.push('isolate_cone=1');
+  }
+  if (cmd.connected_only === true) {
+    parts.push('connected_only=1');
+  }
+  if (cmd.neighborhood_hops === 1 || cmd.neighborhood_hops === 2) {
+    parts.push(`hops=${cmd.neighborhood_hops}`);
+  }
+  if (cmd.search_query) {
+    parts.push(`q=${encodeURIComponent(cmd.search_query)}`);
+  }
+  if (cmd.blast_mode && cmd.blast_mode !== 'off' && VALID_BLAST_MODES.has(cmd.blast_mode)) {
+    parts.push(`blast=${encodeURIComponent(cmd.blast_mode)}`);
+    if (cmd.diff_base_ref && cmd.blast_mode === 'git') {
+      parts.push(`base_ref=${encodeURIComponent(cmd.diff_base_ref)}`);
+    }
+  }
+  if (cmd.working_set_only === true) {
+    parts.push('working_set=1');
+  }
+  if (cmd.compact_visible === true) {
+    parts.push('compact=1');
+  }
+  if (cmd.flatten_2d === true) {
+    parts.push('flat2d=1');
+  }
+  if (cmd.group_by && cmd.group_by !== 'none' && VALID_GROUP_BY.has(cmd.group_by)) {
+    parts.push(`group_by=${encodeURIComponent(cmd.group_by)}`);
+  }
+  if (cmd.active_tab && cmd.active_tab !== '3d' && VALID_TABS.has(cmd.active_tab)) {
+    parts.push(`tab=${encodeURIComponent(cmd.active_tab)}`);
   }
   return `#${parts.join('&')}`;
 }
@@ -734,6 +991,8 @@ export function parseViewportPermalinkHash(
     'focus',
     'edges',
     'finding',
+    'selected_node',
+    'selected_edge',
     'lens',
     'layout',
     'preset',
@@ -741,6 +1000,20 @@ export function parseViewportPermalinkHash(
     'zoom',
     'chronicle',
     'phase',
+    'tier',
+    'subkind',
+    'edge_filter',
+    'only_flagged',
+    'isolate_cone',
+    'connected_only',
+    'hops',
+    'q',
+    'blast',
+    'working_set',
+    'compact',
+    'flat2d',
+    'group_by',
+    'tab',
   ];
   if (!recognizedKeys.some((k) => rawParams.has(k))) return null;
 
@@ -763,6 +1036,14 @@ export function parseViewportPermalinkHash(
     const v = rawParams.get(key);
     return v === undefined ? null : decodePctOnce(v);
   };
+  const parseBoolParam = (key: string): boolean | undefined => {
+    const v = getDecoded(key);
+    if (v === null) return undefined;
+    const norm = v.trim().toLowerCase();
+    if (norm === '1' || norm === 'true') return true;
+    if (norm === '0' || norm === 'false') return false;
+    return undefined;
+  };
 
   const targetRaw = sanitizeViewportPlainText(getDecoded('target'), 64);
   const resolvedSlug = targetRaw || fallbackTargetSlug;
@@ -776,6 +1057,25 @@ export function parseViewportPermalinkHash(
   const zRaw = getDecoded('z') as ZWytheSliceChoice | null;
   const zoomNum = Number(getDecoded('zoom') ?? '1');
   const findingRaw = sanitizeViewportPlainText(getDecoded('finding'), 120);
+  const selectedNodeRaw = sanitizeViewportPlainText(getDecoded('selected_node'), 240);
+  const selectedEdgeRaw = sanitizeViewportPlainText(getDecoded('selected_edge'), 240);
+  const tierRaw = getDecoded('tier') as TierFilterChoice | null;
+  const subkindRaw = sanitizeViewportPlainText(getDecoded('subkind'), 80);
+  const edgeFilterRaw = sanitizeViewportPlainText(getDecoded('edge_filter'), 80);
+  const onlyFlaggedVal = parseBoolParam('only_flagged');
+  const isolateConeVal = parseBoolParam('isolate_cone');
+  const connectedOnlyVal = parseBoolParam('connected_only');
+  const hopsDecoded = getDecoded('hops');
+  const hopsVal: 0 | 1 | 2 | undefined =
+    hopsDecoded === '0' ? 0 : hopsDecoded === '1' ? 1 : hopsDecoded === '2' ? 2 : undefined;
+  const searchQueryRaw = sanitizeViewportPlainText(getDecoded('q'), 160);
+  const blastRaw = getDecoded('blast') as BlastModeChoice | null;
+  const baseRefRaw = sanitizeViewportPlainText(getDecoded('base_ref'), 120);
+  const workingSetVal = parseBoolParam('working_set');
+  const compactVal = parseBoolParam('compact');
+  const flat2dVal = parseBoolParam('flat2d');
+  const groupByRaw = getDecoded('group_by') as ViewportGroupByChoice | null;
+  const tabRaw = getDecoded('tab') as ViewportTabChoice | null;
   const chronicleRaw = sanitizeViewportPlainText(getDecoded('chronicle'), 64);
   const phaseDecoded = getDecoded('phase');
   const phaseIdx =
@@ -788,9 +1088,26 @@ export function parseViewportPermalinkHash(
     ...(sessionRaw ? { session_id: sessionRaw } : {}),
     focus_node_ids: decodeCsv(rawParams.get('focus'), 50),
     highlight_edge_ids: decodeCsv(rawParams.get('edges'), 80),
+    ...(selectedNodeRaw ? { selected_node_id: selectedNodeRaw } : {}),
+    ...(selectedEdgeRaw ? { selected_edge_id: selectedEdgeRaw } : {}),
     finding_id: findingRaw || null,
     lens: lensRaw && VALID_LENSES.has(lensRaw) ? lensRaw : null,
     layout_mode: layoutRaw && VALID_LAYOUTS.has(layoutRaw) ? layoutRaw : null,
+    ...(tierRaw && VALID_TIERS.has(tierRaw) ? { tier_filter: tierRaw } : {}),
+    ...(subkindRaw ? { subkind_filter: subkindRaw } : {}),
+    ...(edgeFilterRaw ? { edge_filter: edgeFilterRaw } : {}),
+    ...(onlyFlaggedVal !== undefined ? { only_flagged: onlyFlaggedVal } : {}),
+    ...(isolateConeVal !== undefined ? { isolate_cone: isolateConeVal } : {}),
+    ...(connectedOnlyVal !== undefined ? { connected_only: connectedOnlyVal } : {}),
+    ...(hopsVal !== undefined ? { neighborhood_hops: hopsVal } : {}),
+    ...(searchQueryRaw ? { search_query: searchQueryRaw } : {}),
+    ...(blastRaw && VALID_BLAST_MODES.has(blastRaw) ? { blast_mode: blastRaw } : {}),
+    ...(baseRefRaw ? { diff_base_ref: baseRefRaw } : {}),
+    ...(workingSetVal !== undefined ? { working_set_only: workingSetVal } : {}),
+    ...(compactVal !== undefined ? { compact_visible: compactVal } : {}),
+    ...(flat2dVal !== undefined ? { flatten_2d: flat2dVal } : {}),
+    ...(groupByRaw && VALID_GROUP_BY.has(groupByRaw) ? { group_by: groupByRaw } : {}),
+    ...(tabRaw && VALID_TABS.has(tabRaw) ? { active_tab: tabRaw } : {}),
     z_wythe_slice: zRaw && VALID_Z_SLICES.has(zRaw) ? zRaw : null,
     zoom_stratum: zoomNum === 2 || zoomNum === 3 ? zoomNum : 1,
     framing_preset: presetRaw && VALID_PRESETS.has(presetRaw) ? presetRaw : 'iso_overview',

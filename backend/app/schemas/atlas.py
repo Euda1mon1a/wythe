@@ -7,7 +7,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 TierKind = Literal["truth", "manipulate", "display"]
 NodeSubkind = Literal[
@@ -793,6 +793,12 @@ class UiFocusStatePayload(StrictSchema):
     connected_only: bool = False
     neighborhood_hops: Literal[0, 1, 2] = 0
     search_query: str = Field(default="", max_length=200)
+    working_set_only: bool = False
+    compact_visible: bool = False
+    flatten_2d: bool = False
+    group_by: str = Field(default="none", max_length=24)
+    z_wythe_slice: str = Field(default="all", max_length=24)
+    zoom_stratum: Literal[1, 2, 3] = 1
     active_trace_route: str | None = Field(default=None, max_length=200)
     camera_position: str | None = Field(default=None, max_length=96)
     camera_target: str | None = Field(default=None, max_length=96)
@@ -849,9 +855,26 @@ class UiFocusExplainRead(StrictSchema):
     layout_mode: str
     blast_mode: str
     diff_base_ref: str
+    tier_filter: str = "all"
+    subkind_filter: str = "all"
+    edge_filter: str = "all"
+    only_flagged: bool = False
+    isolate_cone: bool = False
+    connected_only: bool = False
+    neighborhood_hops: Literal[0, 1, 2] = 0
+    search_query: str = ""
+    working_set_only: bool = False
+    compact_visible: bool = False
+    flatten_2d: bool = False
+    group_by: str = "none"
+    z_wythe_slice: str = "all"
+    zoom_stratum: Literal[1, 2, 3] = 1
+    visible_node_count: int = 0
+    in_frustum_count: int = 0
     headline: str
     color_reason: str
     focused_node: LlmNodePointer | None = None
+    selected_node_id: str | None = None
     selected_edge_id: str | None = None
     selected_finding_id: str | None = None
     focused_district: DistrictXraySummary | None = None
@@ -1034,6 +1057,21 @@ ViewportLensChoice = Literal[
     "cluster",
     "containers",
 ]
+TierFilterChoice = Literal["all", "truth", "manipulate", "display"]
+BlastModeChoice = Literal["off", "git", "snapshot"]
+ViewportGroupByChoice = Literal["none", "cluster", "subkind"]
+ViewportTabChoice = Literal["3d", "index", "governance", "understanding", "lineage", "gate"]
+
+
+def _pop_flagged_only_alias(raw: Any) -> Any:
+    """Normalize input alias `flagged_only -> only_flagged` without relaxing `extra='forbid'`."""
+    if isinstance(raw, dict) and "flagged_only" in raw:
+        copied = dict(raw)
+        alias_val = copied.pop("flagged_only")
+        if copied.get("only_flagged") is None:
+            copied["only_flagged"] = alias_val
+        return copied
+    return raw
 
 _CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _EXECUTABLE_TEXT_RE = re.compile(
@@ -1107,18 +1145,44 @@ class TourKeyframe(StrictSchema):
     title: str = Field(max_length=120)
     focus_node_ids: list[str] = Field(default_factory=list, max_length=50)
     highlight_edge_ids: list[str] = Field(default_factory=list, max_length=80)
+    selected_node_id: str | None = Field(default=None, max_length=200)
+    selected_edge_id: str | None = Field(default=None, max_length=200)
     finding_id: str | None = Field(default=None, max_length=120)
     lens: ViewportLensChoice | None = None
     layout_mode: ViewportLayoutChoice | None = None
+    tier_filter: TierFilterChoice | None = None
+    subkind_filter: str | None = Field(default=None, max_length=32)
+    edge_filter: str | None = Field(default=None, max_length=32)
+    only_flagged: bool | None = None
+    isolate_cone: bool | None = None
+    connected_only: bool | None = None
+    neighborhood_hops: Literal[0, 1, 2] | None = None
+    search_query: str | None = Field(default=None, max_length=200)
+    blast_mode: BlastModeChoice | None = None
+    diff_base_ref: str | None = Field(default=None, max_length=128)
+    working_set_only: bool | None = None
+    compact_visible: bool | None = None
+    flatten_2d: bool | None = None
+    group_by: ViewportGroupByChoice | None = None
+    active_tab: ViewportTabChoice | None = None
+    open_drawer: bool | None = None
+    reset_filters: bool = False
     z_wythe_slice: ZWytheSliceChoice | None = None
     zoom_stratum: Literal[1, 2, 3] = 1
     framing_preset: FramingPreset = "iso_overview"
     caption: str = Field(default="", max_length=400)
 
-    @field_validator("title", "caption", mode="before")
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_aliases(cls, data: Any) -> Any:
+        return _pop_flagged_only_alias(data)
+
+    @field_validator(
+        "title", "caption", "search_query", "subkind_filter", "edge_filter", "diff_base_ref", mode="before"
+    )
     @classmethod
     def _clean_text(cls, value: Any, info: Any) -> Any:
-        if not isinstance(value, str):
+        if value is None or not isinstance(value, str):
             return value
         return sanitize_viewport_plain_text(value, field_name=str(info.field_name))
 
@@ -1133,14 +1197,14 @@ class TourKeyframe(StrictSchema):
             for item in value
         ]
 
-    @field_validator("finding_id", mode="before")
+    @field_validator("finding_id", "selected_node_id", "selected_edge_id", mode="before")
     @classmethod
-    def _clean_finding_id(cls, value: Any) -> Any:
+    def _clean_finding_id(cls, value: Any, info: Any) -> Any:
         if value is None or not isinstance(value, str):
             return value
-        return validate_semantic_atlas_id(value, field_name="finding_id")
+        return validate_semantic_atlas_id(value, field_name=str(info.field_name))
 
-    @field_validator("step_index", "zoom_stratum", mode="before")
+    @field_validator("step_index", "zoom_stratum", "neighborhood_hops", mode="before")
     @classmethod
     def _reject_bool_int(cls, value: Any, info: Any) -> Any:
         if value is True or value is False:
@@ -1280,15 +1344,35 @@ class ViewportCommand(StrictSchema):
     correlation_id: str | None = Field(default=None, max_length=128)
     target_slug: str = Field(min_length=1, max_length=64)
     session_id: str | None = Field(default=None, max_length=64)
+    refresh_session_id: str | None = Field(default=None, max_length=64)
     expected_evidence_revision: str | None = Field(default=None, max_length=96)
     expires_at: datetime | None = None
     delivery_state: ViewportDeliveryState = "accepted_by_service"
     applied_by_client_ids: list[str] = Field(default_factory=list, max_length=64)
     focus_node_ids: list[str] = Field(default_factory=list, max_length=50)
     highlight_edge_ids: list[str] = Field(default_factory=list, max_length=80)
+    selected_node_id: str | None = Field(default=None, max_length=200)
+    selected_edge_id: str | None = Field(default=None, max_length=200)
     finding_id: str | None = Field(default=None, max_length=120)
     lens: ViewportLensChoice | None = None
     layout_mode: ViewportLayoutChoice | None = None
+    tier_filter: TierFilterChoice | None = None
+    subkind_filter: str | None = Field(default=None, max_length=32)
+    edge_filter: str | None = Field(default=None, max_length=32)
+    only_flagged: bool | None = None
+    isolate_cone: bool | None = None
+    connected_only: bool | None = None
+    neighborhood_hops: Literal[0, 1, 2] | None = None
+    search_query: str | None = Field(default=None, max_length=200)
+    blast_mode: BlastModeChoice | None = None
+    diff_base_ref: str | None = Field(default=None, max_length=128)
+    working_set_only: bool | None = None
+    compact_visible: bool | None = None
+    flatten_2d: bool | None = None
+    group_by: ViewportGroupByChoice | None = None
+    active_tab: ViewportTabChoice | None = None
+    open_drawer: bool | None = None
+    reset_filters: bool = False
     z_wythe_slice: ZWytheSliceChoice | None = None
     zoom_stratum: Literal[1, 2, 3] = 1
     framing_preset: FramingPreset = "iso_overview"
@@ -1296,6 +1380,11 @@ class ViewportCommand(StrictSchema):
     tour_keyframes: list[TourKeyframe] = Field(default_factory=list, max_length=32)
     chronicle_frames: list[ChronicleFrame] = Field(default_factory=list, max_length=32)
     chronicle_timeline: ChronicleTimeline | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_command_aliases(cls, data: Any) -> Any:
+        return _pop_flagged_only_alias(data)
 
     @field_validator("command_id", mode="before")
     @classmethod
@@ -1323,11 +1412,11 @@ class ViewportCommand(StrictSchema):
             raise ValueError(f"Markup or script content is forbidden in `{info.field_name}`.")
         return cleaned
 
-    @field_validator("zoom_stratum", mode="before")
+    @field_validator("zoom_stratum", "neighborhood_hops", mode="before")
     @classmethod
-    def _reject_bool_zoom_stratum(cls, value: Any) -> Any:
+    def _reject_bool_zoom_stratum(cls, value: Any, info: Any) -> Any:
         if value is True or value is False:
-            raise ValueError("`zoom_stratum` must be integer 1, 2, or 3, not boolean.")
+            raise ValueError(f"`{info.field_name}` must be an integer, not boolean.")
         return value
 
     @field_validator("target_slug", mode="before")
@@ -1348,24 +1437,26 @@ class ViewportCommand(StrictSchema):
             raise ValueError("Markup or coordinate tuples are forbidden in `target_slug`.")
         return cleaned
 
-    @field_validator("session_id", mode="before")
+    @field_validator("session_id", "refresh_session_id", mode="before")
     @classmethod
-    def _clean_session_id(cls, value: Any) -> Any:
+    def _clean_session_id(cls, value: Any, info: Any) -> Any:
         if value is None or not isinstance(value, str):
             return value
         cleaned = _CTRL_CHARS_RE.sub("", value).strip()
         if not cleaned:
             return None
         if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
-            raise ValueError("Markup or script content is forbidden in `session_id`.")
+            raise ValueError(f"Markup or script content is forbidden in `{info.field_name}`.")
         return cleaned
 
-    @field_validator("caption", mode="before")
+    @field_validator(
+        "caption", "search_query", "subkind_filter", "edge_filter", "diff_base_ref", mode="before"
+    )
     @classmethod
-    def _clean_command_caption(cls, value: Any) -> Any:
-        if not isinstance(value, str):
+    def _clean_command_caption(cls, value: Any, info: Any) -> Any:
+        if value is None or not isinstance(value, str):
             return value
-        return sanitize_viewport_plain_text(value, field_name="caption")
+        return sanitize_viewport_plain_text(value, field_name=str(info.field_name))
 
     @field_validator("focus_node_ids", "highlight_edge_ids", mode="before")
     @classmethod
@@ -1378,12 +1469,12 @@ class ViewportCommand(StrictSchema):
             for item in value
         ]
 
-    @field_validator("finding_id", mode="before")
+    @field_validator("finding_id", "selected_node_id", "selected_edge_id", mode="before")
     @classmethod
-    def _clean_command_finding(cls, value: Any) -> Any:
+    def _clean_command_finding(cls, value: Any, info: Any) -> Any:
         if value is None or not isinstance(value, str):
             return value
-        return validate_semantic_atlas_id(value, field_name="finding_id")
+        return validate_semantic_atlas_id(value, field_name=str(info.field_name))
 
 
 class ViewportCommandEvent(StrictSchema):

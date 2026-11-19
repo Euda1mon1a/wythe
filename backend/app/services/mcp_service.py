@@ -25,6 +25,7 @@ from app.schemas.atlas import (
     InvestigationCorrectionCreate,
     InvestigationCreateRequest,
     InvestigationFollowUpdate,
+    InvestigationTurnCreate,
     LlmContextConeReport,
     TourKeyframe,
     TruthAtlasReport,
@@ -42,10 +43,12 @@ from app.services.investigation_service import (
     build_evidence_identity,
     compare_investigation_revisions,
     create_or_reopen_investigation,
+    get_active_session_ids_for_target,
     get_investigation_delta_events,
     get_investigation_session,
     get_or_run_cached_scan,
     list_investigations,
+    record_investigation_turn,
     update_investigation_follow,
 )
 from app.services.llm_context_service import (
@@ -213,10 +216,12 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "wythe_focus_camera",
         "description": (
-            "Agent -> Human 3D Camera Choreography: steer a connected 3D Wythe browser tab to frame "
-            "semantic Atlas node IDs, call/drift edges, Z-wythe slices, Zoom strata, or boundary findings "
-            "without raw coordinates, returning headless structured evidence, `#target=...` permalink, "
-            "and honest `delivery_state`."
+            "Agent -> Human 1:1 3D Camera & Filter Parity Choreography: steer a connected 3D Wythe browser tab "
+            "to frame semantic Atlas node IDs, select nodes/edges/findings, switch lenses/layouts/tabs, or apply "
+            "filters (`tier_filter`, `subkind_filter`, `edge_filter`, `only_flagged`/`flagged_only`, `isolate_cone`, "
+            "`connected_only`, `neighborhood_hops`, `search_query`, `blast_mode`, `working_set_only`, "
+            "`compact_visible`, `flatten_2d`, `group_by`, `reset_filters`) without raw coordinates, returning "
+            "structured evidence, `#target=...` permalink, applied filter/salience state, and `delivery_state`."
         ),
         "annotations": {
             "readOnlyHint": False,
@@ -234,6 +239,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "session_id": {
                     "type": "string",
                     "description": "Optional browser session ID for multi-tab viewport isolation.",
+                },
+                "refresh_session_id": {
+                    "type": "string",
+                    "description": "Optional session ID whose shared investigation drawer should refresh on arrival.",
                 },
                 "correlation_id": {
                     "type": "string",
@@ -255,6 +264,14 @@ MCP_TOOLS: list[dict[str, Any]] = [
                     "maxItems": 80,
                     "description": "Optional Atlas edge IDs (`e:...`) to illuminate along the lineage corridor.",
                 },
+                "selected_node_id": {
+                    "type": "string",
+                    "description": "Optional semantic Atlas node ID to select in the Inspector.",
+                },
+                "selected_edge_id": {
+                    "type": "string",
+                    "description": "Optional semantic Atlas edge ID to select in the Inspector.",
+                },
                 "finding_id": {
                     "type": "string",
                     "description": "Optional BoundaryFinding ID (`f:TRUTH-003:0`) or rule code.",
@@ -266,6 +283,81 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "layout_mode": {
                     "type": "string",
                     "enum": ["cluster", "grid", "subkind", "connected", "lifecycle_z", "temporal_z"],
+                },
+                "tier_filter": {
+                    "type": "string",
+                    "enum": ["all", "truth", "manipulate", "display"],
+                },
+                "subkind_filter": {
+                    "type": "string",
+                    "description": "Filter by node subkind (`all`, `table`, `route`, `service`, `page`, etc.).",
+                },
+                "edge_filter": {
+                    "type": "string",
+                    "description": "Filter edges (`all`, `writes`, `reads`, `guards`, `helpers`, `verified`, `declared`, `unverified`, `broken`).",
+                },
+                "only_flagged": {
+                    "type": "boolean",
+                    "description": "Show only nodes with boundary findings or non-clean status.",
+                },
+                "flagged_only": {
+                    "type": "boolean",
+                    "description": "Alias for `only_flagged`.",
+                },
+                "isolate_cone": {
+                    "type": "boolean",
+                    "description": "Isolate the transitive 3-tier lineage cone around the focused/selected node.",
+                },
+                "connected_only": {
+                    "type": "boolean",
+                    "description": "Hide disconnected nodes under the active edge filter.",
+                },
+                "neighborhood_hops": {
+                    "type": "integer",
+                    "enum": [0, 1, 2],
+                    "description": "Filter to 1-hop or 2-hop neighborhood around selection (`0` disables).",
+                },
+                "search_query": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "Substring search filter across node labels, columns, and HTTP routes.",
+                },
+                "blast_mode": {
+                    "type": "string",
+                    "enum": ["off", "git", "snapshot"],
+                },
+                "diff_base_ref": {
+                    "type": "string",
+                    "description": "Git base ref when `blast_mode='git'` (e.g. `HEAD~1`, `WORKING`).",
+                },
+                "working_set_only": {
+                    "type": "boolean",
+                    "description": "Isolate `focus_node_ids` into an active working set.",
+                },
+                "compact_visible": {
+                    "type": "boolean",
+                    "description": "Compact spatial coordinates around currently visible nodes.",
+                },
+                "flatten_2d": {
+                    "type": "boolean",
+                    "description": "Toggle 2D flat plane (`true`) vs 3D stratified planes (`false`).",
+                },
+                "group_by": {
+                    "type": "string",
+                    "enum": ["none", "cluster", "subkind"],
+                },
+                "active_tab": {
+                    "type": "string",
+                    "enum": ["3d", "index", "governance", "understanding", "lineage", "gate"],
+                },
+                "open_drawer": {
+                    "type": "boolean",
+                    "description": "Open the Ask Wythe shared investigation drawer in connected browsers.",
+                },
+                "reset_filters": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Reset all 3D filters, cone/working-set isolation, and layout overrides to overview defaults.",
                 },
                 "z_wythe_slice": {
                     "type": "string",
@@ -344,6 +436,8 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 },
                 "focus_node_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
                 "highlight_edge_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 80},
+                "selected_node_id": {"type": "string"},
+                "selected_edge_id": {"type": "string"},
                 "finding_id": {"type": "string"},
                 "lens": {
                     "type": "string",
@@ -353,6 +447,28 @@ MCP_TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "enum": ["cluster", "grid", "subkind", "connected", "lifecycle_z", "temporal_z"],
                 },
+                "tier_filter": {"type": "string", "enum": ["all", "truth", "manipulate", "display"]},
+                "subkind_filter": {"type": "string"},
+                "edge_filter": {"type": "string"},
+                "only_flagged": {"type": "boolean"},
+                "flagged_only": {"type": "boolean"},
+                "isolate_cone": {"type": "boolean"},
+                "connected_only": {"type": "boolean"},
+                "neighborhood_hops": {"type": "integer", "enum": [0, 1, 2]},
+                "search_query": {"type": "string", "maxLength": 200},
+                "blast_mode": {"type": "string", "enum": ["off", "git", "snapshot"]},
+                "diff_base_ref": {"type": "string"},
+                "working_set_only": {"type": "boolean"},
+                "compact_visible": {"type": "boolean"},
+                "flatten_2d": {"type": "boolean"},
+                "group_by": {"type": "string", "enum": ["none", "cluster", "subkind"]},
+                "active_tab": {
+                    "type": "string",
+                    "enum": ["3d", "index", "governance", "understanding", "lineage", "gate"],
+                },
+                "open_drawer": {"type": "boolean"},
+                "reset_filters": {"type": "boolean", "default": False},
+                "refresh_session_id": {"type": "string"},
                 "z_wythe_slice": {
                     "type": "string",
                     "enum": ["all", "z0_blueprint", "z1_built", "z2_runtime", "z_base", "z_head"],
@@ -373,8 +489,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "name": "wythe_investigation",
         "description": (
             "Shared Human-Agent Investigation & Six-Link Understanding: list/inspect durable sessions, "
-            "record clarifications (`promoted_to_ruling=False`), compare pinned vs current scan revisions, "
-            "read browser delivery receipts, or evaluate the Six-Link Understanding Chain and shipped examples."
+            "record external frontier agent turns (`record_turn` -> live pop-out drawer wakeup), record clarifications "
+            "(`promoted_to_ruling=False`), compare pinned vs current scan revisions, read browser delivery receipts, "
+            "or evaluate the Six-Link Understanding Chain and shipped examples."
         ),
         "annotations": {
             "readOnlyHint": False,
@@ -391,6 +508,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
                         "list_sessions",
                         "get_session",
                         "create_session",
+                        "record_turn",
                         "record_correction",
                         "set_follow",
                         "compare_revisions",
@@ -406,6 +524,22 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "client_id": {"type": "string"},
                 "title": {"type": "string"},
                 "note": {"type": "string"},
+                "answer_markdown": {"type": "string"},
+                "actor": {"type": "string", "enum": ["human", "agent", "system"]},
+                "engine": {"type": "string"},
+                "model_id": {"type": "string"},
+                "selected_node_id": {"type": "string"},
+                "selected_edge_id": {"type": "string"},
+                "selected_finding_id": {"type": "string"},
+                "referenced_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+                "focus_node_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                "lens": {
+                    "type": "string",
+                    "enum": ["status", "contention", "gravity", "subkind", "cluster", "containers"],
+                },
+                "only_flagged": {"type": "boolean"},
+                "isolate_cone": {"type": "boolean"},
+                "open_drawer": {"type": "boolean"},
                 "target_ref_id": {"type": "string"},
                 "turn_id": {"type": "string"},
                 "kind": {"type": "string"},
@@ -763,6 +897,29 @@ def _resolve_camera_beat_ids(
     return list(dict.fromkeys(resolved_nodes)), list(dict.fromkeys(highlight_edge_ids)), resolved_finding
 
 
+def compute_smart_dense_salience_mode(
+    cmd: ViewportCommand,
+    total_node_count: int,
+) -> str:
+    """Return deterministic salience mode matching `page.tsx` / `wytheCameraChoreography.ts`."""
+    if cmd.reset_filters:
+        return "reset_to_overview"
+    has_explicit_filter = (
+        cmd.isolate_cone is not None
+        or cmd.neighborhood_hops is not None
+        or cmd.working_set_only is not None
+        or cmd.only_flagged is not None
+        or cmd.tier_filter is not None
+        or cmd.subkind_filter is not None
+        or bool(cmd.search_query)
+    )
+    if total_node_count > 120 and cmd.focus_node_ids and not has_explicit_filter:
+        if len(cmd.focus_node_ids) == 1:
+            return "auto_isolate_cone"
+        return "auto_working_set_compact"
+    return "explicit"
+
+
 def _execute_camera_choreography_tool(
     session: Session,
     canonical: str,
@@ -777,13 +934,34 @@ def _execute_camera_choreography_tool(
         "target",
         "profile",
         "session_id",
+        "refresh_session_id",
         "correlation_id",
         "expected_evidence_revision",
         "focus_node_ids",
         "highlight_edge_ids",
+        "selected_node_id",
+        "selected_edge_id",
         "finding_id",
         "lens",
         "layout_mode",
+        "tier_filter",
+        "subkind_filter",
+        "edge_filter",
+        "only_flagged",
+        "flagged_only",
+        "isolate_cone",
+        "connected_only",
+        "neighborhood_hops",
+        "search_query",
+        "blast_mode",
+        "diff_base_ref",
+        "working_set_only",
+        "compact_visible",
+        "flatten_2d",
+        "group_by",
+        "active_tab",
+        "open_drawer",
+        "reset_filters",
         "z_wythe_slice",
         "zoom_stratum",
         "framing_preset",
@@ -826,9 +1004,16 @@ def _execute_camera_choreography_tool(
         "target",
         "profile",
         "session_id",
+        "refresh_session_id",
         "correlation_id",
         "expected_evidence_revision",
+        "selected_node_id",
+        "selected_edge_id",
         "finding_id",
+        "subkind_filter",
+        "edge_filter",
+        "search_query",
+        "diff_base_ref",
     ):
         opt_val = args.get(opt_str_key)
         if opt_val is not None and not isinstance(opt_val, str):
@@ -854,16 +1039,39 @@ def _execute_camera_choreography_tool(
         if ("/" in prelim_slug or "\\" in prelim_slug or prelim_slug in (".", ".."))
         else (prelim_slug or "wythe")
     )
+    eff_only_flagged = (
+        args.get("only_flagged") if args.get("only_flagged") is not None else args.get("flagged_only")
+    )
     prelim_cmd = ViewportCommand(
         target_slug=prelim_slug_safe[:64],
         session_id=args.get("session_id"),
+        refresh_session_id=args.get("refresh_session_id"),
         correlation_id=args.get("correlation_id"),
         expected_evidence_revision=args.get("expected_evidence_revision"),
         focus_node_ids=raw_focus_ids,
         highlight_edge_ids=raw_edge_ids,
+        selected_node_id=args.get("selected_node_id"),
+        selected_edge_id=args.get("selected_edge_id"),
         finding_id=args.get("finding_id"),
         lens=args.get("lens"),
         layout_mode=args.get("layout_mode"),
+        tier_filter=args.get("tier_filter"),
+        subkind_filter=args.get("subkind_filter"),
+        edge_filter=args.get("edge_filter"),
+        only_flagged=eff_only_flagged,
+        isolate_cone=args.get("isolate_cone"),
+        connected_only=args.get("connected_only"),
+        neighborhood_hops=args.get("neighborhood_hops"),
+        search_query=args.get("search_query"),
+        blast_mode=args.get("blast_mode"),
+        diff_base_ref=args.get("diff_base_ref"),
+        working_set_only=args.get("working_set_only"),
+        compact_visible=args.get("compact_visible"),
+        flatten_2d=args.get("flatten_2d"),
+        group_by=args.get("group_by"),
+        active_tab=args.get("active_tab"),
+        open_drawer=args.get("open_drawer"),
+        reset_filters=bool(args.get("reset_filters", False)),
         z_wythe_slice=args.get("z_wythe_slice"),
         zoom_stratum=1 if args.get("zoom_stratum") is None else args.get("zoom_stratum"),
         framing_preset=(
@@ -957,6 +1165,33 @@ def _execute_camera_choreography_tool(
             }
         )
 
+    resolved_selected_node: str | None = None
+    if prelim_cmd.selected_node_id:
+        sel_nodes, _, _ = _resolve_camera_beat_ids(
+            report,
+            [prelim_cmd.selected_node_id],
+            [],
+            None,
+            notes,
+            unresolved_nodes,
+            unresolved_edges,
+            unresolved_findings,
+        )
+        resolved_selected_node = sel_nodes[0] if sel_nodes else prelim_cmd.selected_node_id
+
+    resolved_selected_edge = prelim_cmd.selected_edge_id
+    if resolved_selected_edge:
+        _, _, _ = _resolve_camera_beat_ids(
+            report,
+            [],
+            [resolved_selected_edge],
+            None,
+            notes,
+            unresolved_nodes,
+            unresolved_edges,
+            unresolved_findings,
+        )
+
     top_nodes, top_edges, top_finding = _resolve_camera_beat_ids(
         report,
         prelim_cmd.focus_node_ids,
@@ -967,6 +1202,31 @@ def _execute_camera_choreography_tool(
         unresolved_edges,
         unresolved_findings,
     )
+    if not top_nodes and resolved_selected_node:
+        top_nodes = [resolved_selected_node]
+
+    shared_parity_kwargs: dict[str, Any] = {
+        "refresh_session_id": prelim_cmd.refresh_session_id,
+        "selected_node_id": resolved_selected_node,
+        "selected_edge_id": resolved_selected_edge,
+        "tier_filter": prelim_cmd.tier_filter,
+        "subkind_filter": prelim_cmd.subkind_filter,
+        "edge_filter": prelim_cmd.edge_filter,
+        "only_flagged": prelim_cmd.only_flagged,
+        "isolate_cone": prelim_cmd.isolate_cone,
+        "connected_only": prelim_cmd.connected_only,
+        "neighborhood_hops": prelim_cmd.neighborhood_hops,
+        "search_query": prelim_cmd.search_query,
+        "blast_mode": prelim_cmd.blast_mode,
+        "diff_base_ref": prelim_cmd.diff_base_ref,
+        "working_set_only": prelim_cmd.working_set_only,
+        "compact_visible": prelim_cmd.compact_visible,
+        "flatten_2d": prelim_cmd.flatten_2d,
+        "group_by": prelim_cmd.group_by,
+        "active_tab": prelim_cmd.active_tab,
+        "open_drawer": prelim_cmd.open_drawer,
+        "reset_filters": prelim_cmd.reset_filters,
+    }
 
     if resolved_kfs:
         first_kf = resolved_kfs[0]
@@ -999,6 +1259,7 @@ def _execute_camera_choreography_tool(
             tour_keyframes=resolved_kfs,
             chronicle_frames=resolved_cfs,
             chronicle_timeline=resolved_tl,
+            **shared_parity_kwargs,
         )
     else:
         final_cmd = ViewportCommand(
@@ -1018,6 +1279,7 @@ def _execute_camera_choreography_tool(
             tour_keyframes=[],
             chronicle_frames=resolved_cfs,
             chronicle_timeline=resolved_tl,
+            **shared_parity_kwargs,
         )
 
     ack = publish_viewport_command(
@@ -1081,6 +1343,46 @@ def _execute_camera_choreography_tool(
         else None
     )
 
+    salience_mode = compute_smart_dense_salience_mode(final_cmd, len(report.nodes))
+    eff_isolate_cone = (
+        True if salience_mode == "auto_isolate_cone" else final_cmd.isolate_cone
+    )
+    eff_working_set = (
+        True if salience_mode == "auto_working_set_compact" else final_cmd.working_set_only
+    )
+    eff_compact = (
+        True if salience_mode == "auto_working_set_compact" else final_cmd.compact_visible
+    )
+    applied_controls = {
+        "salience_mode": salience_mode,
+        "total_graph_nodes": len(report.nodes),
+        "reset_filters": final_cmd.reset_filters,
+        "selected_node_id": final_cmd.selected_node_id
+        or (final_cmd.focus_node_ids[0] if final_cmd.focus_node_ids else None),
+        "selected_edge_id": final_cmd.selected_edge_id,
+        "finding_id": final_cmd.finding_id,
+        "lens": final_cmd.lens,
+        "layout_mode": final_cmd.layout_mode,
+        "tier_filter": final_cmd.tier_filter,
+        "subkind_filter": final_cmd.subkind_filter,
+        "edge_filter": final_cmd.edge_filter,
+        "only_flagged": final_cmd.only_flagged,
+        "isolate_cone": eff_isolate_cone,
+        "connected_only": final_cmd.connected_only,
+        "neighborhood_hops": final_cmd.neighborhood_hops,
+        "search_query": final_cmd.search_query,
+        "blast_mode": final_cmd.blast_mode,
+        "diff_base_ref": final_cmd.diff_base_ref,
+        "working_set_only": eff_working_set,
+        "compact_visible": eff_compact,
+        "flatten_2d": final_cmd.flatten_2d,
+        "group_by": final_cmd.group_by,
+        "active_tab": final_cmd.active_tab,
+        "open_drawer": final_cmd.open_drawer,
+        "z_wythe_slice": final_cmd.z_wythe_slice,
+        "zoom_stratum": final_cmd.zoom_stratum,
+    }
+
     artifact = {
         "seq": ack.seq,
         "command_id": ack.command_id,
@@ -1098,6 +1400,7 @@ def _execute_camera_choreography_tool(
         "focus_node_ids": final_cmd.focus_node_ids,
         "highlight_edge_ids": final_cmd.highlight_edge_ids,
         "finding_id": final_cmd.finding_id,
+        "applied_controls": applied_controls,
         "headless_evidence": {
             "focused_nodes": headless_nodes,
             "highlighted_edges": headless_edges,
@@ -1113,6 +1416,11 @@ def _execute_camera_choreography_tool(
         "unresolved_finding_ids": unresolved_findings,
     }
 
+    non_null_summary = [
+        f"{k}=`{v}`"
+        for k, v in applied_controls.items()
+        if v is not None and k not in ("total_graph_nodes", "reset_filters") or (k == "reset_filters" and v)
+    ]
     mode_title = "Camera Tour" if is_tour else "Camera Focus"
     md = [
         f"# Wythe 3D {mode_title} :: `{report.target_slug}` (seq={ack.seq})",
@@ -1123,6 +1431,7 @@ def _execute_camera_choreography_tool(
         ),
         f"- **Evidence Revision**: `{ev_identity.evidence_revision_id}` (`{ev_identity.source_commit[:16]}`)",
         f"- **Canonical Permalink**: `{ack.permalink}`",
+        f"- **Applied Controls & Salience**: {', '.join(non_null_summary)}",
     ]
     if final_cmd.focus_node_ids:
         md.append(f"- **Focused Nodes**: {', '.join(f'`{n}`' for n in final_cmd.focus_node_ids)}")
@@ -1649,6 +1958,27 @@ def _execute_tool_blocks(
             "focus_revision": explain.focus_revision,
             "evidence_revision_id": explain.evidence_revision_id,
             "follow_state": explain.follow_state,
+            "active_tab": explain.active_tab,
+            "lens": explain.lens,
+            "layout_mode": explain.layout_mode,
+            "tier_filter": explain.tier_filter,
+            "subkind_filter": explain.subkind_filter,
+            "edge_filter": explain.edge_filter,
+            "only_flagged": explain.only_flagged,
+            "isolate_cone": explain.isolate_cone,
+            "connected_only": explain.connected_only,
+            "neighborhood_hops": explain.neighborhood_hops,
+            "search_query": explain.search_query,
+            "blast_mode": explain.blast_mode,
+            "diff_base_ref": explain.diff_base_ref,
+            "working_set_only": explain.working_set_only,
+            "compact_visible": explain.compact_visible,
+            "flatten_2d": explain.flatten_2d,
+            "group_by": explain.group_by,
+            "z_wythe_slice": explain.z_wythe_slice,
+            "zoom_stratum": explain.zoom_stratum,
+            "visible_node_count": explain.visible_node_count,
+            "in_frustum_count": explain.in_frustum_count,
             "selected_node_id": explain.focused_node.id if explain.focused_node else None,
             "selected_edge_id": explain.selected_edge_id,
             "selected_finding_id": explain.selected_finding_id,
@@ -1816,6 +2146,7 @@ def _execute_investigation_tool(session: Session, args: dict[str, Any]) -> str:
         "list_sessions",
         "get_session",
         "create_session",
+        "record_turn",
         "record_correction",
         "set_follow",
         "compare_revisions",
@@ -1909,6 +2240,118 @@ def _execute_investigation_tool(session: Session, args: dict[str, Any]) -> str:
             ),
         )
         return _render_investigation_resource_markdown(inv)
+
+    if action == "record_turn":
+        raw_ans = str(args.get("answer_markdown") or args.get("note") or "").strip()
+        if not raw_ans:
+            raise ValueError("`record_turn` requires non-empty `answer_markdown`.")
+        question_str = str(args.get("question") or "").strip() or "External frontier agent analysis"
+        existing_inv = get_investigation_session(sid) if sid else None
+        if existing_inv is not None:
+            resolved_t = _resolve_target_for_mcp(session, target_arg or existing_inv.target_slug)
+            eff_sid = existing_inv.session_id
+        else:
+            resolved_t = _resolve_target_for_mcp(session, target_arg)
+            cand_sid = sid
+            if not cand_sid:
+                active_sids = get_active_session_ids_for_target(resolved_t.slug)
+                if len(active_sids) == 1:
+                    cand_sid = active_sids[0]
+                else:
+                    saved_focus = read_saved_ui_focus_state()
+                    if str(saved_focus.get("active_slug") or "") == resolved_t.slug:
+                        cand_sid = str(saved_focus.get("session_id") or "").strip() or None
+            created_inv = create_or_reopen_investigation(
+                session,
+                InvestigationCreateRequest(
+                    target_slug=resolved_t.slug,
+                    session_id=cand_sid,
+                    client_id=args.get("client_id") or "mcp-frontier-agent",
+                    title=args.get("title"),
+                ),
+            )
+            eff_sid = created_inv.session_id
+
+        report = (
+            get_or_run_cached_scan(session, resolved_t, strict_gate=True)
+            if resolved_t.id is not None and resolved_t.id > 0
+            else run_target_scan(session, resolved_t, strict_gate=True, persist_snapshot=False)
+        )
+        ev_id = build_evidence_identity(report).evidence_revision_id
+        raw_focus_nodes = args.get("focus_node_ids")
+        focus_list = (
+            [str(x).strip() for x in raw_focus_nodes if str(x).strip()]
+            if isinstance(raw_focus_nodes, list)
+            else []
+        )
+        resolved_focus, _, _ = _resolve_camera_beat_ids(
+            report, focus_list, [], None, [], [], [], []
+        )
+        raw_refs = args.get("referenced_ids")
+        ref_list = (
+            [str(x).strip() for x in raw_refs if str(x).strip()]
+            if isinstance(raw_refs, list)
+            else []
+        )
+        for fid in resolved_focus:
+            if fid not in ref_list:
+                ref_list.append(fid)
+
+        actor_val = args.get("actor") if args.get("actor") in ("human", "agent", "system") else "agent"
+        saved_turn = record_investigation_turn(
+            session,
+            eff_sid,
+            InvestigationTurnCreate(
+                client_id=args.get("client_id") or "mcp-frontier-agent",
+                actor=actor_val,  # type: ignore[arg-type]
+                question=question_str,
+                answer_markdown=raw_ans,
+                engine=str(args.get("engine") or "frontier"),
+                model_id=str(args.get("model_id") or "external-mcp-agent"),
+                authored_by="model",
+                selected_node_id=args.get("selected_node_id")
+                or (resolved_focus[0] if resolved_focus else None),
+                selected_edge_id=args.get("selected_edge_id"),
+                selected_finding_id=args.get("selected_finding_id"),
+                referenced_ids=ref_list,
+            ),
+            report=report,
+        )
+        wakeup_cmd = ViewportCommand(
+            target_slug=resolved_t.slug,
+            session_id=eff_sid,
+            refresh_session_id=eff_sid,
+            open_drawer=True if args.get("open_drawer") is None else bool(args.get("open_drawer")),
+            focus_node_ids=resolved_focus,
+            selected_node_id=args.get("selected_node_id"),
+            lens=args.get("lens"),
+            only_flagged=args.get("only_flagged"),
+            isolate_cone=args.get("isolate_cone"),
+        )
+        vp_ack = publish_viewport_command(
+            wakeup_cmd,
+            current_evidence_revision=ev_id,
+        )
+        validated_cnt = sum(
+            1 for r in saved_turn.validated_references if r.validation_state == "validated"
+        )
+        receipt_obj = {
+            "target_slug": resolved_t.slug,
+            "session_id": eff_sid,
+            "turn_id": saved_turn.turn_id,
+            "validated_ref_count": validated_cnt,
+            "validated_references": [
+                r.model_dump(mode="json") for r in saved_turn.validated_references
+            ],
+            "viewport_seq": vp_ack.seq,
+            "delivery_state": vp_ack.delivery_state,
+        }
+        return (
+            f"# Recorded External Frontier Turn `{saved_turn.turn_id}`\n"
+            f"> Session: `{eff_sid}` (`{resolved_t.slug}`) | Validated Refs: `{validated_cnt}` | "
+            f"Viewport Wakeup: `seq={vp_ack.seq}` (`{vp_ack.delivery_state}`)\n\n"
+            f"```json\n{json.dumps(receipt_obj, indent=2)}\n```"
+        )
 
     if action == "get_receipts":
         cmd_id = str(args.get("command_id") or "").strip() or None

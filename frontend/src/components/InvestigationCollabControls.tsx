@@ -81,10 +81,21 @@ export function ValidatedReferencesList({
         {references.map((ref, idx) => {
           const badge = formatValidationBadge(ref.validation_state, needsRevalidation);
           const vanished = ref.validation_state === 'vanished_in_current_scan';
-          const nodeMatch = nodesById?.get(ref.ref_id);
-          const canSelect = Boolean(
-            onSelectNode && !vanished && (ref.kind === 'node' || nodeMatch),
-          );
+          let nodeMatch = nodesById?.get(ref.ref_id);
+          if (!nodeMatch && ref.source_file && nodesById) {
+            let bestDist = Infinity;
+            for (const cand of nodesById.values()) {
+              if (cand.source_file === ref.source_file) {
+                const dist = ref.line ? Math.abs((cand.line ?? 1) - ref.line) : 0;
+                if (dist < bestDist) {
+                  bestDist = dist;
+                  nodeMatch = cand;
+                }
+              }
+            }
+          }
+          const selectableNodeId = nodeMatch ? nodeMatch.id : ref.kind === 'node' ? ref.ref_id : null;
+          const canSelect = Boolean(onSelectNode && !vanished && selectableNodeId);
           const displayLabel =
             ref.label || (nodeMatch ? `${nodeMatch.tier}:${nodeMatch.label}` : ref.ref_id);
           return (
@@ -93,10 +104,10 @@ export function ValidatedReferencesList({
               className="flex flex-wrap items-center justify-between gap-1.5 border border-slate-800 bg-slate-950/75 px-2 py-1 font-mono text-[10px]"
             >
               <div className="flex flex-wrap items-center gap-1.5">
-                {canSelect ? (
+                {canSelect && selectableNodeId ? (
                   <button
                     type="button"
-                    onClick={() => onSelectNode?.(ref.ref_id)}
+                    onClick={() => onSelectNode?.(selectableNodeId)}
                     className="min-h-6 text-left font-semibold text-teal-300 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
                   >
                     {displayLabel}

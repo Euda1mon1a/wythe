@@ -10,6 +10,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -121,12 +122,128 @@ _mcp_tool_intent_re = re.compile(
     r"mcp|wythe_[a-z0-9_]+|atlas_[a-z0-9_]+"
     r"|tools?|camera|viewport|focus|fly|move|steer|pan|orbit|tour|walkthrough|chronicle"
     r"|lens|layout|zoom|strat(?:um|a)|frustum|unshown|off[- ]?screen|outside"
+    r"|filter(?:s|ed|ing)?|flagged(?:_?only)?|only[_ -]?flagged|cone|isolat(?:e|ed|ing|ion)"
+    r"|tier(?:_filter)?|subkind(?:_filter)?|edge[_ -]?filter|salien(?:ce|t)|select(?:ed|ion)?"
+    r"|working[_ -]?set|compact(?:_visible)?|flatten(?:_?2d)?|group[_ -]?by|reset[_ -]?filters"
     r"|blast(?:\s+|[-_])radius|lineage(?:\s+|[-_])cone|plugins?"
     r"|show\s+me|delet(?:e|ed|ing|ion)|remov(?:e|ed|ing)|affect(?:s|ed)?"
     r"|break(?:s|ing)?|broken|callers?|who\s+calls|used\s+by"
     r")\b",
     re.IGNORECASE,
 )
+_VIEWPORT_MUTATION_TOOLS = frozenset({"wythe_focus_camera", "wythe_camera_tour"})
+_VIEWPORT_VERIFICATION_GATE_PROMPT = (
+    "VERIFICATION GATE: No viewport tool (`wythe_focus_camera` or `wythe_camera_tour`) was called "
+    "on this turn, so the user's 3D view/lens/filters have NOT changed. Call `wythe_focus_camera` "
+    "now with the exact requested parameters, or state honestly that no view change was executed."
+)
+_VIEWPORT_TRUTH_BANNER = (
+    "> **Viewport Notice:** No camera or filter command was executed on this turn; "
+    "your 3D view remains unchanged.\n\n"
+)
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
+_CLAIM_NEGATION_RE = re.compile(
+    r"\b(?:"
+    r"not|no|never|cannot|can't|couldn't|didn't|did\s+not|haven't|have\s+not|has\s+not"
+    r"|unavailable|unable|unchanged|without\s+changing|if\s+you|you\s+can|can\s+(?:control|steer|switch|focus|filter)"
+    r"|to\s+(?:switch|change|filter|focus|isolate|reset)"
+    r")\b",
+    re.IGNORECASE,
+)
+_FIRST_PERSON_MUTATION_RE = re.compile(
+    r"\b(?:"
+    r"(?:i\s+(?:have\s+)?(?:just\s+)?|i've\s+(?:just\s+)?|we\s+(?:have\s+)?(?:just\s+)?)"
+    r"(?:switched|changed|filtered|focused|applied|zoomed|isolated|steered|moved|panned|orbited|"
+    r"enabled|disabled|toggled|set|selected|reset|updated|activated|framed|turned\s+(?:on|off))"
+    r")\b",
+    re.IGNORECASE,
+)
+_VIEWPORT_TARGET_NOUN_RE = re.compile(
+    r"\b(?:"
+    r"camera|3d\s+view|view(?:port)?|lens|layout(?:_mode)?|filter(?:s)?|flagged(?:_?only)?|"
+    r"only[_ -]?flagged|cone|isolate[_ -]?cone|tier(?:_filter)?|subkind(?:_filter)?|edge[_ -]?filter|"
+    r"stratum|z[_ -]?wythe|slice|working[_ -]?set|compact(?:_visible)?|flatten(?:_?2d)?|"
+    r"group[_ -]?by|blast(?:_mode)?|hops?|tab|contention|gravity|containers"
+    r")\b",
+    re.IGNORECASE,
+)
+_PASSIVE_MUTATION_RE = re.compile(
+    r"\b(?:the\s+)?(?:3d\s+)?(?:camera|view(?:port)?|lens|layout|filter(?:s)?|cone\s+isolation|flagged[- ]?only)"
+    r"\s+(?:has\s+been|have\s+been|is\s+now|was\s+just)\s+"
+    r"(?:switched|changed|filtered|focused|applied|zoomed|isolated|updated|enabled|disabled|reset|set)\b",
+    re.IGNORECASE,
+)
+_PURE_CAPABILITY_QUESTION_RE = re.compile(
+    r"^\s*(?:can\s+you|are\s+you\s+able|do\s+you\s+have|what\s+(?:is|are|does|happens|breaks|tools)|"
+    r"why\s+(?:is|are|does)|how\s+(?:do|does|can)|explain\b|summarize\b|describe\b|tell\s+me\b)",
+    re.IGNORECASE,
+)
+_IMPERATIVE_CLAUSE_AFTER_QUESTION_RE = re.compile(
+    r"(?:[;,]|\band\s+(?:then\s+)?|\bplease\s+)"
+    r"\s*(?:switch|change|focus|filter|isolate|zoom|fly|move|steer|set|turn\s+(?:on|off)|enable|disable|reset)\b",
+    re.IGNORECASE,
+)
+_USER_VIEWPORT_MUTATION_RE = re.compile(
+    r"(?:"
+    r"\b(?:use|call|run|invoke)\s+`?(?:wythe_focus_camera|wythe_camera_tour)`?\b"
+    r"|\b(?:switch|change|set|apply|update)\s+(?:the\s+)?(?:3d\s+)?(?:camera|view(?:port)?|lens|"
+    r"layout(?:_mode)?|tier(?:_filter)?|subkind(?:_filter)?|edge[_ -]?filter|blast(?:_mode)?|"
+    r"z[_ -]?wythe|slice|zoom(?:_stratum)?|group[_ -]?by|tab)\b"
+    r"|\bfilter\s+(?:to|by|for|the\s+view|nodes)\b"
+    r"|\bisolate\s+(?:the\s+)?(?:3-tier\s+|lineage\s+)?cone\b"
+    r"|\b(?:turn\s+(?:on|off)|enable|disable)\s+(?:the\s+)?(?:cone|isolate[_ -]?cone|flagged(?:_?only)?|"
+    r"only[_ -]?flagged|connected[_ -]?only|working[_ -]?set|compact(?:_visible)?|flatten(?:_?2d)?)\b"
+    r"|\bfocus\s+(?:the\s+)?(?:3d\s+)?(?:camera|view(?:port)?|on)\b"
+    r"|\b(?:fly|steer|pan|orbit|zoom)\s+(?:the\s+)?(?:3d\s+)?(?:camera|to|into|on)\b"
+    r"|\breset\s+(?:all\s+|the\s+)?(?:3d\s+)?(?:filters|view(?:port)?|camera)\b"
+    r"|\b(?:flagged_?only|only_?flagged|isolate_?cone|working_?set_?only|compact_?visible|flatten_?2d)\s*=\s*(?:true|false)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _claims_unexecuted_viewport_mutation(
+    text: str | None,
+    executed_tools: Sequence[str] | None,
+) -> bool:
+    """Return True when prose claims a viewport/lens/filter mutation occurred without executing a viewport tool."""
+    if not text or not text.strip():
+        return False
+    if executed_tools and any(t in _VIEWPORT_MUTATION_TOOLS for t in executed_tools):
+        return False
+    for raw_sentence in _SENTENCE_SPLIT_RE.split(text):
+        sentence = raw_sentence.strip()
+        if not sentence or "Viewport Notice:" in sentence:
+            continue
+        if _CLAIM_NEGATION_RE.search(sentence):
+            continue
+        if _FIRST_PERSON_MUTATION_RE.search(sentence) and _VIEWPORT_TARGET_NOUN_RE.search(sentence):
+            return True
+        if _PASSIVE_MUTATION_RE.search(sentence):
+            return True
+    return False
+
+
+def _user_requested_viewport_mutation(question: str | None) -> bool:
+    """Return True when `question` directly asks the assistant to mutate the 3D camera, lens, or filters."""
+    if not question or not question.strip():
+        return False
+    cleaned = question.strip()
+    if _PURE_CAPABILITY_QUESTION_RE.search(cleaned) and not _IMPERATIVE_CLAUSE_AFTER_QUESTION_RE.search(cleaned):
+        return False
+    return bool(_USER_VIEWPORT_MUTATION_RE.search(cleaned))
+
+
+def _apply_viewport_truth_guardrail(
+    text: str,
+    executed_tools: Sequence[str] | None,
+) -> str:
+    """Deterministically prepend `_VIEWPORT_TRUTH_BANNER` if prose falsely claims an unexecuted view change."""
+    if _claims_unexecuted_viewport_mutation(text, executed_tools) and not text.lstrip().startswith(
+        "> **Viewport Notice:**"
+    ):
+        return f"{_VIEWPORT_TRUTH_BANNER}{text}"
+    return text
 _plain_english_intent_re = re.compile(
     r"(?:"
     r"\bplain[- ]english\b"
@@ -593,9 +710,6 @@ def _execute_inprocess_mcp_tool_call(
     except TypeError:
         rpc_res = dispatch_mcp_request(db_session, rpc_msg, slice_mode="full")
 
-    if executed_tools_out is not None and canonical_fn not in executed_tools_out:
-        executed_tools_out.append(canonical_fn)
-
     rpc_err = (rpc_res or {}).get("error")
     res_obj = (rpc_res or {}).get("result") or {}
     blocks = res_obj.get("content") if isinstance(res_obj.get("content"), list) else []
@@ -617,6 +731,8 @@ def _execute_inprocess_mcp_tool_call(
             }
         )
     else:
+        if executed_tools_out is not None and canonical_fn not in executed_tools_out:
+            executed_tools_out.append(canonical_fn)
         _collect_tool_refs(args_dict, joined_text, hinted_refs_out)
         out_str = joined_text or json.dumps(res_obj)
     return json.dumps(args_dict), _cap_tool_output(out_str)
@@ -660,8 +776,12 @@ def build_ask_instructions(
             "confirm accurately that you can control the live 3D camera via `wythe_focus_camera` and "
             "`wythe_camera_tour` and name the exposed Wythe MCP tools rather than claiming you cannot control a "
             "camera. When asked to focus, move, fly, frame, or tour the 3D camera, switch lens/layout/zoom stratum, "
-            "or inspect unshown nodes outside the current frustum, you MUST call the corresponding MCP tool and "
-            "ground your answer in the returned tool payload (including honest `delivery_state`). "
+            "apply filters (`only_flagged`/`flagged_only`, `isolate_cone`, `tier_filter`, `subkind_filter`, "
+            "`edge_filter`, `working_set_only`, `compact_visible`, `flatten_2d`, `group_by`, `reset_filters`), "
+            "or inspect unshown nodes outside the current frustum, you MUST call `wythe_focus_camera` (or the "
+            "corresponding MCP tool) BEFORE claiming any UI/view mutation, and ground your answer in the returned "
+            "tool payload (including honest `delivery_state`). NEVER state in prose that you switched, filtered, "
+            "focused, or isolated the view unless the viewport tool actually executed on this turn. "
         )
     else:
         capability_block = (
@@ -707,6 +827,7 @@ def _run_local_chat_completion(
     user_text: str,
     snap_path: Path | None,
     *,
+    question: str | None = None,
     toolless_instructions: str | None = None,
     inline_data_url: str | None = None,
     history: list[AskChatTurn] | None = None,
@@ -782,6 +903,36 @@ def _run_local_chat_completion(
         try:
             return _post_chat_message(messages, req_tools), req_tools
         except urllib.error.HTTPError as exc:
+            # 1) Text-only servers (e.g. `mlx_lm.server`) serving VLM-named checkpoints reject
+            # multimodal `image_url` list `content` with HTTP 400/404/415/422/500 while still
+            # supporting native OpenAI `tools` on string `content`. Strip the image FIRST while
+            # preserving `req_tools`, and only strip `req_tools` if text+tools also fails.
+            if round_idx == 0 and used_vision and exc.code in (400, 404, 415, 422, 500):
+                messages[len(prior_msgs) + 1] = {"role": "user", "content": user_text}
+                used_vision = False
+                try:
+                    return _post_chat_message(messages, req_tools), req_tools
+                except urllib.error.HTTPError as text_http:
+                    if req_tools and text_http.code in (400, 404, 422, 501):
+                        messages[0] = {
+                            "role": "system",
+                            "content": toolless_instructions or build_ask_instructions(tools_enabled=False),
+                        }
+                        tool_fallback_note = _TOOL_FALLBACK_REASON
+                        try:
+                            return _post_chat_message(messages, None), None
+                        except urllib.error.HTTPError as final_http:
+                            raise RuntimeError(
+                                f"Local model server at {base_url} answered HTTP {final_http.code}."
+                            ) from final_http
+                    raise RuntimeError(
+                        f"Local model server at {base_url} answered HTTP {text_http.code}."
+                    ) from text_http
+                except (TimeoutError, OSError, ValueError) as inner_exc:
+                    raise RuntimeError(
+                        f"Local model text fallback at {base_url} failed ({type(inner_exc).__name__}: {inner_exc})."
+                    ) from inner_exc
+            # 2) Already text-only request where server rejects `tools` parameter.
             if round_idx == 0 and req_tools and exc.code in (400, 404, 422, 501):
                 messages[0] = {
                     "role": "system",
@@ -791,22 +942,9 @@ def _run_local_chat_completion(
                 try:
                     return _post_chat_message(messages, None), None
                 except urllib.error.HTTPError as inner_http:
-                    if used_vision and inner_http.code in (400, 415, 422, 500):
-                        messages[len(prior_msgs) + 1] = {"role": "user", "content": user_text}
-                        used_vision = False
-                        return _post_chat_message(messages, None), None
                     raise RuntimeError(
                         f"Local model server at {base_url} answered HTTP {inner_http.code}."
                     ) from inner_http
-            if round_idx == 0 and used_vision and exc.code in (400, 415, 422, 500):
-                messages[len(prior_msgs) + 1] = {"role": "user", "content": user_text}
-                used_vision = False
-                try:
-                    return _post_chat_message(messages, req_tools), req_tools
-                except (TimeoutError, OSError, ValueError) as inner_exc:
-                    raise RuntimeError(
-                        f"Local model text fallback at {base_url} failed ({type(inner_exc).__name__}: {inner_exc})."
-                    ) from inner_exc
             raise RuntimeError(f"Local model server at {base_url} answered HTTP {exc.code}.") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Could not reach local model server at {base_url} ({exc.reason}).") from exc
@@ -815,8 +953,12 @@ def _run_local_chat_completion(
                 f"Local model server at {base_url} failed during completion ({type(exc).__name__}: {exc})."
             ) from exc
 
+    seen_executed: list[str] = executed_tools_out if executed_tools_out is not None else []
     ran_any_tools = False
-    for round_idx in range(max(1, max_rounds)):
+    enforcement_retried = False
+    effective_max_rounds = max(1, max_rounds)
+    round_idx = 0
+    while round_idx < effective_max_rounds:
         msg, active_tools = _send_round(round_idx, active_tools)
         raw_calls = msg.get("tool_calls")
         valid_calls = (
@@ -826,8 +968,29 @@ def _run_local_chat_completion(
         )
         if not valid_calls:
             text = str(msg.get("content") or "").strip()
+            has_vp_tool = any(t in _VIEWPORT_MUTATION_TOOLS for t in seen_executed)
+            if (
+                db_session is not None
+                and active_tools
+                and not has_vp_tool
+                and not enforcement_retried
+                and (
+                    _claims_unexecuted_viewport_mutation(text, seen_executed)
+                    or _user_requested_viewport_mutation(question)
+                )
+            ):
+                messages.append({"role": "assistant", "content": text})
+                messages.append({"role": "user", "content": _VIEWPORT_VERIFICATION_GATE_PROMPT})
+                enforcement_retried = True
+                effective_max_rounds += 1
+                round_idx += 1
+                continue
             if text:
-                return text, used_vision, tool_fallback_note
+                return (
+                    _apply_viewport_truth_guardrail(text, seen_executed),
+                    used_vision,
+                    tool_fallback_note,
+                )
             if ran_any_tools:
                 break
             raise RuntimeError(f"Local model `{model_id}` returned an empty completion.")
@@ -853,7 +1016,7 @@ def _run_local_chat_completion(
                 tool_schemas_by_name=tool_schemas_by_name,
                 target_slug=target_slug,
                 session_id=session_id,
-                executed_tools_out=executed_tools_out,
+                executed_tools_out=seen_executed,
                 hinted_refs_out=hinted_refs_out,
             )
             sanitized_calls.append(
@@ -879,14 +1042,19 @@ def _run_local_chat_completion(
             }
         )
         messages.extend(tool_reply_msgs)
+        round_idx += 1
 
-    synth_msg, _ = _send_round(max_rounds, None)
+    synth_msg, _ = _send_round(effective_max_rounds, None)
     synth_text = str(synth_msg.get("content") or "").strip()
     if synth_text:
-        return synth_text, used_vision, tool_fallback_note
-    if executed_tools_out:
         return (
-            f"Executed Wythe MCP tool(s): {', '.join(f'`{t}`' for t in executed_tools_out)}.",
+            _apply_viewport_truth_guardrail(synth_text, seen_executed),
+            used_vision,
+            tool_fallback_note,
+        )
+    if seen_executed:
+        return (
+            f"Executed Wythe MCP tool(s): {', '.join(f'`{t}`' for t in seen_executed)}.",
             used_vision,
             tool_fallback_note,
         )
@@ -1133,6 +1301,7 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                     instructions,
                     full_prompt,
                     snap_path,
+                    question=payload.question,
                     toolless_instructions=toolless_instructions,
                     inline_data_url=inline_snap,
                     history=eff_history,
@@ -1187,6 +1356,8 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         tid = _preserve_unresolved_question(unavail_msg)
         suffix = f" [question preserved in session={eff_sid}, turn={tid}]" if tid else ""
         raise RuntimeError(f"{unavail_msg}{suffix}")
+
+    answer_md = _apply_viewport_truth_guardrail(answer_md, executed_tools)
 
     explicit_seed_refs = [
         r

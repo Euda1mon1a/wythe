@@ -22,6 +22,7 @@ import {
 import {
   atlasApi,
   type AtlasNode,
+  type BlastModeChoice,
   type BoundaryFinding,
   type EndToEndChain,
   type FollowState,
@@ -30,11 +31,14 @@ import {
   type InvestigationRevisionComparisonRead,
   type InvestigationSessionRead,
   type InvestigationSummaryRead,
+  type TierFilterChoice,
   type UiFocusExplainRead,
   type ViewportCommand,
   type ViewportCommandEvent,
   type ViewportCommandReceiptRead,
+  type ViewportGroupByChoice,
   type ViewportReceiptOutcome,
+  type ViewportTabChoice,
   type ZWytheSliceChoice,
 } from '@/api/atlas';
 import { AccessibleIndexView } from '@/components/AccessibleIndexView';
@@ -72,7 +76,9 @@ import { formatObservedInstant } from '@/lib/clock';
 import {
   applyIncomingViewportEvent,
   buildViewportPermalinkHash,
+  computeSmartDenseSalience,
   createInitialAgentCameraState,
+  isPureDrawerRefreshCommand,
   normalizeViewportTimeline,
   parseViewportPermalinkHash,
   resumeAgentCameraFollow,
@@ -426,6 +432,24 @@ export default function WytheWorkspacePage() {
       setSelectedNodeId(null);
       setSelectedFindingId(null);
       setSelectedEdgeId(null);
+      setTierFilter('all');
+      setSubkindFilter('all');
+      setEdgeFilter('all');
+      setOnlyFlagged(false);
+      setIsolateCone(false);
+      setConnectedOnly(false);
+      setNeighborhoodHops(0);
+      setSearchQuery('');
+      setBlastMode('off');
+      setWorkingSetIds(new Set());
+      setWorkingSetActive(false);
+      setCompactVisible(false);
+      setCollapsedGroups(new Set());
+      setPinnedPositions({});
+      setActiveTraceChain(null);
+      setZWytheSlice('all');
+      setRequestedZoomStratum(1);
+      setAgentCameraRequest(null);
       const identity = resolveTabInvestigationIdentity({
         targetSlug: cleanedSlug,
         locationHref: '',
@@ -618,9 +642,29 @@ export default function WytheWorkspacePage() {
     (beat: {
       focusNodeIds: string[];
       highlightEdgeIds: string[];
+      selectedNodeId?: string | null;
+      selectedEdgeId?: string | null;
       findingId?: string | null;
       lens?: SceneLens | null;
       layoutMode?: SceneLayoutMode | null;
+      tierFilter?: TierFilterChoice | null;
+      subkindFilter?: string | null;
+      edgeFilter?: string | null;
+      onlyFlagged?: boolean | null;
+      isolateCone?: boolean | null;
+      connectedOnly?: boolean | null;
+      neighborhoodHops?: 0 | 1 | 2 | null;
+      searchQuery?: string | null;
+      blastMode?: BlastModeChoice | null;
+      diffBaseRef?: string | null;
+      workingSetOnly?: boolean | null;
+      compactVisible?: boolean | null;
+      flatten2d?: boolean | null;
+      groupBy?: ViewportGroupByChoice | null;
+      activeTab?: ViewportTabChoice | null;
+      openDrawer?: boolean | null;
+      resetFilters?: boolean;
+      isTimelineStep?: boolean;
       zWytheSlice?: ZWytheSliceChoice | null;
       zoomStratum?: 1 | 2 | 3;
       framingPreset: FramingPreset;
@@ -628,29 +672,178 @@ export default function WytheWorkspacePage() {
       targetSlug?: string;
       chronicleTimeline?: ViewportCommand['chronicle_timeline'];
     }) => {
+      if (beat.resetFilters) {
+        setTierFilter('all');
+        setSubkindFilter('all');
+        setEdgeFilter('all');
+        setOnlyFlagged(false);
+        setIsolateCone(false);
+        setConnectedOnly(false);
+        setNeighborhoodHops(0);
+        setSearchQuery('');
+        setBlastMode('off');
+        setWorkingSetActive(false);
+        setCompactVisible(false);
+        setFlatten2D(false);
+        setGroupBy('none');
+        setCollapsedGroups(new Set());
+        if (!beat.zWytheSlice) setZWytheSlice('all');
+      }
+
       if (beat.lens) setSceneLens(beat.lens);
       if (beat.layoutMode) setSceneLayout(beat.layoutMode);
       if (beat.zWytheSlice) setZWytheSlice(beat.zWytheSlice);
-      else setZWytheSlice('all');
-      setRequestedZoomStratum(beat.zoomStratum ?? 1);
+      else if (beat.isTimelineStep) setZWytheSlice('all');
+      if (beat.zoomStratum != null) setRequestedZoomStratum(beat.zoomStratum);
+
+      if (beat.tierFilter != null) setTierFilter(beat.tierFilter);
+      if (beat.subkindFilter != null) {
+        setSubkindFilter(beat.subkindFilter as 'all' | AtlasNode['subkind']);
+      }
+      if (beat.edgeFilter != null) setEdgeFilter(beat.edgeFilter as EdgeFilterMode);
+      if (beat.onlyFlagged != null) setOnlyFlagged(beat.onlyFlagged);
+      if (beat.isolateCone != null) setIsolateCone(beat.isolateCone);
+      if (beat.connectedOnly != null) setConnectedOnly(beat.connectedOnly);
+      if (beat.neighborhoodHops != null) setNeighborhoodHops(beat.neighborhoodHops);
+      if (beat.searchQuery != null) setSearchQuery(beat.searchQuery);
+      if (beat.blastMode != null) setBlastMode(beat.blastMode);
+      if (beat.diffBaseRef != null) setDiffBaseRef(beat.diffBaseRef);
+      if (beat.compactVisible != null) setCompactVisible(beat.compactVisible);
+      if (beat.flatten2d != null) setFlatten2D(beat.flatten2d);
+      if (beat.groupBy != null) setGroupBy(beat.groupBy);
+
+      if (beat.activeTab != null) {
+        if (beat.activeTab === 'governance' || beat.activeTab === 'gate') {
+          setActiveTab('gate');
+        } else if (beat.activeTab === 'understanding') {
+          setActiveTab('3d');
+          setAskDrawerOpen(true);
+        } else {
+          setActiveTab(beat.activeTab);
+        }
+      }
+      if (beat.openDrawer === true) setAskDrawerOpen(true);
+      else if (beat.openDrawer === false) setAskDrawerOpen(false);
 
       let resolvedFocus = [...beat.focusNodeIds];
-      if (resolvedFocus.length === 0 && beat.findingId && report?.findings) {
-        const hitFinding = report.findings.find((f) => f.id === beat.findingId);
-        if (hitFinding?.node_id) resolvedFocus = [hitFinding.node_id];
+      if (resolvedFocus.length === 0 && beat.selectedNodeId) {
+        resolvedFocus = [beat.selectedNodeId];
       }
-      if (resolvedFocus.length > 0) {
+      if (beat.findingId && report?.findings) {
+        const hitFinding = report.findings.find(
+          (f) => f.id === beat.findingId || f.rule_code.toLowerCase() === beat.findingId!.toLowerCase(),
+        );
+        setSelectedFindingId(hitFinding?.id ?? beat.findingId);
+        if (resolvedFocus.length === 0 && hitFinding?.node_id) {
+          resolvedFocus = [hitFinding.node_id];
+        }
+      } else if (beat.findingId) {
+        setSelectedFindingId(beat.findingId);
+      }
+      if (beat.selectedEdgeId != null) {
+        setSelectedEdgeId(beat.selectedEdgeId || null);
+      }
+
+      if (beat.workingSetOnly === true) {
+        if (resolvedFocus.length > 0) {
+          const wsSet = new Set(resolvedFocus);
+          if (beat.highlightEdgeIds.length > 0 && report?.edges) {
+            const wantedEdges = new Set(beat.highlightEdgeIds);
+            for (const edge of report.edges) {
+              if (wantedEdges.has(edge.id)) {
+                wsSet.add(edge.source_id);
+                wsSet.add(edge.target_id);
+              }
+            }
+          }
+          setWorkingSetIds(wsSet);
+        }
+        setWorkingSetActive(true);
+      } else if (beat.workingSetOnly === false) {
+        setWorkingSetActive(false);
+      }
+
+      const salience = computeSmartDenseSalience({
+        totalNodeCount: report?.nodes.length ?? 0,
+        resolvedFocus,
+        highlightEdgeIds: beat.highlightEdgeIds,
+        allEdges: report?.edges ?? [],
+        selectedNodeId: beat.selectedNodeId ?? null,
+        isolateCone: beat.isolateCone ?? null,
+        neighborhoodHops: beat.neighborhoodHops ?? null,
+        workingSetOnly: beat.workingSetOnly ?? null,
+        onlyFlagged: beat.onlyFlagged ?? null,
+        tierFilter: beat.tierFilter ?? null,
+        subkindFilter: beat.subkindFilter ?? null,
+        searchQuery: beat.searchQuery ?? null,
+        resetFilters: beat.resetFilters,
+      });
+
+      if (salience.mode === 'auto_isolate_cone') {
+        setSelectedNodeId(salience.selectedNodeId);
+        setIsolateCone(true);
+        setNeighborhoodHops(0);
+        setWorkingSetActive(false);
+        setCompactVisible(false);
+      } else if (salience.mode === 'auto_working_set_compact') {
+        setSelectedNodeId(salience.selectedNodeId);
+        setWorkingSetIds(new Set(salience.workingSetIds ?? resolvedFocus));
+        setWorkingSetActive(true);
+        setCompactVisible(true);
+        setIsolateCone(false);
+        setNeighborhoodHops(0);
+      } else if (beat.selectedNodeId) {
+        setSelectedNodeId(beat.selectedNodeId);
+      } else if (resolvedFocus.length > 0) {
         setSelectedNodeId(resolvedFocus[0]);
+      } else if (beat.resetFilters && !beat.selectedEdgeId && !beat.findingId) {
+        setSelectedNodeId(null);
       }
 
       if (typeof window !== 'undefined') {
+        const effectiveIsolateCone =
+          salience.mode === 'auto_isolate_cone'
+            ? true
+            : salience.mode === 'auto_working_set_compact'
+              ? false
+              : beat.isolateCone ?? undefined;
+        const effectiveWorkingSet =
+          salience.mode === 'auto_working_set_compact'
+            ? true
+            : salience.mode === 'auto_isolate_cone'
+              ? false
+              : beat.workingSetOnly ?? undefined;
+        const effectiveCompact =
+          salience.mode === 'auto_working_set_compact'
+            ? true
+            : salience.mode === 'auto_isolate_cone'
+              ? false
+              : beat.compactVisible ?? undefined;
         const hash = buildViewportPermalinkHash({
           target_slug: beat.targetSlug || activeSlug,
           session_id: activeSessionId ?? undefined,
           focus_node_ids: resolvedFocus,
           highlight_edge_ids: beat.highlightEdgeIds,
+          selected_node_id: beat.selectedNodeId ?? undefined,
+          selected_edge_id: beat.selectedEdgeId ?? undefined,
+          finding_id: beat.findingId ?? undefined,
           lens: beat.lens ?? undefined,
           layout_mode: beat.layoutMode ?? undefined,
+          tier_filter: beat.tierFilter ?? undefined,
+          subkind_filter: beat.subkindFilter ?? undefined,
+          edge_filter: beat.edgeFilter ?? undefined,
+          only_flagged: beat.onlyFlagged ?? undefined,
+          isolate_cone: effectiveIsolateCone,
+          connected_only: beat.connectedOnly ?? undefined,
+          neighborhood_hops: beat.neighborhoodHops ?? undefined,
+          search_query: beat.searchQuery ?? undefined,
+          blast_mode: beat.blastMode ?? undefined,
+          diff_base_ref: beat.diffBaseRef ?? undefined,
+          working_set_only: effectiveWorkingSet,
+          compact_visible: effectiveCompact,
+          flatten_2d: beat.flatten2d ?? undefined,
+          group_by: beat.groupBy ?? undefined,
+          active_tab: beat.activeTab ?? undefined,
           framing_preset: beat.framingPreset,
           z_wythe_slice: beat.zWytheSlice ?? undefined,
           zoom_stratum: beat.zoomStratum,
@@ -669,11 +862,15 @@ export default function WytheWorkspacePage() {
         caption: sanitizeViewportPlainText(beat.caption),
       }));
     },
-    [activeSlug, activeSessionId, report?.findings],
+    [activeSlug, activeSessionId, report?.nodes.length, report?.edges, report?.findings],
   );
 
   const applyCommandOrFirstStep = useCallback(
     (cmd: ViewportCommand) => {
+      if (isPureDrawerRefreshCommand(cmd)) {
+        if (cmd.open_drawer === true) setAskDrawerOpen(true);
+        return;
+      }
       const items = normalizeViewportTimeline(cmd);
       if (items.length > 0) {
         const desiredIdx = cmd.chronicle_timeline
@@ -687,9 +884,29 @@ export default function WytheWorkspacePage() {
           targetSlug: cmd.target_slug,
           focusNodeIds: selected.focusNodeIds,
           highlightEdgeIds: selected.highlightEdgeIds,
+          selectedNodeId: selected.selectedNodeId,
+          selectedEdgeId: selected.selectedEdgeId,
           findingId: selected.findingId,
           lens: selected.lens,
           layoutMode: selected.layoutMode,
+          tierFilter: selected.tierFilter,
+          subkindFilter: selected.subkindFilter,
+          edgeFilter: selected.edgeFilter,
+          onlyFlagged: selected.onlyFlagged,
+          isolateCone: selected.isolateCone,
+          connectedOnly: selected.connectedOnly,
+          neighborhoodHops: selected.neighborhoodHops,
+          searchQuery: selected.searchQuery,
+          blastMode: selected.blastMode,
+          diffBaseRef: selected.diffBaseRef,
+          workingSetOnly: selected.workingSetOnly,
+          compactVisible: selected.compactVisible,
+          flatten2d: selected.flatten2d,
+          groupBy: selected.groupBy,
+          activeTab: selected.activeTab,
+          openDrawer: selected.openDrawer,
+          resetFilters: selected.resetFilters,
+          isTimelineStep: true,
           zWytheSlice: selected.zWytheSlice,
           zoomStratum: selected.zoomStratum,
           framingPreset: selected.framingPreset,
@@ -704,9 +921,29 @@ export default function WytheWorkspacePage() {
         targetSlug: cmd.target_slug,
         focusNodeIds: cmd.focus_node_ids ?? [],
         highlightEdgeIds: cmd.highlight_edge_ids ?? [],
+        selectedNodeId: cmd.selected_node_id ?? null,
+        selectedEdgeId: cmd.selected_edge_id ?? null,
         findingId: cmd.finding_id,
         lens: (cmd.lens ?? null) as SceneLens | null,
         layoutMode: (cmd.layout_mode ?? null) as SceneLayoutMode | null,
+        tierFilter: cmd.tier_filter ?? null,
+        subkindFilter: cmd.subkind_filter ?? null,
+        edgeFilter: cmd.edge_filter ?? null,
+        onlyFlagged: cmd.only_flagged ?? null,
+        isolateCone: cmd.isolate_cone ?? null,
+        connectedOnly: cmd.connected_only ?? null,
+        neighborhoodHops: cmd.neighborhood_hops ?? null,
+        searchQuery: cmd.search_query ?? null,
+        blastMode: cmd.blast_mode ?? null,
+        diffBaseRef: cmd.diff_base_ref ?? null,
+        workingSetOnly: cmd.working_set_only ?? null,
+        compactVisible: cmd.compact_visible ?? null,
+        flatten2d: cmd.flatten_2d ?? null,
+        groupBy: cmd.group_by ?? null,
+        activeTab: cmd.active_tab ?? null,
+        openDrawer: cmd.open_drawer ?? null,
+        resetFilters: Boolean(cmd.reset_filters),
+        isTimelineStep: false,
         zWytheSlice: cmd.z_wythe_slice ?? null,
         zoomStratum: cmd.zoom_stratum ?? 1,
         framingPreset: cmd.framing_preset ?? 'iso_overview',
@@ -911,6 +1148,61 @@ export default function WytheWorkspacePage() {
     }
   }, [report?.findings, agentCamState.activeEvent, agentCamState.followMode]);
 
+  // Re-apply Smart Dense-Graph Salience if a cold permalink hydrated before `report.nodes` finished loading
+  useEffect(() => {
+    const activeEvent = agentCamState.activeEvent;
+    const activeCmd = activeEvent?.command;
+    const totalNodes = report?.nodes.length ?? 0;
+    if (
+      !coldPermalinkActive ||
+      activeEvent?.issued_at !== 'permalink' ||
+      !activeCmd ||
+      totalNodes <= 120 ||
+      agentCamState.followMode !== 'following'
+    ) {
+      return;
+    }
+    const resolvedFocus = [...(activeCmd.focus_node_ids ?? [])];
+    if (resolvedFocus.length === 0 && activeCmd.selected_node_id) {
+      resolvedFocus.push(activeCmd.selected_node_id);
+    }
+    const salience = computeSmartDenseSalience({
+      totalNodeCount: totalNodes,
+      resolvedFocus,
+      highlightEdgeIds: activeCmd.highlight_edge_ids ?? [],
+      allEdges: report?.edges ?? [],
+      selectedNodeId: activeCmd.selected_node_id ?? null,
+      isolateCone: activeCmd.isolate_cone ?? null,
+      neighborhoodHops: activeCmd.neighborhood_hops ?? null,
+      workingSetOnly: activeCmd.working_set_only ?? null,
+      onlyFlagged: activeCmd.only_flagged ?? null,
+      tierFilter: activeCmd.tier_filter ?? null,
+      subkindFilter: activeCmd.subkind_filter ?? null,
+      searchQuery: activeCmd.search_query ?? null,
+      resetFilters: Boolean(activeCmd.reset_filters),
+    });
+    if (salience.mode === 'auto_isolate_cone') {
+      setSelectedNodeId(salience.selectedNodeId);
+      setIsolateCone(true);
+      setNeighborhoodHops(0);
+      setWorkingSetActive(false);
+      setCompactVisible(false);
+    } else if (salience.mode === 'auto_working_set_compact') {
+      setSelectedNodeId(salience.selectedNodeId);
+      setWorkingSetIds(new Set(salience.workingSetIds ?? resolvedFocus));
+      setWorkingSetActive(true);
+      setCompactVisible(true);
+      setIsolateCone(false);
+      setNeighborhoodHops(0);
+    }
+  }, [
+    coldPermalinkActive,
+    report?.nodes.length,
+    report?.edges,
+    agentCamState.activeEvent,
+    agentCamState.followMode,
+  ]);
+
   // Subscribe to `/api/v1/viewport/stream?target_slug=...&session_id=...` SSE stream
   const sseBaselineSeq = initialViewportState?.latest?.seq ?? 0;
   useEffect(() => {
@@ -974,6 +1266,30 @@ export default function WytheWorkspacePage() {
           pausedNotifiedIdsRef.current.add(decision.commandKey);
         }
 
+        const refreshSid = parsed.command.refresh_session_id;
+        const isPureRefresh = isPureDrawerRefreshCommand(parsed.command);
+        if (decision.action === 'apply' || decision.action === 'queue_while_paused') {
+          if (refreshSid && (!activeSessionId || refreshSid === activeSessionId)) {
+            void refreshInvestigationState(refreshSid);
+          } else if (parsed.command.open_drawer === true && activeSessionId) {
+            void refreshInvestigationState(activeSessionId);
+          }
+          if (parsed.command.open_drawer === true) {
+            setAskDrawerOpen(true);
+          }
+          if (isPureRefresh) {
+            const updated = recordAckedCommandId(
+              activeSlug,
+              activeSessionId,
+              decision.commandKey,
+            );
+            ackedCommandIdsRef.current = new Set(updated);
+            pausedNotifiedIdsRef.current.delete(decision.commandKey);
+            sendViewportReceipt(parsed, 'applied', 'Refreshed investigation drawer');
+            return;
+          }
+        }
+
         if (decision.action === 'apply') {
           setAgentCamState((prev) => {
             const res = applyIncomingViewportEvent(
@@ -1026,6 +1342,7 @@ export default function WytheWorkspacePage() {
     sseBaselineSeq,
     report?.content_digest,
     applyCommandOrFirstStep,
+    refreshInvestigationState,
     sendViewportReceipt,
   ]);
 
@@ -1074,8 +1391,25 @@ export default function WytheWorkspacePage() {
               ? [selectedNodeId]
               : [],
         highlight_edge_ids: currentAgentBeat?.highlightEdgeIds ?? [],
+        selected_edge_id: selectedEdgeId ?? undefined,
+        finding_id: selectedFindingId ?? undefined,
         lens: sceneLens,
         layout_mode: sceneLayout,
+        tier_filter: tierFilter !== 'all' ? tierFilter : undefined,
+        subkind_filter: subkindFilter !== 'all' ? subkindFilter : undefined,
+        edge_filter: edgeFilter !== 'all' ? edgeFilter : undefined,
+        only_flagged: onlyFlagged ? true : undefined,
+        isolate_cone: isolateCone ? true : undefined,
+        connected_only: connectedOnly ? true : undefined,
+        neighborhood_hops: neighborhoodHops > 0 ? neighborhoodHops : undefined,
+        search_query: searchQuery || undefined,
+        blast_mode: blastMode !== 'off' ? blastMode : undefined,
+        diff_base_ref: blastMode === 'git' ? diffBaseRef : undefined,
+        working_set_only: workingSetActive ? true : undefined,
+        compact_visible: compactVisible ? true : undefined,
+        flatten_2d: flatten2D ? true : undefined,
+        group_by: groupBy !== 'none' ? groupBy : undefined,
+        active_tab: activeTab !== '3d' ? activeTab : undefined,
         framing_preset: currentAgentBeat?.framingPreset ?? 'iso_overview',
         z_wythe_slice: zWytheSlice !== 'all' ? zWytheSlice : undefined,
         zoom_stratum: requestedZoomStratum,
@@ -1091,8 +1425,25 @@ export default function WytheWorkspacePage() {
       activeSessionId,
       currentAgentBeat,
       selectedNodeId,
+      selectedEdgeId,
+      selectedFindingId,
       sceneLens,
       sceneLayout,
+      tierFilter,
+      subkindFilter,
+      edgeFilter,
+      onlyFlagged,
+      isolateCone,
+      connectedOnly,
+      neighborhoodHops,
+      searchQuery,
+      blastMode,
+      diffBaseRef,
+      workingSetActive,
+      compactVisible,
+      flatten2D,
+      groupBy,
+      activeTab,
       zWytheSlice,
       requestedZoomStratum,
       agentCamState.activeEvent?.command.chronicle_timeline,
@@ -1163,9 +1514,29 @@ export default function WytheWorkspacePage() {
             targetSlug: resumed.activeEvent.command.target_slug,
             focusNodeIds: item.focusNodeIds,
             highlightEdgeIds: item.highlightEdgeIds,
+            selectedNodeId: item.selectedNodeId,
+            selectedEdgeId: item.selectedEdgeId,
             findingId: item.findingId,
             lens: item.lens,
             layoutMode: item.layoutMode,
+            tierFilter: item.tierFilter,
+            subkindFilter: item.subkindFilter,
+            edgeFilter: item.edgeFilter,
+            onlyFlagged: item.onlyFlagged,
+            isolateCone: item.isolateCone,
+            connectedOnly: item.connectedOnly,
+            neighborhoodHops: item.neighborhoodHops,
+            searchQuery: item.searchQuery,
+            blastMode: item.blastMode,
+            diffBaseRef: item.diffBaseRef,
+            workingSetOnly: item.workingSetOnly,
+            compactVisible: item.compactVisible,
+            flatten2d: item.flatten2d,
+            groupBy: item.groupBy,
+            activeTab: item.activeTab,
+            openDrawer: item.openDrawer,
+            resetFilters: item.resetFilters,
+            isTimelineStep: true,
             zWytheSlice: item.zWytheSlice,
             zoomStratum: item.zoomStratum,
             framingPreset: item.framingPreset,
@@ -1222,9 +1593,29 @@ export default function WytheWorkspacePage() {
             targetSlug: next.activeEvent?.command.target_slug,
             focusNodeIds: item.focusNodeIds,
             highlightEdgeIds: item.highlightEdgeIds,
+            selectedNodeId: item.selectedNodeId,
+            selectedEdgeId: item.selectedEdgeId,
             findingId: item.findingId,
             lens: item.lens,
             layoutMode: item.layoutMode,
+            tierFilter: item.tierFilter,
+            subkindFilter: item.subkindFilter,
+            edgeFilter: item.edgeFilter,
+            onlyFlagged: item.onlyFlagged,
+            isolateCone: item.isolateCone,
+            connectedOnly: item.connectedOnly,
+            neighborhoodHops: item.neighborhoodHops,
+            searchQuery: item.searchQuery,
+            blastMode: item.blastMode,
+            diffBaseRef: item.diffBaseRef,
+            workingSetOnly: item.workingSetOnly,
+            compactVisible: item.compactVisible,
+            flatten2d: item.flatten2d,
+            groupBy: item.groupBy,
+            activeTab: item.activeTab,
+            openDrawer: item.openDrawer,
+            resetFilters: item.resetFilters,
+            isTimelineStep: true,
             zWytheSlice: item.zWytheSlice,
             zoomStratum: item.zoomStratum,
             framingPreset: item.framingPreset,
@@ -1494,7 +1885,22 @@ export default function WytheWorkspacePage() {
     }
     const prevFocus = params.get('focus') ?? '';
     const nextFocus = selectedNodeId ?? '';
-    if (prevFocus === nextFocus && !params.has('finding')) {
+    const prevFocusItems = prevFocus
+      ? prevFocus
+          .split(',')
+          .map((item) => {
+            try {
+              return decodeURIComponent(item);
+            } catch {
+              return item;
+            }
+          })
+          .filter(Boolean)
+      : [];
+    if (
+      (prevFocus === nextFocus || (selectedNodeId && prevFocusItems.includes(selectedNodeId))) &&
+      !params.has('finding')
+    ) {
       return;
     }
     if (selectedNodeId) {
@@ -1549,6 +1955,12 @@ export default function WytheWorkspacePage() {
         connected_only: connectedOnly,
         neighborhood_hops: neighborhoodHops,
         search_query: searchQuery,
+        working_set_only: workingSetActive,
+        compact_visible: compactVisible,
+        flatten_2d: flatten2D,
+        group_by: groupBy,
+        z_wythe_slice: zWytheSlice,
+        zoom_stratum: requestedZoomStratum,
         active_trace_route: activeTraceChain
           ? `${activeTraceChain.http_method} ${activeTraceChain.http_path}`
           : null,
@@ -1622,6 +2034,12 @@ export default function WytheWorkspacePage() {
     connectedOnly,
     neighborhoodHops,
     searchQuery,
+    workingSetActive,
+    compactVisible,
+    flatten2D,
+    groupBy,
+    zWytheSlice,
+    requestedZoomStratum,
     activeTraceChain,
     askDrawerOpen,
     isSessionHydrated,
@@ -1671,6 +2089,8 @@ export default function WytheWorkspacePage() {
     hoverFocusMeta.district,
     hoverFocusMeta.cameraPosition,
     hoverFocusMeta.cameraTarget,
+    hoverFocusMeta.visibleNodeCount,
+    liveViewportDigest?.inFrustumCount,
   ]);
 
   const openAskWytheDrawer = useCallback(
@@ -1835,6 +2255,12 @@ export default function WytheWorkspacePage() {
           connected_only: connectedOnly,
           neighborhood_hops: neighborhoodHops,
           search_query: searchQuery,
+          working_set_only: workingSetActive,
+          compact_visible: compactVisible,
+          flatten_2d: flatten2D,
+          group_by: groupBy,
+          z_wythe_slice: zWytheSlice,
+          zoom_stratum: requestedZoomStratum,
           active_trace_route: activeTraceChain
             ? `${activeTraceChain.http_method} ${activeTraceChain.http_path}`
             : null,
@@ -1907,6 +2333,12 @@ export default function WytheWorkspacePage() {
       connectedOnly,
       neighborhoodHops,
       searchQuery,
+      workingSetActive,
+      compactVisible,
+      flatten2D,
+      groupBy,
+      zWytheSlice,
+      requestedZoomStratum,
       activeTraceChain,
       hoverFocusMeta.cameraPosition,
       hoverFocusMeta.cameraTarget,
@@ -3514,6 +3946,7 @@ export default function WytheWorkspacePage() {
                       workingSetIds={workingSetIds}
                       workingSetActive={workingSetActive}
                       groupBy={groupBy}
+                      zoomStratum={requestedZoomStratum}
                       collapsedGroups={collapsedGroups}
                       pinnedPositions={pinnedPositions}
                       diffOverlay={diffOverlay}

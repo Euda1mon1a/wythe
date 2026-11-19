@@ -265,6 +265,42 @@ def build_viewport_permalink(
             ("chronicle", urllib.parse.quote(cmd.chronicle_timeline.timeline_id, safe=""))
         )
         pairs.append(("phase", str(cmd.chronicle_timeline.active_phase_index)))
+    if cmd.finding_id:
+        pairs.append(("finding", urllib.parse.quote(cmd.finding_id, safe="")))
+    if cmd.selected_node_id:
+        pairs.append(("selected_node", urllib.parse.quote(cmd.selected_node_id, safe="")))
+    if cmd.selected_edge_id:
+        pairs.append(("selected_edge", urllib.parse.quote(cmd.selected_edge_id, safe="")))
+    if cmd.tier_filter and cmd.tier_filter != "all":
+        pairs.append(("tier", urllib.parse.quote(cmd.tier_filter, safe="")))
+    if cmd.subkind_filter and cmd.subkind_filter != "all":
+        pairs.append(("subkind", urllib.parse.quote(cmd.subkind_filter, safe="")))
+    if cmd.edge_filter and cmd.edge_filter != "all":
+        pairs.append(("edge_filter", urllib.parse.quote(cmd.edge_filter, safe="")))
+    if cmd.only_flagged is True:
+        pairs.append(("only_flagged", "1"))
+    if cmd.isolate_cone is True:
+        pairs.append(("isolate_cone", "1"))
+    if cmd.connected_only is True:
+        pairs.append(("connected_only", "1"))
+    if cmd.neighborhood_hops in (1, 2):
+        pairs.append(("hops", str(cmd.neighborhood_hops)))
+    if cmd.search_query:
+        pairs.append(("q", urllib.parse.quote(cmd.search_query, safe="")))
+    if cmd.blast_mode and cmd.blast_mode != "off":
+        pairs.append(("blast", urllib.parse.quote(cmd.blast_mode, safe="")))
+        if cmd.diff_base_ref and cmd.blast_mode == "git":
+            pairs.append(("base_ref", urllib.parse.quote(cmd.diff_base_ref, safe="")))
+    if cmd.working_set_only is True:
+        pairs.append(("working_set", "1"))
+    if cmd.compact_visible is True:
+        pairs.append(("compact", "1"))
+    if cmd.flatten_2d is True:
+        pairs.append(("flat2d", "1"))
+    if cmd.group_by and cmd.group_by != "none":
+        pairs.append(("group_by", urllib.parse.quote(cmd.group_by, safe="")))
+    if cmd.active_tab and cmd.active_tab != "3d":
+        pairs.append(("tab", urllib.parse.quote(cmd.active_tab, safe="")))
 
     fragment = "&".join(f"{key}={val}" for key, val in pairs)
     prefix = base_origin.rstrip("/") if base_origin else ""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.parse
@@ -11,6 +12,7 @@ import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
+import httpx
 import uvicorn
 
 from app.adapters.autodetect import detect_repository_stack
@@ -53,6 +55,189 @@ from app.services.portable_config_service import (
 )
 from app.services.scanner_service import run_target_scan
 from app.services.ui_focus_service import explain_ui_focus
+from app.services.viewport_service import (
+    DEFAULT_VIEWPORT_ORIGIN,
+    _validate_viewport_server_url,
+)
+
+
+def _run_reply_cli(args: argparse.Namespace) -> int:
+    """Pipe frontier/terminal markdown into the live Ask Wythe drawer + optional 3D viewport steering."""
+    if args.message is not None:
+        raw_md = str(args.message)
+    elif args.file is not None:
+        raw_md = Path(args.file).expanduser().read_text(encoding="utf-8")
+    else:
+        is_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+        if is_tty or sys.stdin is None:
+            print(
+                "wythe reply error: provide markdown via stdin pipe, --message, or --file.",
+                file=sys.stderr,
+            )
+            return 2
+        raw_md = sys.stdin.read()
+
+    markdown_body = raw_md.strip()
+    if not markdown_body:
+        print("wythe reply error: empty markdown reply body.", file=sys.stderr)
+        return 2
+
+    server_raw = (
+        args.server
+        or os.getenv("WYTHE_SERVER_URL")
+        or DEFAULT_VIEWPORT_ORIGIN
+    )
+    vp_cmd_url = _validate_viewport_server_url(
+        server_raw,
+        allow_remote=bool(args.allow_remote_viewport),
+    )
+    api_base = vp_cmd_url.removesuffix("/viewport/command")
+
+    focus_ids: list[str] = []
+    for raw_item in args.focus or []:
+        for tok in str(raw_item).split(","):
+            cleaned_tok = tok.strip()
+            if cleaned_tok and cleaned_tok not in focus_ids:
+                focus_ids.append(cleaned_tok)
+
+    resolved_slug = (args.target or "").strip() or None
+    resolved_sid = (args.session or "").strip() or None
+    question_text = (args.question or "External frontier CLI analysis").strip()
+
+    with httpx.Client(trust_env=False, follow_redirects=False, timeout=10.0) as client:
+        if not resolved_slug or not resolved_sid:
+            q_parts: list[str] = []
+            if resolved_slug:
+                q_parts.append(f"target={urllib.parse.quote(resolved_slug)}")
+            if resolved_sid:
+                q_parts.append(f"session_id={urllib.parse.quote(resolved_sid)}")
+            qs = f"?{'&'.join(q_parts)}" if q_parts else ""
+            focus_resp = client.get(f"{api_base}/ui-focus{qs}")
+            if 200 <= focus_resp.status_code < 300:
+                focus_json = focus_resp.json()
+                if not resolved_slug and isinstance(focus_json.get("active_slug"), str):
+                    resolved_slug = focus_json["active_slug"].strip() or None
+                if not resolved_sid and isinstance(focus_json.get("session_id"), str):
+                    resolved_sid = focus_json["session_id"].strip() or None
+
+        if not resolved_slug:
+            targets_resp = client.get(f"{api_base}/targets")
+            if 200 <= targets_resp.status_code < 300:
+                targets_list = targets_resp.json()
+                if isinstance(targets_list, list) and targets_list:
+                    resolved_slug = str(targets_list[0].get("slug") or "").strip() or None
+        if not resolved_slug:
+            print("wythe reply error: could not resolve an active target slug.", file=sys.stderr)
+            return 2
+
+        if not resolved_sid:
+            inv_list_resp = client.get(
+                f"{api_base}/investigations?target_slug={urllib.parse.quote(resolved_slug)}"
+            )
+            if 200 <= inv_list_resp.status_code < 300:
+                sessions = inv_list_resp.json().get("sessions") or []
+                if sessions:
+                    resolved_sid = str(sessions[0].get("session_id") or "").strip() or None
+            if not resolved_sid:
+                create_resp = client.post(
+                    f"{api_base}/investigations",
+                    json={"target_slug": resolved_slug, "client_id": "wythe-reply-cli"},
+                )
+                if create_resp.status_code < 200 or create_resp.status_code >= 300:
+                    print(
+                        f"wythe reply error: failed to create session (HTTP {create_resp.status_code}): "
+                        f"{create_resp.text[:240]}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                resolved_sid = str(create_resp.json()["session_id"])
+
+        turn_payload = {
+            "client_id": "wythe-reply-cli",
+            "actor": "agent",
+            "question": question_text,
+            "answer_markdown": markdown_body,
+            "engine": str(args.engine or "frontier"),
+            "model_id": str(args.model or "frontier-cli"),
+            "authored_by": "model",
+            "selected_node_id": focus_ids[0] if focus_ids else None,
+            "referenced_ids": focus_ids,
+        }
+        turn_resp = client.post(
+            f"{api_base}/investigations/{urllib.parse.quote(resolved_sid, safe='')}/turns",
+            json=turn_payload,
+        )
+        if turn_resp.status_code == 404:
+            reopen_resp = client.post(
+                f"{api_base}/investigations",
+                json={
+                    "target_slug": resolved_slug,
+                    "session_id": resolved_sid,
+                    "client_id": "wythe-reply-cli",
+                },
+            )
+            if 200 <= reopen_resp.status_code < 300:
+                turn_resp = client.post(
+                    f"{api_base}/investigations/{urllib.parse.quote(resolved_sid, safe='')}/turns",
+                    json=turn_payload,
+                )
+        if turn_resp.status_code < 200 or turn_resp.status_code >= 300:
+            print(
+                f"wythe reply error: turn rejected (HTTP {turn_resp.status_code}): {turn_resp.text[:240]}",
+                file=sys.stderr,
+            )
+            return 2
+        turn_json = turn_resp.json()
+
+        has_explicit_vp = bool(
+            focus_ids
+            or args.lens
+            or args.layout_mode
+            or args.tier_filter
+            or args.only_flagged
+            or args.isolate_cone
+            or args.reset_filters
+        )
+        vp_seq: int | None = None
+        if has_explicit_vp:
+            vp_body = {
+                "target_slug": resolved_slug,
+                "session_id": resolved_sid,
+                "refresh_session_id": resolved_sid,
+                "open_drawer": True,
+                "focus_node_ids": focus_ids,
+                "selected_node_id": focus_ids[0] if focus_ids else None,
+                "lens": args.lens,
+                "layout_mode": args.layout_mode,
+                "tier_filter": args.tier_filter,
+                "only_flagged": True if args.only_flagged else None,
+                "isolate_cone": True if args.isolate_cone else None,
+                "reset_filters": bool(args.reset_filters),
+            }
+            vp_resp = client.post(vp_cmd_url, json=vp_body)
+            if vp_resp.status_code < 200 or vp_resp.status_code >= 300:
+                print(
+                    f"wythe reply error: viewport command rejected (HTTP {vp_resp.status_code}): "
+                    f"{vp_resp.text[:240]}",
+                    file=sys.stderr,
+                )
+                return 2
+            vp_seq = int(vp_resp.json().get("seq") or 0) or None
+
+    val_refs = turn_json.get("validated_references") or []
+    val_count = sum(
+        1 for item in val_refs if isinstance(item, dict) and item.get("validation_state") == "validated"
+    )
+    receipt = {
+        "ok": True,
+        "target_slug": resolved_slug,
+        "session_id": turn_json["session_id"],
+        "turn_id": turn_json["turn_id"],
+        "validated_ref_count": val_count,
+        "viewport_command_seq": vp_seq,
+    }
+    print(json.dumps(receipt, indent=2))
+    return 0
 
 
 def _resolve_cli_target(
@@ -768,6 +953,84 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_focus.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON instead of Markdown")
 
+    p_reply = sub.add_parser(
+        "reply",
+        help="Pipe frontier/terminal markdown directly into the live Ask Wythe pop-out drawer over SSE",
+    )
+    p_reply.add_argument(
+        "--server",
+        "--server-url",
+        dest="server",
+        default=None,
+        help="Running Wythe server base URL (defaults to WYTHE_SERVER_URL or http://127.0.0.1:8780)",
+    )
+    p_reply.add_argument(
+        "--allow-remote-viewport",
+        dest="allow_remote_viewport",
+        action="store_true",
+        help="Allow --server to target a non-loopback/non-private host",
+    )
+    p_reply.add_argument("--target", default=None, help="Optional target slug (defaults to active UI focus)")
+    p_reply.add_argument(
+        "--session",
+        "--session-id",
+        dest="session",
+        default=None,
+        help="Optional shared investigation session ID (defaults to active UI focus session)",
+    )
+    p_reply.add_argument("--question", default="External frontier CLI analysis", help="Prompt/heading for the turn")
+    p_reply.add_argument("--model", default="frontier-cli", help="Model badge recorded on the turn")
+    p_reply.add_argument("--engine", default="frontier", help="Engine badge recorded on the turn")
+    p_reply.add_argument("-m", "--message", default=None, help="Inline markdown message (defaults to stdin)")
+    p_reply.add_argument("-f", "--file", default=None, help="Read markdown reply from file path")
+    p_reply.add_argument(
+        "--focus",
+        action="append",
+        default=None,
+        help="Optional semantic Atlas node ID(s) to frame in 3D (repeatable or comma-separated)",
+    )
+    p_reply.add_argument(
+        "--lens",
+        choices=("status", "contention", "gravity", "subkind", "cluster", "containers"),
+        default=None,
+        help="Optional 3D lens to activate alongside the reply",
+    )
+    p_reply.add_argument(
+        "--layout",
+        "--layout-mode",
+        dest="layout_mode",
+        choices=("cluster", "grid", "subkind", "connected", "lifecycle_z", "temporal_z"),
+        default=None,
+        help="Optional 3D spatial layout mode",
+    )
+    p_reply.add_argument(
+        "--tier",
+        "--tier-filter",
+        dest="tier_filter",
+        choices=("all", "truth", "manipulate", "display"),
+        default=None,
+        help="Optional stratum tier filter",
+    )
+    p_reply.add_argument(
+        "--only-flagged",
+        "--flagged-only",
+        dest="only_flagged",
+        action="store_true",
+        help="Enable Flagged-Only filter in the 3D viewport",
+    )
+    p_reply.add_argument(
+        "--isolate-cone",
+        dest="isolate_cone",
+        action="store_true",
+        help="Isolate the 3-tier lineage cone in the 3D viewport",
+    )
+    p_reply.add_argument(
+        "--reset-filters",
+        dest="reset_filters",
+        action="store_true",
+        help="Reset all 3D viewport filters to overview defaults",
+    )
+
     p_und = sub.add_parser(
         "understand",
         help="Evaluate Six-Link Outcome, Authority, Provenance & Preservation Understanding Chain",
@@ -886,6 +1149,13 @@ def main(argv: list[str] | None = None) -> int:
             server_url=args.server_url,
             allow_remote_viewport=bool(args.allow_remote_viewport),
         )
+
+    if args.cmd == "reply":
+        try:
+            return _run_reply_cli(args)
+        except Exception as exc:  # noqa: BLE001
+            print(f"wythe reply error: {exc}", file=sys.stderr)
+            return 2
 
     if args.cmd == "focus":
         if args.remote:
