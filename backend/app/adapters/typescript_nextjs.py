@@ -19,6 +19,7 @@ from app.adapters.base import (
     RawCandidateFinding,
 )
 from app.adapters.treesitter_engine import (
+    _LEADING_MOUNT_INTERP_RE,
     blank_comments_cst,
     extract_ts_http_calls_cst,
     is_resolvable_url_const_value,
@@ -55,7 +56,10 @@ _REEXPORT_STAR_RE = re.compile(
     re.MULTILINE,
 )
 _HTTP_CALL_START_RE = re.compile(
-    r"""\b(?:api\.|axios\.|http\.|client\.|ky\.)?(?P<verb>get|post|put|patch|del|delete|fetch|apiRequest|request|httpClient|ofetch)\s*(?:<[^;()]{0,220}?>)?\s*\(\s*(?:[A-Za-z_$][A-Za-z0-9_$.]*\s*\?\s*)?(?P<quote>['"`])"""
+    r"""\b(?:new\s+(?:window\.|globalThis\.)?(?P<es_verb>EventSource)|(?:api\.|axios\.|http\.|client\.|ky\.)?(?P<verb>get|post|put|patch|del|delete|fetch|apiRequest|request|httpClient|ofetch))\s*(?:<[^;()]{0,220}?>)?\s*\(\s*(?:[A-Za-z_$][A-Za-z0-9_$.]*\s*\?\s*)?(?P<quote>['"`])"""
+)
+_CONCAT_HTTP_CALL_RE = re.compile(
+    r"""\b(?:new\s+(?:window\.|globalThis\.)?(?P<es_verb>EventSource)|(?:api\.|axios\.|http\.|client\.|ky\.)?(?P<verb>get|post|put|patch|del|delete|fetch|apiRequest|request|httpClient|ofetch))\s*(?:<[^;()]{0,220}?>)?\s*\(\s*(?P<lhs>(?:this\.)?[A-Za-z_$][\w$.]*)\s*\+\s*(?P<quote>['"`])(?P<tail>/[^'"`\n]*)(?P=quote)"""
 )
 _FETCH_LIKE_VERBS = frozenset({"FETCH", "APIREQUEST", "REQUEST", "HTTPCLIENT", "OFETCH"})
 _VALID_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
@@ -81,7 +85,12 @@ _URL_ALIAS_CONST_RE = re.compile(
 )
 _TEMPLATE_HEAD_CONST_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
 _URL_CALL_IDENT_RE = re.compile(
-    r"""\b(?:api\.|axios\.|http\.|client\.|ky\.)?(?P<verb>get|post|put|patch|del|delete|fetch|apiRequest|request|httpClient|ofetch)\s*(?:<[^;()]{0,220}?>)?\s*\(\s*(?P<ident>[A-Za-z_$][\w$]*)\s*[,)]"""
+    r"""\b(?:new\s+(?:window\.|globalThis\.)?(?P<es_verb>EventSource)|(?:api\.|axios\.|http\.|client\.|ky\.)?(?P<verb>get|post|put|patch|del|delete|fetch|apiRequest|request|httpClient|ofetch))\s*(?:<[^;()]{0,220}?>)?\s*\(\s*(?P<ident>[A-Za-z_$][\w$]*)\s*[,)]"""
+)
+_NEXT_API_CLIENT_SUFFIXES = ("-client", "_client", "-api", "_api", "-service", "_service")
+_NEXT_HTML_SCRIPT_RE = re.compile(r"<script\b[^>]*>(?P<body>[\s\S]*?)</script>", re.IGNORECASE)
+_NEXT_HTML_MARKUP_RE = re.compile(
+    r"<(?:img|button|input|select|textarea|div|span)\b[^>]*>", re.IGNORECASE
 )
 
 
@@ -161,9 +170,204 @@ def _collect_url_consts(
     return _build_scoped_url_consts(txt, imported_consts=imported_consts)[0]
 
 
-_FN_PARAM_HEAD_RE = re.compile(
-    r"""(?:\bfunction\b[A-Za-z0-9_$\s]*(?:<[^>{}()]*>)?\s*\((?P<fparams>[^)]*)\)\s*(?::[^{=]+)?\s*\{|\bcatch\s*\((?P<cparam>[^)]*)\)\s*\{|\((?P<aparams>[^()]*)\)\s*(?::[^=;\r\n)]+)?\s*=>|(?P<sparam>[A-Za-z_$][\w$]*)\s*=>)"""
-)
+_FN_KW_RE = re.compile(r"\bfunction\b(?:\s*\*)?(?:\s+[A-Za-z_$][\w$]*)?")
+_CATCH_KW_RE = re.compile(r"\bcatch\s*\(")
+_ARROW_TOKEN_RE = re.compile(r"=>")
+
+
+def _find_matching_delim_reverse(txt: str, close_idx: int, open_ch: str, close_ch: str) -> int:
+    depth = 1
+    i = close_idx - 1
+    while i >= 0 and depth > 0:
+        ch = txt[i]
+        if ch == close_ch:
+            depth += 1
+        elif ch == open_ch:
+            depth -= 1
+        i -= 1
+    return i + 1 if depth == 0 else -1
+
+
+def _skip_optional_return_type_to_brace(code_only: str, pos: int) -> int:
+    """Advance past optional `: ReturnType` (including object `{...}` types) to body `{`, or -1."""
+    n = len(code_only)
+    i = pos
+    while i < n and code_only[i].isspace():
+        i += 1
+    if i < n and code_only[i] == "{":
+        return i
+    if i >= n or code_only[i] != ":":
+        return -1
+    i += 1
+    pdepth = bdepth = adepth = 0
+    while i < n:
+        ch = code_only[i]
+        if ch == "(":
+            pdepth += 1
+        elif ch == ")":
+            pdepth = max(0, pdepth - 1)
+        elif ch == "[":
+            bdepth += 1
+        elif ch == "]":
+            bdepth = max(0, bdepth - 1)
+        elif ch == "<":
+            adepth += 1
+        elif ch == ">" and (i == 0 or code_only[i - 1] != "="):
+            adepth = max(0, adepth - 1)
+        elif ch == "{":
+            if pdepth == 0 and bdepth == 0 and adepth == 0:
+                # Object return type `: { a: number } {` vs function body `{`:
+                close_brace = _find_matching_delim(code_only, i, "{", "}")
+                k = close_brace
+                while k < n and code_only[k].isspace():
+                    k += 1
+                if k < n and code_only[k] in ("{", "|", "&", "["):
+                    i = close_brace
+                    continue
+                return i
+            else:
+                i = _find_matching_delim(code_only, i, "{", "}")
+                continue
+        elif ch == ";" and pdepth == 0 and bdepth == 0 and adepth == 0:
+            return -1
+        i += 1
+    return -1
+
+
+def _find_arrow_params_open_paren(code_only: str, arrow_start: int) -> tuple[int, int] | None:
+    """Locate `(params)` preceding `=>` at `arrow_start`, allowing `: ReturnType` in between."""
+    i = arrow_start - 1
+    while i >= 0 and code_only[i].isspace():
+        i -= 1
+    if i < 0:
+        return None
+    if code_only[i] == ")":
+        open_p = _find_matching_delim_reverse(code_only, i, "(", ")")
+        if open_p >= 0:
+            return (open_p, i)
+    # Walk backwards over optional `: ReturnType` (balanced `>`, `}`, `]`, `)`) to find `):`
+    pdepth = bdepth = cdepth = adepth = 0
+    k = i
+    while k >= 0:
+        ch = code_only[k]
+        if ch == ")":
+            pdepth += 1
+        elif ch == "(":
+            if pdepth == 0:
+                return None
+            pdepth -= 1
+        elif ch == "]":
+            bdepth += 1
+        elif ch == "[":
+            if bdepth == 0:
+                return None
+            bdepth -= 1
+        elif ch == "}":
+            cdepth += 1
+        elif ch == "{":
+            if cdepth == 0:
+                return None
+            cdepth -= 1
+        elif ch == ">" and (k == 0 or code_only[k - 1] != "="):
+            adepth += 1
+        elif ch == "<":
+            if adepth > 0:
+                adepth -= 1
+        elif ch == ":" and pdepth == 0 and bdepth == 0 and cdepth == 0 and adepth == 0:
+            j = k - 1
+            while j >= 0 and code_only[j].isspace():
+                j -= 1
+            if j >= 0 and code_only[j] == ")":
+                open_p = _find_matching_delim_reverse(code_only, j, "(", ")")
+                if open_p >= 0:
+                    return (open_p, j)
+            return None
+        elif ch in (";", "=") and pdepth == 0 and bdepth == 0 and cdepth == 0 and adepth == 0:
+            return None
+        k -= 1
+    return None
+
+
+def _iter_ts_fn_and_catch_scopes(
+    code_only: str,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int, set[str]]]]:
+    """Extract `(fn_scopes, param_scopes)` with balanced type-annotation support."""
+    n = len(code_only)
+    fn_scopes: list[tuple[int, int]] = [(0, n)]
+    param_scopes: list[tuple[int, int, set[str]]] = []
+    fn_param_parens: set[int] = set()
+
+    for m in _FN_KW_RE.finditer(code_only):
+        i = m.end()
+        while i < n and code_only[i].isspace():
+            i += 1
+        if i < n and code_only[i] == "<":
+            i = _find_matching_delim(code_only, i, "<", ">")
+            while i < n and code_only[i].isspace():
+                i += 1
+        if i >= n or code_only[i] != "(":
+            continue
+        open_p = i
+        close_p = _find_matching_delim(code_only, open_p, "(", ")")
+        if close_p <= open_p:
+            continue
+        fn_param_parens.add(open_p)
+        brace_pos = _skip_optional_return_type_to_brace(code_only, close_p)
+        if brace_pos < 0:
+            continue
+        span = (brace_pos, _find_matching_delim(code_only, brace_pos, "{", "}"))
+        fn_scopes.append(span)
+        bound = _extract_param_bound_names(code_only[open_p + 1 : close_p - 1])
+        if bound:
+            param_scopes.append((span[0], span[1], bound))
+
+    for m in _CATCH_KW_RE.finditer(code_only):
+        open_p = m.end() - 1
+        close_p = _find_matching_delim(code_only, open_p, "(", ")")
+        k = close_p
+        while k < n and code_only[k].isspace():
+            k += 1
+        if k < n and code_only[k] == "{":
+            span = (k, _find_matching_delim(code_only, k, "{", "}"))
+            bound = _extract_param_bound_names(code_only[open_p + 1 : close_p - 1])
+            if bound:
+                param_scopes.append((span[0], span[1], bound))
+
+    for m in _ARROW_TOKEN_RE.finditer(code_only):
+        arrow_start, arrow_end = m.start(), m.end()
+        # Check single-identifier `param => ...` first
+        j = arrow_start - 1
+        while j >= 0 and code_only[j].isspace():
+            j -= 1
+        raw_params: str | None = None
+        if j >= 0 and (code_only[j].isalnum() or code_only[j] in ("_", "$")):
+            id_end = j + 1
+            while j >= 0 and (code_only[j].isalnum() or code_only[j] in ("_", "$")):
+                j -= 1
+            ident = code_only[j + 1 : id_end]
+            prev_k = j
+            while prev_k >= 0 and code_only[prev_k].isspace():
+                prev_k -= 1
+            if (prev_k < 0 or code_only[prev_k] != ":") and ident not in (
+                "async",
+                "void",
+                "typeof",
+                "keyof",
+                "readonly",
+            ):
+                raw_params = ident
+        if raw_params is None:
+            pbounds = _find_arrow_params_open_paren(code_only, arrow_start)
+            if pbounds is not None and pbounds[0] not in fn_param_parens:
+                raw_params = code_only[pbounds[0] + 1 : pbounds[1]]
+        if raw_params is not None:
+            span = (arrow_end, _find_arrow_expr_end(code_only, arrow_end))
+            fn_scopes.append(span)
+            bound = _extract_param_bound_names(raw_params)
+            if bound:
+                param_scopes.append((span[0], span[1], bound))
+
+    return fn_scopes, param_scopes
 _LOCAL_BIND_RE = re.compile(r"""\b(?P<kw>const|let|var|function)\s+(?P<name>[A-Za-z_$][\w$]*)\b""")
 _DESTRUCT_BIND_RE = re.compile(r"""\b(?P<kw>const|let|var)\s+(?P<pat>\{[^;\n]{1,200}\}|\[[^;\n]{1,200}\])\s*=""")
 _REASSIGN_STMT_RE = re.compile(
@@ -351,22 +555,72 @@ def _find_arrow_expr_end(txt: str, start: int) -> int:
     return i
 
 
-def _apply_url_scope_map(outer: dict[str, str], bmap: dict[str, str | None]) -> dict[str, str]:
+def _collect_fallback_imported_idents(code_only: str) -> set[str]:
+    names: set[str] = set()
+    for m in re.finditer(
+        r"""(?:^|[;\r\n])[ \t]*import\s+(?!type\b)(?P<clause>[^;'"\r\n]+?)\s+from\s*['"]""",
+        code_only,
+    ):
+        clause = m.group("clause").strip()
+        if "{" in clause and "}" in clause:
+            before, rest = clause.split("{", 1)
+            inside, _ = rest.split("}", 1)
+            def_name = before.rstrip(",").strip()
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", def_name):
+                names.add(def_name)
+            for raw_it in inside.split(","):
+                it = raw_it.strip()
+                if not it or it.startswith("type "):
+                    continue
+                parts = re.split(r"\s+as\s+", it, maxsplit=1)
+                al = parts[-1].strip()
+                if re.fullmatch(r"[A-Za-z_$][\w$]*", al):
+                    names.add(al)
+        elif "* as " in clause:
+            al = clause.split("* as ", 1)[1].strip()
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", al):
+                names.add(al)
+        elif re.fullmatch(r"[A-Za-z_$][\w$]*", clause):
+            names.add(clause)
+    return names
+
+
+def _apply_url_scope_map(
+    outer: dict[str, str],
+    bmap: dict[str, str | None],
+    outer_blocked: frozenset[str] = frozenset(),
+) -> tuple[dict[str, str], frozenset[str]]:
     merged = {k: v for k, v in outer.items() if k not in bmap}
+    local_invalid = {k for k, v in bmap.items() if v is None}
     pending = {k: v for k, v in bmap.items() if v is not None}
+    cur_blocked = (outer_blocked - set(pending)) | local_invalid
     if not pending:
-        return merged
+        return merged, frozenset(cur_blocked)
     working = {**merged, **pending}
     for _ in range(4):
         for k in list(pending):
             working[k] = resolve_url_const_head(
                 working[k],
                 {ok: ov for ok, ov in working.items() if ok != k and is_resolvable_url_const_value(ov)},
+                strip_unresolved_mount=False,
             )
+    unresolved_pending = {k for k in pending if not is_resolvable_url_const_value(working[k])}
+    eff_blocked = cur_blocked | unresolved_pending
+    for k in list(pending):
+        working[k] = resolve_url_const_head(
+            working[k],
+            {ok: ov for ok, ov in working.items() if ok != k and is_resolvable_url_const_value(ov)},
+            strip_unresolved_mount=True,
+            blocked_names=eff_blocked,
+        )
+    final_blocked = set(cur_blocked)
     for k in pending:
         if is_resolvable_url_const_value(working[k]):
             merged[k] = working[k]
-    return merged
+            final_blocked.discard(k)
+        else:
+            final_blocked.add(k)
+    return merged, frozenset(final_blocked)
 
 
 def _has_closing_line_quote(src: str, start: int, quote_ch: str) -> bool:
@@ -554,7 +808,7 @@ def _build_scoped_url_consts(
 
     for m in re.finditer(
         r"""(?:^|[;{])[ \t]*(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*string\s*)?=\s*"""
-        r"""(?P<lhs>[A-Za-z_$][\w$]*)\s*\+\s*(?P<q>['"`])(?P<tail>/[^'"`\n]*)(?P=q)[ \t]*(?:as\s+const[ \t]*)?(?=[;\r\n}]|$)""",
+        r"""(?P<lhs>(?:this\.)?[A-Za-z_$][\w$.]*)\s*\+\s*(?P<q>['"`])(?P<tail>/[^'"`\n]*)(?P=q)[ \t]*(?:as\s+const[ \t]*)?(?=[;\r\n}]|$)""",
         txt,
         re.MULTILINE,
     ):
@@ -570,21 +824,7 @@ def _build_scoped_url_consts(
             concat_val = f"${{{lhs_ident}}}{tail}"
             bmap[name] = concat_val if bmap.get(name, concat_val) == concat_val else None
 
-    fn_scopes: list[tuple[int, int]] = [root_span]
-    param_scopes: list[tuple[int, int, set[str]]] = []
-    for m in _FN_PARAM_HEAD_RE.finditer(code_only):
-        raw_params = (
-            m.group("fparams") or m.group("cparam") or m.group("aparams") or m.group("sparam") or ""
-        )
-        if m.group("fparams") is not None or m.group("cparam") is not None:
-            span = (m.end() - 1, _find_matching_delim(code_only, m.end() - 1, "{", "}"))
-        else:
-            span = (m.end(), _find_arrow_expr_end(code_only, m.end()))
-        if m.group("cparam") is None:
-            fn_scopes.append(span)
-        bound = _extract_param_bound_names(raw_params)
-        if bound:
-            param_scopes.append((span[0], span[1], bound))
+    fn_scopes, param_scopes = _iter_ts_fn_and_catch_scopes(code_only)
 
     def innermost_fn_scope(pos: int) -> tuple[int, int]:
         return min(
@@ -659,12 +899,15 @@ def _build_scoped_url_consts(
         for k, v in (imported_consts or {}).items()
         if is_resolvable_url_const_value(v)
     }
-    root_consts = _apply_url_scope_map(base_outer, block_decls.get(root_span, {}))
+    init_blocked = frozenset(_collect_fallback_imported_idents(code_only) - set(base_outer))
+    root_consts, root_blocked = _apply_url_scope_map(
+        base_outer, block_decls.get(root_span, {}), init_blocked
+    )
     inner_blocks = [(s, e, bmap) for (s, e), bmap in block_decls.items() if (s, e) != root_span]
 
-    def consts_at(pos: int) -> dict[str, str]:
+    def scope_state_at(pos: int) -> tuple[dict[str, str], frozenset[str]]:
         if not inner_blocks and not param_scopes:
-            return root_consts
+            return root_consts, root_blocked
         events: list[tuple[int, int, str, Any]] = []
         for s, e, pnames in param_scopes:
             if s <= pos < e:
@@ -673,17 +916,24 @@ def _build_scoped_url_consts(
             if s <= pos < e:
                 events.append((e - s, 0, "block", bmap))
         if not events:
-            return root_consts
+            return root_consts, root_blocked
         events.sort(key=lambda item: (item[0], item[1]), reverse=True)
         env = dict(root_consts)
+        blocked = set(root_blocked)
         for _span_len, _prio, kind, payload in events:
             if kind == "params":
                 for pname in payload:
                     env.pop(pname, None)
+                    blocked.add(pname)
             else:
-                env = _apply_url_scope_map(env, payload)
-        return env
+                env, b_next = _apply_url_scope_map(env, payload, frozenset(blocked))
+                blocked = set(b_next)
+        return env, frozenset(blocked)
 
+    def consts_at(pos: int) -> dict[str, str]:
+        return scope_state_at(pos)[0]
+
+    consts_at._scope_state_at = scope_state_at  # type: ignore[attr-defined]
     return root_consts, consts_at
 
 
@@ -1034,7 +1284,10 @@ def _extract_object_http_calls_fallback(
         if depth != 0:
             continue
         inner = txt[m.end() : i - 1]
-        local_consts = consts_at(m.start())
+        state_fn = getattr(consts_at, "_scope_state_at", None)
+        local_consts, local_blocked = (
+            state_fn(m.start()) if state_fn is not None else (consts_at(m.start()), frozenset())
+        )
         url_val: str | None = None
         explicit_method: str | None = None
         method_dynamic = False
@@ -1050,7 +1303,9 @@ def _extract_object_http_calls_fallback(
                 if qm:
                     cand = qm.group("u")
                     if qm.group("q") == "`":
-                        cand = resolve_url_const_head(cand, local_consts)
+                        cand = resolve_url_const_head(
+                            cand, local_consts, blocked_names=local_blocked
+                        )
                     url_val = cand if is_same_origin_url_path(cand) else None
                 else:
                     url_val = None
@@ -1104,11 +1359,15 @@ def _extract_ts_http_calls(
         return results
 
     _root_consts, consts_at = _build_scoped_url_consts(txt, imported_consts=seed_consts)
+    state_at = getattr(consts_at, "_scope_state_at", None)
     results = []
     n = len(txt)
     for m in _HTTP_CALL_START_RE.finditer(txt):
-        local_consts = consts_at(m.start())
-        verb = m.group("verb").upper()
+        local_consts, local_blocked = (
+            state_at(m.start()) if state_at is not None else (consts_at(m.start()), frozenset())
+        )
+        is_es = m.group("es_verb") is not None
+        verb = "GET" if is_es else (m.group("verb") or "GET").upper()
         if verb == "DEL":
             verb = "DELETE"
         quote = m.group("quote")
@@ -1122,7 +1381,11 @@ def _extract_ts_http_calls(
             seen_heads.add(hm.group("name"))
             buf.append(local_consts[hm.group("name")])
             i = hm.end()
-        if i >= n or (not buf and txt[i] != "/"):
+        if i >= n or (
+            not buf
+            and txt[i] != "/"
+            and not (quote == "`" and _LEADING_MOUNT_INTERP_RE.match(txt, i) is not None)
+        ):
             continue
         if quote != "`":
             while i < n and txt[i] not in (quote, "\n"):
@@ -1150,22 +1413,40 @@ def _extract_ts_http_calls(
                         brace_depth -= 1
                     buf.append(ch)
                     i += 1
-        if verb in _FETCH_LIKE_VERBS:
+        if not is_es and verb in _FETCH_LIKE_VERBS:
             verb = _fetch_method_from_call_tail(txt, i)
         raw_url = "".join(buf)
         if quote == "`":
-            raw_url = resolve_url_const_head(raw_url, local_consts)
+            raw_url = resolve_url_const_head(raw_url, local_consts, blocked_names=local_blocked)
         if is_same_origin_url_path(raw_url):
             lineno = txt.count("\n", 0, m.start()) + 1
             results.append((verb, raw_url, lineno))
+    for cm in _CONCAT_HTTP_CALL_RE.finditer(txt):
+        local_consts, local_blocked = (
+            state_at(cm.start()) if state_at is not None else (consts_at(cm.start()), frozenset())
+        )
+        is_es_c = cm.group("es_verb") is not None
+        cverb = "GET" if is_es_c else (cm.group("verb") or "GET").upper()
+        if cverb == "DEL":
+            cverb = "DELETE"
+        elif not is_es_c and cverb in _FETCH_LIKE_VERBS:
+            cverb = _fetch_method_from_call_tail(txt, cm.end() - 1)
+        cand_u = resolve_url_const_head(
+            f"${{{cm.group('lhs')}}}{cm.group('tail')}",
+            local_consts,
+            blocked_names=local_blocked,
+        )
+        if is_same_origin_url_path(cand_u):
+            results.append((cverb, cand_u, txt.count("\n", 0, cm.start()) + 1))
     for im in _URL_CALL_IDENT_RE.finditer(txt):
         local_consts = consts_at(im.start())
         ident = im.group("ident")
         if ident in local_consts and is_same_origin_url_path(local_consts[ident]):
-            iverb = im.group("verb").upper()
+            is_es_i = im.group("es_verb") is not None
+            iverb = "GET" if is_es_i else (im.group("verb") or "GET").upper()
             if iverb == "DEL":
                 iverb = "DELETE"
-            elif iverb in _FETCH_LIKE_VERBS:
+            elif not is_es_i and iverb in _FETCH_LIKE_VERBS:
                 iverb = (
                     _fetch_method_from_call_tail(txt, im.end(), at_second_arg=True)
                     if txt[im.end() - 1] == ","
@@ -1386,13 +1667,25 @@ def _resolve_ts_import(
         base = (current_file.parent / spec).resolve()
     else:
         return ws_resolver.resolve_import(spec, current_file) if ws_resolver is not None else None
-    for candidate in (
-        base,
-        Path(f"{base}.ts"),
-        Path(f"{base}.tsx"),
-        base / "index.ts",
-        base / "index.tsx",
-    ):
+    candidates = [base]
+    if base.suffix in (".js", ".mjs"):
+        for alt in (".ts", ".tsx", ".mts"):
+            candidates.append(base.with_suffix(alt))
+    candidates.extend(
+        (
+            Path(f"{base}.ts"),
+            Path(f"{base}.tsx"),
+            Path(f"{base}.js"),
+            Path(f"{base}.jsx"),
+            Path(f"{base}.mjs"),
+            base / "index.ts",
+            base / "index.tsx",
+            base / "index.js",
+            base / "index.jsx",
+            base / "index.mjs",
+        )
+    )
+    for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
     return ws_resolver.resolve_import(spec, current_file) if ws_resolver is not None else None
@@ -1414,7 +1707,7 @@ class TypeScriptNextJsAdapter:
         src_root = (fe_dir / "src").resolve() if (fe_dir / "src").is_dir() else fe_dir
         if not fe_dir.is_dir():
             return DisplayExtractionResult(nodes=[], edges=[], http_calls=[], findings=[])
-        _next_exts = (".ts", ".tsx", ".js", ".jsx")
+        _next_exts = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".html", ".htm")
         url_const_resolver = build_frontend_url_const_resolver(src_root, _next_exts)
         comp_resolver_for = build_a11y_component_resolver(src_root, _next_exts)
         ws_resolver = WorkspaceResolver.build(repo_root.resolve(), extra_roots=(fe_dir, src_root))
@@ -1436,7 +1729,7 @@ class TypeScriptNextJsAdapter:
         seen_resolved: set[Path] = set()
         for sroot in scan_roots:
             for fpath in sorted(sroot.rglob("*")):
-                if not fpath.is_file() or fpath.suffix not in (".ts", ".tsx"):
+                if not fpath.is_file() or fpath.suffix.lower() not in _next_exts:
                     continue
                 fe_parts = fpath.relative_to(fe_dir).parts if fpath.is_relative_to(fe_dir) else fpath.parts
                 if any(p in _SKIP_DIR_PARTS for p in fe_parts[:-1]):
@@ -1454,20 +1747,38 @@ class TypeScriptNextJsAdapter:
                     ".test." in fpath.name
                     or ".spec." in fpath.name
                     or ".stories." in fpath.name
-                    or fpath.name.endswith(".d.ts")
-                    or rel_src.endswith(("/route.ts", "types/api-generated.ts"))
+                    or fpath.name.endswith(
+                        (
+                            ".d.ts",
+                            ".config.ts",
+                            ".config.js",
+                            ".config.mjs",
+                            ".config.cjs",
+                        )
+                    )
+                    or rel_src.endswith(("/route.ts", "/route.js", "types/api-generated.ts"))
                     or rel_src.startswith("pages/api/")
-                    or rel_src in ("lib/api.ts", "app/layout.tsx")
+                    or rel_src in ("lib/api.ts", "app/layout.tsx", "app/layout.jsx", "app/layout.js")
                 ):
                     continue
                 try:
                     raw_txt = fpath.read_text(encoding="utf-8")
                 except (OSError, UnicodeError):
                     continue
-                clean_txt = _strip_ts_comments(raw_txt)
+                if fpath.suffix.lower() in (".html", ".htm"):
+                    chars = ["\n" if ch == "\n" else " " for ch in raw_txt]
+                    for sm in _NEXT_HTML_SCRIPT_RE.finditer(raw_txt):
+                        bs, be = sm.span("body")
+                        sc_clean = _strip_ts_comments(sm.group("body"))
+                        for ci, cch in enumerate(sc_clean):
+                            if bs + ci < be:
+                                chars[bs + ci] = cch
+                    clean_txt = "".join(chars)
+                else:
+                    clean_txt = _strip_ts_comments(raw_txt)
                 cleaned_texts[resolved] = clean_txt
                 raw_texts[resolved] = raw_txt
-                if fpath.name in ("index.ts", "index.tsx") and not rel_src.startswith("pages/"):
+                if fpath.name in ("index.ts", "index.tsx", "index.js", "index.jsx", "index.mjs") and not rel_src.startswith("pages/"):
                     targets: list[Path] = []
                     for rex in (_REEXPORT_STAR_RE, _REEXPORT_NAMED_RE):
                         for m in rex.finditer(clean_txt):
@@ -1501,26 +1812,38 @@ class TypeScriptNextJsAdapter:
             rel_repo = fpath.relative_to(repo_root.resolve()).as_posix()
             parts = Path(rel_src).parts
             head = parts[0] if parts else ""
-            stem_slug = rel_src.removesuffix(".tsx").removesuffix(".ts").replace("/", ".")
+            stem_low = fpath.stem.lower()
+            stem_slug = Path(rel_src).with_suffix("").as_posix().replace("/", ".")
+            is_client_stem = (
+                stem_low in ("api", "client", "http", "queries")
+                or fpath.stem.endswith(("Client", "Api", "Service"))
+                or stem_low.endswith(_NEXT_API_CLIENT_SUFFIXES)
+                or fpath.name.endswith(".gen.ts")
+            )
 
-            if head == "app" and fpath.name == "page.tsx":
+            if head == "app" and fpath.name in ("page.tsx", "page.jsx", "page.js"):
                 route_lbl = _nextjs_route_label(rel_src)
                 subkind, label, cluster, role = "page", route_lbl, "pages", "surface"
-            elif head == "pages" and fpath.suffix == ".tsx" and not fpath.name.startswith("_"):
-                sub_lbl = "/" + rel_src.removeprefix("pages/").removesuffix(".tsx").removesuffix("/index").removesuffix("index")
+            elif head == "pages" and fpath.suffix in (".tsx", ".jsx", ".js") and not fpath.name.startswith("_"):
+                sub_lbl = "/" + Path(rel_src.removeprefix("pages/")).with_suffix("").as_posix().removesuffix("/index").removesuffix("index")
                 subkind, label, cluster, role = "page", sub_lbl or "/", "pages", "surface"
-            elif head in ("hooks", "store", "stores") and "services" not in parts and fpath.stem != "api":
+            elif fpath.suffix.lower() in (".html", ".htm"):
+                sub_lbl = "/" if stem_low in ("index", "home") else f"/{stem_low}"
+                subkind, label, cluster, role = "page", sub_lbl, "pages", "surface"
+            elif head in ("hooks", "store", "stores") and "services" not in parts and not is_client_stem:
                 subkind, label, cluster, role = "hook", fpath.stem, "hooks", "surface"
-            elif head in ("api", "client", "clients", "services") or "services" in parts or fpath.stem in ("api", "client") or fpath.name.endswith(".gen.ts"):
+            elif head in ("api", "client", "clients", "services", "queries") or "services" in parts or is_client_stem:
                 subkind, label, cluster, role = "api_client", fpath.stem, "api_clients", "surface"
             elif head in ("components", "app"):
                 subkind, label, cluster, role = "component", fpath.stem, head, "surface"
             elif len(parts) >= 2:
-                # Feature folders, lib/, utils/, constants/ ...: same rules, named by role.
+                # Feature folders, lib/, core/, utils/, shared/, constants/ ...: same rules, named by role.
                 label = f"{fpath.parent.name}/{fpath.stem}" if fpath.stem in _GENERIC_STEMS else fpath.stem
                 is_hook = fpath.stem == "hooks" or bool(_HOOK_STEM_RE.match(fpath.stem))
                 subkind = "hook" if is_hook else "component"
                 cluster, role = head, "surface"
+            elif fpath.suffix.lower() == ".mjs":
+                subkind, label, cluster, role = "api_client", fpath.stem, "api_clients", "surface"
             else:
                 continue
 
@@ -1647,6 +1970,11 @@ class TypeScriptNextJsAdapter:
                 )
             node.http_methods = methods_seen
             node.http_paths = paths_seen[:25]
+            if len(paths_seen) > 25 and "total paths" not in node.summary:
+                node.summary = (
+                    f"{node.summary.rstrip('.')} "
+                    f"({len(paths_seen)} total paths; {len(paths_seen) - 25} omitted beyond 25-path cap)."
+                )
 
             # 3. DISP-003: API client bypassing OpenAPI-generated types
             if node.subkind == "api_client" and file_calls > 0 and not uses_generated_types:
@@ -1718,10 +2046,15 @@ class TypeScriptNextJsAdapter:
                             )
                         )
 
-            # 6. DISP-005: WCAG static accessibility markup checks on JSX/TSX modules
-            if fpath.suffix == ".tsx":
+            # 6. DISP-005: WCAG static accessibility markup checks on JSX/TSX/HTML & markup templates
+            a11y_src: str | None = None
+            if fpath.suffix.lower() in (".tsx", ".jsx", ".html", ".htm"):
+                a11y_src = raw_texts[fpath]
+            elif fpath.suffix.lower() in (".ts", ".js", ".mjs") and _NEXT_HTML_MARKUP_RE.search(txt):
+                a11y_src = txt
+            if a11y_src is not None:
                 a11y_hits = scan_a11y_markup_findings(
-                    raw_texts[fpath],
+                    a11y_src,
                     node.id,
                     rel_repo,
                     component_resolver=comp_resolver_for(fpath, raw_texts[fpath]),

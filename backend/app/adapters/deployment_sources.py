@@ -11,13 +11,29 @@ from app.adapters.service_sources import script_id
 from app.schemas.atlas import AtlasEdge
 
 
-def symbolic_path(node: ast.AST, names: dict[str, str]) -> str | None:
+def symbolic_path(
+    node: ast.AST,
+    names: dict[str, str],
+    owner: str | None = None,
+) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.Name):
+        if node.id == "__file__" and owner:
+            return owner
         return names.get(node.id)
+    if isinstance(node, ast.Attribute) and node.attr == "parent":
+        base = symbolic_path(node.value, names, owner)
+        if base is None or base in ("", ".", "/", "~"):
+            return None
+        p = PurePosixPath(base)
+        parent = str(p.parent)
+        if not parent or parent == base or ".." in PurePosixPath(parent).parts:
+            return None
+        return parent
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-        left, right = symbolic_path(node.left, names), symbolic_path(node.right, names)
+        left = symbolic_path(node.left, names, owner)
+        right = symbolic_path(node.right, names, owner)
         if left is not None and right is not None:
             return str(PurePosixPath(left) / right)
     if isinstance(node, ast.Call) and not node.keywords:
@@ -29,8 +45,16 @@ def symbolic_path(node: ast.AST, names: dict[str, str]) -> str | None:
             and not node.args
         ):
             return "~"  # symbolic only: never inspect the operator's home
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"resolve", "expanduser"}
+            and not node.args
+        ):
+            return symbolic_path(node.func.value, names, owner)
+        if isinstance(node.func, ast.Name) and node.func.id == "str" and len(node.args) == 1:
+            return symbolic_path(node.args[0], names, owner)
         if isinstance(node.func, ast.Name) and node.func.id in {"Path", "PurePosixPath"}:
-            values = [symbolic_path(arg, names) for arg in node.args]
+            values = [symbolic_path(arg, names, owner) for arg in node.args]
             if values and all(v is not None for v in values):
                 return str(PurePosixPath(*values))
     return None
@@ -71,12 +95,18 @@ def deployment_mappings(
         names: dict[str, str] = {}
         for statement in tree.body:
             if isinstance(statement, ast.Assign):
-                value = symbolic_path(statement.value, names)
+                value = symbolic_path(statement.value, names, owner)
                 for target in statement.targets:
                     if isinstance(target, ast.Name):
                         names.pop(target.id, None)
                         if value is not None:
                             names[target.id] = value
+            elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+                names.pop(statement.target.id, None)
+                if statement.value is not None:
+                    value = symbolic_path(statement.value, names, owner)
+                    if value is not None:
+                        names[statement.target.id] = value
             for node in ast.walk(statement):
                 if (
                     not isinstance(node, ast.Call)
@@ -87,8 +117,10 @@ def deployment_mappings(
                 kwargs = {k.arg: k.value for k in node.keywords}
                 src = node.args[0] if node.args else kwargs.get("repo_path")
                 dst = node.args[1] if len(node.args) > 1 else kwargs.get("live_path")
-                source = symbolic_path(src, names) if src is not None else None
-                dest = symbolic_path(dst, names) if dst is not None else None
+                source = symbolic_path(src, names, owner) if src is not None else None
+                dest = symbolic_path(dst, names, owner) if dst is not None else None
+                if source is not None and source.startswith("./"):
+                    source = source.removeprefix("./")
                 if (
                     source is None
                     or dest is None

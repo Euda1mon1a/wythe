@@ -26,6 +26,16 @@ from pydantic import Field
 
 from app.core.clock import utc_now
 from app.schemas.atlas import StrictSchema
+from app.services.understanding_discordance import (
+    FirstDivergencePoint,
+    PerturbationCaseResult,
+    RulePredictionComparison,
+    VerdictClause,
+    evaluate_first_divergence,
+    evaluate_perturbation_matrix,
+    evaluate_rule_prediction_comparisons,
+    evaluate_verdict_clauses,
+)
 
 _MAX_BUNDLE_BYTES = 8 * 1024 * 1024  # 8 MiB ceiling for companion JSON receipts
 _MAX_JSON_DEPTH = 64
@@ -453,6 +463,8 @@ class OutcomeLifecycleExplanation(StrictSchema):
     outcome_id: str
     subject_id: str
     producer_claimed_stage: str | None = None
+    producer_claimed_delivery_status: str | None = None
+    producer_claimed_terminal_state: str | None = None
     last_proven_stage: OutcomeStage
     current_stage: OutcomeStage
     settlement_state: Literal[
@@ -476,6 +488,8 @@ class OutcomeLifecycleExplanation(StrictSchema):
         "failed",
         "unknown",
     ] = "unknown"
+    positive_commit_established: bool = False
+    positive_delivery_established: bool = False
     blind_retry_prohibited: bool = False
     retry_guidance: str = ""
     predecessor_chain_verified: bool = False
@@ -620,6 +634,12 @@ class UnderstandingChainReport(StrictSchema):
     evaluated_at: str
     consequence_headline: str
     last_supported_cause: str
+    verdict_sentence: str = ""
+    verdict_markdown: str = ""
+    verdict_clauses: list[VerdictClause] = Field(default_factory=list)
+    first_divergence: FirstDivergencePoint | None = None
+    rule_prediction_comparisons: list[RulePredictionComparison] = Field(default_factory=list)
+    perturbation_matrix: list[PerturbationCaseResult] = Field(default_factory=list)
     overall_missing_joins: list[str] = Field(default_factory=list)
     links: list[UnderstandingChainLink] = Field(default_factory=list)
     effective_authority: list[EffectiveAuthorityExplanation] = Field(default_factory=list)
@@ -2347,14 +2367,47 @@ def explain_outcome_lifecycle(
     if proximity_rejected:
         missing_joins.append("explicit_request_or_predecessor_join")
 
+    contiguous_chain_ok = True
+    if len(transitions) >= 2:
+        for step_idx in range(1, len(transitions)):
+            prev_tr = transitions[step_idx - 1]
+            cur_tr = transitions[step_idx]
+            digest_linked = (
+                cur_tr.predecessor_state_digest is not None
+                and prev_tr.state_digest is not None
+                and cur_tr.predecessor_state_digest == prev_tr.state_digest
+            )
+            req_linked = (
+                cur_tr.request_or_attempt_id is not None
+                and prev_tr.request_or_attempt_id is not None
+                and cur_tr.request_or_attempt_id == prev_tr.request_or_attempt_id
+            )
+            if not (digest_linked or req_linked):
+                contiguous_chain_ok = False
+                missing_joins.append(f"unlinked_transition_step_{step_idx + 1}")
+
     has_pred_vectors = any(t.predecessor_state_digest or t.state_digest for t in transitions)
-    predecessor_verified = bool(has_pred_vectors and predecessor_ok and not proximity_rejected)
+    predecessor_verified = bool(
+        has_pred_vectors and predecessor_ok and contiguous_chain_ok and not proximity_rejected
+    )
 
     # Infer or normalize stage from explicit producer fields while enforcing lost-reply invariants
     raw_claimed_val = _pick(raw_item, "current_stage", "stage")
     producer_claimed_stage = (
         str(raw_claimed_val).strip()
         if raw_claimed_val is not None and str(raw_claimed_val).strip() != ""
+        else None
+    )
+    raw_claimed_deliv = _pick(raw_item, "delivery_status", "delivery")
+    producer_claimed_delivery = (
+        str(raw_claimed_deliv).strip()
+        if raw_claimed_deliv is not None and str(raw_claimed_deliv).strip() != ""
+        else None
+    )
+    raw_claimed_term = _pick(raw_item, "authoritative_terminal_state", "terminal_state", "final_state")
+    producer_claimed_terminal = (
+        str(raw_claimed_term).strip()
+        if raw_claimed_term is not None and str(raw_claimed_term).strip() != ""
         else None
     )
     explicit_stage = producer_claimed_stage or ""
@@ -2562,14 +2615,24 @@ def explain_outcome_lifecycle(
             "indeterminate_settlement_blind_retry_prohibited_until_authoritative_reconciliation"
         )
     elif current_stage == "authoritatively_settled":
-        settlement_state = (
-            "settled_aborted" if settled_terminal in _NEGATIVE_TERMINAL_STATES else "settled_committed"
-        )
-        if deliv_raw != "delivered":
+        if settled_terminal in _NEGATIVE_TERMINAL_STATES:
+            settlement_state = "settled_aborted"
+        elif settled_terminal in _POSITIVE_TERMINAL_STATES:
+            settlement_state = "settled_committed"
+        else:
+            settlement_state = "unknown"
+            uncertainty.append(
+                "Stage claimed 'authoritatively_settled' without a positive authoritative terminal state."
+            )
+            missing_joins.append("authoritative_terminal_settlement_state")
+        if settlement_state == "settled_committed" and deliv_raw != "delivered":
             uncertainty.append("Database state settled, but downstream timeline/workbook refresh is separate.")
             missing_joins.append("consumer_timeline_or_workbook_refresh_receipt")
     elif current_stage == "delivered_to_human" and settled_terminal in _POSITIVE_TERMINAL_STATES:
         settlement_state = "settled_committed"
+    elif current_stage == "rejected":
+        uncertainty.append("Outcome was explicitly rejected before state commitment.")
+        missing_joins.append("rejected_outcome_no_commit")
     elif current_stage == "granted_not_executed":
         uncertainty.append("Broker/capability grant was issued, which does not establish execution.")
         missing_joins.append("execution_invocation_receipt")
@@ -2611,6 +2674,90 @@ def explain_outcome_lifecycle(
         and not bool(_pick(raw_item, "content_equality_only", default=False))
         and not force_indeterminate_settlement
     )
+    has_explicit_deliv_receipt = any(
+        _is_nonempty_settlement_value(raw_item.get(dk))
+        for dk in (
+            "delivery_receipt",
+            "delivery_receipt_id",
+            "delivery_receipt_ref",
+            "client_delivery_receipt",
+        )
+    )
+    has_delivery_backing = bool(
+        has_explicit_deliv_receipt
+        or authorship
+        or (
+            predecessor_verified
+            and any(t.stage == "delivered_to_human" and t.state_digest is not None for t in transitions)
+        )
+        or (
+            tool_executed is True
+            and ans_ground == "grounded"
+            and _pick(raw_item, "evidence_producer", "producer") is not None
+        )
+    )
+    positive_delivery_established = bool(
+        current_stage == "delivered_to_human"
+        and deliv_status == "delivered"
+        and ans_ground in ("grounded", "not_applicable")
+        and has_delivery_backing
+        and not force_indeterminate_settlement
+        and not proximity_rejected
+        and contiguous_chain_ok
+    )
+    if current_stage == "delivered_to_human" and not positive_delivery_established:
+        uncertainty.append(
+            "Stage claimed 'delivered_to_human' without positive verified delivery evidence."
+        )
+        missing_joins.append("positive_human_delivery_receipt")
+
+    has_positive_exec_or_commit = bool(
+        settlement_state == "settled_committed"
+        or tool_executed is True
+        or (
+            len(transitions) == 1
+            and transitions[0].stage in ("executed", "authoritatively_settled")
+            and transitions[0].state_digest is not None
+        )
+        or (
+            len(transitions) >= 2
+            and predecessor_verified
+            and any(
+                t.stage in ("executed", "authoritatively_settled", "delivered_to_human")
+                for t in transitions
+            )
+        )
+    )
+    positive_commit_established = bool(
+        has_positive_exec_or_commit
+        and current_stage
+        in (
+            "executed",
+            "executed_missing_followup_grounding",
+            "supplied_answer_unrecorded",
+            "queued_not_rendered",
+            "authoritatively_settled",
+            "delivered_to_human",
+        )
+        and settlement_state
+        not in (
+            "uncommitted_candidate",
+            "indeterminate_requires_settlement",
+            "settled_aborted",
+            "unknown",
+        )
+        and not force_indeterminate_settlement
+        and not proximity_rejected
+        and contiguous_chain_ok
+    )
+    if (
+        not positive_commit_established
+        and settlement_state != "settled_aborted"
+        and current_stage not in ("rejected", "candidate_sealed", "granted_not_executed")
+        and not force_indeterminate_settlement
+    ):
+        missing_joins.append("positive_commit_or_execution_evidence")
+
     default_reason = f"Lifecycle reached '{current_stage}' (last proven: '{last_proven}')."
     if force_indeterminate_settlement:
         claimed_note = (
@@ -2673,11 +2820,15 @@ def explain_outcome_lifecycle(
         outcome_id=outcome_id,
         subject_id=subj_id,
         producer_claimed_stage=producer_claimed_stage,
+        producer_claimed_delivery_status=producer_claimed_delivery,
+        producer_claimed_terminal_state=producer_claimed_terminal,
         last_proven_stage=last_proven,
         current_stage=current_stage,
         settlement_state=settlement_state,
         answer_grounding=ans_ground,
         delivery_status=deliv_status,
+        positive_commit_established=positive_commit_established,
+        positive_delivery_established=positive_delivery_established,
         blind_retry_prohibited=blind_retry_prohibited,
         retry_guidance=retry_guidance,
         predecessor_chain_verified=predecessor_verified,
@@ -3320,12 +3471,15 @@ def _synthesize_six_links(
     else:
         if has_indeterminate_retry_ban:
             comm_state = "unresolved"
-        elif any(o.settlement_state == "settled_aborted" for o in outcomes):
+        elif any(
+            o.settlement_state == "settled_aborted" or o.current_stage == "rejected"
+            for o in outcomes
+        ):
             comm_state = "degraded_or_drifted"
-        elif any(o.current_stage in ("declared", "granted_not_executed", "candidate_sealed") for o in outcomes):
-            comm_state = "unverified"
-        else:
+        elif all(o.positive_commit_established for o in outcomes):
             comm_state = "supported"
+        else:
+            comm_state = "unverified"
         comm_sum = " ".join(
             f"{o.outcome_id}: stage='{o.current_stage}'"
             + (
@@ -3344,15 +3498,16 @@ def _synthesize_six_links(
         )
         if has_indeterminate_retry_ban:
             vis_state = "unresolved"
-        elif all(
-            o.current_stage == "delivered_to_human"
-            and o.answer_grounding in ("grounded", "not_applicable")
-            for o in outcomes
-        ):
+        elif all(o.positive_delivery_established for o in outcomes):
             vis_state = "supported"
         elif any(
             o.current_stage
-            in ("executed_missing_followup_grounding", "supplied_answer_unrecorded", "queued_not_rendered")
+            in (
+                "executed_missing_followup_grounding",
+                "supplied_answer_unrecorded",
+                "queued_not_rendered",
+                "delivered_to_human",
+            )
             for o in outcomes
         ):
             vis_state = "unverified"
@@ -3716,6 +3871,19 @@ def analyze_understanding_bundle(
                 )
             )
 
+    rule_pred_evals = evaluate_rule_prediction_comparisons(
+        list(_pick(raw_bundle, "rule_prediction_comparisons", "rule_comparisons", default=[]) or [])
+    )
+    first_div_eval = evaluate_first_divergence(
+        _pick(raw_bundle, "first_divergence", "participant_epistemics", default=None)
+    )
+    perturbation_evals = evaluate_perturbation_matrix(
+        list(_pick(raw_bundle, "perturbation_matrix", "perturbation_cases", default=[]) or [])
+    )
+    verdict_clauses, verdict_sentence, verdict_md, verdict_missing = evaluate_verdict_clauses(
+        list(_pick(raw_bundle, "verdict_clauses", default=[]) or [])
+    )
+
     intent_meta = _pick(raw_bundle, "intent", default={}) or {}
     links, headline, last_supported, overall_missing = _synthesize_six_links(
         question=question,
@@ -3728,6 +3896,15 @@ def analyze_understanding_bundle(
         doc_claims=doc_evals,
         corrections=corrections,
     )
+    extra_missing = [
+        *(m for rc in rule_pred_evals for m in rc.missing_joins),
+        *(first_div_eval.missing_joins if first_div_eval is not None else []),
+        *verdict_missing,
+    ]
+    for em in extra_missing:
+        if em not in overall_missing:
+            overall_missing.append(em)
+
     cov_statement = (
         f"Evaluated {len(authority_evals)} authority item(s), {len(prov_evals)} provenance record(s), "
         f"{len(out_evals)} outcome lifecycle(s), {len(pres_evals)} preservation contract(s), and "
@@ -3744,6 +3921,12 @@ def analyze_understanding_bundle(
         evaluated_at=eval_ts,
         consequence_headline=headline,
         last_supported_cause=last_supported,
+        verdict_sentence=verdict_sentence,
+        verdict_markdown=verdict_md,
+        verdict_clauses=verdict_clauses,
+        first_divergence=first_div_eval,
+        rule_prediction_comparisons=rule_pred_evals,
+        perturbation_matrix=perturbation_evals,
         overall_missing_joins=overall_missing,
         links=links,
         effective_authority=authority_evals,

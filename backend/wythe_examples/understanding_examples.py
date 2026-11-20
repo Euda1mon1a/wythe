@@ -85,6 +85,9 @@ def list_shipped_understanding_examples() -> list[UnderstandingExampleSummary]:
                 "tool_data_supplied_final_answer_unsupported",
                 "unchanged_code_changed_policy_config_model_settings",
                 "changed_source_stale_explanatory_note",
+                "rule_vs_prediction_vs_observed",
+                "participant_epistemics_and_hop_vs_caller",
+                "single_variable_perturbation_and_missing_receipt",
             ],
         ),
     ]
@@ -916,6 +919,167 @@ def _assistant_bundle_dict(stage: Literal["baseline", "candidate"]) -> dict[str,
                     "compose_subject, and rollup_node; header status is overly broad."
                 ),
             }
+        ],
+        "verdict_clauses": [
+            {
+                "clause_id": "koa-voice-recall",
+                "text": "Koa recalled the task by voice.",
+                "state": "supported",
+                "evidence_ref": "sdk:continuity-koa-voice-07",
+                "source_location": "backend/app/services/channel_router.py:11",
+            },
+            {
+                "clause_id": "app-updated-readback",
+                "text": "The app later read the updated value.",
+                "state": "supported",
+                "evidence_ref": "sdk:app-readback-07",
+                "source_location": "frontend/src/app/page.tsx:3",
+            },
+            {
+                "clause_id": "tendril-retrieval-refusal",
+                "text": "Tendril said it could not retrieve the task.",
+                "state": "supported",
+                "evidence_ref": "sdk:turn-reply-tendril-07",
+                "source_location": "backend/app/api/routes/gateway.py:6",
+            },
+            (
+                {
+                    "clause_id": "tendril-storage-authz",
+                    "text": "Its storage-access denial is supported by the SDK authorization receipt.",
+                    "state": "supported",
+                    "evidence_ref": "sdk:authz-deny-tendril-07",
+                    "source_location": "config/capabilities.json:14",
+                }
+                if is_cand
+                else {
+                    "clause_id": "tendril-storage-authz",
+                    "text": "Its storage-access decision is unverified because the authorization receipt is missing.",
+                    "state": "unverified",
+                    "missing_receipt": "sdk:authz-deny-tendril-07",
+                }
+            ),
+        ],
+        "first_divergence": {
+            "divergence_id": "voice-pickup-first-gap",
+            "stage_label": "Voice Handoff Context Assembly",
+            "summary": (
+                "Authorized task was present in storage, eligible for Koa, and included in the "
+                "verified Koa voice turn."
+                if is_cand
+                else "Task existed in storage and was eligible for Koa, but was omitted from the "
+                "handoff turn while only the Canopy ingress hop was observed."
+            ),
+            "expected_by_owner": "Koa picks up task-harmless-07 seamlessly when switching to voice.",
+            "actual_observed": (
+                "Koa received task-harmless-07 in turn context with verified caller receipt."
+                if is_cand
+                else "Turn context omitted task-harmless-07; ingress capture observed Canopy hop without caller identity."
+            ),
+            "actor": "Koa" if is_cand else "unattributed_caller_at_Canopy",
+            "channel": "owner_voice",
+            "observed_at": "2026-11-16T12:08:00Z",
+            "exists_in_storage": "present",
+            "storage_source_ref": "storage:tasks_db#task-harmless-07",
+            "eligible_for_actor": "present",
+            "eligibility_source_ref": "config/capabilities.json#koa_owner_scope",
+            "present_in_turn": "present" if is_cand else "absent",
+            "turn_context_source_ref": "trace:turn-pickup-403#context_packet",
+            "evidence_reaching_turn": (
+                ["system_prompt_static", "memory_context_packet", "task-harmless-07"]
+                if is_cand
+                else ["system_prompt_static", "turn_utterance_ref"]
+            ),
+            "observed_hop": "Canopy",
+            "hop_evidence_ref": "wiretap:canopy-ingress-hop-403",
+            "attributed_caller": "Koa" if is_cand else None,
+            "caller_receipt_ref": "sdk:caller-koa-403" if is_cand else None,
+            "unattributed_candidate_callers": [] if is_cand else ["Koa", "Tendril"],
+        },
+        "rule_prediction_comparisons": [
+            {
+                "comparison_id": "facetime-60m-limit",
+                "subject_id": "voice_session_budget",
+                "requires_device_delivery_receipt": True,
+                "owner_rule": {
+                    "rule_id": "RULE-FACETIME-60M",
+                    "label": "FaceTime 60-minute limit",
+                    "statement": "Voice/FaceTime sessions apply a 60-minute call limit with phone notification.",
+                    "source_ref": "docs/policies/voice-session-limits.md:18",
+                    "authority_ref": "DECISION-VOICE-60M",
+                },
+                "implementation_predictions": [
+                    {
+                        "prediction_id": "pred-hard-hangup",
+                        "reading_label": "Reading A: Hard 60-minute cutoff",
+                        "predicted_before_boundary": "Normal call under 60 minutes (identical to Reading B).",
+                        "predicted_at_boundary": "Terminate FaceTime call immediately at t=60m.",
+                        "source_ref": "backend/app/services/voice_timer_legacy.py:44",
+                        "match_state": "refuted_by_observation",
+                    },
+                    {
+                        "prediction_id": "pred-soft-advisory",
+                        "reading_label": "Reading B: Soft 60-minute advisory timer",
+                        "predicted_before_boundary": "Normal call under 60 minutes (identical to Reading A).",
+                        "predicted_at_boundary": "Emit 60m notice and allow conversation to continue.",
+                        "source_ref": "backend/app/services/channel_router.py:11",
+                        "match_state": "consistent_with_observation",
+                    },
+                ],
+                "observed_result": {
+                    "observation_id": "obs-facetime-expiry-61m",
+                    "summary": "At t=61m expiry, FaceTime session remained active and continued conversation.",
+                    "observed_at": "2026-11-16T13:01:00Z",
+                    "source_ref": "receipt:facetime-session-061@t=61m",
+                    "delivery_verified": is_cand,
+                    "delivery_receipt_ref": "receipt:phone-apns-push-061" if is_cand else None,
+                },
+                "discriminating_observation": (
+                    "Continued bidirectional voice frames at t=61m distinguished the two readings, "
+                    "refuting Reading A (hang-up) and matching Reading B (continued conversation)."
+                ),
+                "open_questions": (
+                    []
+                    if is_cand
+                    else [
+                        "Whether the 60-minute expiry notification reached the phone remains open (no positive APNs/device delivery receipt; #104)."
+                    ]
+                ),
+            }
+        ],
+        "perturbation_matrix": [
+            {
+                "case_id": "switch-text-to-voice-koa",
+                "label": "Switch channel text -> voice (Koa)",
+                "varied_factor": "channel: owner_text -> owner_voice",
+                "held_fixed": ["task:task-harmless-07", "host:Canopy", "model:local-instruct-8b", "agent:Koa"],
+                "expected_outcome": "Koa recovers task-harmless-07 by voice without restatement.",
+                "observed_outcome": "Koa recovered task-harmless-07 on owner_voice.",
+                "decisive_receipt_ref": "sdk:continuity-koa-voice-07",
+                "passed": True,
+            },
+            {
+                "case_id": "switch-koa-to-unauthorized-tendril",
+                "label": "Switch agent Koa -> Tendril (same host & model)",
+                "varied_factor": "agent: Koa -> Tendril (unauthorized)",
+                "held_fixed": ["task:task-harmless-07", "host:Canopy", "model:local-instruct-8b"],
+                "expected_outcome": "Task stays private; Tendril is denied access.",
+                "observed_outcome": "Tendril could not retrieve task-harmless-07.",
+                "decisive_receipt_ref": "sdk:authz-deny-tendril-07",
+                "passed": True,
+            },
+            {
+                "case_id": "remove-decisive-authz-receipt",
+                "label": "Remove decisive authorization receipt",
+                "varied_factor": "receipt: remove sdk:authz-deny-tendril-07",
+                "held_fixed": ["task:task-harmless-07", "host:Canopy", "model:local-instruct-8b", "agent:Tendril"],
+                "expected_outcome": "Wythe marks Tendril storage-access decision unverified and names missing receipt.",
+                "observed_outcome": "Storage-access decision flagged unverified due to missing sdk:authz-deny-tendril-07.",
+                "receipt_present": False,
+                "missing_receipt_id": "sdk:authz-deny-tendril-07",
+                "unverified_conclusion": "Tendril storage-access decision is unverified because sdk:authz-deny-tendril-07 is missing.",
+                "expects_unverified_on_missing_receipt": True,
+                "passed": True,
+            },
         ],
     }
 

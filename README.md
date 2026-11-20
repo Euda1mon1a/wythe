@@ -17,7 +17,7 @@ Wythe supports **38 stack profiles** via `--profile auto` (**1 production-dogfoo
 
 > [!IMPORTANT]
 > **Status, Maturity & Zero-Maintenance Notice (`"AS IS"`)**
-> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.2.7` or `wythe==0.2.7`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
+> - **No Maintenance Promises:** Wythe is released free under the MIT License strictly **"AS IS"** as an open-source give-back from internal engineering work. The author makes **zero promises of ongoing maintenance, bug fixes, feature requests, support, SLAs, or issue/PR turnaround**. Pin exact tags or commit SHAs in CI (e.g., `Euda1mon1a/wythe@v0.2.8` or `wythe==0.2.8`) and fork freely. See [`SUPPORT.md`](SUPPORT.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request.
 > - **Tier-1 vs. Experimental Adapters:** Only **`fastapi-sqlalchemy-nextjs`** (`postgres-sqlalchemy` + `python-fastapi` + `typescript-nextjs`) is marked **`implemented`** (production-hardened & self-dogfooded). The other **36 experimental profiles** (`nextjs-prisma`, `node-kysely-react`, `node-sql-tools-sveltekit`, `django-nextjs`, `postgres-drizzle-nextjs`, `postgres-go-react`, `rust-fullstack-wasm`, partial-coverage profiles, etc.) are marked **`experimental`**—prefer `wythe diff` or `.wythe/governance.json` ratchets before enabling `--strict`.
 
 ---
@@ -61,7 +61,7 @@ Pin an explicit release tag (do not track unpinned branches if you want zero-sur
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0
-- uses: Euda1mon1a/wythe@v0.2.7
+- uses: Euda1mon1a/wythe@v0.2.8
   with:
     mode: diff
     base-ref: origin/main
@@ -317,6 +317,10 @@ binary strata (`0` target-binary/`ldd` or build-tool execution;
   port occupancy verifier (`PORT-001`, `PORT-002`; `--otel-traces`,
   `--ebpf-flows`, `--memgraph`, `--vmmap`, `--port-listeners`, and
   opt-in `--probe-local-ports`).
+- `wythe-plugin-agent-discordance` (`#117`): Cross-channel agent
+  continuity, cross-agent isolation, hop-only vs caller-verified
+  attribution, and missing SDK authorization receipt checks
+  (`DISC-001`, `DISC-002`, MCP `wythe_agent_discordance`).
 - `wythe-plugin-agent-harness`, `wythe-plugin-cpsat`, &
   `wythe-plugin-solver-chronicle`: Agent prompt/tool hygiene
   (`AGENT-001..003`), domain CP-SAT lineage, and 6-phase chronicles.
@@ -327,11 +331,11 @@ binary strata (`0` target-binary/`ldd` or build-tool execution;
 
 The [Open WebUI source audit](docs/audits/open-webui.md) records the 0.1.7 repairs, measured coverage and remaining gaps. Its FastAPI/Svelte profile remains experimental.
 
-Every stack family has been scanned against synthetic regression suites and pinned open-source repositories (`wythe[treesitter]==0.2.7`):
+Every stack family has been scanned against synthetic regression suites and pinned open-source repositories (`wythe[treesitter]==0.2.8`):
 
 | Repository | Profile (`--profile auto`) | Maturity | Tier 1 (Truth) | Tier 2 (Manipulate) | Tier 3 (Display) | Verified Edges / E2E Chains | Notes & Observed Boundaries |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`Euda1mon1a/wythe`** (`v0.2.7`) | `fastapi-sqlalchemy-nextjs` | **Implemented** | 7 tables, 1 SQL fn | 9 routes, 71 services | 1 page, 27 hooks/clients | **346 / 31** | Self-dogfooded (`PASS --strict`, 0 blocking, 0 warnings) |
+| **`Euda1mon1a/wythe`** (`v0.2.8`) | `fastapi-sqlalchemy-nextjs` | **Implemented** | 7 tables, 1 SQL fn | 9 routes, 72 services | 1 page, 27 hooks/clients | **346 / 31** | Self-dogfooded (`PASS --strict`, 0 blocking, 0 warnings) |
 | **`fastapi/full-stack-fastapi-template`** (`aabb90126964`) | `fastapi-react-spa` | Experimental | 2 tables | 6 routes, 7 services | 10 pages, 58 hooks/clients | **229 / 39** | SQLModel + nested Alembic + Hey API OpenAPI SDK (`0` `DISP-004`/`007`) |
 | **`makeplane/plane`** (`9cefae892c4c`) | `django-nextjs` | Experimental | 112 tables, 34 Redis | 109 routes, 238 services | 58 pages, 1,590 UI nodes | **5,095 / 300** | Imported Django URL packages & CBVs; Next.js `pages`+`app` (`300` report cap) |
 | **`docmost/docmost`** (`3a3e812f25e8`) | `node-kysely-react` | Experimental | 49 tables, 16 fn, 14 Redis/BullMQ | 70 routes, 486 services | 26 pages, 817 UI nodes | **3,854 / 300** | Kysely `CamelCasePlugin` replay + NestJS BullMQ `@Processor`/`@InjectQueue` |

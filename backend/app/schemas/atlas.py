@@ -542,6 +542,11 @@ class LlmBriefRead(StrictSchema):
     source_commit: str
     approx_tokens: int
     markdown: str
+    observed_at: datetime | None = None
+    valid_until: datetime | None = None
+    observation_source: str = ""
+    coverage_complete: bool = True
+    unobserved_tiers: list[TierKind] = Field(default_factory=list)
 
 
 class LlmNodePointer(StrictSchema):
@@ -553,6 +558,7 @@ class LlmNodePointer(StrictSchema):
     status: NodeStatus
     columns: list[str] = Field(default_factory=list)
     http_paths: list[str] = Field(default_factory=list)
+    omitted_http_path_count: int = 0
 
 
 class ConeEdgeSummary(StrictSchema):
@@ -664,6 +670,11 @@ class LlmContextConeReport(StrictSchema):
     completeness: ConeCompleteness | None = None
     approx_tokens: int = 0
     markdown: str = ""
+    observed_at: datetime | None = None
+    valid_until: datetime | None = None
+    observation_source: str = ""
+    coverage_complete: bool = True
+    unobserved_tiers: list[TierKind] = Field(default_factory=list)
 
 
 LineageConeSlice = LlmContextConeReport

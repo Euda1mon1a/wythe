@@ -630,11 +630,28 @@ def _execute_inprocess_mcp_tool_call(
     fn_name: str,
     raw_arguments: Any,
     tool_schemas_by_name: dict[str, dict[str, Any]],
+    all_known_tool_names: frozenset[str] = frozenset(),
     target_slug: str | None,
     session_id: str | None,
     executed_tools_out: list[str] | None,
+    failed_tools_out: list[tuple[str, str]] | None = None,
     hinted_refs_out: list[str] | None,
 ) -> tuple[str, str]:
+    err_tool_label = fn_name or "unknown"
+
+    def _reject_call(serialized_args: str, error_text: str) -> tuple[str, str]:
+        if failed_tools_out is not None:
+            failed_tools_out.append((err_tool_label, error_text))
+        err_payload = json.dumps(
+            {
+                "ok": False,
+                "isError": True,
+                "tool": err_tool_label,
+                "error": error_text,
+            }
+        )
+        return serialized_args, _cap_tool_output(err_payload)
+
     if raw_arguments is None or (isinstance(raw_arguments, str) and not raw_arguments.strip()):
         args_dict: dict[str, Any] = {}
     elif isinstance(raw_arguments, dict):
@@ -643,59 +660,84 @@ def _execute_inprocess_mcp_tool_call(
         try:
             loaded = json.loads(raw_arguments)
         except ValueError as exc:
-            err_json = json.dumps(
-                {
-                    "ok": False,
-                    "isError": True,
-                    "tool": fn_name or "unknown",
-                    "error": f"Malformed JSON arguments: {exc}",
-                }
-            )
-            return "{}", _cap_tool_output(err_json)
+            return _reject_call("{}", f"Malformed JSON arguments: {exc}")
         if not isinstance(loaded, dict):
-            err_json = json.dumps(
-                {
-                    "ok": False,
-                    "isError": True,
-                    "tool": fn_name or "unknown",
-                    "error": "Tool arguments must be a JSON object.",
-                }
-            )
-            return "{}", _cap_tool_output(err_json)
+            return _reject_call("{}", "Tool arguments must be a JSON object.")
         args_dict = dict(loaded)
     else:
-        err_json = json.dumps(
-            {
-                "ok": False,
-                "isError": True,
-                "tool": fn_name or "unknown",
-                "error": "Tool arguments must be a JSON object string.",
-            }
-        )
-        return "{}", _cap_tool_output(err_json)
+        return _reject_call("{}", "Tool arguments must be a JSON object string.")
 
     canonical_fn = (
         fn_name.replace("atlas_", "wythe_", 1) if fn_name.startswith("atlas_") else fn_name
     )
     spec = tool_schemas_by_name.get(fn_name) or tool_schemas_by_name.get(canonical_fn)
     if not fn_name or spec is None:
-        err_json = json.dumps(
-            {
-                "ok": False,
-                "isError": True,
-                "tool": fn_name or "unknown",
-                "error": f"Unknown Wythe MCP tool `{fn_name}`. Available tools: {list(_ask_mcp_tool_names)}.",
-            }
+        offered_list = list(tool_schemas_by_name.keys())
+        if fn_name in all_known_tool_names or canonical_fn in all_known_tool_names:
+            return _reject_call(
+                json.dumps(args_dict),
+                f"Unoffered Wythe MCP tool `{fn_name}` is not enabled for this Ask round. "
+                f"Offered tools: {offered_list}.",
+            )
+        return _reject_call(
+            json.dumps(args_dict),
+            f"Unknown Wythe MCP tool `{fn_name}`. Available tools: {offered_list}.",
         )
-        return json.dumps(args_dict), _cap_tool_output(err_json)
 
     props = (spec.get("inputSchema") or {}).get("properties") or {}
-    if "target" in props and target_slug and not str(args_dict.get("target") or "").strip():
-        args_dict["target"] = target_slug
-    if canonical_fn in _session_scoped_mcp_tools and session_id:
-        raw_sid = str(args_dict.get("session_id") or "").strip()
-        if not raw_sid or raw_sid == "default":
-            args_dict["session_id"] = session_id
+    bound_target = (target_slug or "").strip() or None
+    bound_sid = (session_id or "").strip() or None
+
+    if bound_target is not None:
+        for t_key in ("target", "target_slug"):
+            if t_key not in args_dict or args_dict[t_key] is None:
+                continue
+            raw_t_val = args_dict[t_key]
+            if not isinstance(raw_t_val, str):
+                return _reject_call(
+                    json.dumps(args_dict),
+                    f"Target scope violation: `{t_key}` must match active target `{bound_target}`.",
+                )
+            explicit_t = raw_t_val.strip()
+            if explicit_t and explicit_t != bound_target:
+                return _reject_call(
+                    json.dumps(args_dict),
+                    f"Target scope violation: `{t_key}={explicit_t}` does not match active Ask target `{bound_target}`.",
+                )
+        if "target_slug" in args_dict and "target_slug" not in props:
+            args_dict.pop("target_slug", None)
+        if "target" in props:
+            args_dict["target"] = bound_target
+        if "target_slug" in props:
+            args_dict["target_slug"] = bound_target
+
+    for s_key in ("session_id", "refresh_session_id"):
+        if s_key not in args_dict or args_dict[s_key] is None:
+            continue
+        raw_s_val = args_dict[s_key]
+        if not isinstance(raw_s_val, str):
+            return _reject_call(
+                json.dumps(args_dict),
+                f"Session scope violation: `{s_key}` must be a string matching active session.",
+            )
+        raw_sid = raw_s_val.strip()
+        if raw_sid and raw_sid != "default":
+            if bound_sid is not None and raw_sid != bound_sid:
+                return _reject_call(
+                    json.dumps(args_dict),
+                    f"Session scope violation: `{s_key}={raw_sid}` does not match active Ask session `{bound_sid}`.",
+                )
+            if bound_target is not None:
+                existing_inv = get_investigation_session(raw_sid)
+                if existing_inv is not None and existing_inv.target_slug != bound_target:
+                    return _reject_call(
+                        json.dumps(args_dict),
+                        f"Session scope violation: session `{raw_sid}` belongs to target "
+                        f"`{existing_inv.target_slug}`, not `{bound_target}`.",
+                    )
+
+    if canonical_fn in _session_scoped_mcp_tools and bound_sid is not None:
+        args_dict["session_id"] = bound_sid
 
     rpc_msg = {
         "jsonrpc": "2.0",
@@ -719,15 +761,20 @@ def _execute_inprocess_mcp_tool_call(
         if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
     ).strip()
     if rpc_err:
-        err_msg = rpc_err.get("message") if isinstance(rpc_err, dict) else str(rpc_err)
+        err_msg = str(rpc_err.get("message") if isinstance(rpc_err, dict) else rpc_err)
+        if failed_tools_out is not None:
+            failed_tools_out.append((err_tool_label, err_msg))
         out_str = json.dumps({"ok": False, "isError": True, "tool": canonical_fn, "error": err_msg})
     elif res_obj.get("isError"):
+        err_msg = joined_text or "MCP tool returned an error."
+        if failed_tools_out is not None:
+            failed_tools_out.append((err_tool_label, err_msg))
         out_str = json.dumps(
             {
                 "ok": False,
                 "isError": True,
                 "tool": canonical_fn,
-                "error": joined_text or "MCP tool returned an error.",
+                "error": err_msg,
             }
         )
     else:
@@ -867,7 +914,33 @@ def _run_local_chat_completion(
         if openai_tools is not None
         else (build_ask_openai_tools() if db_session is not None else None)
     )
-    tool_schemas_by_name = {str(spec["name"]): spec for spec in MCP_TOOLS if spec.get("name")}
+    all_mcp_schemas_by_name = {str(spec["name"]): spec for spec in MCP_TOOLS if spec.get("name")}
+    all_known_mcp_names = frozenset(all_mcp_schemas_by_name.keys())
+
+    def _schemas_for_offered_tools(
+        offered: list[dict[str, Any]] | None,
+    ) -> dict[str, dict[str, Any]]:
+        allowed: dict[str, dict[str, Any]] = {}
+        for item in offered or ():
+            if not isinstance(item, dict):
+                continue
+            fn_def = item.get("function")
+            offered_name = str(
+                fn_def.get("name") if isinstance(fn_def, dict) else item.get("name") or ""
+            ).strip()
+            if not offered_name:
+                continue
+            canon_offered = (
+                offered_name.replace("atlas_", "wythe_", 1)
+                if offered_name.startswith("atlas_")
+                else offered_name
+            )
+            matched_spec = all_mcp_schemas_by_name.get(offered_name) or all_mcp_schemas_by_name.get(
+                canon_offered
+            )
+            if matched_spec is not None:
+                allowed[offered_name] = matched_spec
+        return allowed
 
     def _post_chat_message(
         req_messages: list[dict[str, Any]],
@@ -954,12 +1027,14 @@ def _run_local_chat_completion(
             ) from exc
 
     seen_executed: list[str] = executed_tools_out if executed_tools_out is not None else []
+    failed_tools: list[tuple[str, str]] = []
     ran_any_tools = False
     enforcement_retried = False
     effective_max_rounds = max(1, max_rounds)
     round_idx = 0
     while round_idx < effective_max_rounds:
         msg, active_tools = _send_round(round_idx, active_tools)
+        round_tool_schemas = _schemas_for_offered_tools(active_tools)
         raw_calls = msg.get("tool_calls")
         valid_calls = (
             [tc for tc in raw_calls[:max_calls_per_round] if isinstance(tc, dict)]
@@ -990,6 +1065,7 @@ def _run_local_chat_completion(
                     _apply_viewport_truth_guardrail(text, seen_executed),
                     used_vision,
                     tool_fallback_note,
+                    "model",
                 )
             if ran_any_tools:
                 break
@@ -1013,10 +1089,12 @@ def _run_local_chat_completion(
                 tc_id=tc_id,
                 fn_name=fn_name,
                 raw_arguments=fn_obj.get("arguments"),
-                tool_schemas_by_name=tool_schemas_by_name,
+                tool_schemas_by_name=round_tool_schemas,
+                all_known_tool_names=all_known_mcp_names,
                 target_slug=target_slug,
                 session_id=session_id,
                 executed_tools_out=seen_executed,
+                failed_tools_out=failed_tools,
                 hinted_refs_out=hinted_refs_out,
             )
             sanitized_calls.append(
@@ -1051,12 +1129,37 @@ def _run_local_chat_completion(
             _apply_viewport_truth_guardrail(synth_text, seen_executed),
             used_vision,
             tool_fallback_note,
+            "model",
         )
-    if seen_executed:
+    if seen_executed or failed_tools:
+        notice_lines = [
+            (
+                f"> **System / Tool Status Notice (non-model fallback):** Local model `{model_id}` "
+                "returned empty synthesis after MCP tool dispatch; your question remains unanswered by the model."
+            ),
+        ]
+        if seen_executed:
+            succeeded_fmt = ", ".join(f"`{t}`" for t in seen_executed)
+            notice_lines.append(f"- **Succeeded MCP tool call(s):** {succeeded_fmt}")
+        if failed_tools:
+            failed_fmt = "; ".join(
+                f"`{t_name}` (`isError=true`: {t_err[:160]})" for t_name, t_err in failed_tools
+            )
+            notice_lines.append(f"- **Failed / rejected MCP tool call(s):** {failed_fmt}")
+        empty_synth_reason = (
+            f"Local model `{model_id}` returned empty synthesis after MCP tool dispatch; "
+            "emitted system tool-execution status notice (question remains unanswered by model)."
+        )
+        eff_tool_fb = (
+            f"{tool_fallback_note} {empty_synth_reason}".strip()
+            if tool_fallback_note
+            else empty_synth_reason
+        )
         return (
-            f"Executed Wythe MCP tool(s): {', '.join(f'`{t}`' for t in seen_executed)}.",
+            "\n".join(notice_lines),
             used_vision,
-            tool_fallback_note,
+            eff_tool_fb,
+            "scanner_brief",
         )
     raise RuntimeError(f"Local model `{model_id}` returned an empty completion.")
 
@@ -1143,7 +1246,11 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         inv_hist = get_investigation_session(eff_sid)
         if inv_hist is not None:
             for prior_t in inv_hist.turns[-6:]:
-                if prior_t.status == "answered" and prior_t.answer_markdown:
+                if (
+                    prior_t.status == "answered"
+                    and prior_t.authored_by == "model"
+                    and prior_t.answer_markdown
+                ):
                     eff_history.append(AskChatTurn(role="user", content=prior_t.question[:2000]))
                     eff_history.append(
                         AskChatTurn(role="assistant", content=prior_t.answer_markdown[:4000])
@@ -1194,6 +1301,7 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         else payload.engine
     )
     answer_md = ""
+    authored_by_source: Literal["model", "scanner_brief"] = "model"
     engine_used: str = "local"
     model_used = ""
     used_vision = False
@@ -1270,6 +1378,8 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                         apple_prompt,
                     )
                 engine_used = "apple"
+                authored_by_source = "model"
+                executed_tools = []
                 model_used = "apple-foundation-models-on-device"
                 used_vision = False
                 if prior_fail_note:
@@ -1295,6 +1405,8 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                     continue
                 break
             try:
+                local_executed: list[str] = []
+                local_refs: list[str] = []
                 chat_res = _run_local_chat_completion(
                     local_status.base_url,
                     local_status.model_id,
@@ -1309,14 +1421,20 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                     db_session=session,
                     target_slug=target.slug if target is not None else focus.active_slug,
                     session_id=eff_sid,
-                    executed_tools_out=executed_tools,
-                    hinted_refs_out=hinted_refs,
+                    executed_tools_out=local_executed,
+                    hinted_refs_out=local_refs,
                 )
-                if len(chat_res) == 3:
-                    answer_md, used_vision, tool_fallback_note = chat_res
+                if len(chat_res) == 4:
+                    answer_md, used_vision, tool_fallback_note, authored_by_source = chat_res
+                elif len(chat_res) == 3:
+                    answer_md, used_vision, tool_fallback_note = chat_res  # type: ignore[misc]
+                    authored_by_source = "model"
                 else:
                     answer_md, used_vision = chat_res  # type: ignore[misc]
                     tool_fallback_note = None
+                    authored_by_source = "model"
+                executed_tools = local_executed
+                hinted_refs = local_refs
                 engine_used = "local"
                 if (
                     local_status.model_id == "default_model"
@@ -1385,6 +1503,16 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
         ):
             matched_node_ids.append(vref.ref_id)
 
+    eff_authored_by: Literal["model", "scanner_brief"] = (
+        "scanner_brief" if authored_by_source != "model" else "model"
+    )
+    if eff_authored_by != "model" and not fallback_reason:
+        fallback_reason = (
+            f"Local model `{model_used or 'local'}` returned empty synthesis after MCP tool dispatch; "
+            "emitted system tool-execution status notice (question remains unanswered by model)."
+        )
+    eff_fallback_reason = fallback_reason[:480] if fallback_reason else None
+
     recorded_tid: str | None = None
     if eff_sid is not None:
         saved_turn = record_investigation_turn(
@@ -1399,8 +1527,8 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
                 model_id=model_used,
                 used_vision=used_vision,
                 image_supplied=has_multimodal_image,
-                authored_by="model",
-                fallback_reason=fallback_reason,
+                authored_by=eff_authored_by,
+                fallback_reason=eff_fallback_reason,
                 selected_node_id=cone_seed_id,
                 selected_edge_id=payload.selected_edge_id or focus.selected_edge_id,
                 selected_finding_id=payload.selected_finding_id or focus.selected_finding_id,
@@ -1414,12 +1542,12 @@ def ask_wythe_with_live_context(session: Session, payload: AskWytheRequest) -> A
     return AskWytheResponse(
         session_id=eff_sid,
         turn_id=recorded_tid,
-        authored_by="model",
+        authored_by=eff_authored_by,
         engine_used=engine_used,  # type: ignore[arg-type]
         model_id=model_used,
         used_vision_snapshot=used_vision,
         image_supplied=has_multimodal_image,
-        fallback_reason=fallback_reason,
+        fallback_reason=eff_fallback_reason,
         context_headline=focus.headline,
         answer_markdown=answer_md,
         executed_tools=executed_tools,

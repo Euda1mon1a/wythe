@@ -318,23 +318,136 @@ class _ImportResolver:
         return hits
 
 
+def _is_dyn_import_call(call: ast.Call) -> bool:
+    fn = call.func
+    if isinstance(fn, ast.Name):
+        return fn.id in {"import_module", "__import__", "spec_from_file_location"}
+    if isinstance(fn, ast.Attribute):
+        return fn.attr in {"import_module", "__import__", "spec_from_file_location"}
+    return False
+
+
+def _verified_lazy_getattr_dicts(
+    tree: ast.Module,
+    skip: set[int],
+) -> dict[str, ast.Dict]:
+    """Return module-level string dicts that `__getattr__` actually indexes and dynamically imports."""
+    top_dicts: dict[str, ast.Dict] = {}
+    getattr_fns: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    helper_dyn_params: dict[str, set[int]] = {}
+
+    for stmt in tree.body:
+        if id(stmt) in skip:
+            continue
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Dict):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name):
+                    top_dicts[t.id] = stmt.value
+        elif (
+            isinstance(stmt, ast.AnnAssign)
+            and isinstance(stmt.target, ast.Name)
+            and isinstance(stmt.value, ast.Dict)
+        ):
+            top_dicts[stmt.target.id] = stmt.value
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if stmt.name == "__getattr__":
+                getattr_fns.append(stmt)
+            else:
+                pnames = [a.arg for a in (*stmt.args.posonlyargs, *stmt.args.args)]
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.Call) and _is_dyn_import_call(sub) and sub.args:
+                        arg_names = {
+                            n.id for n in ast.walk(sub.args[0]) if isinstance(n, ast.Name)
+                        }
+                        for idx, pn in enumerate(pnames):
+                            if pn in arg_names:
+                                helper_dyn_params.setdefault(stmt.name, set()).add(idx)
+
+    if not top_dicts or not getattr_fns:
+        return {}
+
+    verified: set[str] = set()
+    for gfn in getattr_fns:
+        var_taint: dict[str, set[str]] = {}
+
+        def _taint(expr: ast.AST | None, _vt: dict[str, set[str]] = var_taint) -> set[str]:
+            if expr is None or id(expr) in skip:
+                return set()
+            found_t: set[str] = set()
+            for sub in ast.walk(expr):
+                if id(sub) in skip:
+                    continue
+                if (
+                    isinstance(sub, ast.Subscript)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id in top_dicts
+                ):
+                    found_t.add(sub.value.id)
+                elif (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "get"
+                    and isinstance(sub.func.value, ast.Name)
+                    and sub.func.value.id in top_dicts
+                ):
+                    found_t.add(sub.func.value.id)
+                elif isinstance(sub, ast.Name) and sub.id in _vt:
+                    found_t.update(_vt[sub.id])
+            return found_t
+
+        for _ in range(2):
+            for node in ast.walk(gfn):
+                if id(node) in skip:
+                    continue
+                if isinstance(node, ast.Assign):
+                    rhs_t = _taint(node.value)
+                    if rhs_t:
+                        for tgt in node.targets:
+                            for nm in ast.walk(tgt):
+                                if isinstance(nm, ast.Name):
+                                    var_taint.setdefault(nm.id, set()).update(rhs_t)
+                elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                    rhs_t = _taint(node.value)
+                    if rhs_t:
+                        for nm in ast.walk(node.target):
+                            if isinstance(nm, ast.Name):
+                                var_taint.setdefault(nm.id, set()).update(rhs_t)
+                elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+                    rhs_t = _taint(node.value)
+                    if rhs_t:
+                        var_taint.setdefault(node.target.id, set()).update(rhs_t)
+
+        for node in ast.walk(gfn):
+            if id(node) in skip or not isinstance(node, ast.Call) or not node.args:
+                continue
+            if _is_dyn_import_call(node):
+                verified.update(_taint(node.args[0]))
+            elif isinstance(node.func, ast.Name) and node.func.id in helper_dyn_params:
+                for pidx in helper_dyn_params[node.func.id]:
+                    if pidx < len(node.args):
+                        verified.update(_taint(node.args[pidx]))
+
+    return {k: top_dicts[k] for k in verified}
+
+
 def _collect_runtime_import_sites(
     source: str,
     module_name: str,
     rel_repo: str,
     package_name: str,
-) -> list[tuple[str, str, int]]:
-    """Return `(target_module, importer_rel_path, lineno)` for runtime imports and PEP 562 exports."""
+) -> list[tuple[str, str, int, str]]:
+    """Return `(target_module, importer_rel_path, lineno, import_kind)` (`'eager'` | `'lazy_getattr'`)."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return []
     skip = _excluded_ids(tree)
     own_pkg = module_name if rel_repo.endswith("__init__.py") else module_name.rpartition(".")[0]
-    out: list[tuple[str, str, int]] = []
-    for node in ast.walk(tree):
+    out: list[tuple[str, str, int, str]] = []
+
+    def _record_import_node(node: ast.AST, kind: str) -> None:
         if id(node) in skip:
-            continue
+            return
         if isinstance(node, ast.ImportFrom):
             src_mod = node.module or ""
             if node.level:
@@ -347,12 +460,12 @@ def _collect_runtime_import_sites(
                 cand_srcs.append(f"{package_name}.{src_mod}")
             for cand_src in cand_srcs:
                 if cand_src:
-                    out.append((cand_src, rel_repo, node.lineno))
+                    out.append((cand_src, rel_repo, node.lineno, kind))
                 for alias in node.names:
                     if alias.name != "*":
                         ln = getattr(alias, "lineno", None) or node.lineno
                         qual = f"{cand_src}.{alias.name}" if cand_src else alias.name
-                        out.append((qual, rel_repo, ln))
+                        out.append((qual, rel_repo, ln, kind))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 ln = getattr(alias, "lineno", None) or node.lineno
@@ -362,16 +475,33 @@ def _collect_runtime_import_sites(
                 for cand_imp in cand_imps:
                     parts = cand_imp.split(".")
                     for k in range(2, len(parts) + 1):
-                        out.append((".".join(parts[:k]), rel_repo, ln))
+                        out.append((".".join(parts[:k]), rel_repo, ln, kind))
 
-    if rel_repo.endswith("__init__.py") and any(
-        isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == "__getattr__"
-        for s in tree.body
-    ):
-        for stmt in tree.body:
-            val_node = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
-            if not isinstance(val_node, ast.Dict):
+    def _walk_scope(stmts: list[ast.stmt], kind: str) -> None:
+        for st in stmts:
+            if id(st) in skip:
                 continue
+            if isinstance(st, (ast.Import, ast.ImportFrom)):
+                _record_import_node(st, kind)
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if kind == "eager" and st.name == "__getattr__" and rel_repo.endswith("__init__.py"):
+                    _walk_scope(st.body, "lazy_getattr")
+            elif isinstance(st, ast.ClassDef):
+                _walk_scope(st.body, kind)
+            else:
+                for attr_n in ("body", "orelse", "finalbody"):
+                    sub_b = getattr(st, attr_n, None)
+                    if isinstance(sub_b, list):
+                        _walk_scope(sub_b, kind)
+                for h in getattr(st, "handlers", ()):
+                    if isinstance(h, ast.ExceptHandler):
+                        _walk_scope(h.body, kind)
+
+    _walk_scope(tree.body, "eager")
+
+    if rel_repo.endswith("__init__.py"):
+        verified_dicts = _verified_lazy_getattr_dicts(tree, skip)
+        for val_node in verified_dicts.values():
             for val in val_node.values:
                 mod_str: str | None = None
                 if (
@@ -384,10 +514,17 @@ def _collect_runtime_import_sites(
                 elif isinstance(val, ast.Constant) and isinstance(val.value, str):
                     mod_str = val.value
                 if mod_str:
-                    ln = getattr(val, "lineno", None) or stmt.lineno
-                    out.append((mod_str, rel_repo, ln))
+                    if mod_str.startswith(".") and own_pkg:
+                        lvl = len(mod_str) - len(mod_str.lstrip("."))
+                        base_p = own_pkg
+                        for _ in range(lvl - 1):
+                            base_p = base_p.rpartition(".")[0]
+                        tail_m = mod_str.lstrip(".")
+                        mod_str = f"{base_p}.{tail_m}" if tail_m else base_p
+                    ln = getattr(val, "lineno", None) or getattr(val_node, "lineno", 1)
+                    out.append((mod_str, rel_repo, ln, "lazy_getattr"))
                     if not mod_str.startswith(f"{package_name}."):
-                        out.append((f"{package_name}.{mod_str}", rel_repo, ln))
+                        out.append((f"{package_name}.{mod_str}", rel_repo, ln, "lazy_getattr"))
     return out
 
 
@@ -1114,13 +1251,15 @@ class PythonFastApiAdapter:
                             prefix_m = ".".join(parts_t[:k])
                             mod_to_test_files.setdefault(prefix_m, []).append(t_rel)
 
-        passive_importers_by_mod: dict[str, list[tuple[str, int]]] = {}
+        passive_importers_by_mod: dict[str, list[tuple[str, int, str, str]]] = {}
         if unwired_rels:
             for s_rel_repo, s_mod_name, s_text in scanned_sources:
-                for tgt_mod, imp_rel, imp_line in _collect_runtime_import_sites(
+                for tgt_mod, imp_rel, imp_line, imp_kind in _collect_runtime_import_sites(
                     s_text, s_mod_name, s_rel_repo, package_name
                 ):
-                    passive_importers_by_mod.setdefault(tgt_mod, []).append((imp_rel, imp_line))
+                    passive_importers_by_mod.setdefault(tgt_mod, []).append(
+                        (imp_rel, imp_line, imp_kind, s_mod_name)
+                    )
 
         for rel_app in unwired_rels:
             node = nodes_by_rel[rel_app]
@@ -1140,32 +1279,59 @@ class PythonFastApiAdapter:
                 if test_hits
                 else ""
             )
+            dedup_sites: dict[tuple[str, int], tuple[str, str]] = {}
+            for imp_rel, ln, imp_kind, imp_mod_name in passive_importers_by_mod.get(mod_full, ()):
+                if imp_rel == node.source_file:
+                    continue
+                prev = dedup_sites.get((imp_rel, ln))
+                if prev is None or (prev[0] != "eager" and imp_kind == "eager"):
+                    dedup_sites[(imp_rel, ln)] = (imp_kind, imp_mod_name)
             passive_sites = sorted(
-                {(imp_rel, ln) for imp_rel, ln in passive_importers_by_mod.get(mod_full, ()) if imp_rel != node.source_file},
+                ((imp_rel, ln, kind, imp_mod) for (imp_rel, ln), (kind, imp_mod) in dedup_sites.items()),
                 key=lambda item: (0 if item[0].endswith("__init__.py") else 1, item[0], item[1]),
             )
             reexport_note = ""
             remediation_text = "Check dynamic and external callers before wiring, refactoring, or removing the module."
             if passive_sites:
-                ptr_list = ", ".join(f"`{p}:{ln}`" for p, ln in passive_sites[:4])
-                more_ptrs = f" (+{len(passive_sites) - 4} more)" if len(passive_sites) > 4 else ""
-                has_pkg_init = any(p.endswith("__init__.py") for p, _ in passive_sites)
-                reexport_prefix = "Passively re-exported by" if has_pkg_init else "Passively imported by"
-                target_noun = "the package" if has_pkg_init else "those module(s)"
-                reexport_note = (
-                    f"{reexport_prefix} {ptr_list}{more_ptrs}; deleting `{node.source_file}` "
-                    f"without removing that re-export/import will raise `ImportError`/`ModuleNotFoundError` "
-                    f"when importing {target_noun}."
+                has_eager = any(kind == "eager" for _, _, kind, _ in passive_sites)
+                shown_sites = (
+                    [(p, ln, k, m) for p, ln, k, m in passive_sites if k == "eager"]
+                    if has_eager
+                    else passive_sites
                 )
+                ptr_list = ", ".join(f"`{p}:{ln}`" for p, ln, _, _ in shown_sites[:4])
+                more_ptrs = f" (+{len(shown_sites) - 4} more)" if len(shown_sites) > 4 else ""
+                if has_eager:
+                    has_pkg_init = any(p.endswith("__init__.py") for p, _, _, _ in shown_sites)
+                    reexport_prefix = "Passively re-exported by" if has_pkg_init else "Passively imported by"
+                    target_noun = "the package" if has_pkg_init else "those module(s)"
+                    reexport_note = (
+                        f"{reexport_prefix} {ptr_list}{more_ptrs}; deleting `{node.source_file}` "
+                        f"without removing that re-export/import will raise `ImportError`/`ModuleNotFoundError` "
+                        f"when importing {target_noun}."
+                    )
+                    remediation_text = (
+                        f"Remove or update the passive re-export/import in {ptr_list}{more_ptrs} before "
+                        f"deleting or moving `{node.source_file}` (otherwise importing {target_noun} raises "
+                        "`ImportError`/`ModuleNotFoundError`), and check dynamic or external callers."
+                    )
+                else:
+                    lazy_pkg = shown_sites[0][3]
+                    reexport_note = (
+                        f"Lazily re-exported via `__getattr__` in {ptr_list}{more_ptrs}; "
+                        f"`import {lazy_pkg}` succeeds if `{node.source_file}` is deleted, while "
+                        "accessing the lazily exported attribute raises `ImportError`/`ModuleNotFoundError`."
+                    )
+                    remediation_text = (
+                        f"Remove or update the lazy `__getattr__` export in {ptr_list}{more_ptrs} before "
+                        f"deleting or moving `{node.source_file}` (`import {lazy_pkg}` succeeds, while "
+                        "accessing the lazily exported attribute raises `ImportError`/`ModuleNotFoundError`), "
+                        "and check dynamic or external callers."
+                    )
                 node.verification_note = (
                     f"{node.verification_note} | {reexport_note}"
                     if node.verification_note
                     else reexport_note
-                )
-                remediation_text = (
-                    f"Remove or update the passive re-export/import in {ptr_list}{more_ptrs} before "
-                    f"deleting or moving `{node.source_file}` (otherwise importing {target_noun} raises "
-                    "`ImportError`/`ModuleNotFoundError`), and check dynamic or external callers."
                 )
             findings.append(
                 RawCandidateFinding(

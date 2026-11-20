@@ -689,14 +689,97 @@ export function yieldAgentCameraOnHumanInput(
   };
 }
 
-export function resumeAgentCameraFollow(state: AgentCameraFollowState): AgentCameraFollowState {
-  const nextActive = state.pendingEventWhilePaused ?? state.activeEvent;
+export interface ResumeAgentCameraFollowOptions {
+  nowMs?: number;
+  currentEvidenceRevisionId?: string | null;
+  activeTargetSlug?: string;
+  activeSessionId?: string | null;
+  clientId?: string;
+}
+
+function isViewportEventInvalidForResume(
+  event: ViewportCommandEvent,
+  options?: ResumeAgentCameraFollowOptions,
+): boolean {
+  const nowMs = options?.nowMs ?? Date.now();
+  const deliveryState = event.delivery_state ?? 'accepted_by_service';
+  if (
+    deliveryState === 'expired' ||
+    deliveryState === 'stale' ||
+    deliveryState === 'rejected'
+  ) {
+    return true;
+  }
+  const rawExp = event.command.expires_at?.trim() || null;
+  if (rawExp !== null) {
+    const expMs = Date.parse(rawExp);
+    if (!Number.isFinite(expMs) || expMs <= nowMs) {
+      return true;
+    }
+  }
+  const expectedRev = event.command.expected_evidence_revision?.trim() || null;
+  if (expectedRev && options?.currentEvidenceRevisionId !== undefined) {
+    const curRev = options.currentEvidenceRevisionId?.trim() || null;
+    if (expectedRev !== curRev) {
+      return true;
+    }
+  }
+  if (options?.activeTargetSlug && event.command.target_slug !== options.activeTargetSlug) {
+    return true;
+  }
+  const eventSid = event.command.session_id?.trim() || null;
+  if (eventSid && options?.activeSessionId !== undefined) {
+    const curSid = options.activeSessionId?.trim() || null;
+    if (eventSid !== curSid) {
+      return true;
+    }
+  }
+  if (options?.clientId && (event.applied_by_client_ids ?? []).includes(options.clientId)) {
+    return true;
+  }
+  return false;
+}
+
+export function resumeAgentCameraFollow(
+  state: AgentCameraFollowState,
+  options?: ResumeAgentCameraFollowOptions,
+): AgentCameraFollowState {
+  const pending = state.pendingEventWhilePaused;
+  if (pending && isViewportEventInvalidForResume(pending, options)) {
+    const pendingCmdId = pending.command.command_id?.trim() || null;
+    const activeCmdId = state.activeEvent?.command.command_id?.trim() || null;
+    const sameAsPending =
+      state.activeEvent != null &&
+      (state.activeEvent === pending ||
+        (pending.seq > 0 && state.activeEvent.seq === pending.seq) ||
+        Boolean(pendingCmdId && activeCmdId === pendingCmdId));
+    const preservedActive = sameAsPending ? null : state.activeEvent;
+    const items = normalizeViewportTimeline(preservedActive?.command);
+    const nextTl: ChronicleTimeline | null = preservedActive?.command.chronicle_timeline ?? null;
+    const timelineMode: AgentCameraFollowState['timelineMode'] =
+      items.length > 0 ? items[0].kind : nextTl ? 'chronicle' : 'none';
+    const maxStep = Math.max(0, items.length - 1);
+    return {
+      ...state,
+      followMode: 'following',
+      liveFollowing: true,
+      haltedReason: null,
+      chronicleTimelineId: preservedActive ? (nextTl?.timeline_id ?? state.chronicleTimelineId) : null,
+      lastYieldReason: null,
+      activeEvent: preservedActive,
+      pendingEventWhilePaused: null,
+      timelineMode,
+      stepIndex: preservedActive ? Math.min(state.stepIndex, maxStep) : 0,
+    };
+  }
+
+  const nextActive = pending ?? state.activeEvent;
   const items = normalizeViewportTimeline(nextActive?.command);
   const nextTl: ChronicleTimeline | null = nextActive?.command.chronicle_timeline ?? null;
   const timelineMode: AgentCameraFollowState['timelineMode'] =
     items.length > 0 ? items[0].kind : nextTl ? 'chronicle' : 'none';
   const maxStep = Math.max(0, items.length - 1);
-  const nextStep = state.pendingEventWhilePaused
+  const nextStep = pending
     ? nextTl
       ? Math.max(0, Math.min(maxStep, Math.trunc(nextTl.active_phase_index ?? 0)))
       : 0

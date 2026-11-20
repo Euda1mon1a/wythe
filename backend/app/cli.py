@@ -1249,6 +1249,15 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"# Wythe Understanding Chain :: {chain.example_slug or chain.target_slug or 'bundle'}")
                     print(f"> Question: {chain.question}")
+                    if chain.verdict_sentence:
+                        print(f"> Verdict: {chain.verdict_sentence}")
+                    if chain.first_divergence is not None:
+                        fd = chain.first_divergence
+                        print(
+                            f"> First Divergence [{fd.stage_label}]: actor={fd.actor}, channel={fd.channel}, "
+                            f"storage={fd.exists_in_storage}, eligible={fd.eligible_for_actor}, "
+                            f"in_turn={fd.present_in_turn}, caller_attribution={fd.caller_attribution_state}"
+                        )
                     print(f"> Headline: {chain.consequence_headline}")
                     print(f"> Last Supported Cause: {chain.last_supported_cause}")
                     for lk in chain.links:

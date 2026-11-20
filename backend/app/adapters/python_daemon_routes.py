@@ -74,12 +74,17 @@ def _regex_pattern_to_route_path(pat: str) -> str | None:
 
 
 def _has_external_display_sources(repo_root: Path) -> bool:
-    for cand in ("frontend", "web", "client", "ui", "apps", "examples"):
+    for cand in ("frontend", "web", "client", "ui"):
         d = repo_root / cand
         if not d.is_dir() or d.is_symlink():
             continue
         found, _ = source_files(d, {".tsx", ".jsx", ".vue", ".svelte"})
         if found:
+            return True
+    apps_dir = repo_root / "apps"
+    if apps_dir.is_dir() and not apps_dir.is_symlink():
+        apps_found, _ = source_files(apps_dir, {".tsx", ".jsx", ".vue", ".svelte"})
+        if len(apps_found) >= 8:
             return True
     root_ui = [
         p
@@ -112,7 +117,9 @@ def _collect_dict_route_keys(stmts: list[ast.stmt]) -> dict[str, list[str]]:
             name, val = stmt.targets[0].id, stmt.value
         elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
             name, val = stmt.target.id, stmt.value
-        if name and isinstance(val, ast.Dict):
+        if not name or val is None:
+            continue
+        if isinstance(val, ast.Dict):
             keys = [
                 k.value
                 for k in val.keys
@@ -120,6 +127,28 @@ def _collect_dict_route_keys(stmts: list[ast.stmt]) -> dict[str, list[str]]:
             ]
             if keys:
                 tables[name] = keys
+        elif isinstance(val, (ast.Set, ast.Tuple, ast.List)):
+            elts = [
+                e.value
+                for e in val.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value.startswith("/")
+            ]
+            if elts:
+                tables[name] = elts
+        elif (
+            isinstance(val, ast.Call)
+            and isinstance(val.func, ast.Name)
+            and val.func.id in {"frozenset", "set", "tuple", "list"}
+            and val.args
+            and isinstance(val.args[0], (ast.Set, ast.Tuple, ast.List))
+        ):
+            elts = [
+                e.value
+                for e in val.args[0].elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value.startswith("/")
+            ]
+            if elts:
+                tables[name] = elts
     return tables
 
 
@@ -146,7 +175,9 @@ class _ExtractedEndpoint:
     html_ref: str | None = None
 
 
-def _is_urlparse_of_self_path(expr: ast.AST, path_vars: set[str]) -> bool:
+def _is_urlparse_of_self_path(
+    expr: ast.AST, path_vars: set[str], path_helpers: set[str] | None = None
+) -> bool:
     if not isinstance(expr, ast.Call):
         return False
     fn_name = (
@@ -157,11 +188,16 @@ def _is_urlparse_of_self_path(expr: ast.AST, path_vars: set[str]) -> bool:
         else ""
     )
     return fn_name in {"urlparse", "urlsplit"} and bool(expr.args) and _is_path_expr(
-        expr.args[0], path_vars, set()
+        expr.args[0], path_vars, set(), path_helpers
     )
 
 
-def _is_path_expr(expr: ast.AST | None, path_vars: set[str], parsed_vars: set[str]) -> bool:
+def _is_path_expr(
+    expr: ast.AST | None,
+    path_vars: set[str],
+    parsed_vars: set[str],
+    path_helpers: set[str] | None = None,
+) -> bool:
     if expr is None:
         return False
     if isinstance(expr, ast.Name):
@@ -171,9 +207,18 @@ def _is_path_expr(expr: ast.AST | None, path_vars: set[str], parsed_vars: set[st
             return True
         if expr.attr == "path" and (
             (isinstance(expr.value, ast.Name) and expr.value.id in parsed_vars)
-            or _is_urlparse_of_self_path(expr.value, path_vars)
+            or _is_urlparse_of_self_path(expr.value, path_vars, path_helpers)
         ):
             return True
+    if (
+        path_helpers
+        and isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and isinstance(expr.func.value, ast.Name)
+        and expr.func.value.id == "self"
+        and expr.func.attr in path_helpers
+    ):
+        return True
     if (
         isinstance(expr, ast.Subscript)
         and isinstance(expr.slice, ast.Constant)
@@ -181,19 +226,65 @@ def _is_path_expr(expr: ast.AST | None, path_vars: set[str], parsed_vars: set[st
         and isinstance(expr.value, ast.Call)
         and isinstance(expr.value.func, ast.Attribute)
         and expr.value.func.attr in {"split", "partition"}
-        and _is_path_expr(expr.value.func.value, path_vars, parsed_vars)
+        and _is_path_expr(expr.value.func.value, path_vars, parsed_vars, path_helpers)
     ):
         return True
     if (
         isinstance(expr, ast.Call)
         and isinstance(expr.func, ast.Attribute)
         and expr.func.attr in {"rstrip", "strip", "removeprefix"}
-        and _is_path_expr(expr.func.value, path_vars, parsed_vars)
+        and _is_path_expr(expr.func.value, path_vars, parsed_vars, path_helpers)
     ):
         return True
+    if isinstance(expr, ast.IfExp):
+        return _is_path_expr(expr.body, path_vars, parsed_vars, path_helpers) or _is_path_expr(
+            expr.orelse, path_vars, parsed_vars, path_helpers
+        )
     if isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.Or) and expr.values:
-        return _is_path_expr(expr.values[0], path_vars, parsed_vars)
+        return _is_path_expr(expr.values[0], path_vars, parsed_vars, path_helpers)
     return False
+
+
+def _discover_class_path_helpers(
+    class_methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> set[str]:
+    helpers: set[str] = set()
+    for _ in range(3):
+        before = len(helpers)
+        for m_name, m_def in class_methods.items():
+            if m_name in _DO_METHODS or m_name in helpers:
+                continue
+            m_pvars: set[str] = set()
+            m_parsed: set[str] = set()
+            for arg in m_def.args.args[1:]:
+                if "path" in arg.arg.lower() or "route" in arg.arg.lower():
+                    m_pvars.add(arg.arg)
+            for _pass in range(2):
+                for sub in ast.walk(m_def):
+                    lhs_name: str | None = None
+                    rhs_val: ast.AST | None = None
+                    if (
+                        isinstance(sub, ast.Assign)
+                        and len(sub.targets) == 1
+                        and isinstance(sub.targets[0], ast.Name)
+                    ):
+                        lhs_name, rhs_val = sub.targets[0].id, sub.value
+                    elif isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name):
+                        lhs_name, rhs_val = sub.target.id, sub.value
+                    if lhs_name and rhs_val is not None:
+                        if _is_urlparse_of_self_path(rhs_val, m_pvars, helpers):
+                            m_parsed.add(lhs_name)
+                        elif _is_path_expr(rhs_val, m_pvars, m_parsed, helpers):
+                            m_pvars.add(lhs_name)
+            if any(
+                isinstance(sub, ast.Return)
+                and _is_path_expr(sub.value, m_pvars, m_parsed, helpers)
+                for sub in ast.walk(m_def)
+            ):
+                helpers.add(m_name)
+        if len(helpers) == before:
+            break
+    return helpers
 
 
 def _scan_html_markers(node: ast.AST, str_env: dict[str, str]) -> tuple[bool, str | None]:
@@ -233,21 +324,36 @@ def _extract_handler_method_endpoints(
         ):
             bodies.append(class_methods[sub.func.attr])
 
+    path_helpers = _discover_class_path_helpers(class_methods)
     path_vars: set[str] = set()
     parsed_vars: set[str] = set()
+    local_routes = dict(dict_routes)
+    local_str_env = dict(str_env)
     # Parameter names like `path` / `route_path` in 1-hop helper methods
     for idx, helper_fn in enumerate(bodies):
+        local_routes.update(_collect_dict_route_keys(helper_fn.body))
+        local_str_env = _collect_str_bindings(helper_fn.body, local_str_env)
         if idx > 0:
             for arg in helper_fn.args.args[1:]:
                 if "path" in arg.arg.lower() or "route" in arg.arg.lower():
                     path_vars.add(arg.arg)
-        for sub in ast.walk(helper_fn):
-            if isinstance(sub, ast.Assign) and len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name):
-                tname = sub.targets[0].id
-                if _is_urlparse_of_self_path(sub.value, path_vars):
-                    parsed_vars.add(tname)
-                elif _is_path_expr(sub.value, path_vars, parsed_vars):
-                    path_vars.add(tname)
+        for _pass in range(2):
+            for sub in ast.walk(helper_fn):
+                tname: str | None = None
+                rhs: ast.AST | None = None
+                if (
+                    isinstance(sub, ast.Assign)
+                    and len(sub.targets) == 1
+                    and isinstance(sub.targets[0], ast.Name)
+                ):
+                    tname, rhs = sub.targets[0].id, sub.value
+                elif isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name):
+                    tname, rhs = sub.target.id, sub.value
+                if tname and rhs is not None:
+                    if _is_urlparse_of_self_path(rhs, path_vars, path_helpers):
+                        parsed_vars.add(tname)
+                    elif _is_path_expr(rhs, path_vars, parsed_vars, path_helpers):
+                        path_vars.add(tname)
 
     all_called: set[str] = set()
     serves_html = False
@@ -291,41 +397,112 @@ def _extract_handler_method_endpoints(
             )
         )
 
+    def _static_route_str(node_e: ast.AST) -> str | None:
+        if isinstance(node_e, ast.Constant) and isinstance(node_e.value, str):
+            return node_e.value
+        if isinstance(node_e, (ast.Name, ast.BinOp, ast.JoinedStr)):
+            if isinstance(node_e, ast.Name) and node_e.id not in local_str_env:
+                return None
+            ev = _eval_str_expr(node_e, local_str_env)
+            if ev and ev.startswith("/"):
+                return ev.replace("__dyn__", "{param}")
+        return None
+
+    def _extract_guard_test(test_expr: ast.AST, ln: int, guard_branch: ast.AST | None) -> None:
+        if isinstance(test_expr, ast.BoolOp) and isinstance(test_expr.op, ast.And):
+            for v in test_expr.values:
+                _extract_guard_test(v, ln, guard_branch)
+            return
+        if isinstance(test_expr, ast.UnaryOp) and isinstance(test_expr.op, ast.Not):
+            inner = test_expr.operand
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "startswith"
+                and _is_path_expr(inner.func.value, path_vars, parsed_vars, path_helpers)
+                and inner.args
+            ):
+                arg0 = inner.args[0]
+                s0 = _static_route_str(arg0)
+                if s0:
+                    _add(s0, True, ln, guard_branch)
+                elif isinstance(arg0, ast.Tuple):
+                    for elt in arg0.elts:
+                        se = _static_route_str(elt)
+                        if se:
+                            _add(se, True, ln, guard_branch)
+            return
+        if isinstance(test_expr, ast.Compare) and len(test_expr.ops) == 1 and len(test_expr.comparators) == 1:
+            op, left, right = test_expr.ops[0], test_expr.left, test_expr.comparators[0]
+            if isinstance(op, ast.NotEq):
+                if _is_path_expr(left, path_vars, parsed_vars, path_helpers):
+                    sr = _static_route_str(right)
+                    if sr:
+                        _add(sr, False, ln, guard_branch)
+                elif _is_path_expr(right, path_vars, parsed_vars, path_helpers):
+                    sl = _static_route_str(left)
+                    if sl:
+                        _add(sl, False, ln, guard_branch)
+            elif isinstance(op, ast.NotIn) and _is_path_expr(left, path_vars, parsed_vars, path_helpers):
+                if isinstance(right, (ast.Tuple, ast.List, ast.Set)):
+                    for elt in right.elts:
+                        se = _static_route_str(elt)
+                        if se:
+                            _add(se, False, ln, guard_branch)
+                elif isinstance(right, ast.Name) and right.id in local_routes:
+                    for r_key in local_routes[right.id]:
+                        _add(r_key, False, ln, guard_branch)
+
     for b_fn in bodies:
         for sub in ast.walk(b_fn):
             if isinstance(sub, ast.If):
                 if_body = ast.Module(body=sub.body, type_ignores=[])
+                terminates_early = bool(sub.body) and isinstance(
+                    sub.body[-1], (ast.Return, ast.Raise, ast.Continue, ast.Break)
+                )
+                if terminates_early:
+                    else_branch = (
+                        ast.Module(body=sub.orelse, type_ignores=[]) if sub.orelse else None
+                    )
+                    _extract_guard_test(sub.test, sub.lineno, else_branch)
                 # Associate branch body for surgical called_symbols when test matches a path branch
                 for cmp in ast.walk(sub.test):
                     if isinstance(cmp, ast.Compare) and len(cmp.ops) == 1 and len(cmp.comparators) == 1:
                         op, left, right = cmp.ops[0], cmp.left, cmp.comparators[0]
                         if isinstance(op, ast.Eq):
-                            if _is_path_expr(left, path_vars, parsed_vars) and isinstance(right, ast.Constant) and isinstance(right.value, str):
-                                _add(right.value, False, sub.lineno, if_body)
-                            elif _is_path_expr(right, path_vars, parsed_vars) and isinstance(left, ast.Constant) and isinstance(left.value, str):
-                                _add(left.value, False, sub.lineno, if_body)
-                        elif isinstance(op, ast.In) and _is_path_expr(left, path_vars, parsed_vars):
+                            if _is_path_expr(left, path_vars, parsed_vars, path_helpers):
+                                sr = _static_route_str(right)
+                                if sr:
+                                    _add(sr, False, sub.lineno, if_body)
+                            elif _is_path_expr(right, path_vars, parsed_vars, path_helpers):
+                                sl = _static_route_str(left)
+                                if sl:
+                                    _add(sl, False, sub.lineno, if_body)
+                        elif isinstance(op, ast.In) and _is_path_expr(left, path_vars, parsed_vars, path_helpers):
                             if isinstance(right, (ast.Tuple, ast.List, ast.Set)):
                                 for elt in right.elts:
-                                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                                        _add(elt.value, False, sub.lineno, if_body)
-                            elif isinstance(right, ast.Name) and right.id in dict_routes:
-                                for r_key in dict_routes[right.id]:
+                                    se = _static_route_str(elt)
+                                    if se:
+                                        _add(se, False, sub.lineno, if_body)
+                            elif isinstance(right, ast.Name) and right.id in local_routes:
+                                for r_key in local_routes[right.id]:
                                     _add(r_key, False, sub.lineno, if_body)
                     elif (
                         isinstance(cmp, ast.Call)
                         and isinstance(cmp.func, ast.Attribute)
                         and cmp.func.attr == "startswith"
-                        and _is_path_expr(cmp.func.value, path_vars, parsed_vars)
+                        and _is_path_expr(cmp.func.value, path_vars, parsed_vars, path_helpers)
                         and cmp.args
                     ):
                         arg0 = cmp.args[0]
-                        if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str):
-                            _add(arg0.value, True, sub.lineno, if_body)
+                        s0 = _static_route_str(arg0)
+                        if s0:
+                            _add(s0, True, sub.lineno, if_body)
                         elif isinstance(arg0, ast.Tuple):
                             for elt in arg0.elts:
-                                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                                    _add(elt.value, True, sub.lineno, if_body)
+                                se = _static_route_str(elt)
+                                if se:
+                                    _add(se, True, sub.lineno, if_body)
                     elif (
                         isinstance(cmp, ast.Call)
                         and isinstance(cmp.func, ast.Attribute)
@@ -333,12 +510,12 @@ def _extract_handler_method_endpoints(
                         and len(cmp.args) >= 2
                         and isinstance(cmp.args[0], ast.Constant)
                         and isinstance(cmp.args[0].value, str)
-                        and _is_path_expr(cmp.args[1], path_vars, parsed_vars)
+                        and _is_path_expr(cmp.args[1], path_vars, parsed_vars, path_helpers)
                     ):
                         rx_p = _regex_pattern_to_route_path(cmp.args[0].value)
                         if rx_p:
                             _add(rx_p, False, sub.lineno, if_body)
-            elif isinstance(sub, ast.Match) and _is_path_expr(sub.subject, path_vars, parsed_vars):
+            elif isinstance(sub, ast.Match) and _is_path_expr(sub.subject, path_vars, parsed_vars, path_helpers):
                 for case in sub.cases:
                     pats = list(case.pattern.patterns) if isinstance(case.pattern, ast.MatchOr) else [case.pattern]
                     for p_item in pats:
@@ -353,22 +530,76 @@ def _extract_handler_method_endpoints(
                 and isinstance(sub.func, ast.Attribute)
                 and sub.func.attr == "get"
                 and isinstance(sub.func.value, ast.Name)
-                and sub.func.value.id in dict_routes
+                and sub.func.value.id in local_routes
                 and sub.args
-                and _is_path_expr(sub.args[0], path_vars, parsed_vars)
+                and _is_path_expr(sub.args[0], path_vars, parsed_vars, path_helpers)
             ):
-                for r_key in dict_routes[sub.func.value.id]:
+                for r_key in local_routes[sub.func.value.id]:
                     _add(r_key, False, sub.lineno, None)
 
     return found
 
 
+def _discover_repo_server_and_handler_classes(
+    trees: dict[str, ast.Module],
+) -> tuple[set[str], set[str]]:
+    server_classes = {
+        "HTTPServer",
+        "ThreadingHTTPServer",
+        "TCPServer",
+        "ThreadingTCPServer",
+        "DualStackServer",
+    }
+    handler_classes: set[str] = set()
+    all_class_defs = [
+        n for tree in trees.values() for n in ast.walk(tree) if isinstance(n, ast.ClassDef)
+    ]
+    for _ in range(4):
+        before = (len(server_classes), len(handler_classes))
+        for cls in all_class_defs:
+            base_names = {
+                b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else ""
+                for b in cls.bases
+            }
+            if base_names & server_classes:
+                server_classes.add(cls.name)
+            cls_methods = {
+                m.name for m in cls.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            if (
+                any(bn.endswith("RequestHandler") for bn in base_names)
+                or (base_names & handler_classes)
+                or (any(bn for bn in base_names) and (cls_methods & set(_DO_METHODS)))
+            ):
+                handler_classes.add(cls.name)
+        if (len(server_classes), len(handler_classes)) == before:
+            break
+    # Also resolve imported aliases (`from server_lib import CustomHTTPServer as MySrv`)
+    for _ in range(2):
+        for tree in trees.values():
+            for n in ast.walk(tree):
+                if isinstance(n, ast.ImportFrom):
+                    for al in n.names:
+                        if al.asname and al.name in server_classes:
+                            server_classes.add(al.asname)
+                        if al.asname and al.name in handler_classes:
+                            handler_classes.add(al.asname)
+    return server_classes, handler_classes
+
+
 def _extract_http_server_bindings(
-    tree: ast.Module, consts: dict[str, str | int]
+    tree: ast.Module,
+    consts: dict[str, str | int],
+    repo_server_classes: set[str] | None = None,
+    repo_handler_classes: set[str] | None = None,
 ) -> dict[str, list[tuple[str, str]]]:
     """Return `{HandlerClassName: [(binding_label, caller_scope)]}` for HTTPServer/ThreadingHTTPServer."""
-    server_classes = {"HTTPServer", "ThreadingHTTPServer", "TCPServer", "ThreadingTCPServer"}
-    for stmt in tree.body:
+    server_classes = set(
+        repo_server_classes
+        or {"HTTPServer", "ThreadingHTTPServer", "TCPServer", "ThreadingTCPServer"}
+    )
+    known_handlers = set(repo_handler_classes or ())
+    for stmt in ast.walk(tree):
         if isinstance(stmt, ast.ClassDef):
             base_names = {
                 b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else ""
@@ -391,6 +622,27 @@ def _extract_http_server_bindings(
                 matched = [cn for cn in nested_classes if cn in returned_names]
                 factory_returns[top_s.name] = matched[0] if matched else nested_classes[0]
 
+    def _handler_name_from_arg(h_arg: ast.AST | None) -> str:
+        if h_arg is None:
+            return ""
+        h_name = (
+            h_arg.id
+            if isinstance(h_arg, ast.Name)
+            else h_arg.attr
+            if isinstance(h_arg, ast.Attribute)
+            else ""
+        )
+        if not h_name and isinstance(h_arg, ast.Call):
+            cfn = (
+                h_arg.func.id
+                if isinstance(h_arg.func, ast.Name)
+                else h_arg.func.attr
+                if isinstance(h_arg.func, ast.Attribute)
+                else ""
+            )
+            h_name = factory_returns.get(cfn, "")
+        return h_name
+
     def _scan_stmts(stmts: list[ast.stmt], scope_name: str) -> None:
         for s in stmts:
             if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -411,29 +663,26 @@ def _extract_http_server_bindings(
                     if isinstance(node.func, ast.Attribute)
                     else ""
                 )
-                if cls_name not in server_classes or len(node.args) < 2:
+                if cls_name not in server_classes:
                     continue
-                h_arg = node.args[1]
-                h_name = (
-                    h_arg.id
-                    if isinstance(h_arg, ast.Name)
-                    else h_arg.attr
-                    if isinstance(h_arg, ast.Attribute)
-                    else ""
-                )
-                if not h_name and isinstance(h_arg, ast.Call):
-                    cfn = (
-                        h_arg.func.id
-                        if isinstance(h_arg.func, ast.Name)
-                        else h_arg.func.attr
-                        if isinstance(h_arg.func, ast.Attribute)
-                        else ""
-                    )
-                    h_name = factory_returns.get(cfn, "")
+                h_arg: ast.AST | None = None
+                addr_arg: ast.AST | None = None
+                if len(node.args) >= 2:
+                    addr_arg, h_arg = node.args[0], node.args[1]
+                else:
+                    for kw in node.keywords:
+                        if kw.arg in {"RequestHandlerClass", "handler", "handler_class", "handler_cls"}:
+                            h_arg = kw.value
+                        elif kw.arg in {"server_address", "addr", "address"}:
+                            addr_arg = kw.value
+                    if h_arg is None and len(node.args) == 1:
+                        cand_h = _handler_name_from_arg(node.args[0])
+                        if cand_h and (cand_h in known_handlers or cand_h.endswith("Handler")):
+                            h_arg = node.args[0]
+                h_name = _handler_name_from_arg(h_arg)
                 if not h_name:
                     continue
                 addr_str = cls_name
-                addr_arg = node.args[0]
                 if isinstance(addr_arg, (ast.Tuple, ast.List)) and len(addr_arg.elts) == 2:
                     h_el, p_el = addr_arg.elts
                     host_v = (
@@ -457,6 +706,260 @@ def _extract_http_server_bindings(
 
     _scan_stmts(tree.body, "*")
     return bindings
+
+
+_FASTAPI_DECORATOR_VERBS: dict[str, str] = {
+    "get": "GET",
+    "post": "POST",
+    "put": "PUT",
+    "delete": "DELETE",
+    "patch": "PATCH",
+    "websocket": "GET",
+}
+
+
+def _collect_cross_module_router_mounts(trees: dict[str, ast.Module]) -> dict[tuple[str, str], list[str]]:
+    """Return `{(target_rel, router_var): [mount_prefix]}` from `app.include_router(...)` calls."""
+    by_stem: dict[str, list[str]] = {}
+    for r in trees:
+        p = PurePosixPath(r)
+        mod_dot = ".".join(p.with_suffix("").parts)
+        by_stem.setdefault(mod_dot, []).append(r)
+        if p.name == "__init__.py" and len(p.parts) > 1:
+            by_stem.setdefault(".".join(p.parent.parts), []).append(r)
+
+    mounts: dict[tuple[str, str], list[str]] = {}
+    for rel, tree in sorted(trees.items()):
+        mod_env = _collect_str_bindings(tree.body, {})
+        imp_router_src: dict[str, tuple[str, str]] = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and n.module:
+                cand_rels = [
+                    r
+                    for m_key, rels in by_stem.items()
+                    if m_key == n.module or m_key.endswith("." + n.module)
+                    for r in rels
+                ]
+                if len(cand_rels) == 1:
+                    for al in n.names:
+                        imp_router_src[al.asname or al.name] = (cand_rels[0], al.name)
+            elif isinstance(n, ast.Import):
+                for al in n.names:
+                    cand_rels = [
+                        r
+                        for m_key, rels in by_stem.items()
+                        if m_key == al.name or m_key.endswith("." + al.name)
+                        for r in rels
+                    ]
+                    if len(cand_rels) == 1:
+                        imp_router_src[al.asname or al.name] = (cand_rels[0], "router")
+
+        scopes = [(tree.body, mod_env)] + [
+            (s.body, _collect_str_bindings(s.body, mod_env))
+            for s in tree.body
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for stmts, sc_env in scopes:
+            for n in ast.walk(ast.Module(body=stmts, type_ignores=[])):
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "include_router"
+                    and n.args
+                ):
+                    r_arg = n.args[0]
+                    target_pair: tuple[str, str] | None = None
+                    if isinstance(r_arg, ast.Name) and r_arg.id in imp_router_src:
+                        target_pair = imp_router_src[r_arg.id]
+                    elif (
+                        isinstance(r_arg, ast.Attribute)
+                        and isinstance(r_arg.value, ast.Name)
+                        and r_arg.value.id in imp_router_src
+                    ):
+                        target_pair = (imp_router_src[r_arg.value.id][0], r_arg.attr)
+                    elif isinstance(r_arg, ast.Name):
+                        target_pair = (rel, r_arg.id)
+                    if target_pair is None:
+                        continue
+                    pref = ""
+                    for kw in n.keywords:
+                        if kw.arg == "prefix":
+                            ev = _eval_str_expr(kw.value, sc_env)
+                            if ev:
+                                pref = ev.replace("__dyn__", "{param}")
+                    mounts.setdefault(target_pair, []).append(pref)
+    return mounts
+
+
+def _extract_fastapi_starlette_endpoints(
+    rel: str,
+    tree: ast.Module,
+    mod_str_env: dict[str, str],
+    router_mounts: dict[tuple[str, str], list[str]],
+) -> list[_ExtractedEndpoint]:
+    """Extract FastAPI/Starlette `@app.<verb>`, `APIRouter`, `create_app()`, and `Route(...)`."""
+    has_web_import = False
+    receivers: dict[str, str] = {}
+    for n in ast.walk(tree):
+        if (
+            isinstance(n, ast.Import)
+            and any(a.name.split(".", 1)[0] in {"fastapi", "starlette"} for a in n.names)
+        ) or (
+            isinstance(n, ast.ImportFrom)
+            and n.module
+            and n.module.split(".", 1)[0] in {"fastapi", "starlette"}
+        ):
+            has_web_import = True
+
+    def _join_route(p1: str, p2: str, p3: str) -> str:
+        segs = [s.strip("/") for s in (p1, p2, p3) if s and s.strip("/")]
+        return _norm_http_path("/" + "/".join(segs))
+
+    endpoints: list[_ExtractedEndpoint] = []
+    seen_ep: set[tuple[str, str, str]] = set()
+
+    def _scan_scope(stmts: list[ast.stmt], sc_env: dict[str, str], local_recvs: dict[str, str]) -> None:
+        recvs = dict(local_recvs)
+        for s in stmts:
+            lhs_id: str | None = None
+            rhs_val: ast.AST | None = None
+            if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
+                lhs_id, rhs_val = s.targets[0].id, s.value
+            elif isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name):
+                lhs_id, rhs_val = s.target.id, s.value
+            if lhs_id and isinstance(rhs_val, ast.Call):
+                cname = (
+                    rhs_val.func.id
+                    if isinstance(rhs_val.func, ast.Name)
+                    else rhs_val.func.attr
+                    if isinstance(rhs_val.func, ast.Attribute)
+                    else ""
+                )
+                if cname in {"FastAPI", "APIRouter", "Starlette"}:
+                    has_pref = ""
+                    for kw in rhs_val.keywords:
+                        if kw.arg == "prefix":
+                            ev = _eval_str_expr(kw.value, sc_env)
+                            if ev:
+                                has_pref = ev.replace("__dyn__", "{param}")
+                    recvs[lhs_id] = has_pref
+        if not has_web_import and not recvs:
+            return
+
+        for s in stmts:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Recurse into factory functions (`create_app`, `build_app`, etc.)
+                inner_env = _collect_str_bindings(s.body, sc_env)
+                _scan_scope(s.body, inner_env, recvs)
+                for dec in s.decorator_list:
+                    if not isinstance(dec, ast.Call) or not isinstance(dec.func, ast.Attribute):
+                        continue
+                    if not isinstance(dec.func.value, ast.Name):
+                        continue
+                    r_var = dec.func.value.id
+                    if r_var not in recvs and not has_web_import:
+                        continue
+                    attr = dec.func.attr
+                    verbs: list[str] = []
+                    if attr in _FASTAPI_DECORATOR_VERBS:
+                        verbs = [_FASTAPI_DECORATOR_VERBS[attr]]
+                    elif attr in {"api_route", "route"}:
+                        for kw in dec.keywords:
+                            if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple, ast.Set)):
+                                verbs = [
+                                    el.value.upper()
+                                    for el in kw.value.elts
+                                    if isinstance(el, ast.Constant) and isinstance(el.value, str)
+                                ]
+                        if not verbs:
+                            verbs = ["GET"]
+                    if not verbs:
+                        continue
+                    p_expr = dec.args[0] if dec.args else next(
+                        (kw.value for kw in dec.keywords if kw.arg == "path"), None
+                    )
+                    raw_p = _eval_str_expr(p_expr, sc_env) if p_expr is not None else "/"
+                    if raw_p is None:
+                        continue
+                    sub_p = raw_p.replace("__dyn__", "{param}")
+                    r_pref = recvs.get(r_var, "")
+                    mount_prefs = router_mounts.get((rel, r_var)) or [""]
+                    sh, hr = _scan_html_markers(s, inner_env)
+                    if not sh:
+                        for call_n in ast.walk(s):
+                            if isinstance(call_n, ast.Call):
+                                cfn = (
+                                    call_n.func.id
+                                    if isinstance(call_n.func, ast.Name)
+                                    else call_n.func.attr
+                                    if isinstance(call_n.func, ast.Attribute)
+                                    else ""
+                                )
+                                if cfn == "HTMLResponse":
+                                    sh = True
+                    called = _called_func_names(s) | {s.name}
+                    for mp in mount_prefs:
+                        full_p = _join_route(mp, r_pref, sub_p)
+                        for vb in verbs:
+                            if (vb, full_p, s.name) not in seen_ep:
+                                seen_ep.add((vb, full_p, s.name))
+                                endpoints.append(
+                                    _ExtractedEndpoint(
+                                        method=vb,
+                                        full_path=full_p,
+                                        is_prefix=False,
+                                        lineno=s.lineno,
+                                        handler_symbol=s.name,
+                                        called_symbols=set(called),
+                                        serves_html=sh,
+                                        html_ref=hr,
+                                    )
+                                )
+            elif has_web_import:
+                for call_n in ast.walk(s):
+                    if not isinstance(call_n, ast.Call):
+                        continue
+                    cfn = (
+                        call_n.func.id
+                        if isinstance(call_n.func, ast.Name)
+                        else call_n.func.attr
+                        if isinstance(call_n.func, ast.Attribute)
+                        else ""
+                    )
+                    if cfn == "Route" and len(call_n.args) >= 2:
+                        raw_rp = _eval_str_expr(call_n.args[0], sc_env)
+                        ep_arg = call_n.args[1]
+                        ep_sym = ep_arg.id if isinstance(ep_arg, ast.Name) else (
+                            ep_arg.attr if isinstance(ep_arg, ast.Attribute) else "endpoint"
+                        )
+                        if raw_rp:
+                            full_rp = _norm_http_path(raw_rp.replace("__dyn__", "{param}"))
+                            r_verbs = ["GET"]
+                            for kw in call_n.keywords:
+                                if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple, ast.Set)):
+                                    cand_vs = [
+                                        el.value.upper()
+                                        for el in kw.value.elts
+                                        if isinstance(el, ast.Constant) and isinstance(el.value, str)
+                                    ]
+                                    if cand_vs:
+                                        r_verbs = cand_vs
+                            for vb in r_verbs:
+                                if (vb, full_rp, ep_sym) not in seen_ep:
+                                    seen_ep.add((vb, full_rp, ep_sym))
+                                    endpoints.append(
+                                        _ExtractedEndpoint(
+                                            method=vb,
+                                            full_path=full_rp,
+                                            is_prefix=False,
+                                            lineno=getattr(call_n, "lineno", 1),
+                                            handler_symbol=ep_sym,
+                                            called_symbols={ep_sym},
+                                        )
+                                    )
+
+    _scan_scope(tree.body, mod_str_env, receivers)
+    return endpoints
 
 
 def _extract_mcp_endpoints(tree: ast.Module) -> list[_ExtractedEndpoint]:
@@ -736,11 +1239,16 @@ def add_daemon_routes_and_subprocesses(
     route_keys_by_rel: dict[str, dict[str, list[str]]] = {}
     emitted_html_pages: set[str] = set()
 
+    repo_server_classes, repo_handler_classes = _discover_repo_server_and_handler_classes(trees)
+    router_mounts = _collect_cross_module_router_mounts(trees)
+
     # Cross-module HTTPServer binding lookup if server is instantiated in another module
     global_bindings: dict[str, list[tuple[str, str, str]]] = {}
     for rel, tree in sorted(trees.items()):
         consts = _collect_scalar_consts(tree.body)
-        for h_cls, items in _extract_http_server_bindings(tree, consts).items():
+        for h_cls, items in _extract_http_server_bindings(
+            tree, consts, repo_server_classes, repo_handler_classes
+        ).items():
             for addr_lbl, sc_name in items:
                 global_bindings.setdefault(h_cls, []).append((rel, addr_lbl, sc_name))
 
@@ -837,7 +1345,14 @@ def add_daemon_routes_and_subprocesses(
                 )
             )
 
-        summary_parts = [f"Daemon route surface `{label}` ({', '.join(methods)} {', '.join(http_paths[:6])})."]
+        path_cap_note = (
+            f" ({len(http_paths)} total paths; {len(http_paths) - 25} omitted beyond 25-path cap)"
+            if len(http_paths) > 25
+            else ""
+        )
+        summary_parts = [
+            f"Daemon route surface `{label}` ({', '.join(methods)} {', '.join(http_paths[:6])}){path_cap_note}."
+        ]
         if binding_notes:
             summary_parts.append(
                 "Bound via " + ", ".join(dict.fromkeys(b[1] for b in binding_notes)) + "."
@@ -988,6 +1503,18 @@ def add_daemon_routes_and_subprocesses(
                 "mcp_tools",
                 mcp_eps[0].lineno,
                 mcp_eps,
+                [],
+            )
+
+        fastapi_eps = _extract_fastapi_starlette_endpoints(rel, tree, mod_str_env, router_mounts)
+        if fastapi_eps:
+            _emit_route_group(
+                rel,
+                "fastapi",
+                f"{PurePosixPath(rel).stem}.fastapi",
+                "fastapi_http",
+                fastapi_eps[0].lineno,
+                fastapi_eps,
                 [],
             )
 

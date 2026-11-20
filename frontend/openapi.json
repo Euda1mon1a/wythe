@@ -3,7 +3,7 @@
   "info": {
     "title": "Wythe API",
     "description": "Why -> Therefore: 3-tier architecture & lineage verifier. PostgreSQL holds truth, Backend manipulates truth, UI displays truth.",
-    "version": "0.2.7"
+    "version": "0.2.8"
   },
   "paths": {
     "/api/v1/adapters/slots": {
@@ -5538,6 +5538,201 @@
         ],
         "title": "EvidenceSourceItem"
       },
+      "FirstDivergencePoint": {
+        "properties": {
+          "divergence_id": {
+            "type": "string",
+            "title": "Divergence Id"
+          },
+          "stage_label": {
+            "type": "string",
+            "title": "Stage Label"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "expected_by_owner": {
+            "type": "string",
+            "title": "Expected By Owner"
+          },
+          "actual_observed": {
+            "type": "string",
+            "title": "Actual Observed"
+          },
+          "actor": {
+            "type": "string",
+            "title": "Actor"
+          },
+          "channel": {
+            "type": "string",
+            "title": "Channel"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "exists_in_storage": {
+            "type": "string",
+            "enum": [
+              "present",
+              "absent",
+              "unverified"
+            ],
+            "title": "Exists In Storage",
+            "default": "unverified"
+          },
+          "storage_source_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Storage Source Ref"
+          },
+          "eligible_for_actor": {
+            "type": "string",
+            "enum": [
+              "present",
+              "absent",
+              "unverified"
+            ],
+            "title": "Eligible For Actor",
+            "default": "unverified"
+          },
+          "eligibility_source_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligibility Source Ref"
+          },
+          "present_in_turn": {
+            "type": "string",
+            "enum": [
+              "present",
+              "absent",
+              "unverified"
+            ],
+            "title": "Present In Turn",
+            "default": "unverified"
+          },
+          "turn_context_source_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn Context Source Ref"
+          },
+          "evidence_reaching_turn": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Evidence Reaching Turn"
+          },
+          "observed_hop": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Hop"
+          },
+          "hop_evidence_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hop Evidence Ref"
+          },
+          "caller_attribution_state": {
+            "type": "string",
+            "enum": [
+              "caller_verified",
+              "hop_only",
+              "unverified",
+              "conflicting"
+            ],
+            "title": "Caller Attribution State",
+            "default": "unverified"
+          },
+          "attributed_caller": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attributed Caller"
+          },
+          "caller_receipt_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Caller Receipt Ref"
+          },
+          "unattributed_candidate_callers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Unattributed Candidate Callers"
+          },
+          "missing_joins": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Missing Joins"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "divergence_id",
+          "stage_label",
+          "summary",
+          "expected_by_owner",
+          "actual_observed",
+          "actor",
+          "channel"
+        ],
+        "title": "FirstDivergencePoint",
+        "description": "AC 2: First point where observed behavior differed from intent + actor knowledge."
+      },
       "GateEvaluation": {
         "properties": {
           "verdict": {
@@ -5663,6 +5858,52 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "ImplementationPrediction": {
+        "properties": {
+          "prediction_id": {
+            "type": "string",
+            "title": "Prediction Id"
+          },
+          "reading_label": {
+            "type": "string",
+            "title": "Reading Label"
+          },
+          "predicted_before_boundary": {
+            "type": "string",
+            "title": "Predicted Before Boundary",
+            "default": ""
+          },
+          "predicted_at_boundary": {
+            "type": "string",
+            "title": "Predicted At Boundary"
+          },
+          "source_ref": {
+            "type": "string",
+            "title": "Source Ref"
+          },
+          "match_state": {
+            "type": "string",
+            "enum": [
+              "consistent_with_observation",
+              "refuted_by_observation",
+              "undistinguished",
+              "unverified"
+            ],
+            "title": "Match State",
+            "default": "undistinguished"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "prediction_id",
+          "reading_label",
+          "predicted_at_boundary",
+          "source_ref"
+        ],
+        "title": "ImplementationPrediction",
+        "description": "What one reading or branch of the implementation predicts before and at a boundary."
       },
       "ImportClosureSummary": {
         "properties": {
@@ -7143,6 +7384,52 @@
           "markdown": {
             "type": "string",
             "title": "Markdown"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Until"
+          },
+          "observation_source": {
+            "type": "string",
+            "title": "Observation Source",
+            "default": ""
+          },
+          "coverage_complete": {
+            "type": "boolean",
+            "title": "Coverage Complete",
+            "default": true
+          },
+          "unobserved_tiers": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "truth",
+                "manipulate",
+                "display"
+              ]
+            },
+            "type": "array",
+            "title": "Unobserved Tiers"
           }
         },
         "additionalProperties": false,
@@ -7295,6 +7582,52 @@
             "type": "string",
             "title": "Markdown",
             "default": ""
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Until"
+          },
+          "observation_source": {
+            "type": "string",
+            "title": "Observation Source",
+            "default": ""
+          },
+          "coverage_complete": {
+            "type": "boolean",
+            "title": "Coverage Complete",
+            "default": true
+          },
+          "unobserved_tiers": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "truth",
+                "manipulate",
+                "display"
+              ]
+            },
+            "type": "array",
+            "title": "Unobserved Tiers"
           }
         },
         "additionalProperties": false,
@@ -7376,6 +7709,11 @@
             },
             "type": "array",
             "title": "Http Paths"
+          },
+          "omitted_http_path_count": {
+            "type": "integer",
+            "title": "Omitted Http Path Count",
+            "default": 0
           }
         },
         "additionalProperties": false,
@@ -7389,6 +7727,58 @@
           "status"
         ],
         "title": "LlmNodePointer"
+      },
+      "ObservedBoundaryResult": {
+        "properties": {
+          "observation_id": {
+            "type": "string",
+            "title": "Observation Id"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "source_ref": {
+            "type": "string",
+            "title": "Source Ref"
+          },
+          "delivery_verified": {
+            "type": "boolean",
+            "title": "Delivery Verified",
+            "default": false
+          },
+          "delivery_receipt_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Receipt Ref"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "observation_id",
+          "summary",
+          "source_ref"
+        ],
+        "title": "ObservedBoundaryResult",
+        "description": "Empirical or captured observation distinguishing implementation predictions."
       },
       "OnDeviceEngineStatus": {
         "properties": {
@@ -7651,6 +8041,28 @@
             ],
             "title": "Producer Claimed Stage"
           },
+          "producer_claimed_delivery_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Producer Claimed Delivery Status"
+          },
+          "producer_claimed_terminal_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Producer Claimed Terminal State"
+          },
           "last_proven_stage": {
             "type": "string",
             "enum": [
@@ -7726,6 +8138,16 @@
             ],
             "title": "Delivery Status",
             "default": "unknown"
+          },
+          "positive_commit_established": {
+            "type": "boolean",
+            "title": "Positive Commit Established",
+            "default": false
+          },
+          "positive_delivery_established": {
+            "type": "boolean",
+            "title": "Positive Delivery Established",
+            "default": false
           },
           "blind_retry_prohibited": {
             "type": "boolean",
@@ -7883,6 +8305,137 @@
         ],
         "title": "OutcomeTransitionRecord",
         "description": "Single observed stage in a cross-boundary outcome lifecycle."
+      },
+      "OwnerRuleSpec": {
+        "properties": {
+          "rule_id": {
+            "type": "string",
+            "title": "Rule Id"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "statement": {
+            "type": "string",
+            "title": "Statement"
+          },
+          "source_ref": {
+            "type": "string",
+            "title": "Source Ref"
+          },
+          "authority_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authority Ref"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rule_id",
+          "label",
+          "statement",
+          "source_ref"
+        ],
+        "title": "OwnerRuleSpec",
+        "description": "Owner-declared domain or operational rule linked to its canonical source."
+      },
+      "PerturbationCaseResult": {
+        "properties": {
+          "case_id": {
+            "type": "string",
+            "title": "Case Id"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "varied_factor": {
+            "type": "string",
+            "title": "Varied Factor"
+          },
+          "held_fixed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Held Fixed"
+          },
+          "expected_outcome": {
+            "type": "string",
+            "title": "Expected Outcome"
+          },
+          "observed_outcome": {
+            "type": "string",
+            "title": "Observed Outcome"
+          },
+          "conclusion_state": {
+            "type": "string",
+            "enum": [
+              "supported",
+              "unverified",
+              "failed_regression"
+            ],
+            "title": "Conclusion State"
+          },
+          "passed": {
+            "type": "boolean",
+            "title": "Passed"
+          },
+          "decisive_receipt_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decisive Receipt Ref"
+          },
+          "missing_receipt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Missing Receipt Id"
+          },
+          "unverified_conclusion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unverified Conclusion"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "case_id",
+          "label",
+          "varied_factor",
+          "expected_outcome",
+          "observed_outcome",
+          "conclusion_state",
+          "passed"
+        ],
+        "title": "PerturbationCaseResult",
+        "description": "AC 3: Single-variable fresh-case perturbation check and missing-receipt detector."
       },
       "PluginListResponse": {
         "properties": {
@@ -9102,6 +9655,97 @@
           "updated_by"
         ],
         "title": "RulePolicyUpdate"
+      },
+      "RulePredictionComparison": {
+        "properties": {
+          "comparison_id": {
+            "type": "string",
+            "title": "Comparison Id"
+          },
+          "subject_id": {
+            "type": "string",
+            "title": "Subject Id"
+          },
+          "owner_rule": {
+            "$ref": "#/components/schemas/OwnerRuleSpec"
+          },
+          "implementation_predictions": {
+            "items": {
+              "$ref": "#/components/schemas/ImplementationPrediction"
+            },
+            "type": "array",
+            "title": "Implementation Predictions"
+          },
+          "observed_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ObservedBoundaryResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "discriminating_observation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discriminating Observation"
+          },
+          "matched_prediction_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Matched Prediction Ids"
+          },
+          "refuted_prediction_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Refuted Prediction Ids"
+          },
+          "open_questions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Open Questions"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "supported",
+              "degraded_or_drifted",
+              "unverified",
+              "unresolved"
+            ],
+            "title": "State",
+            "default": "unverified"
+          },
+          "missing_joins": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Missing Joins"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "comparison_id",
+          "subject_id",
+          "owner_rule"
+        ],
+        "title": "RulePredictionComparison",
+        "description": "AC 1: Owner rule, implementation predictions, and observed result in one record."
       },
       "RuntimeProvenanceEvaluation": {
         "properties": {
@@ -12119,6 +12763,47 @@
             "type": "string",
             "title": "Last Supported Cause"
           },
+          "verdict_sentence": {
+            "type": "string",
+            "title": "Verdict Sentence",
+            "default": ""
+          },
+          "verdict_markdown": {
+            "type": "string",
+            "title": "Verdict Markdown",
+            "default": ""
+          },
+          "verdict_clauses": {
+            "items": {
+              "$ref": "#/components/schemas/VerdictClause"
+            },
+            "type": "array",
+            "title": "Verdict Clauses"
+          },
+          "first_divergence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FirstDivergencePoint"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rule_prediction_comparisons": {
+            "items": {
+              "$ref": "#/components/schemas/RulePredictionComparison"
+            },
+            "type": "array",
+            "title": "Rule Prediction Comparisons"
+          },
+          "perturbation_matrix": {
+            "items": {
+              "$ref": "#/components/schemas/PerturbationCaseResult"
+            },
+            "type": "array",
+            "title": "Perturbation Matrix"
+          },
           "overall_missing_joins": {
             "items": {
               "type": "string"
@@ -12648,6 +13333,70 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "VerdictClause": {
+        "properties": {
+          "clause_id": {
+            "type": "string",
+            "title": "Clause Id"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "supported",
+              "unverified",
+              "degraded_or_drifted",
+              "indeterminate"
+            ],
+            "title": "State"
+          },
+          "evidence_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Ref"
+          },
+          "source_location": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Location"
+          },
+          "missing_receipt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Missing Receipt"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "clause_id",
+          "text",
+          "state"
+        ],
+        "title": "VerdictClause",
+        "description": "Single clause in the top-level verdict sentence linked to its exact evidence."
       },
       "ViewportCommand": {
         "properties": {

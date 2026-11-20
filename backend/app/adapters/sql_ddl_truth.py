@@ -195,6 +195,52 @@ class SqlDdlTruthAdapter:
                             remediation="Apply pending SQL migrations on the target database.",
                         )
                     )
+            for live_tbl in sorted(live_tables):
+                if is_migration_meta_table(live_tbl) or live_tbl in ddl_tables:
+                    continue
+                live_nid = table_symbol_map.get(live_tbl)
+                if live_nid is None:
+                    live_nid = f"t:live:{live_tbl}"
+                    if live_nid not in existing_ids:
+                        nodes.append(
+                            AtlasNode(
+                                id=live_nid,
+                                tier="truth",
+                                subkind="table",
+                                label=live_tbl,
+                                source_file="<live_catalog>",
+                                line=1,
+                                status="gray_zone",
+                                role="unmanaged_live",
+                                cluster="live_catalog",
+                                summary=(
+                                    f"Live database table `{live_tbl}` observed via `{obs_source}` "
+                                    "without a matching SQL DDL declaration."
+                                ),
+                            )
+                        )
+                        existing_ids.add(live_nid)
+                    table_symbol_map.setdefault(live_tbl, live_nid)
+                live_node = next((n for n in nodes if n.id == live_nid), None)
+                if live_node is not None and live_node.status == "clean":
+                    live_node.status = "gray_zone"
+                findings.append(
+                    RawCandidateFinding(
+                        rule_code="TRUTH-005",
+                        node_id=live_nid,
+                        source_file=live_node.source_file if live_node is not None else "<live_catalog>",
+                        line=live_node.line if live_node is not None else 1,
+                        title=f"Live database table `{live_tbl}` has no CREATE TABLE in SQL DDL",
+                        detail=(
+                            f"Read-only catalog probe ({obs_source}) found `{live_tbl}` in the live "
+                            "database catalog, but no repository SQL DDL file declares it."
+                        ),
+                        remediation=(
+                            f"Add the SQL migration or schema DDL that creates `{live_tbl}` "
+                            "(or retire unmanaged live tables) so the schema can be rebuilt from source."
+                        ),
+                    )
+                )
 
         return TruthExtractionResult(
             nodes=nodes,

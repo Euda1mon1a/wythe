@@ -1503,8 +1503,69 @@ export default function WytheWorkspacePage() {
         return yieldAgentCameraOnHumanInput(prev, 'pointerdown');
       }
       syncFollowStateToBackend('following', 'manual_resume_button');
+      const nowMs = Date.now();
+      const currentEvidenceRev =
+        latestEvidenceRevRef.current ?? (report?.content_digest ? undefined : null);
       const pendingEvt = prev.pendingEventWhilePaused;
-      const resumed = resumeAgentCameraFollow(prev);
+      const resumeDecision =
+        pendingEvt && activeSlug
+          ? evaluateIncomingViewportCommand({
+              event: pendingEvt,
+              source: 'resume',
+              activeTargetSlug: activeSlug,
+              activeSessionId,
+              clientId: tabClientId,
+              followState: 'following',
+              currentEvidenceRevisionId: currentEvidenceRev,
+              ackedCommandIds: ackedCommandIdsRef.current,
+              pausedNotifiedCommandIds: pausedNotifiedIdsRef.current,
+              nowMs,
+            })
+          : null;
+      const resumed = resumeAgentCameraFollow(prev, {
+        nowMs,
+        currentEvidenceRevisionId: currentEvidenceRev,
+        activeTargetSlug: activeSlug || undefined,
+        activeSessionId,
+        clientId: tabClientId || undefined,
+      });
+
+      if (pendingEvt) {
+        const cmdKey = resumeDecision?.commandKey ?? getViewportCommandKey(pendingEvt);
+        pausedNotifiedIdsRef.current.delete(cmdKey);
+        if (resumeDecision && resumeDecision.action !== 'apply') {
+          if (resumeDecision.markAcked && pendingEvt.seq > 0 && activeSlug) {
+            const updated = recordAckedCommandId(activeSlug, activeSessionId, cmdKey);
+            ackedCommandIdsRef.current = new Set(updated);
+          }
+          if (resumeDecision.receiptOutcome && pendingEvt.seq > 0 && activeSlug) {
+            sendViewportReceipt(
+              pendingEvt,
+              resumeDecision.receiptOutcome,
+              resumeDecision.reason,
+            );
+          }
+          return resumed;
+        }
+        if (isPureDrawerRefreshCommand(pendingEvt.command)) {
+          const refreshSid = pendingEvt.command.refresh_session_id;
+          if (refreshSid && (!activeSessionId || refreshSid === activeSessionId)) {
+            void refreshInvestigationState(refreshSid);
+          } else if (pendingEvt.command.open_drawer === true && activeSessionId) {
+            void refreshInvestigationState(activeSessionId);
+          }
+          if (pendingEvt.command.open_drawer === true) {
+            setAskDrawerOpen(true);
+          }
+          if (pendingEvt.seq > 0 && activeSlug && !ackedCommandIdsRef.current.has(cmdKey)) {
+            const updated = recordAckedCommandId(activeSlug, activeSessionId, cmdKey);
+            ackedCommandIdsRef.current = new Set(updated);
+            sendViewportReceipt(pendingEvt, 'applied', 'Refreshed investigation drawer');
+          }
+          return resumed;
+        }
+      }
+
       if (resumed.activeEvent?.command) {
         const items = normalizeViewportTimeline(resumed.activeEvent.command);
         if (items.length > 0) {
@@ -1550,7 +1611,7 @@ export default function WytheWorkspacePage() {
         }
       }
       if (pendingEvt && pendingEvt.seq > 0 && activeSlug) {
-        const key = getViewportCommandKey(pendingEvt);
+        const key = resumeDecision?.commandKey ?? getViewportCommandKey(pendingEvt);
         if (!ackedCommandIdsRef.current.has(key)) {
           const updated = recordAckedCommandId(activeSlug, activeSessionId, key);
           ackedCommandIdsRef.current = new Set(updated);
@@ -1562,8 +1623,11 @@ export default function WytheWorkspacePage() {
   }, [
     activeSlug,
     activeSessionId,
+    tabClientId,
+    report?.content_digest,
     applyBeatToWorkspace,
     applyCommandOrFirstStep,
+    refreshInvestigationState,
     sendViewportReceipt,
     syncFollowStateToBackend,
   ]);
@@ -2171,10 +2235,18 @@ export default function WytheWorkspacePage() {
         return created;
       },
       setFollowState: async (state) => {
+        const curEvRev =
+          latestEvidenceRevRef.current ?? (report?.content_digest ? undefined : null);
         setAgentCamState((prev) =>
           state === 'paused'
             ? yieldAgentCameraOnHumanInput(prev, 'pointerdown')
-            : resumeAgentCameraFollow(prev),
+            : resumeAgentCameraFollow(prev, {
+                nowMs: Date.now(),
+                currentEvidenceRevisionId: curEvRev,
+                activeTargetSlug: activeSlug || undefined,
+                activeSessionId,
+                clientId: tabClientId || undefined,
+              }),
         );
         syncFollowStateToBackend(state, 'window_wythe_bridge');
         return { session_id: activeSessionId, follow_state: state };
@@ -2198,6 +2270,7 @@ export default function WytheWorkspacePage() {
     activeSlug,
     activeSessionId,
     tabClientId,
+    report?.content_digest,
     selectedNodeId,
     selectedEdgeId,
     selectedFindingId,

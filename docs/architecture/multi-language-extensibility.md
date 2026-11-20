@@ -112,7 +112,7 @@ Every adapter family is evaluated on synthetic regression suites (`backend/tests
 
 | Repository (`git rev-parse --short HEAD`) | Detected Profile | Tier-1 Truth | Tier-2 Manipulate | Tier-3 Display | Verified Edges / E2E Chains | Observed Parser & Transport Boundaries |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`Euda1mon1a/wythe`** (`v0.2.7`) | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 7 tables, 1 SQL fn | 9 routes, 71 services | 1 page, 27 hooks/clients | **346 / 31** | `PASS --strict` (0 blocking, 0 warnings) |
+| **`Euda1mon1a/wythe`** (`v0.2.8`) | `fastapi-sqlalchemy-nextjs` (**Implemented**) | 7 tables, 1 SQL fn | 9 routes, 72 services | 1 page, 27 hooks/clients | **346 / 31** | `PASS --strict` (0 blocking, 0 warnings) |
 | **`fastapi/full-stack-fastapi-template`** (`aabb90126964`, `v0.2.1`) | `fastapi-react-spa` (Experimental) | 2 SQLModel tables | 6 routes, 7 services | 10 pages, 58 hooks/clients | **229 / 39** | `0` `DISP-004`/`DISP-007`; Hey API generated OpenAPI SDK + SQLModel tables resolve end-to-end |
 | **`makeplane/plane`** (`9cefae892c4c`, `v0.2.1`) | `django-nextjs` (Experimental) | 112 Django tables, 34 ephemeral stores | 109 routes, 238 services | 58 pages, 1,590 hooks/clients | **5,095 / 300** | Resolves Django `urls` packages & CBVs; E2E chain reporting reaches the 300-chain cap |
 | **`docmost/docmost`** (`3a3e812f25e8`, `v0.2.1`) | `node-kysely-react` (Experimental) | 49 Kysely tables, 16 SQL fn, 14 ephemeral stores | 70 routes, 486 services | 26 pages, 817 hooks/clients | **3,854 / 300** | Kysely migration replay + NestJS inherited DI + BullMQ queues; hits 300-chain report cap |

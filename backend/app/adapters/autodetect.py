@@ -261,7 +261,21 @@ def _has_python_backend_source_evidence(repo_root: Path, py_deps: str) -> bool:
     """Return True only on positive Python backend/daemon/store evidence (never standalone `.sql` files alone)."""
     if any(
         tok in py_deps
-        for tok in ("sqlite3", "aiosqlite", "psycopg", "asyncpg", "sqlalchemy", "sqlmodel", "mcp", "fastmcp")
+        for tok in (
+            "sqlite3",
+            "aiosqlite",
+            "psycopg",
+            "asyncpg",
+            "sqlalchemy",
+            "sqlmodel",
+            "mcp",
+            "fastmcp",
+            "fastapi",
+            "starlette",
+            "uvicorn",
+            "aiohttp",
+            "flask",
+        )
     ):
         return True
     checked = 0
@@ -294,12 +308,36 @@ def _has_python_backend_source_evidence(repo_root: Path, py_deps: str) -> bool:
                     "@mcp.tool",
                     "fastmcp",
                     "mcp.server",
+                    "fastapi(",
+                    "apirouter(",
+                    "starlette(",
+                    "uvicorn.run",
                 )
             ):
                 return True
-            if checked >= 120:
+            if checked >= 600:
                 return False
     return False
+
+
+def _count_python_service_sources(repo_root: Path) -> tuple[int, bool]:
+    """Return `(py_count, has_service_units)` across non-test/non-example repository directories."""
+    skip = {".git", ".venv", "venv", "env", "node_modules", "dist", "build", "tests", "test", "examples", "example", "docs"}
+    py_count = 0
+    has_units = False
+    for p in repo_root.rglob("*"):
+        if not p.is_file() or p.is_symlink():
+            continue
+        rel_parts = p.relative_to(repo_root).parts if p.is_relative_to(repo_root) else p.parts
+        if any(part in skip or (part.startswith(".") and part != ".docker") for part in rel_parts[:-1]):
+            continue
+        if p.suffix == ".py":
+            py_count += 1
+        elif p.suffix in (".plist", ".service"):
+            has_units = True
+        if py_count >= 12 and has_units:
+            break
+    return py_count, has_units
 
 
 def _has_standalone_sql_files(repo_root: Path, be_dir: Path) -> bool:
@@ -431,7 +469,7 @@ def detect_repository_stack(
     elif (
         bool(all_fe_deps & _JS_FRONTEND_DEPS)
         or any((d / f).is_file() for d in fe_cfg_dirs for f in ("vite.config.ts", "vite.config.js", "vite.config.mts"))
-        or (frontend_sub != "." and _has_dir_sources(fe_dir, (".ts", ".tsx", ".js", ".jsx")))
+        or (frontend_sub != "." and _has_dir_sources(fe_dir, (".ts", ".tsx", ".js", ".jsx", ".mjs", ".html")))
     ):
         disp_adapter = "typescript-react"
         signals.append("Display: React SPA / Vite markers")
@@ -600,18 +638,25 @@ def detect_repository_stack(
             detected_signals=signals,
         )
 
+    py_svc_count, has_svc_units = _count_python_service_sources(repo_root)
+    has_standalone_sql = _has_standalone_sql_files(repo_root, be_dir)
+    has_substantial_py_services = py_svc_count >= 2 or (
+        py_svc_count >= 1 and (has_svc_units or has_standalone_sql)
+    )
     has_python_services = (
         not node_owned_backend
         and not has_python_app_layout
         and (
-            (has_py_project_deps or has_py_backend_src_ev)
-            if disp_adapter != "no-display"
-            else (
-                has_py_project_deps
-                or has_py_backend_src_ev
-                or any(repo_root.glob("*.py"))
-                or ((repo_root / "scripts").is_dir() and _has_dir_sources(repo_root / "scripts", (".py",)))
-                or ((repo_root / "src").is_dir() and _has_dir_sources(repo_root / "src", (".py",)))
+            has_py_project_deps
+            or has_py_backend_src_ev
+            or has_substantial_py_services
+            or (
+                disp_adapter == "no-display"
+                and (
+                    any(repo_root.glob("*.py"))
+                    or ((repo_root / "scripts").is_dir() and _has_dir_sources(repo_root / "scripts", (".py",)))
+                    or ((repo_root / "src").is_dir() and _has_dir_sources(repo_root / "src", (".py",)))
+                )
             )
         )
     )

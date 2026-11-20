@@ -671,12 +671,15 @@ def run_target_scan(
     `probe_url` opts into one unauthenticated GET per unbacked frontend call against a
     running backend (see `route_probe_service`) to confirm or clear DISP-004/007 findings.
     """
+    from app.services import investigation_service as _inv_svc
+
+    pre_scan_state = _inv_svc.capture_scan_input_state(session, target)
     profile_slug = (
         "fastapi-sqlalchemy-nextjs"
         if target.stack_profile_slug.endswith("-native")
         else target.stack_profile_slug
     )
-    repo_root = Path(target.repo_path).resolve()
+    repo_root = pre_scan_state[0]
     active_artifacts = get_active_stratum_artifacts()
     strict_artifact_plugins = bool(active_artifacts)
     plugin_load_notes: list[str] = []
@@ -783,6 +786,7 @@ def run_target_scan(
             resolved_disp_adapter,
             enabled_tokens,
             git_fp[1],
+            pre_scan_state[1],
             plugin_cache_sig,
         )
         if git_fp is not None
@@ -1040,6 +1044,10 @@ def run_target_scan(
         strict_plugins=strict_artifact_plugins,
     )
 
+    post_scan_check = _inv_svc.capture_scan_input_state(session, target)
+    if post_scan_check == pre_scan_state:
+        _inv_svc._record_report_tree_sha(repo_root, report.content_digest, pre_scan_state[1])
+
     if persist_snapshot and target.id:
         snap = ScanSnapshot(
             target_id=target.id,
@@ -1060,14 +1068,15 @@ def run_target_scan(
         session.commit()
         session.refresh(snap)
         report.snapshot_id = snap.id
-        from app.services.investigation_service import record_persisted_snapshot_stamp
-
-        record_persisted_snapshot_stamp(
+        _inv_svc.record_persisted_snapshot_stamp(
             session,
             target,
             strict_gate=strict_gate,
             snapshot_id=snap.id,
             report=report,
+            pre_scan_state=pre_scan_state,
+            allow_local_plugins=allow_local_plugins,
+            local_plugin_modules=local_plugin_modules,
         )
 
     return report

@@ -65,14 +65,70 @@ def collect_git_changes(root: Path, base_ref: str) -> GitChanges:
     return changes
 
 
+def _resolve_intra_repo_symlink(
+    link_path: PurePosixPath,
+    symlink_targets: dict[str, str],
+) -> str:
+    cur_link = link_path
+    seen: set[str] = {cur_link.as_posix()}
+    for _ in range(8):
+        raw_target = symlink_targets[cur_link.as_posix()]
+        if (
+            not raw_target
+            or "\x00" in raw_target
+            or "\n" in raw_target
+            or raw_target.startswith(("/", "~"))
+        ):
+            raise ValueError(f"Base tree contains an unresolved symlink or submodule: {link_path}")
+        cur_parts = list(cur_link.parent.parts)
+        parts = [p for p in raw_target.replace("\\", "/").split("/") if p not in ("", ".")]
+        if not parts:
+            raise ValueError(f"Base tree contains an unresolved symlink or submodule: {link_path}")
+        for idx, part in enumerate(parts):
+            if part == ".git":
+                raise ValueError(f"Base tree contains an unsafe symlink target: {link_path}")
+            if part == "..":
+                if not cur_parts:
+                    raise ValueError(
+                        f"Base tree contains an unresolved symlink or submodule: {link_path}"
+                    )
+                cur_parts.pop()
+            else:
+                cur_parts.append(part)
+            if idx < len(parts) - 1 and "/".join(cur_parts) in symlink_targets:
+                raise ValueError(
+                    f"Base tree contains an unresolved symlink or submodule: {link_path}"
+                )
+        if not cur_parts:
+            raise ValueError(f"Base tree contains an unresolved symlink or submodule: {link_path}")
+        resolved_rel = "/".join(cur_parts)
+        if resolved_rel not in symlink_targets:
+            return resolved_rel
+        if resolved_rel in seen:
+            raise ValueError(f"Base tree contains a symlink cycle: {link_path}")
+        seen.add(resolved_rel)
+        cur_link = PurePosixPath(resolved_rel)
+    raise ValueError(f"Base tree contains an excessively deep symlink chain: {link_path}")
+
+
 def materialize_base_tree(root: Path, base_commit: str, destination: Path) -> None:
     """Copy committed blobs exactly, including export-ignored files; never execute code.
 
-    Unsupported symlinks and submodules fail explicitly instead of inventing a
-    complete before-image. The caller reports incomplete evidence in that case.
+    Committed intra-repo relative file symlinks (`120000`) whose normalized target is a
+    committed regular file inside the same base tree are materialized as regular file
+    copies strictly inside `destination` so downstream `O_NOFOLLOW` readers stay safe.
+    Repo-escaping symlinks, directory symlinks, intermediate symlink hops, dangling/untracked
+    targets, and submodules fail closed (`INCOMPLETE`).
     """
     entries = _git(root, "ls-tree", "-r", "-z", "--full-tree", base_commit)
+    dest_real = destination.resolve()
     paths_by_oid: dict[bytes, list[Path]] = {}
+    regular_oid_by_rel: dict[str, bytes] = {}
+    symlink_oid_by_rel: dict[str, tuple[PurePosixPath, bytes]] = {}
+    all_tracked_rels: set[str] = set()
+    needed_oids: list[bytes] = []
+    seen_oids: set[bytes] = set()
+
     for entry in entries.split(b"\0"):
         if not entry:
             continue
@@ -81,13 +137,27 @@ def materialize_base_tree(root: Path, base_commit: str, destination: Path) -> No
         path = PurePosixPath(raw_path.decode("utf-8", errors="surrogateescape"))
         if path.is_absolute() or any(p in ("..", ".git") for p in path.parts):
             raise ValueError("Unsafe path in base tree")
-        if mode not in (b"100644", b"100755") or kind != b"blob":
+        rel_posix = path.as_posix()
+        all_tracked_rels.add(rel_posix)
+        if mode in (b"100644", b"100755") and kind == b"blob":
+            regular_oid_by_rel[rel_posix] = oid
+            paths_by_oid.setdefault(oid, []).append(destination.joinpath(*path.parts))
+            if oid not in seen_oids:
+                seen_oids.add(oid)
+                needed_oids.append(oid)
+        elif mode == b"120000" and kind == b"blob":
+            symlink_oid_by_rel[rel_posix] = (path, oid)
+            if oid not in seen_oids:
+                seen_oids.add(oid)
+                needed_oids.append(oid)
+        else:
             raise ValueError(f"Base tree contains an unresolved symlink or submodule: {path}")
-        paths_by_oid.setdefault(oid, []).append(destination.joinpath(*path.parts))
-    if not paths_by_oid:
+
+    if not needed_oids:
         return
-    data = io.BytesIO(_git(root, "cat-file", "--batch", input=b"\n".join(paths_by_oid) + b"\n"))
-    for oid, paths in paths_by_oid.items():
+    data = io.BytesIO(_git(root, "cat-file", "--batch", input=b"\n".join(needed_oids) + b"\n"))
+    blobs_by_oid: dict[bytes, bytes] = {}
+    for oid in needed_oids:
         header = data.readline().split()
         if len(header) != 3 or header[:2] != [oid, b"blob"]:
             raise ValueError("Incomplete base blob evidence")
@@ -95,6 +165,27 @@ def materialize_base_tree(root: Path, base_commit: str, destination: Path) -> No
         contents = data.read(size)
         if len(contents) != size or data.read(1) != b"\n":
             raise ValueError("Truncated base blob evidence")
+        blobs_by_oid[oid] = contents
+
+    if symlink_oid_by_rel:
+        symlink_targets: dict[str, str] = {}
+        for rel, (_, oid) in symlink_oid_by_rel.items():
+            raw_bytes = blobs_by_oid[oid]
+            if len(raw_bytes) > 4096:
+                raise ValueError(f"Base tree contains an unresolved symlink or submodule: {rel}")
+            symlink_targets[rel] = raw_bytes.decode("utf-8", errors="surrogateescape")
+        for lpath, _oid in symlink_oid_by_rel.values():
+            resolved_rel = _resolve_intra_repo_symlink(lpath, symlink_targets)
+            if resolved_rel in regular_oid_by_rel:
+                tgt_oid = regular_oid_by_rel[resolved_rel]
+                paths_by_oid.setdefault(tgt_oid, []).append(destination.joinpath(*lpath.parts))
+            else:
+                raise ValueError(f"Base tree contains an unresolved symlink or submodule: {lpath}")
+
+    for oid, paths in paths_by_oid.items():
+        contents = blobs_by_oid[oid]
         for path in paths:
+            if not path.resolve().is_relative_to(dest_real):
+                raise ValueError("Unsafe destination path in base tree")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(contents)

@@ -1914,6 +1914,11 @@ def _emit_helper_edge(
             prev_edge.symbol_links = []
         else:
             prev_edge.symbol_links = sorted(set(prev_edge.symbol_links) | set(sym_links))
+        if (
+            "host_install_path_unverified" in evidence_note
+            and "host_install_path_unverified" not in prev_edge.evidence_note
+        ):
+            prev_edge.evidence_note = f"{prev_edge.evidence_note} (host_install_path_unverified)"
         return
     if eid in seen_edge_ids:
         return
@@ -1975,18 +1980,40 @@ def _resolve_direct_host_targets(
     real_root: Path,
     by_src: dict[str, list[AtlasNode]],
     all_repo_scripts: set[str],
-) -> list[tuple[str, tuple[str, ...]]]:
+) -> list[tuple[str, tuple[str, ...], bool]]:
+    candidates = set(by_src) | all_repo_scripts
     cmd_targets = extract_command_targets_from_argv(argv, env_bindings, None)
     triples = resolve_command_targets_with_symbols(
-        cmd_targets, real_root, None, search_roots, set(by_src) | all_repo_scripts
+        cmd_targets, real_root, None, search_roots, candidates
     )
-    resolved_map: dict[str, tuple[str, ...]] = {rel: syms for rel, _, syms in triples}
+    resolved_map: dict[str, tuple[tuple[str, ...], bool]] = {
+        rel: (syms, False) for rel, _, syms in triples
+    }
     for ct in cmd_targets:
-        if ct.kind in ("file", "node_script"):
-            sref = source_reference(ct.value, owner_rel, set(by_src) | all_repo_scripts)
-            if sref and sref not in resolved_map:
-                resolved_map[sref] = ()
-    return [(k, resolved_map[k]) for k in sorted(resolved_map)]
+        if ct.kind not in ("file", "node_script"):
+            continue
+        raw_val = ct.value.strip().replace("\\", "/")
+        norm_val = raw_val.removeprefix("./")
+        sib_val = str(PurePosixPath(owner_rel).parent / norm_val)
+        sref = source_reference(ct.value, owner_rel, candidates)
+        if sref is not None:
+            if sref not in resolved_map:
+                is_suffix = norm_val not in candidates and sib_val not in candidates
+                resolved_map[sref] = ((), is_suffix)
+            continue
+        if (
+            norm_val.startswith("/")
+            and "\x00" not in norm_val
+            and "://" not in norm_val
+            and ".." not in PurePosixPath(norm_val).parts
+            and not re.search(r"[$~{}]", norm_val)
+        ):
+            leaf = PurePosixPath(norm_val).name
+            if leaf != "__init__.py" and leaf.endswith((".py", ".sh", ".js", ".ts", ".mjs")):
+                b_matches = sorted(p for p in candidates if p == leaf or p.endswith("/" + leaf))
+                if len(b_matches) == 1 and b_matches[0] not in resolved_map:
+                    resolved_map[b_matches[0]] = ((), True)
+    return [(k, resolved_map[k][0], resolved_map[k][1]) for k in sorted(resolved_map)]
 
 
 def augment_container_launchers(
@@ -2345,7 +2372,7 @@ def augment_container_launchers(
         elif not already_had_node and eff_argv:
             unwrapped = _unwrap_host_prefix(eff_argv)
             if unwrapped and PurePosixPath(unwrapped[0]).name not in CONTAINER_CLI_BINARIES:
-                for repo_rel, syms in _resolve_direct_host_targets(
+                for repo_rel, syms, via_suffix in _resolve_direct_host_targets(
                     eff_argv, p_env, rel, p_search, real_root, by_src, all_repo_scripts
                 ):
                     for tnode in ensure_repo_target_nodes(
@@ -2353,13 +2380,19 @@ def augment_container_launchers(
                     ):
                         node_by_id.setdefault(tnode.id, tnode)
                         p_linked = True
+                        l_note = (
+                            f"Launchd command suffix-matches `{repo_rel}` (`host_install_path_unverified`); "
+                            "host installation path, launchd admission, and execution are not observed."
+                            if via_suffix
+                            else "Launchd command resolves to this repository source; host admission and execution are not observed."
+                        )
                         _emit_helper_edge(
                             f"e:launchd:{rel}->{tnode.id}",
                             nid,
                             tnode,
                             syms,
                             f"{rel}:{cmd_line}",
-                            "Launchd command resolves to this repository source; host admission and execution are not observed.",
+                            l_note,
                             seen_edge_ids,
                             existing_pairs,
                             result,
@@ -2476,7 +2509,7 @@ def augment_container_launchers(
             unwrapped = _unwrap_host_prefix(argv_list)
             if unwrapped and PurePosixPath(unwrapped[0]).name in CONTAINER_CLI_BINARIES:
                 continue
-            for repo_rel, syms in _resolve_direct_host_targets(
+            for repo_rel, syms, via_suffix in _resolve_direct_host_targets(
                 argv_list, s_env, rel, s_search, real_root, by_src, all_repo_scripts
             ):
                 if repo_rel == rel:
@@ -2486,13 +2519,19 @@ def augment_container_launchers(
                 ):
                     node_by_id.setdefault(tnode.id, tnode)
                     s_linked = True
+                    s_note = (
+                        f"Systemd `{espec.directive}` suffix-matches `{repo_rel}` (`host_install_path_unverified`); "
+                        "host installation path, systemd admission, and service liveness are not observed."
+                        if via_suffix
+                        else f"Systemd `{espec.directive}` resolves to `{repo_rel}`; host admission and service liveness are not observed."
+                    )
                     _emit_helper_edge(
                         f"e:systemd:{rel}->{tnode.id}",
                         nid,
                         tnode,
                         syms,
                         f"{rel}:{espec.line}",
-                        f"Systemd `{espec.directive}` resolves to `{repo_rel}`; host admission and service liveness are not observed.",
+                        s_note,
                         seen_edge_ids,
                         existing_pairs,
                         result,

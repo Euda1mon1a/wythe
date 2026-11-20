@@ -189,6 +189,13 @@ def extract_ts_backend_routes_cst(source: str, mount_prefix: str = "") -> list[t
 
 
 _TEMPLATE_PLACEHOLDER_RE = re.compile(r"\$\{\s*(?P<name>[A-Za-z_$][\w$]*)\s*\}")
+_LEADING_MOUNT_INTERP_RE = re.compile(
+    r"\$\{\s*(?P<expr>(?:this\.)?[A-Za-z_$][\w$.]*)\s*\}(?=/api/|/)"
+)
+_MOUNT_EXPR_RE = re.compile(r"^(?:this\.)?[A-Za-z_$][\w$.]*$")
+_ENV_MOUNT_RHS_RE = re.compile(
+    r"^(?:import\.meta\.env\.[A-Za-z_$][\w$]*|process\.env\.[A-Za-z_$][\w$]*)(?:\s*(?:\?\?|\|\|)\s*['\"`]{2})?$"
+)
 
 
 def is_same_origin_url_path(val: str) -> bool:
@@ -201,25 +208,47 @@ def is_resolvable_url_const_value(val: str) -> bool:
     return val == "" or val.startswith(("/", "http://", "https://", "ws://", "wss://"))
 
 
-def resolve_url_const_head(url_val: str, url_consts: dict[str, str] | None) -> str:
-    """Expand statically known `${NAME}` URL pieces across template/concatenation expressions."""
-    if not url_consts or "${" not in url_val:
+def resolve_url_const_head(
+    url_val: str,
+    url_consts: dict[str, str] | None,
+    *,
+    strip_unresolved_mount: bool = True,
+    blocked_names: set[str] | frozenset[str] | None = None,
+) -> str:
+    """Expand statically known `${NAME}` URL pieces and normalize leading mount-prefix interpolations."""
+    if "${" not in url_val:
         return url_val
     cur = url_val
-    for _ in range(4):
-        changed = False
+    if url_consts:
+        for _ in range(4):
+            changed = False
 
-        def _repl(m: re.Match[str]) -> str:
-            nonlocal changed
-            name = m.group("name")
-            if name in url_consts:
-                changed = True
-                return url_consts[name]
-            return m.group(0)
+            def _repl(m: re.Match[str]) -> str:
+                nonlocal changed
+                name = m.group("name")
+                if name in url_consts:
+                    changed = True
+                    return url_consts[name]
+                return m.group(0)
 
-        cur = _TEMPLATE_PLACEHOLDER_RE.sub(_repl, cur)
-        if not changed or "${" not in cur:
-            break
+            cur = _TEMPLATE_PLACEHOLDER_RE.sub(_repl, cur)
+            if not changed or "${" not in cur:
+                break
+    if strip_unresolved_mount and cur.startswith("${"):
+        mm = _LEADING_MOUNT_INTERP_RE.match(cur)
+        if mm is not None:
+            expr = mm.group("expr")
+            is_location = expr.startswith(
+                ("window.location", "document.location", "location.", "self.location")
+            )
+            root_ident = expr.split(".", 1)[0]
+            is_blocked = (
+                root_ident != "this"
+                and blocked_names is not None
+                and root_ident in blocked_names
+            )
+            if not is_location and not is_blocked:
+                cur = cur[mm.end() :]
     return cur
 
 
@@ -282,9 +311,19 @@ def _cst_url_template_from_expr(raw: bytes, node: Any, depth: int = 0) -> str | 
         return None if "${" in val else val
     if cur.type == "template_string":
         return _unquote_node(raw, cur)
+    raw_txt = raw[cur.start_byte : cur.end_byte].decode("utf-8", errors="replace").strip()
+    if _ENV_MOUNT_RHS_RE.fullmatch(raw_txt):
+        return ""
     if cur.type == "identifier":
-        ident = raw[cur.start_byte : cur.end_byte].decode("utf-8", errors="replace")
-        return f"${{{ident}}}"
+        return f"${{{raw_txt}}}"
+    if (
+        cur.type == "member_expression"
+        and _MOUNT_EXPR_RE.fullmatch(raw_txt)
+        and not raw_txt.startswith(
+            ("window.location", "document.location", "location.", "self.location")
+        )
+    ):
+        return f"${{{raw_txt}}}"
     if cur.type == "binary_expression" and len(cur.named_children) >= 2:
         op_node = cur.child_by_field_name("operator") or (
             cur.children[1] if len(cur.children) >= 3 else None
@@ -319,24 +358,44 @@ def _collect_cst_var_decl(raw: bytes, decl_node: Any, raw_local: dict[str, str |
                 raw_local[b] = None
 
 
-def _merge_cst_local_consts(outer_consts: dict[str, str], raw_local: dict[str, str | None]) -> dict[str, str]:
+def _merge_cst_local_consts(
+    outer_consts: dict[str, str],
+    raw_local: dict[str, str | None],
+    outer_blocked: frozenset[str] = frozenset(),
+) -> tuple[dict[str, str], frozenset[str]]:
     if not raw_local:
-        return outer_consts
+        return outer_consts, outer_blocked
     merged = {k: v for k, v in outer_consts.items() if k not in raw_local}
+    local_invalid = {k for k, v in raw_local.items() if v is None}
     pending = {k: v for k, v in raw_local.items() if v is not None}
+    cur_blocked = (outer_blocked - set(pending)) | local_invalid
     if not pending:
-        return merged
+        return merged, frozenset(cur_blocked)
     working = {**merged, **pending}
     for _ in range(4):
         for k in list(pending):
             working[k] = resolve_url_const_head(
                 working[k],
                 {ok: ov for ok, ov in working.items() if ok != k and is_resolvable_url_const_value(ov)},
+                strip_unresolved_mount=False,
             )
+    unresolved_pending = {k for k in pending if not is_resolvable_url_const_value(working[k])}
+    eff_blocked = cur_blocked | unresolved_pending
+    for k in list(pending):
+        working[k] = resolve_url_const_head(
+            working[k],
+            {ok: ov for ok, ov in working.items() if ok != k and is_resolvable_url_const_value(ov)},
+            strip_unresolved_mount=True,
+            blocked_names=eff_blocked,
+        )
+    final_blocked = set(cur_blocked)
     for k in pending:
         if is_resolvable_url_const_value(working[k]):
             merged[k] = working[k]
-    return merged
+            final_blocked.discard(k)
+        else:
+            final_blocked.add(k)
+    return merged, frozenset(final_blocked)
 
 
 def _collect_hoisted_cst_vars(raw: bytes, root: Any, out: set[str]) -> None:
@@ -457,7 +516,35 @@ def _collect_mutated_cst_vars(raw: bytes, container: Any, out: set[str]) -> None
     visit(container, frozenset())
 
 
-def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, str]) -> dict[str, str]:
+def _collect_cst_imported_idents(raw: bytes, root_node: Any) -> set[str]:
+    names: set[str] = set()
+    for ch in root_node.named_children:
+        if ch.type != "import_statement":
+            continue
+        for sub in ch.named_children:
+            if sub.type == "import_clause":
+                for ic in sub.named_children:
+                    if ic.type == "identifier":
+                        names.add(raw[ic.start_byte : ic.end_byte].decode("utf-8", errors="replace"))
+                    elif ic.type == "namespace_import":
+                        for ns_c in ic.named_children:
+                            if ns_c.type == "identifier":
+                                names.add(raw[ns_c.start_byte : ns_c.end_byte].decode("utf-8", errors="replace"))
+                    elif ic.type == "named_imports":
+                        for sp in ic.named_children:
+                            if sp.type == "import_specifier":
+                                al = sp.child_by_field_name("alias") or sp.child_by_field_name("name")
+                                if al is not None:
+                                    names.add(raw[al.start_byte : al.end_byte].decode("utf-8", errors="replace"))
+    return names
+
+
+def _apply_cst_block_decls(
+    raw: bytes,
+    container: Any,
+    outer_consts: dict[str, str],
+    outer_blocked: frozenset[str] = frozenset(),
+) -> tuple[dict[str, str], frozenset[str]]:
     """Update `outer_consts` with lexical local `const X = '/...'` bindings and drop shadowed ones."""
     raw_local: dict[str, str | None] = {}
     for ch in container.named_children:
@@ -481,7 +568,7 @@ def _apply_cst_block_decls(raw: bytes, container: Any, outer_consts: dict[str, s
     _collect_mutated_cst_vars(raw, container, mutated)
     for b in mutated:
         raw_local[b] = None
-    return _merge_cst_local_consts(outer_consts, raw_local)
+    return _merge_cst_local_consts(outer_consts, raw_local, outer_blocked)
 
 
 def _unwrap_cst_expr(node: Any) -> Any:
@@ -551,6 +638,7 @@ def _extract_cst_object_request(
     scope_consts: dict[str, str],
     *,
     verb_from_callee: str | None,
+    blocked_names: frozenset[str] = frozenset(),
 ) -> tuple[str, str] | None:
     """Extract `(http_method, raw_url)` from `{ url: '/api/...', ...options }` SDK/axios request objects."""
     obj = _unwrap_cst_expr(obj_node)
@@ -566,7 +654,11 @@ def _extract_cst_object_request(
         key_name, v_node = pair
         if key_name == "url":
             tpl = _cst_url_template_from_expr(raw, v_node)
-            cand = resolve_url_const_head(tpl, scope_consts) if tpl is not None else ""
+            cand = (
+                resolve_url_const_head(tpl, scope_consts, blocked_names=blocked_names)
+                if tpl is not None
+                else ""
+            )
             if cand and is_same_origin_url_path(cand):
                 url_val = cand
             else:
@@ -615,13 +707,15 @@ def extract_ts_http_calls_cst(
     has_tauri_import = b"@tauri-apps" in raw or b"__TAURI__" in raw
     found: list[tuple[str, str, int]] = []
     init_consts = dict(url_consts or {})
-    root_consts = _apply_cst_block_decls(raw, tree.root_node, init_consts)
+    init_blocked = frozenset(_collect_cst_imported_idents(raw, tree.root_node) - set(init_consts))
+    root_consts, root_blocked = _apply_cst_block_decls(raw, tree.root_node, init_consts, init_blocked)
     hoisted_root_vars: set[str] = set()
     _collect_hoisted_cst_vars(raw, tree.root_node, hoisted_root_vars)
     if hoisted_root_vars:
         root_consts = {k: v for k, v in root_consts.items() if k not in hoisted_root_vars}
+        root_blocked = root_blocked | frozenset(hoisted_root_vars)
 
-    def walk(node: Any, scope_consts: dict[str, str]) -> None:
+    def walk(node: Any, scope_consts: dict[str, str], scope_blocked: frozenset[str]) -> None:
         ntype = node.type
         if ntype in (
             "function_declaration",
@@ -642,6 +736,7 @@ def extract_ts_http_calls_cst(
             _collect_hoisted_cst_vars(raw, node, bound)
             if bound:
                 scope_consts = {k: v for k, v in scope_consts.items() if k not in bound}
+                scope_blocked = scope_blocked | frozenset(bound)
         elif ntype == "catch_clause":
             c_param = node.child_by_field_name("parameter")
             if c_param is not None:
@@ -649,6 +744,7 @@ def extract_ts_http_calls_cst(
                 _collect_cst_pattern_idents(raw, c_param, c_bound)
                 if c_bound:
                     scope_consts = {k: v for k, v in scope_consts.items() if k not in c_bound}
+                    scope_blocked = scope_blocked | frozenset(c_bound)
         elif ntype == "for_in_statement":
             left = node.child_by_field_name("left")
             if left is not None:
@@ -656,6 +752,7 @@ def extract_ts_http_calls_cst(
                 _collect_cst_pattern_idents(raw, left, f_bound)
                 if f_bound:
                     scope_consts = {k: v for k, v in scope_consts.items() if k not in f_bound}
+                    scope_blocked = scope_blocked | frozenset(f_bound)
         elif ntype == "for_statement":
             init_node = node.child_by_field_name("initializer")
             if init_node is not None and init_node.type in ("lexical_declaration", "variable_declaration"):
@@ -666,9 +763,43 @@ def extract_ts_http_calls_cst(
                 for b in for_mutated:
                     if b in for_local:
                         for_local[b] = None
-                scope_consts = _merge_cst_local_consts(scope_consts, for_local)
+                scope_consts, scope_blocked = _merge_cst_local_consts(
+                    scope_consts, for_local, scope_blocked
+                )
         elif ntype == "statement_block":
-            scope_consts = _apply_cst_block_decls(raw, node, scope_consts)
+            scope_consts, scope_blocked = _apply_cst_block_decls(
+                raw, node, scope_consts, scope_blocked
+            )
+
+        if ntype == "new_expression" and node.children:
+            ctor_node = node.child_by_field_name("constructor") or (
+                node.named_children[0] if node.named_children else None
+            )
+            while ctor_node is not None and ctor_node.type in _CALLEE_WRAPPERS and ctor_node.named_children:
+                ctor_node = ctor_node.named_children[-1]
+            ctor_name = ""
+            if ctor_node is not None:
+                if ctor_node.type == "identifier":
+                    ctor_name = raw[ctor_node.start_byte : ctor_node.end_byte].decode("utf-8", errors="replace")
+                elif ctor_node.type == "member_expression" and ctor_node.children:
+                    prop_c = ctor_node.children[-1]
+                    ctor_name = raw[prop_c.start_byte : prop_c.end_byte].decode("utf-8", errors="replace")
+            if ctor_name == "EventSource":
+                args_node = node.child_by_field_name("arguments") or next(
+                    (c for c in node.children if c.type == "arguments"), None
+                )
+                if args_node is not None:
+                    arg_items = [c for c in args_node.children if c.type not in ("(", ")", ",")]
+                    first_arg = arg_items[0] if arg_items else None
+                    if first_arg is not None:
+                        tpl = _cst_url_template_from_expr(raw, first_arg)
+                        url_val = (
+                            resolve_url_const_head(tpl, scope_consts, blocked_names=scope_blocked)
+                            if tpl is not None
+                            else ""
+                        )
+                        if is_same_origin_url_path(url_val):
+                            found.append(("GET", url_val, ctor_node.start_point[0] + 1))
 
         if ntype == "call_expression" and node.children:
             fn_node = node.children[0]
@@ -694,7 +825,11 @@ def extract_ts_http_calls_cst(
                         found.append((tverb, f"/tauri/{cmd}", fn_node.start_point[0] + 1))
                 elif first_arg is not None:
                     tpl = _cst_url_template_from_expr(raw, first_arg)
-                    url_val = resolve_url_const_head(tpl, scope_consts) if tpl is not None else ""
+                    url_val = (
+                        resolve_url_const_head(tpl, scope_consts, blocked_names=scope_blocked)
+                        if tpl is not None
+                        else ""
+                    )
                     upper_c = "DELETE" if callee_name.lower() == "del" else callee_name.upper()
                     if is_same_origin_url_path(url_val):
                         if upper_c in _HTTP_VERBS:
@@ -708,13 +843,14 @@ def extract_ts_http_calls_cst(
                             first_arg,
                             scope_consts,
                             verb_from_callee=upper_c if upper_c in _HTTP_VERBS else None,
+                            blocked_names=scope_blocked,
                         )
                         if obj_req is not None:
                             found.append((obj_req[0], obj_req[1], fn_node.start_point[0] + 1))
         for ch in node.children:
-            walk(ch, scope_consts)
+            walk(ch, scope_consts, scope_blocked)
 
-    walk(tree.root_node, root_consts)
+    walk(tree.root_node, root_consts, root_blocked)
     return found
 
 

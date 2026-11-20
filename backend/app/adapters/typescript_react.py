@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,7 +33,13 @@ from app.adapters.typescript_nextjs import (
 )
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
-_EXTS = (".ts", ".tsx", ".js", ".jsx")
+_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".html", ".htm")
+_API_CLIENT_SUFFIXES = ("-client", "_client", "-api", "_api", "-service", "_service")
+_API_CLIENT_STEMS = frozenset({"api", "client", "http", "queries", "request", "fetcher", "transport", "sse"})
+_HTTP_OR_A11Y_HINT_RE = re.compile(
+    r"(?:\bfetch\s*\(|\bEventSource\s*\(|\baxios\b|\.(?:get|post|put|patch|delete|del)\s*(?:<[^>]*>)?\s*\(|<(?:img|button|input|select|textarea)\b|\bonclick\s*=)",
+    re.IGNORECASE,
+)
 
 
 class TypeScriptReactSpaAdapter:
@@ -51,14 +58,51 @@ class TypeScriptReactSpaAdapter:
         barrel_targets: dict[Path, list[Path]] = {}
         nodes_by_path: dict[Path, AtlasNode] = {}
 
-        for fpath in sorted(src_root.rglob("*")):
-            if not fpath.is_file() or fpath.suffix not in _EXTS:
+        candidate_files = sorted(src_root.rglob("*"))
+        if src_root != fe_dir and fe_dir.is_dir():
+            for top_f in sorted(fe_dir.iterdir()):
+                if top_f.is_file() and top_f.suffix.lower() in (".html", ".htm", ".mjs"):
+                    candidate_files.append(top_f)
+
+        has_src_pages = any(
+            f.is_file()
+            and f.is_relative_to(src_root)
+            and f.suffix in (".tsx", ".jsx", ".ts", ".js")
+            and (f.stem == "App" or any(p in f.relative_to(src_root).parts[:2] for p in ("pages", "routes", "views")))
+            for f in candidate_files
+        )
+
+        for fpath in candidate_files:
+            if not fpath.is_file() or fpath.suffix.lower() not in _EXTS:
                 continue
             if any(p in fpath.parts for p in ("node_modules", "dist", "build", "out", "__tests__", "src-tauri")):
                 continue
-            rel_src = fpath.relative_to(src_root).as_posix()
+            is_in_src = fpath.resolve().is_relative_to(src_root)
+            rel_src = (
+                fpath.resolve().relative_to(src_root).as_posix()
+                if is_in_src
+                else fpath.resolve().relative_to(fe_dir).as_posix()
+            )
             if (
-                fpath.name.endswith((".d.ts", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx", ".config.ts", ".config.js"))
+                fpath.name.endswith(
+                    (
+                        ".d.ts",
+                        ".test.ts",
+                        ".test.tsx",
+                        ".test.js",
+                        ".test.jsx",
+                        ".test.mjs",
+                        ".spec.ts",
+                        ".spec.tsx",
+                        ".spec.js",
+                        ".spec.jsx",
+                        ".spec.mjs",
+                        ".config.ts",
+                        ".config.js",
+                        ".config.mjs",
+                        ".config.cjs",
+                    )
+                )
                 or rel_src.endswith("api-generated.ts")
                 or fpath.name == "types.gen.ts"
                 or ("/core/" in f"/{rel_src}" and fpath.name.endswith(".gen.ts"))
@@ -75,8 +119,8 @@ class TypeScriptReactSpaAdapter:
             clean_txt = extract_script_preserving_lines(raw, fpath.suffix)
             parts = Path(rel_src).parts
             eff_parts = parts[1:] if len(parts) > 1 and parts[0] in ("lib", "app") else parts
-            head = eff_parts[0] if eff_parts else ""
-            if fpath.name in ("index.ts", "index.tsx", "index.js") and head not in ("pages", "routes", "views"):
+            top_part = eff_parts[0] if eff_parts else ""
+            if fpath.name in ("index.ts", "index.tsx", "index.js", "index.mjs") and top_part not in ("pages", "routes", "views"):
                 targets: list[Path] = []
                 for rex in (_REEXPORT_STAR_RE, _REEXPORT_NAMED_RE):
                     for m in rex.finditer(clean_txt):
@@ -87,20 +131,33 @@ class TypeScriptReactSpaAdapter:
                 continue
 
             stem_low = fpath.stem.lower()
-            if head in ("pages", "routes", "views") or fpath.stem == "App":
+            is_html = fpath.suffix.lower() in (".html", ".htm")
+            if is_html and not is_in_src and has_src_pages and not _HTTP_OR_A11Y_HINT_RE.search(raw):
+                continue
+
+            is_client_name = (
+                stem_low in _API_CLIENT_STEMS
+                or fpath.stem.endswith(("Client", "Api", "Service"))
+                or stem_low.endswith(_API_CLIENT_SUFFIXES)
+                or fpath.name.endswith(".gen.ts")
+            )
+            if top_part in ("pages", "routes", "views") or fpath.stem == "App" or is_html:
                 lbl = "/" if fpath.stem in ("App", "Home", "index") else f"/{stem_low}"
                 subkind, cluster = "page", "pages"
-            elif head in ("hooks", "stores", "store") or fpath.stem.startswith("use") or stem_low in ("store", "state"):
+            elif top_part in ("hooks", "stores", "store") or fpath.stem.startswith("use") or stem_low in ("store", "state"):
                 lbl, subkind, cluster = fpath.stem, "hook", "hooks"
-            elif (
-                head in ("api", "client", "services", "clients", "queries")
-                or stem_low in ("api", "client", "http", "queries")
-                or fpath.stem.endswith(("Client", "Api", "Service"))
-                or fpath.name.endswith(".gen.ts")
-            ):
+            elif top_part in ("api", "client", "services", "clients", "queries") or is_client_name:
                 lbl, subkind, cluster = fpath.stem, "api_client", "api_clients"
-            elif head in ("components", "features") or fpath.suffix in (".tsx", ".jsx"):
-                lbl, subkind, cluster = fpath.stem, "component", head or "components"
+            elif top_part in ("core", "utils", "shared"):
+                lbl = fpath.stem
+                if bool(_HTTP_OR_A11Y_HINT_RE.search(clean_txt)):
+                    subkind, cluster = "api_client", "api_clients"
+                else:
+                    subkind, cluster = "component", top_part
+            elif top_part in ("components", "features") or fpath.suffix in (".tsx", ".jsx"):
+                lbl, subkind, cluster = fpath.stem, "component", top_part or "components"
+            elif fpath.suffix.lower() in (".mjs", ".js", ".ts") and _HTTP_OR_A11Y_HINT_RE.search(clean_txt):
+                lbl, subkind, cluster = fpath.stem, "api_client", "api_clients"
             else:
                 continue
 

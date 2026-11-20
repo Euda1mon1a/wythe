@@ -31,6 +31,12 @@ from app.core.policy_context import get_active_policy_tokens, name_has_policy_to
 from app.schemas.atlas import AtlasNode
 
 _SFC_SCRIPT_RE = re.compile(r"<script\b[^>]*>(?P<body>[\s\S]*?)</script>", re.IGNORECASE)
+_HTML_SCRIPT_SRC_RE = re.compile(
+    r"""<script\b[^>]*\bsrc\s*=\s*['"](?P<src>[^'"]+)['"]""", re.IGNORECASE
+)
+_HTML_MARKUP_TEMPLATE_RE = re.compile(
+    r"<(?:img|button|input|select|textarea|div|span)\b[^>]*>", re.IGNORECASE
+)
 _VUE_SFC_FETCH_RE = re.compile(
     r"""\b(?:\$fetch|useFetch|useLazyFetch)\s*(?:<[^;()]{0,180}?>)?\s*\(\s*(?P<quote>['"`])(?P<url>/[^'"`\n]+)(?P=quote)(?P<tail>[\s\S]{0,160})"""
 )
@@ -38,8 +44,8 @@ _METHOD_OPT_RE = re.compile(r"""method\s*:\s*['"](?P<m>GET|POST|PUT|PATCH|DELETE
 
 
 def extract_script_preserving_lines(raw_source: str, suffix: str) -> str:
-    """For .vue / .svelte files, replace non-script regions with newlines to preserve line numbers."""
-    if suffix not in (".vue", ".svelte"):
+    """For .vue / .svelte / .html files, replace non-script regions with spaces/newlines preserving lines."""
+    if suffix.lower() not in (".vue", ".svelte", ".html", ".htm"):
         return _strip_ts_comments(raw_source)
 
     chars = ["\n" if ch == "\n" else " " for ch in raw_source]
@@ -97,6 +103,13 @@ def resolve_frontend_import(
         base = lib_dir / spec[5:]
     elif spec.startswith("."):
         base = (current_file.parent / spec).resolve()
+    elif spec.startswith("/") and not spec.startswith("//"):
+        rel_spec = spec.lstrip("/")
+        base = (
+            (src_root.parent / rel_spec).resolve()
+            if src_root.name == "src" and rel_spec.startswith("src/")
+            else (src_root / rel_spec).resolve()
+        )
     else:
         return None
 
@@ -344,6 +357,11 @@ def scan_display_module_semantics(
 ) -> tuple[list[str], list[FrontendHttpCall], list[RawCandidateFinding]]:
     """Extract imports, HTTP calls, and DISP-001..005 findings for a single display node."""
     imported_specs = [m.group("spec") for m in _IMPORT_RE.finditer(cleaned_txt)]
+    if raw_source and rel_repo.endswith((".html", ".htm")):
+        for sm in _HTML_SCRIPT_SRC_RE.finditer(raw_source):
+            s_val = sm.group("src").strip()
+            if s_val and not s_val.startswith(("http://", "https://", "//")):
+                imported_specs.append(s_val)
     uses_schema_types = has_generated_contract_provenance(
         imported_specs,
         raw_source=raw_source,
@@ -398,6 +416,11 @@ def scan_display_module_semantics(
         )
     node.http_methods = methods_seen
     node.http_paths = paths_seen[:25]
+    if len(paths_seen) > 25 and "total paths" not in node.summary:
+        node.summary = (
+            f"{node.summary.rstrip('.')} "
+            f"({len(paths_seen)} total paths; {len(paths_seen) - 25} omitted beyond 25-path cap)."
+        )
 
     findings: list[RawCandidateFinding] = []
     if node.subkind == "api_client" and http_calls and not uses_schema_types:
@@ -467,9 +490,18 @@ def scan_display_module_semantics(
                     )
                 )
 
-    if raw_source and rel_repo.endswith((".tsx", ".jsx", ".vue", ".svelte")):
+    a11y_target: str | None = None
+    if raw_source and rel_repo.endswith((".tsx", ".jsx", ".vue", ".svelte", ".html", ".htm")):
+        a11y_target = raw_source
+    elif (
+        raw_source
+        and rel_repo.endswith((".js", ".mjs", ".ts"))
+        and _HTML_MARKUP_TEMPLATE_RE.search(cleaned_txt)
+    ):
+        a11y_target = cleaned_txt
+    if a11y_target is not None:
         a11y_hits = scan_a11y_markup_findings(
-            raw_source,
+            a11y_target,
             node.id,
             rel_repo,
             component_resolver=component_resolver,

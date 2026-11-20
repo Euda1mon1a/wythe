@@ -24,6 +24,7 @@ from app.schemas.atlas import (
     LlmNodePointer,
     StratumDrilldownRead,
     StratumZoom,
+    TierKind,
     TruthAtlasReport,
     UiFocusExplainRead,
 )
@@ -31,12 +32,35 @@ from app.services.stratum_service import build_node_stratum_drilldown
 
 DEFAULT_BRIEF_TOKENS = 2200
 DEFAULT_CONE_NODES = 40
+_TOTAL_PATHS_RE = re.compile(r"\((\d+)\s+total\s+paths\b")
 _verification_rank: dict[str, int] = {
     "verified": 0,
     "declared": 1,
     "unverified": 2,
     "broken": 3,
 }
+
+
+def _detect_unobserved_tiers(report: TruthAtlasReport) -> list[TierKind]:
+    notes_lc = [n.lower() for n in report.scan_notes]
+    tiers_present = {n.tier for n in report.nodes}
+    out: list[TierKind] = []
+    if any("no-truth adapter" in nl for nl in notes_lc) and "truth" not in tiers_present:
+        out.append("truth")
+    if (
+        any("no-manipulator adapter" in nl for nl in notes_lc)
+        and "manipulate" not in tiers_present
+    ):
+        out.append("manipulate")
+    if "display" not in tiers_present and (
+        any(
+            "does not inspect ui or http routing" in nl or "no-display" in nl
+            for nl in notes_lc
+        )
+        or report.stack_profile in ("python-services", "no-coverage-fallback")
+    ):
+        out.append("display")
+    return out
 
 
 def _scan_identity_line(report: TruthAtlasReport) -> str:
@@ -47,7 +71,20 @@ def _scan_identity_line(report: TruthAtlasReport) -> str:
         else ("clean" if report.worktree_dirty is False else "non-git")
     )
     digest = report.content_digest[:12] if report.content_digest else "none"
-    return f"commit=`{commit}`, worktree={dirty}, content_digest=`{digest}`"
+    obs_iso = report.observed_at.isoformat() if report.observed_at is not None else "unknown"
+    val_iso = report.valid_until.isoformat() if report.valid_until is not None else "unknown"
+    obs_src = report.observation_source or "unknown"
+    unobserved = _detect_unobserved_tiers(report)
+    unobs_tag = (
+        ", display=unobserved (no-display)"
+        if "display" in unobserved
+        else (f", unobserved={unobserved}" if unobserved else "")
+    )
+    return (
+        f"commit=`{commit}`, worktree={dirty}, content_digest=`{digest}`, "
+        f"observed_at=`{obs_iso}`, valid_until=`{val_iso}`, "
+        f"observation_source=`{obs_src}`, coverage_complete={report.coverage_complete}{unobs_tag}"
+    )
 
 
 def _format_cone_edge(edge: AtlasEdge) -> str:
@@ -173,6 +210,9 @@ def _ptr(node: AtlasNode) -> str:
 
 
 def _to_llm_pointer(node: AtlasNode) -> LlmNodePointer:
+    shown_hp = list(node.http_paths[:6])
+    m_tot = _TOTAL_PATHS_RE.search(node.summary or "")
+    total_hp = max(len(node.http_paths), int(m_tot.group(1))) if m_tot else len(node.http_paths)
     return LlmNodePointer(
         id=node.id,
         tier=node.tier,
@@ -181,7 +221,8 @@ def _to_llm_pointer(node: AtlasNode) -> LlmNodePointer:
         pointer=_ptr(node),
         status=node.status,
         columns=list(node.columns[:8]),
-        http_paths=list(node.http_paths[:6]),
+        http_paths=shown_hp,
+        omitted_http_path_count=max(0, total_hp - len(shown_hp)),
     )
 
 
@@ -245,6 +286,17 @@ def build_llms_txt_brief(
     lim_disp = max(5, int(10 * scale))
     lim_ch = max(4, int(10 * scale))
 
+    unobserved = _detect_unobserved_tiers(report)
+    obs_iso = report.observed_at.isoformat() if report.observed_at is not None else "unknown"
+    val_iso = report.valid_until.isoformat() if report.valid_until is not None else "unknown"
+    obs_src = report.observation_source or "unknown"
+    disp_topo = (
+        f"{s.display_pages} pages, {s.display_hooks_and_clients} clients/hooks [unobserved (no-display)]"
+        if "display" in unobserved and not displays
+        else f"{s.display_pages} pages, {s.display_hooks_and_clients} clients/hooks"
+    )
+    unobs_hdr = f" | Unobserved: `{', '.join(unobserved)}`" if unobserved else ""
+
     lines: list[str] = [
         f"# {report.target_name} ({report.target_slug}) — Wythe 3-Tier Map",
         "",
@@ -254,10 +306,13 @@ def build_llms_txt_brief(
             f"(blocking={s.blocking_findings}, warnings={s.warning_findings})"
         ),
         (
+            f"> Freshness: observed_at=`{obs_iso}` | valid_until=`{val_iso}` | "
+            f"observation_source=`{obs_src}` | coverage_complete=`{report.coverage_complete}`{unobs_hdr}"
+        ),
+        (
             f"> Topology: {s.truth_tables} SQL tables, {s.sql_functions} SQL guards, "
             f"{s.ephemeral_stores} Redis/queue lanes | {s.manipulator_routes} route modules, "
-            f"{s.manipulator_services} services/workers | {s.display_pages} pages, "
-            f"{s.display_hooks_and_clients} clients/hooks | {s.verified_edges} verified edges, "
+            f"{s.manipulator_services} services/workers | {disp_topo} | {s.verified_edges} verified edges, "
             f"{s.end_to_end_chains} E2E chains"
         ),
         "",
@@ -295,6 +350,10 @@ def build_llms_txt_brief(
         )
 
     lines.extend(["", "## Tier 3 — Frontend Display Surfaces & API Clients"])
+    if not displays and "display" in unobserved:
+        lines.append(
+            "- unobserved (no-display): Display tier was not inspected by the active stack profile."
+        )
     for d in displays[:lim_disp]:
         paths = f" -> {', '.join(d.http_paths[:3])}" if d.http_paths else ""
         lines.append(f"- [{d.subkind}] `{d.label}` (`{_ptr(d)}`){paths}")
@@ -355,6 +414,11 @@ def build_llms_txt_brief(
         source_commit=report.source_commit,
         approx_tokens=max(1, len(body) // 4),
         markdown=body,
+        observed_at=report.observed_at,
+        valid_until=report.valid_until,
+        observation_source=report.observation_source,
+        coverage_complete=report.coverage_complete,
+        unobserved_tiers=unobserved,
     )
 
 
@@ -498,6 +562,7 @@ def build_lineage_cone_slice(
         else ""
     )
     full_hint = f'wythe context {report.target_slug} "{query}"{zoom_flags} --full'
+    unobserved = _detect_unobserved_tiers(report)
     seeds, suggestions = _resolve_seed_nodes(report, query)
     if not seeds:
         hint = (
@@ -520,7 +585,14 @@ def build_lineage_cone_slice(
                 full_export_hint=full_hint,
             ),
             approx_tokens=max(1, len(hint) // 4),
-            markdown=f"# Lineage Cone :: `{query}` ({report.target_slug})\n\n{hint}",
+            markdown=(
+                f"# Lineage Cone :: `{query}` ({report.target_slug} | {_scan_identity_line(report)})\n\n{hint}"
+            ),
+            observed_at=report.observed_at,
+            valid_until=report.valid_until,
+            observation_source=report.observation_source,
+            coverage_complete=report.coverage_complete,
+            unobserved_tiers=unobserved,
         )
 
     nodes_by_id = {n.id: n for n in report.nodes}
@@ -729,14 +801,20 @@ def build_lineage_cone_slice(
     if disp_ptrs:
         md.append(f"## Tier 3 — Upstream Display ({len(disp_ptrs)})")
         for p in disp_ptrs:
-            hp = f" routes={p.http_paths}" if p.http_paths else ""
+            om = f" (+{p.omitted_http_path_count} omitted)" if p.omitted_http_path_count > 0 else ""
+            hp = f" routes={p.http_paths}{om}" if p.http_paths else ""
             md.append(f"- [{p.subkind}] `{p.label}` (`{p.pointer}`) status={p.status}{hp}")
+        md.append("")
+    elif "display" in unobserved:
+        md.append("## Tier 3 — Upstream Display (unobserved (no-display))")
+        md.append("- unobserved (no-display): Display tier was not inspected by the active stack profile.")
         md.append("")
     if manip_ptrs:
         manip_by_id = {n.id: n for n in cone_nodes if n.tier == "manipulate"}
         md.append(f"## Tier 2 — Backend Manipulation ({len(manip_ptrs)})")
         for p in manip_ptrs:
-            hp = f" routes={p.http_paths}" if p.http_paths else ""
+            om = f" (+{p.omitted_http_path_count} omitted)" if p.omitted_http_path_count > 0 else ""
+            hp = f" routes={p.http_paths}{om}" if p.http_paths else ""
             mn = manip_by_id.get(p.id)
             vnote = f" | verification={mn.verification_note}" if (mn and mn.verification_note) else ""
             md.append(f"- [{p.subkind}] `{p.label}` (`{p.pointer}`) status={p.status}{hp}{vnote}")
@@ -869,6 +947,11 @@ def build_lineage_cone_slice(
         completeness=completeness,
         approx_tokens=max(1, len(md_text) // 4),
         markdown=md_text,
+        observed_at=report.observed_at,
+        valid_until=report.valid_until,
+        observation_source=report.observation_source,
+        coverage_complete=report.coverage_complete,
+        unobserved_tiers=unobserved,
     )
 
 

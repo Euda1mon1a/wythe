@@ -867,6 +867,7 @@ def record_viewport_receipt(
     from app.services.investigation_service import (
         append_session_delta_event,
         get_active_session_ids_for_target,
+        get_investigation_session,
     )
 
     db_path = _resolve_viewport_bus_db_path()
@@ -874,32 +875,63 @@ def record_viewport_receipt(
     now_iso = now.isoformat()
     receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
     clean_client = payload.client_id.strip()
+    clean_slug = payload.target_slug.strip()
+    clean_cmd_id = payload.command_id.strip()
+    req_sid = (payload.session_id or "").strip() or None
 
     with _VIEWPORT_BUS._lock:
         conn = _open_bus_connection(db_path, create=True)
         assert conn is not None
         try:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT seq, session_id, command_json, delivery_state, applied_clients_json "
-                "FROM viewport_events WHERE command_id = ? AND target_slug = ? "
-                "ORDER BY seq DESC LIMIT 1",
-                (payload.command_id, payload.target_slug),
-            ).fetchone()
-            if row is None and payload.seq is not None:
+            if clean_cmd_id:
+                row = conn.execute(
+                    "SELECT seq, session_id, command_json, delivery_state, applied_clients_json "
+                    "FROM viewport_events WHERE command_id = ? AND target_slug = ? "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (clean_cmd_id, clean_slug),
+                ).fetchone()
+                if row is None:
+                    raise LookupError(
+                        f"Viewport command `{clean_cmd_id}` not found for target `{clean_slug}`."
+                    )
+            elif payload.seq is not None:
                 row = conn.execute(
                     "SELECT seq, session_id, command_json, delivery_state, applied_clients_json "
                     "FROM viewport_events WHERE seq = ? AND target_slug = ?",
-                    (payload.seq, payload.target_slug),
+                    (payload.seq, clean_slug),
                 ).fetchone()
-            if row is None:
-                raise LookupError(
-                    f"Viewport command `{payload.command_id}` not found for target `{payload.target_slug}`."
-                )
+                if row is None:
+                    raise LookupError(
+                        f"Viewport event seq={payload.seq} not found for target `{clean_slug}`."
+                    )
+            else:
+                raise ValueError("Viewport receipt requires `command_id` or `seq`.")
 
             ev_seq = int(row[0])
-            ev_sid = str(row[1]) if row[1] is not None else None
+            if payload.seq is not None and ev_seq != int(payload.seq):
+                raise ValueError(
+                    f"Contradictory viewport receipt identity for `{clean_cmd_id}`: "
+                    f"stored seq={ev_seq} does not match supplied seq={payload.seq}."
+                )
+
             cmd_obj = ViewportCommand.model_validate_json(str(row[2]))
+            ev_sid = (str(row[1]).strip() if row[1] is not None else "") or (
+                (cmd_obj.session_id or "").strip() or None
+            )
+            if ev_sid is not None and req_sid != ev_sid:
+                raise ValueError(
+                    f"Viewport command `{clean_cmd_id}` belongs to session `{ev_sid}`, "
+                    f"not `{req_sid or 'unscoped'}`."
+                )
+            if ev_sid is None and req_sid is not None:
+                existing_inv = get_investigation_session(req_sid)
+                if existing_inv is not None and existing_inv.target_slug != clean_slug:
+                    raise ValueError(
+                        f"Session `{req_sid}` belongs to target `{existing_inv.target_slug}`, "
+                        f"not `{clean_slug}`."
+                    )
+
             prev_state = str(row[3] or "accepted_by_service")
             clients: list[str] = json.loads(str(row[4] or "[]"))
 
@@ -923,15 +955,16 @@ def record_viewport_receipt(
             conn.execute(
                 "UPDATE viewport_events "
                 "SET delivery_state = ?, applied_clients_json = ?, command_json = ? "
-                "WHERE seq = ?",
+                "WHERE seq = ? AND target_slug = ?",
                 (
                     new_state,
                     json.dumps(clients[:32]),
                     updated_cmd.model_dump_json(),
                     ev_seq,
+                    clean_slug,
                 ),
             )
-            eff_sid = (payload.session_id or "").strip() or ev_sid
+            eff_sid = ev_sid or req_sid
             conn.execute(
                 "INSERT INTO viewport_receipts ("
                 "receipt_id, command_id, seq, target_slug, session_id, client_id, "
@@ -941,7 +974,7 @@ def record_viewport_receipt(
                     receipt_id,
                     updated_cmd.command_id,
                     ev_seq,
-                    payload.target_slug,
+                    clean_slug,
                     eff_sid,
                     clean_client,
                     payload.outcome,
@@ -953,11 +986,13 @@ def record_viewport_receipt(
             )
             conn.execute("COMMIT")
         finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             conn.close()
 
     delta_sid = eff_sid
     if not delta_sid:
-        sids = get_active_session_ids_for_target(payload.target_slug)
+        sids = get_active_session_ids_for_target(clean_slug)
         if len(sids) == 1:
             delta_sid = sids[0]
     if delta_sid:
@@ -986,7 +1021,7 @@ def record_viewport_receipt(
         receipt_id=receipt_id,
         command_id=updated_cmd.command_id,
         seq=ev_seq,
-        target_slug=payload.target_slug,
+        target_slug=clean_slug,
         session_id=eff_sid,
         client_id=clean_client,
         outcome=payload.outcome,
@@ -1028,7 +1063,7 @@ def list_viewport_receipts(
             "r.client_id, r.outcome, r.delivery_state, r.applied_focus_revision, r.note, r.recorded_at, "
             "COALESCE(e.applied_clients_json, '[]') "
             "FROM viewport_receipts r "
-            "LEFT JOIN viewport_events e ON e.command_id = r.command_id "
+            "LEFT JOIN viewport_events e ON e.command_id = r.command_id AND e.target_slug = r.target_slug "
             f"{where_sql}"
             "ORDER BY r.id DESC LIMIT ?",
             tuple(params),

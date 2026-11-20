@@ -1,4 +1,4 @@
-# Containers, Security Workflows & Plugin Architecture (`v0.2.7`)
+# Containers, Security Workflows & Plugin Architecture (`v0.2.8`)
 
 This document explains why Wythe inspects container and Kubernetes **source blueprints** (`Dockerfile`/`.docker/`, `.dockerignore`, `compose.yaml`/`docker-compose.*.yml`, and Kubernetes manifests) rather than sealed OCI image tarballs, how **Stage 1 (`tach` + Wythe)** hands off to **Stage 2 (`Syft` + `Trivy`)** in CI across Blue, Red, and Purple workflows, and how Wythe's extension system (`wythe.plugins`, `tach.toml` bridge, and OpenLineage export across CLI, HTTP, MCP, and WebGL UI) operates without executing untrusted repository code.
 
@@ -291,7 +291,14 @@ ship as separate optional `wythe.plugins` packages:
   `interaction_capabilities` and `evidence_source_kinds`
   (`source_static`, `compiled_artifact`, `runtime_capture`) via
   `wythe plugins --json` and `GET /api/v1/adapters/plugins`.
-- **Passive non-execution & non-certification**: None of the eight
+- **`wythe-plugin-agent-discordance`** (`DISC-001`, `DISC-002`):
+  Read-only cross-channel agent continuity and cross-agent isolation
+  companion (`--discordance-bundle`, MCP `wythe_agent_discordance`)
+  evaluating owner-rule vs implementation-prediction vs observed-outcome
+  triples, hop-only vs caller-verified attribution, perturbation
+  matrices, and fail-closed rejection of raw transcripts, audio bytes,
+  or credentials.
+- **Passive non-execution & non-certification**: None of the nine
   plugins imports target code, invokes `ldd`/CMake/Bazel/`swiftc`/
   `xcrun`, executes a target binary or solver, or certifies security,
   propagator soundness, or NP-hard global optimality.

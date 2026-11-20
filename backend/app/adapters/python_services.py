@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 from app.adapters.base import (
     DisplayExtractionResult,
     ManipulatorExtractionResult,
+    RawCandidateFinding,
     TruthExtractionResult,
 )
 from app.adapters.deployment_sources import (
@@ -261,6 +262,47 @@ class PythonServicesAdapter:
                     tnode.policy_columns = classify_table_policy_columns(tnode.label, tnode.columns)
         mnode_by_id = {n.id: n for n in result.nodes}
         sql_pfcs_by_tid: dict[str, list[PolicyFieldConsumption]] = {}
+        unmapped_sql_refs: dict[str, list[str]] = {}
+        known_bare_tables: set[str] = {
+            k.rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+            for k in truth.table_symbol_map
+            if not k.startswith(("jsonl:", "registry:", "sqlc:"))
+        }
+        clock_allow_modules = ("clock.py", "program_time.py", "sql_clock.py")
+
+        def _ensure_unmapped_table_node(raw_ref: str, first_rel: str) -> str | None:
+            bare = raw_ref.split(".", 1)[1] if raw_ref.startswith(("public.", "main.", "dbo.")) else raw_ref
+            if (
+                not bare
+                or len(bare) < 2
+                or bare in known_bare_tables
+                or bare.startswith(("sqlite_", "pg_", "pragma_"))
+                or bare in {"temp", "dual", "json_each", "json_tree", "unnest"}
+            ):
+                return None
+            unmapped_tid = f"t:unmapped:{bare}"
+            if unmapped_tid not in tnode_by_id:
+                utnode = AtlasNode(
+                    id=unmapped_tid,
+                    tier="truth",
+                    subkind="table",
+                    label=bare,
+                    source_file=first_rel,
+                    line=1,
+                    status="gray_zone",
+                    role="unmapped",
+                    cluster="unmapped_sql",
+                    summary=(
+                        f"Unmapped SQL table `{bare}` referenced in `{first_rel}` "
+                        "without a resolved CREATE TABLE or inline store declaration."
+                    ),
+                    verification_note="Unmapped SQL table reference; no DDL declaration resolved in repository.",
+                )
+                truth.nodes.append(utnode)
+                tnode_by_id[unmapped_tid] = utnode
+            if first_rel not in unmapped_sql_refs.setdefault(bare, []):
+                unmapped_sql_refs[bare].append(first_rel)
+            return unmapped_tid
 
         # Emit SQL (direct + helper wrappers + f-strings) and JSONL reads_truth / writes_truth edges.
         for rel in sorted(trees):
@@ -270,27 +312,37 @@ class PythonServicesAdapter:
             read_scopes_by_tid: dict[str, set[str]] = {}
             read_sql_refs_by_tid: dict[str, set[str]] = {}
             write_scopes_by_tid: dict[str, set[str]] = {}
+            unmapped_read_scopes: dict[str, set[str]] = {}
+            unmapped_write_scopes: dict[str, set[str]] = {}
 
             raw_reads: dict[str, set[str]] = {k: set(v) for k, v in io.sql_reads.items()}
             if parsed is not None:
                 for ref in parsed.sql_reads:
                     sc_set = {sc for sc, rsyms in parsed.func_reads.items() if ref in rsyms} or {"*"}
                     raw_reads.setdefault(ref, set()).update(sc_set)
-            for ref, sc_set in raw_reads.items():
+            for ref, sc_set in sorted(raw_reads.items()):
                 tid = resolve_store_target_id(ref, truth.table_symbol_map, io)
                 if tid:
                     read_scopes_by_tid.setdefault(tid, set()).update(sc_set)
                     read_sql_refs_by_tid.setdefault(tid, set()).add(ref)
+                else:
+                    utid = _ensure_unmapped_table_node(ref, rel)
+                    if utid:
+                        unmapped_read_scopes.setdefault(utid, set()).update(sc_set)
 
             raw_writes: dict[str, set[str]] = {k: set(v) for k, v in io.sql_writes.items()}
             if parsed is not None:
                 for ref in parsed.sql_writes:
                     sc_set = {sc for sc, wsyms in parsed.func_writes.items() if ref in wsyms} or {"*"}
                     raw_writes.setdefault(ref, set()).update(sc_set)
-            for ref, sc_set in raw_writes.items():
+            for ref, sc_set in sorted(raw_writes.items()):
                 tid = resolve_store_target_id(ref, truth.table_symbol_map, io)
                 if tid:
                     write_scopes_by_tid.setdefault(tid, set()).update(sc_set)
+                else:
+                    utid = _ensure_unmapped_table_node(ref, rel)
+                    if utid:
+                        unmapped_write_scopes.setdefault(utid, set()).update(sc_set)
 
             for j_stem, sc_set in io.jsonl_reads.items():
                 tid = truth.table_symbol_map.get(f"jsonl:{j_stem}") or truth.table_symbol_map.get(f"{j_stem}.jsonl")
@@ -311,6 +363,9 @@ class PythonServicesAdapter:
                 return links
 
             src_nid = script_id(rel)
+            mnode = mnode_by_id.get(src_nid)
+            subst_consts_in_mod: dict[str, list[str]] = {}
+            fb_consts_in_mod: dict[str, list[str]] = {}
             for tid, sc_set in sorted(read_scopes_by_tid.items()):
                 tnode_ref = tnode_by_id.get(tid)
                 edge_pfc: PolicyFieldConsumption | None = None
@@ -339,13 +394,18 @@ class PythonServicesAdapter:
                     if summarized is not None:
                         edge_pfc, ev_note = summarized
                         sql_pfcs_by_tid.setdefault(tid, []).append(edge_pfc)
-                        mnode = mnode_by_id.get(src_nid)
                         if mnode is not None:
                             mnode.policy_field_consumption = (
                                 merge_policy_consumptions([mnode.policy_field_consumption, edge_pfc])
                                 if mnode.policy_field_consumption is not None
                                 else edge_pfc
                             )
+                    for sa in sa_list:
+                        if sa.state == "bypassed":
+                            for sc_const in sa.substituted_constants:
+                                subst_consts_in_mod.setdefault(sc_const, []).append(tnode_ref.label)
+                        for fb_const in sa.fallback_constants:
+                            fb_consts_in_mod.setdefault(fb_const, []).append(tnode_ref.label)
                 result.edges.append(
                     AtlasEdge(
                         id=f"e:script:{rel}:reads_truth:{tid}",
@@ -359,6 +419,20 @@ class PythonServicesAdapter:
                         policy_field_consumption=edge_pfc,
                     )
                 )
+            for utid, sc_set in sorted(unmapped_read_scopes.items()):
+                ulabel = utid.removeprefix("t:unmapped:")
+                result.edges.append(
+                    AtlasEdge(
+                        id=f"e:script:{rel}:reads_truth:{utid}",
+                        source_id=src_nid,
+                        target_id=utid,
+                        kind="reads_truth",
+                        verification="unverified",
+                        evidence_path=f"{rel}:1",
+                        evidence_note=f"Unmapped SQL read reference to `{ulabel}`; no repository DDL/store declaration matched.",
+                        symbol_links=_scope_links(sc_set),
+                    )
+                )
             for tid, sc_set in sorted(write_scopes_by_tid.items()):
                 result.edges.append(
                     AtlasEdge(
@@ -369,6 +443,20 @@ class PythonServicesAdapter:
                         verification="verified",
                         evidence_path=f"{rel}:1",
                         evidence_note="Static SQL/ledger write reference; reachability and runtime store binding remain static.",
+                        symbol_links=_scope_links(sc_set),
+                    )
+                )
+            for utid, sc_set in sorted(unmapped_write_scopes.items()):
+                ulabel = utid.removeprefix("t:unmapped:")
+                result.edges.append(
+                    AtlasEdge(
+                        id=f"e:script:{rel}:writes_truth:{utid}",
+                        source_id=src_nid,
+                        target_id=utid,
+                        kind="writes_truth",
+                        verification="unverified",
+                        evidence_path=f"{rel}:1",
+                        evidence_note=f"Unmapped SQL write reference to `{ulabel}`; no repository DDL/store declaration matched.",
                         symbol_links=_scope_links(sc_set),
                     )
                 )
@@ -387,6 +475,51 @@ class PythonServicesAdapter:
                             symbol_links=_scope_links(sc_set),
                         )
                     )
+            if parsed is not None and mnode is not None:
+                if not rel.startswith("adapters/") and "/adapters/" not in f"/{rel}":
+                    for const_name, lineno, sample in parsed.policy_literals:
+                        mnode.status = "policy_in_code"
+                        subst_tbls = list(dict.fromkeys(subst_consts_in_mod.get(const_name, ())))
+                        fb_tbls = list(dict.fromkeys(fb_consts_in_mod.get(const_name, ())))
+                        usage_suffix = ""
+                        if subst_tbls:
+                            tbl_list = ", ".join(f"`{t}`" for t in subst_tbls)
+                            usage_suffix = f" Overrides database policy column(s) on {tbl_list} in reader output."
+                        elif fb_tbls:
+                            tbl_list = ", ".join(f"`{t}`" for t in fb_tbls)
+                            usage_suffix = f" Used as null/falsy fallback alongside {tbl_list} policy read."
+                        result.findings.append(
+                            RawCandidateFinding(
+                                rule_code="MANIP-001",
+                                node_id=src_nid,
+                                source_file=rel,
+                                line=lineno,
+                                title=f"Hardcoded policy constant `{const_name}` ({sample})",
+                                detail=(
+                                    f"{rel}:{lineno} defines mutable domain policy "
+                                    f"`{const_name}` in Python code.{usage_suffix}"
+                                ),
+                                remediation=(
+                                    "Move policy threshold/vocabulary into database/registry truth "
+                                    "and read via snapshot."
+                                ),
+                            )
+                        )
+                if PurePosixPath(rel).name not in clock_allow_modules:
+                    for clock_expr, lineno in parsed.raw_clock_calls:
+                        if mnode.status == "clean":
+                            mnode.status = "gray_zone"
+                        result.findings.append(
+                            RawCandidateFinding(
+                                rule_code="MANIP-002",
+                                node_id=src_nid,
+                                source_file=rel,
+                                line=lineno,
+                                title=f"Direct host clock call `{clock_expr}`",
+                                detail=f"{rel}:{lineno} calls `{clock_expr}` directly instead of shared DB/program time.",
+                                remediation="Read current date/instant from the shared clock authority module.",
+                            )
+                        )
 
         dynamic = 0
         for rel, tree in trees.items():
@@ -529,5 +662,12 @@ class PythonServicesAdapter:
                 ),
             ]
         )
+        if unmapped_sql_refs:
+            samples = ", ".join(
+                f"`{tbl}` ({rels[0]})" for tbl, rels in sorted(unmapped_sql_refs.items())[:8]
+            )
+            result.notes.append(
+                f"Unmapped SQL table reference(s) without resolved repository DDL ({len(unmapped_sql_refs)}): {samples}."
+            )
         result.notes.extend(f"Unparsed source: {rel}" for rel in failed)
         return result

@@ -33,8 +33,8 @@ def test_cli_plugins_list_and_untrusted_refusal(tmp_path: Path, capsys) -> None:
     by_name = {p["name"]: p for p in payload["plugins"]}
     assert "container-sources" in by_name
     assert "tach-boundaries" in by_name
-    assert by_name["container-sources"]["version"] == __version__ == "0.2.7"
-    assert by_name["tach-boundaries"]["version"] == __version__ == "0.2.7"
+    assert by_name["container-sources"]["version"] == __version__ == "0.2.8"
+    assert by_name["tach-boundaries"]["version"] == __version__ == "0.2.8"
     assert "Kubernetes" in by_name["container-sources"]["description"]
 
     # Local plugin without explicit --allow-local-plugins must fail closed with exit 2

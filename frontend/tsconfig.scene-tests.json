@@ -7,6 +7,9 @@
     "incremental": false,
     "rootDir": "."
   },
-  "include": ["tests/scene.test.ts"],
+  "include": [
+    "tests/scene.test.ts",
+    "src/lib/__tests__/wytheCameraChoreography.test.ts"
+  ],
   "exclude": ["node_modules"]
 }

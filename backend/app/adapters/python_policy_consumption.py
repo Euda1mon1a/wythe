@@ -509,8 +509,8 @@ _SQL_ALIAS_SKIP_WORDS = frozenset(
 )
 _SQL_FROM_OR_JOIN_RE = re.compile(
     r"\b(?:FROM|JOIN)\s+(?:ONLY\s+)?"
-    r'(?:"?[A-Za-z_][A-Za-z0-9_]*"?\.)?"?(?P<tbl>[A-Za-z_][A-Za-z0-9_]*)"?'
-    r'(?:\s+AS\s+"?(?P<alias1>[A-Za-z_][A-Za-z0-9_]*)"?|\s+"?(?P<alias2>[A-Za-z_][A-Za-z0-9_]*)"?)?',
+    r'(?:["`\[]?[A-Za-z_][A-Za-z0-9_]*["`\]]?\.)?["`\[]?(?P<tbl>[A-Za-z_][A-Za-z0-9_]*)["`\]]?'
+    r'(?:\s+AS\s+["`\[]?(?P<alias1>[A-Za-z_][A-Za-z0-9_]*)["`\]]?|\s+["`\[]?(?P<alias2>[A-Za-z_][A-Za-z0-9_]*)["`\]]?)?',
     re.IGNORECASE,
 )
 _SQL_SELECT_CLAUSE_RE = re.compile(
@@ -518,8 +518,165 @@ _SQL_SELECT_CLAUSE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _SQL_QUAL_COL_RE = re.compile(
-    r'"?(?P<qual>[A-Za-z_][A-Za-z0-9_]*)"?\s*\.\s*"?(?P<col>[A-Za-z_][A-Za-z0-9_]*|\*)"?'
+    r'["`\[]?(?P<qual>[A-Za-z_][A-Za-z0-9_]*)["`\]]?\s*\.\s*["`\[]?(?P<col>[A-Za-z_][A-Za-z0-9_]*|\*)["`\]]?'
 )
+_DOLLAR_QUOTE_TAG_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+_SUBQUERY_HEAD_RE = re.compile(r"^\s*(?:SELECT|WITH)\b", re.IGNORECASE)
+_SUBQUERY_PLACEHOLDER = "__wythe_subquery__"
+
+
+def _strip_sql_literals_and_comments(sql_text: str) -> str:
+    """Strip SQL string literals (`'...'`, `$tag$...$tag$`) and comments (`--`, `/* */`),
+    preserving quoted identifiers (`"col"`, `` `col` ``, `[col]`)."""
+    out: list[str] = []
+    i = 0
+    n = len(sql_text)
+    while i < n:
+        ch = sql_text[i]
+        nxt = sql_text[i + 1] if i + 1 < n else ""
+        if ch == "-" and nxt == "-":
+            i += 2
+            while i < n and sql_text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            depth = 1
+            out.append("  ")
+            i += 2
+            while i < n and depth > 0:
+                if sql_text[i] == "/" and i + 1 < n and sql_text[i + 1] == "*":
+                    depth += 1
+                    out.append("  ")
+                    i += 2
+                elif sql_text[i] == "*" and i + 1 < n and sql_text[i + 1] == "/":
+                    depth -= 1
+                    out.append("  ")
+                    i += 2
+                else:
+                    out.append("\n" if sql_text[i] == "\n" else " ")
+                    i += 1
+            continue
+        if ch in ('"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = sql_text[i]
+                out.append(c)
+                i += 1
+                if c == quote:
+                    if i < n and sql_text[i] == quote:
+                        out.append(sql_text[i])
+                        i += 1
+                    else:
+                        break
+            continue
+        if ch == "[":
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = sql_text[i]
+                out.append(c)
+                i += 1
+                if c in ("]", "\n"):
+                    break
+            continue
+        if (
+            ch in "EeNnXxBb"
+            and nxt == "'"
+            and (i == 0 or not (sql_text[i - 1].isalnum() or sql_text[i - 1] == "_"))
+        ):
+            i += 1
+            ch = "'"
+        if ch == "'":
+            newlines = 0
+            i += 1
+            while i < n:
+                c = sql_text[i]
+                if c == "\n":
+                    newlines += 1
+                if c == "\\":
+                    if i + 1 < n and sql_text[i + 1] == "\n":
+                        newlines += 1
+                    i += 2
+                    continue
+                if c == "'":
+                    if i + 1 < n and sql_text[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            out.append("''" + ("\n" * newlines))
+            continue
+        if ch == "$":
+            dm = _DOLLAR_QUOTE_TAG_RE.match(sql_text, i)
+            if dm is not None:
+                tag = dm.group(0)
+                end_idx = sql_text.find(tag, dm.end())
+                span_end = n if end_idx < 0 else end_idx + len(tag)
+                newlines = sql_text.count("\n", i, span_end)
+                out.append("''" + ("\n" * newlines))
+                i = span_end
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _decompose_sql_query_blocks(cleaned_sql: str) -> list[str]:
+    """Split nested `(SELECT ...)` subqueries into isolated query blocks."""
+    sub_blocks: list[str] = []
+    outer_chars: list[str] = []
+    i = 0
+    n = len(cleaned_sql)
+    quote: str | None = None
+    while i < n:
+        ch = cleaned_sql[i]
+        if quote:
+            outer_chars.append(ch)
+            if (quote == "[" and ch == "]") or (quote != "[" and ch == quote):
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"', "`", "["):
+            quote = ch
+            outer_chars.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth = 1
+            j = i + 1
+            inner_q: str | None = None
+            while j < n and depth > 0:
+                cj = cleaned_sql[j]
+                if inner_q:
+                    if (inner_q == "[" and cj == "]") or (inner_q != "[" and cj == inner_q):
+                        inner_q = None
+                elif cj in ("'", '"', "`", "["):
+                    inner_q = cj
+                elif cj == "(":
+                    depth += 1
+                elif cj == ")":
+                    depth -= 1
+                j += 1
+            if depth == 0:
+                inner_txt = cleaned_sql[i + 1 : j - 1]
+                if _SUBQUERY_HEAD_RE.match(inner_txt):
+                    sub_blocks.extend(_decompose_sql_query_blocks(inner_txt))
+                    outer_chars.append(f"({_SUBQUERY_PLACEHOLDER})")
+                    i = j
+                    continue
+        outer_chars.append(ch)
+        i += 1
+    outer_sql = "".join(outer_chars)
+    branches = re.split(
+        r"\b(?:UNION(?:\s+ALL|\s+DISTINCT)?|INTERSECT|EXCEPT)\b",
+        outer_sql,
+        flags=re.IGNORECASE,
+    )
+    return [b for b in branches if b.strip()] + sub_blocks
 
 
 def _split_top_level_sql_commas(proj: str) -> list[str]:
@@ -558,89 +715,112 @@ def _sql_projection_for_table(
     all_table_cols: frozenset[str] = frozenset(),
 ) -> _Val | None:
     """Extract projected columns for `SELECT <proj> FROM/JOIN <tbl>` when `<tbl>` matches target."""
-    from_hits = list(_SQL_FROM_OR_JOIN_RE.finditer(sql_text))
-    if not from_hits:
-        return None
-    target_quals: set[str] = set()
-    total_tables = 0
-    for fh in from_hits:
-        tbl = fh.group("tbl").lower()
-        total_tables += 1
-        if tbl not in sql_table_names:
-            continue
-        target_quals.add(tbl)
-        raw_al = fh.group("alias1") or fh.group("alias2")
-        if raw_al and raw_al.lower() not in _SQL_ALIAS_SKIP_WORDS:
-            target_quals.add(raw_al.lower())
-    if not target_quals:
-        return None
-
+    cleaned_sql = _strip_sql_literals_and_comments(sql_text)
     known_lower = {c.lower(): c for c in all_table_cols}
-    for match in _SQL_SELECT_CLAUSE_RE.finditer(sql_text):
-        proj = match.group("proj").strip()
-        if proj == "*":
-            return _Val(row=True, from_query=True)
-        cols: list[str] = []
-        slots: list[str] = []
-        saw_agg_or_const = False
-        for raw_part in _split_top_level_sql_commas(proj):
-            seg = raw_part.strip()
-            seg = re.split(r"\s+AS\s+", seg, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-            if ")" not in seg:
-                seg = seg.split()[0] if seg else ""
-            if seg == "*" or any(seg.lower() == f"{q}.*" for q in target_quals):
-                return _Val(row=True, from_query=True)
-            upper_seg = seg.upper()
-            if (
-                upper_seg.startswith(("COUNT(", "EXISTS("))
-                or seg.isdigit()
-                or upper_seg in {"TRUE", "FALSE", "NULL"}
-            ):
-                saw_agg_or_const = True
-                slots.append("")
+    matched_vals: list[_Val] = []
+
+    for block in _decompose_sql_query_blocks(cleaned_sql):
+        from_hits = list(_SQL_FROM_OR_JOIN_RE.finditer(block))
+        subq_from_count = len(
+            re.findall(
+                rf"\b(?:FROM|JOIN)\s*\(\s*{_SUBQUERY_PLACEHOLDER}\s*\)",
+                block,
+                flags=re.IGNORECASE,
+            )
+        )
+        if not from_hits:
+            continue
+        target_quals: set[str] = set()
+        total_tables = subq_from_count
+        for fh in from_hits:
+            tbl = fh.group("tbl").lower()
+            total_tables += 1
+            if tbl not in sql_table_names:
                 continue
-            if "(" in seg:
-                expr_cols: list[str] = []
-                for qm in _SQL_QUAL_COL_RE.finditer(seg):
-                    q_low = qm.group("qual").lower()
-                    c_raw = qm.group("col")
-                    if q_low in target_quals:
-                        if c_raw == "*":
-                            return _Val(row=True, from_query=True)
-                        if c_raw.isidentifier():
-                            expr_cols.append(known_lower.get(c_raw.lower(), c_raw))
-                if not expr_cols and total_tables == 1 and known_lower:
-                    for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", seg):
-                        if tok.lower() in known_lower:
-                            expr_cols.append(known_lower[tok.lower()])
-                if expr_cols:
-                    cols.extend(expr_cols)
-                    slots.append(expr_cols[0])
-                else:
+            target_quals.add(tbl)
+            raw_al = fh.group("alias1") or fh.group("alias2")
+            if raw_al and raw_al.lower() not in _SQL_ALIAS_SKIP_WORDS:
+                target_quals.add(raw_al.lower())
+        if not target_quals:
+            continue
+
+        for match in _SQL_SELECT_CLAUSE_RE.finditer(block):
+            proj = match.group("proj").strip()
+            if proj == "*":
+                return _Val(row=True, from_query=True)
+            cols: list[str] = []
+            slots: list[str] = []
+            saw_agg_or_const = False
+            for raw_part in _split_top_level_sql_commas(proj):
+                seg = raw_part.strip()
+                seg = re.split(r"\s+AS\s+", seg, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+                if ")" not in seg and not seg.startswith("'"):
+                    seg = seg.split()[0] if seg else ""
+                if seg == "*" or any(seg.lower() == f"{q}.*" for q in target_quals):
+                    return _Val(row=True, from_query=True)
+                upper_seg = seg.upper()
+                if (
+                    upper_seg.startswith(("COUNT(", "EXISTS("))
+                    or seg.isdigit()
+                    or upper_seg in {"TRUE", "FALSE", "NULL"}
+                    or (seg.startswith("'") and seg.endswith("'"))
+                ):
                     saw_agg_or_const = True
                     slots.append("")
-                continue
-            qual_part, dot, col_part = seg.rpartition(".")
-            qual_clean = qual_part.strip('"').strip("`").lower()
-            col = col_part.strip('"').strip("`")
-            if dot:
-                if qual_clean not in target_quals:
-                    slots.append("")
                     continue
-                if col == "*":
-                    return _Val(row=True, from_query=True)
-            if col.isidentifier() and (dot or total_tables == 1 or col.lower() in known_lower):
-                canon = known_lower.get(col.lower(), col)
-                cols.append(canon)
-                slots.append(canon)
+                if "(" in seg:
+                    expr_cols: list[str] = []
+                    for qm in _SQL_QUAL_COL_RE.finditer(seg):
+                        q_low = qm.group("qual").lower()
+                        c_raw = qm.group("col")
+                        if q_low in target_quals:
+                            if c_raw == "*":
+                                return _Val(row=True, from_query=True)
+                            if c_raw.isidentifier():
+                                expr_cols.append(known_lower.get(c_raw.lower(), c_raw))
+                    if not expr_cols and total_tables == 1 and known_lower:
+                        for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", seg):
+                            if tok != _SUBQUERY_PLACEHOLDER and tok.lower() in known_lower:
+                                expr_cols.append(known_lower[tok.lower()])
+                    if expr_cols:
+                        cols.extend(expr_cols)
+                        slots.append(expr_cols[0])
+                    else:
+                        saw_agg_or_const = True
+                        slots.append("")
+                    continue
+                qual_part, dot, col_part = seg.rpartition(".")
+                qual_clean = qual_part.strip('"`[]').lower()
+                col = col_part.strip('"`[]')
+                if dot:
+                    if qual_clean not in target_quals:
+                        slots.append("")
+                        continue
+                    if col == "*":
+                        return _Val(row=True, from_query=True)
+                if col.isidentifier() and col != _SUBQUERY_PLACEHOLDER and (
+                    dot or total_tables == 1 or col.lower() in known_lower
+                ):
+                    canon = known_lower.get(col.lower(), col)
+                    cols.append(canon)
+                    slots.append(canon)
+                else:
+                    if not re.search(r"[A-Za-z_]", seg):
+                        saw_agg_or_const = True
+                    slots.append("")
+            if cols:
+                matched_vals.append(_Val(cols=frozenset(cols), tuple_cols=tuple(slots), from_query=True))
+            elif saw_agg_or_const or total_tables > 1:
+                matched_vals.append(_Val(existence_only=True, from_query=True))
             else:
-                slots.append("")
-        if cols:
-            return _Val(cols=frozenset(cols), tuple_cols=tuple(slots), from_query=True)
-        if saw_agg_or_const or total_tables > 1:
-            return _Val(existence_only=True, from_query=True)
-        return _Val(dynamic=True, from_query=True)
-    return None
+                matched_vals.append(_Val(dynamic=True, from_query=True))
+
+    if not matched_vals:
+        return None
+    cur = matched_vals[0]
+    for nxt in matched_vals[1:]:
+        cur = cur.merge(nxt)
+    return cur
 
 
 def _null_guard_polarity(

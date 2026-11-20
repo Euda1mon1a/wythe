@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
 import stat
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -1385,6 +1386,44 @@ class ObservedRuntimeTransition:
     redacted_summary: str = ""
     attributes: dict[str, object] = field(default_factory=dict)
     redacted_fields: int = 0
+    trace_id: str = ""
+    span_id: str = ""
+    parent_span_id: str = ""
+    span_kind: str = ""
+
+
+_OTEL_SPAN_KIND_BY_INT: dict[int, str] = {
+    1: "INTERNAL",
+    2: "SERVER",
+    3: "CLIENT",
+    4: "PRODUCER",
+    5: "CONSUMER",
+}
+_OTEL_SPAN_KIND_STRS: frozenset[str] = frozenset(
+    {"INTERNAL", "SERVER", "CLIENT", "PRODUCER", "CONSUMER"}
+)
+
+
+def _normalize_otel_span_kind(raw_kind: object) -> str:
+    if raw_kind is None or isinstance(raw_kind, bool):
+        return ""
+    if isinstance(raw_kind, int):
+        return _OTEL_SPAN_KIND_BY_INT.get(raw_kind, "")
+    s = str(raw_kind).strip().upper()
+    if s.isdigit():
+        return _OTEL_SPAN_KIND_BY_INT.get(int(s), "")
+    if s.startswith("SPAN_KIND_"):
+        s = s.removeprefix("SPAN_KIND_")
+    return s if s in _OTEL_SPAN_KIND_STRS else ""
+
+
+def _clean_span_ident(raw_val: object) -> str:
+    if raw_val is None or isinstance(raw_val, bool):
+        return ""
+    s = re.sub(r"[^A-Za-z0-9_.:/-]+", "", str(raw_val).strip())[:128]
+    if s and set(s) == {"0"}:
+        return ""
+    return s
 
 
 def _otel_any_value(val_obj: Any, depth: int = 0) -> Any:
@@ -1632,6 +1671,31 @@ def _transition_from_attr_dict(
     return None, red_cnt
 
 
+def _attach_otel_span_envelope(
+    tr: ObservedRuntimeTransition,
+    sp: Mapping[str, Any],
+    sp_attrs: Mapping[str, Any],
+) -> ObservedRuntimeTransition:
+    t_id = _clean_span_ident(sp.get("traceId") or sp.get("trace_id") or sp_attrs.get("trace_id"))
+    s_id = _clean_span_ident(sp.get("spanId") or sp.get("span_id") or sp_attrs.get("span_id"))
+    p_id = _clean_span_ident(
+        sp.get("parentSpanId") or sp.get("parent_span_id") or sp_attrs.get("parent_span_id")
+    )
+    raw_kind = (
+        sp.get("kind")
+        if "kind" in sp
+        else (sp.get("spanKind") or sp.get("span_kind") or sp_attrs.get("span.kind"))
+    )
+    s_kind = _normalize_otel_span_kind(raw_kind)
+    return replace(
+        tr,
+        trace_id=t_id,
+        span_id=s_id,
+        parent_span_id=p_id,
+        span_kind=s_kind,
+    )
+
+
 def parse_otel_traces(
     raw_path: Path | str,
     *,
@@ -1674,7 +1738,7 @@ def parse_otel_traces(
                     )
                     total_redacted += r_cnt
                     if tr is not None:
-                        transitions.append(tr)
+                        transitions.append(_attach_otel_span_envelope(tr, sp, sp_attrs))
     else:
         raw_list = data.get("spans", []) if isinstance(data, Mapping) else (data if isinstance(data, list) else None)
         if raw_list is None:
@@ -1694,7 +1758,7 @@ def parse_otel_traces(
             )
             total_redacted += r_cnt
             if tr is not None:
-                transitions.append(tr)
+                transitions.append(_attach_otel_span_envelope(tr, sp, sp_attrs))
 
     return transitions, total_redacted
 
@@ -1790,6 +1854,131 @@ def _norm_tok(raw: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", raw.lower())
 
 
+_GENERIC_RUNTIME_SERVICES: frozenset[str] = frozenset(
+    {"", "service", "ebpf-source", "unknown_service", "unknownservice", "ebpfsource"}
+)
+_GENERIC_FILE_STEMS: frozenset[str] = frozenset(
+    {"index", "page", "layout", "route", "main", "app", "__init__", "models", "views", "urls", "service", "services"}
+)
+
+
+def _non_generic_svc_norm(service_name: str) -> str:
+    raw = service_name.strip().lower()
+    if raw in _GENERIC_RUNTIME_SERVICES:
+        return ""
+    norm = _norm_tok(raw)
+    return "" if norm in _GENERIC_RUNTIME_SERVICES else norm
+
+
+def _service_matches_node(svc_norm: str, node: Any) -> bool:
+    if not svc_norm or len(svc_norm) < 2 or node is None:
+        return False
+    lbl_norm = _norm_tok(str(getattr(node, "label", "") or ""))
+    nsf = str(getattr(node, "source_file", "") or "").replace("\\", "/")
+    tail = nsf.rsplit("/", 1)[-1]
+    nsf_no_ext = nsf.rsplit(".", 1)[0] if "." in tail else nsf
+    sf_norm = _norm_tok(nsf_no_ext)
+    return (bool(lbl_norm) and svc_norm in lbl_norm) or (bool(sf_norm) and svc_norm in sf_norm)
+
+
+def _filepath_or_func_matches(
+    code_filepath: str,
+    code_function: str,
+    node: Any,
+    symbol_links: Sequence[str] = (),
+) -> bool:
+    if node is None:
+        return False
+    fp = code_filepath.strip().replace("\\", "/").lstrip("./").lower()
+    nsf = str(getattr(node, "source_file", "") or "").strip().replace("\\", "/").lstrip("./").lower()
+    has_fp = False
+    if fp and nsf:
+        if fp == nsf or fp.endswith("/" + nsf) or ("/" in fp and nsf.endswith("/" + fp)):
+            has_fp = True
+        elif "/" not in fp:
+            stem = PurePosixPath(fp).stem
+            if fp == PurePosixPath(nsf).name and stem not in _GENERIC_FILE_STEMS:
+                has_fp = True
+    if fp and nsf and not has_fp:
+        return False
+
+    fn_raw = code_function.strip()
+    fn_short = fn_raw.rpartition(".")[2] if "." in fn_raw else fn_raw
+    has_fn = False
+    explicit_fn_callers = False
+    if fn_short:
+        for lnk in symbol_links:
+            lhs, _sep, _rhs = str(lnk).partition("->")
+            lhs_s = lhs.strip()
+            if lhs_s and lhs_s != "*" and " " not in lhs_s and not lhs_s.startswith("/"):
+                explicit_fn_callers = True
+                if lhs_s == fn_short:
+                    has_fn = True
+                    break
+        if not has_fn and not explicit_fn_callers:
+            fn_norm = _norm_tok(fn_short)
+            nsf_stem = PurePosixPath(nsf).stem if nsf else ""
+            if len(fn_norm) >= 4 and (
+                fn_norm == _norm_tok(str(getattr(node, "label", "") or ""))
+                or (nsf_stem not in _GENERIC_FILE_STEMS and fn_norm == _norm_tok(nsf_stem))
+            ):
+                has_fn = True
+
+    if fp:
+        return (has_fp and has_fn) if (fn_short and explicit_fn_callers) else has_fp
+    return has_fn if fn_short else False
+
+
+def _positive_http_caller_matches(
+    tr: ObservedRuntimeTransition,
+    parent_span: ObservedRuntimeTransition | None,
+    src_node: Any,
+    symbol_links: Sequence[str] = (),
+) -> bool:
+    if src_node is None:
+        return False
+    if tr.span_kind != "SERVER":
+        if (tr.code_filepath or tr.code_function) and _filepath_or_func_matches(
+            tr.code_filepath, tr.code_function, src_node, symbol_links
+        ):
+            return True
+        if tr.span_kind == "CLIENT" or tr.source == "ebpf":
+            c_svc = _non_generic_svc_norm(tr.service_name)
+            if c_svc and _service_matches_node(c_svc, src_node):
+                return True
+    if parent_span is not None:
+        if (parent_span.code_filepath or parent_span.code_function) and _filepath_or_func_matches(
+            parent_span.code_filepath, parent_span.code_function, src_node, symbol_links
+        ):
+            return True
+        p_svc = _non_generic_svc_norm(parent_span.service_name)
+        if p_svc and _service_matches_node(p_svc, src_node):
+            return True
+    return False
+
+
+def _route_helper_edge_scoped(edge_obj: Any, tr: ObservedRuntimeTransition) -> bool:
+    links = getattr(edge_obj, "symbol_links", None) or ()
+    mth_prefix = f"{tr.http_method.upper()} "
+    fn_short = (
+        tr.code_function.strip().rpartition(".")[2] or tr.code_function.strip()
+        if (tr.span_kind != "CLIENT" and tr.code_function)
+        else ""
+    )
+    for raw_link in links:
+        lhs, _sep, rhs = str(raw_link).partition("->")
+        lhs_s = lhs.strip()
+        if lhs_s.upper().startswith(mth_prefix):
+            l_path = lhs_s[len(mth_prefix) :].strip()
+            if l_path and _http_path_matches(l_path, tr.http_route):
+                return True
+        elif (lhs_s.startswith("/") and _http_path_matches(lhs_s, tr.http_route)) or (
+            fn_short and (lhs_s == fn_short or rhs.strip() == fn_short)
+        ):
+            return True
+    return False
+
+
 def correlate_traces_and_flows(
     report: Any,
     transitions: Sequence[ObservedRuntimeTransition],
@@ -1806,7 +1995,7 @@ def correlate_traces_and_flows(
     node_hits: dict[str, int] = {n.id: 0 for n in nodes}
     blind_spots: dict[tuple[str, str, str], dict[str, Any]] = {}
 
-    route_nodes = [n for n in nodes if n.http_paths]
+    route_nodes = [n for n in nodes if n.http_paths and getattr(n, "tier", "") != "display"]
     truth_nodes = [n for n in nodes if n.tier == "truth"]
     manip_nodes = [n for n in nodes if n.tier == "manipulate"]
 
@@ -1819,30 +2008,135 @@ def correlate_traces_and_flows(
         node_hits[edge_obj.source_id] = node_hits.get(edge_obj.source_id, 0) + 1
         node_hits[edge_obj.target_id] = node_hits.get(edge_obj.target_id, 0) + 1
 
+    span_by_key: dict[tuple[str, str], ObservedRuntimeTransition] = {
+        (t.trace_id, t.span_id): t for t in transitions if t.trace_id and t.span_id
+    }
+    exercised_handlers_by_ctx: dict[tuple[str, str], set[str]] = {}
+    exercised_handlers_by_span: dict[tuple[str, str], set[str]] = {}
+
+    def _resolve_http_match(
+        tr: ObservedRuntimeTransition,
+    ) -> tuple[list[Any], set[str], list[Any], list[Any]]:
+        raw_rns = [
+            rn
+            for rn in route_nodes
+            if (not rn.http_methods or tr.http_method in rn.http_methods)
+            and any(_http_path_matches(hp, tr.http_route) for hp in rn.http_paths)
+        ]
+        if not raw_rns:
+            return [], set(), [], []
+        matched_rns = list(raw_rns)
+        if len(matched_rns) > 1 and tr.span_kind != "CLIENT" and (tr.code_filepath or tr.code_function):
+            fp_sub = [
+                rn for rn in matched_rns if _filepath_or_func_matches(tr.code_filepath, tr.code_function, rn)
+            ]
+            if fp_sub:
+                matched_rns = fp_sub
+        if len(matched_rns) > 1:
+            tgt_svc = _non_generic_svc_norm(
+                (tr.peer_service or tr.service_name)
+                if (tr.span_kind == "CLIENT" or tr.source == "ebpf")
+                else tr.service_name
+            )
+            if tgt_svc:
+                svc_sub = [rn for rn in matched_rns if _service_matches_node(tgt_svc, rn)]
+                if svc_sub:
+                    matched_rns = svc_sub
+
+        parent_sp = span_by_key.get((tr.trace_id, tr.parent_span_id)) if (tr.trace_id and tr.parent_span_id) else None
+        cand_ids = {rn.id for rn in matched_rns}
+        pos_callers = [
+            e
+            for e in edges
+            if e.kind in ("queries_endpoint", "mutates_endpoint", "uses_client")
+            and e.target_id in cand_ids
+            and _positive_http_caller_matches(tr, parent_sp, node_by_id.get(e.source_id), e.symbol_links)
+        ]
+        if len(matched_rns) > 1:
+            disambig_tgts = {e.target_id for e in pos_callers}
+            if len(disambig_tgts) == 1:
+                matched_rns = [rn for rn in matched_rns if rn.id in disambig_tgts]
+                cand_ids = disambig_tgts
+            else:
+                return matched_rns, set(), [], []
+        if len({e.source_id for e in pos_callers}) > 1:
+            exact_callers = [
+                e
+                for e in pos_callers
+                if (tr.code_filepath or tr.code_function)
+                and _filepath_or_func_matches(tr.code_filepath, tr.code_function, node_by_id.get(e.source_id), e.symbol_links)
+            ]
+            pos_callers = exact_callers if len({e.source_id for e in exact_callers}) == 1 else []
+        scoped_helpers = (
+            [
+                e
+                for e in edges
+                if e.kind == "calls_helper" and e.source_id in cand_ids and _route_helper_edge_scoped(e, tr)
+            ]
+            if len(cand_ids) == 1
+            else []
+        )
+        return matched_rns, cand_ids, pos_callers, scoped_helpers
+
+    # Pre-index exercised route handlers across traces/services so out-of-order child SQL spans join cleanly.
+    for tr in transitions:
+        if tr.protocol != "http":
+            continue
+        _rns, _nids, _callers, scoped_h = _resolve_http_match(tr)
+        if not scoped_h:
+            continue
+        h_targets = {e.target_id for e in scoped_h}
+        if tr.trace_id and tr.span_id:
+            exercised_handlers_by_span.setdefault((tr.trace_id, tr.span_id), set()).update(h_targets)
+        if tr.trace_id:
+            exercised_handlers_by_ctx.setdefault(("trace", tr.trace_id), set()).update(h_targets)
+        svc_k = _non_generic_svc_norm(tr.service_name)
+        if svc_k:
+            exercised_handlers_by_ctx.setdefault(("svc", svc_k), set()).update(h_targets)
+
     for tr in transitions:
         matched_any = False
+        parent_sp = (
+            span_by_key.get((tr.trace_id, tr.parent_span_id))
+            if (tr.trace_id and tr.parent_span_id)
+            else None
+        )
         if tr.protocol == "http":
-            matched_nids: set[str] = set()
-            for rn in route_nodes:
-                method_ok = not rn.http_methods or tr.http_method in rn.http_methods
-                if method_ok and any(_http_path_matches(hp, tr.http_route) for hp in rn.http_paths):
-                    matched_nids.add(rn.id)
-                    node_hits[rn.id] = node_hits.get(rn.id, 0) + 1
-                    matched_any = True
-            for e in edges:
-                if e.kind in ("queries_endpoint", "mutates_endpoint", "uses_client") and (
-                    e.target_id in matched_nids or e.source_id in matched_nids
-                ):
-                    _credit_edge(e, tr.source, tr.redacted_summary)
-                    matched_any = True
-            for ch in chains:
-                if ch.route_node_id in matched_nids and (
-                    not ch.http_method or ch.http_method == tr.http_method
-                ):
-                    ch_set = {ch.display_node_id, *ch.via_node_ids, ch.route_node_id, *ch.manipulator_node_ids}
-                    for e in edges:
-                        if e.kind == "calls_helper" and e.source_id in ch_set and e.target_id in ch_set:
-                            _credit_edge(e, tr.source, tr.redacted_summary)
+            matched_rns, matched_nids, pos_callers, scoped_helpers = _resolve_http_match(tr)
+            for rn in matched_rns:
+                node_hits[rn.id] = node_hits.get(rn.id, 0) + 1
+                matched_any = True
+            for e in pos_callers:
+                _credit_edge(e, tr.source, tr.redacted_summary)
+                matched_any = True
+            scoped_targets: set[str] = set()
+            for e in scoped_helpers:
+                _credit_edge(e, tr.source, tr.redacted_summary)
+                scoped_targets.add(e.target_id)
+                matched_any = True
+            if len(matched_nids) == 1 and scoped_targets:
+                pos_disp_ids = {e.source_id for e in pos_callers}
+                for ch in chains:
+                    if (
+                        ch.route_node_id in matched_nids
+                        and (not ch.http_method or ch.http_method == tr.http_method)
+                        and (not ch.http_path or _http_path_matches(ch.http_path, tr.http_route))
+                    ):
+                        manip_set = set(ch.manipulator_node_ids)
+                        for src_h in sorted(scoped_targets):
+                            out_h = [
+                                e
+                                for e in edges
+                                if e.kind == "calls_helper" and e.source_id == src_h and e.target_id in manip_set
+                            ]
+                            if len(out_h) == 1:
+                                _credit_edge(out_h[0], tr.source, tr.redacted_summary)
+                        if ch.display_node_id in pos_disp_ids and ch.via_node_ids:
+                            via_chain = [ch.display_node_id, *ch.via_node_ids]
+                            for u_id, v_id in itertools.pairwise(via_chain):
+                                for e in edges:
+                                    if e.source_id == u_id and e.target_id == v_id:
+                                        _credit_edge(e, tr.source, tr.redacted_summary)
         elif tr.protocol == "sql":
             tbl_low = tr.db_table.lower()
             is_write = tr.db_operation in ("INSERT", "UPDATE", "DELETE", "UPSERT", "MERGE")
@@ -1857,44 +2151,78 @@ def correlate_traces_and_flows(
                     or tn.label.rpartition(":")[2].lower() == tbl_low
                 )
             }
-            svc_norm = _norm_tok(tr.code_filepath or tr.service_name)
-            cand_edges = [e for e in edges if e.target_id in t_matches and e.kind in want_kinds]
-            if len(cand_edges) > 1 and svc_norm:
-                narrowed = [
-                    e
-                    for e in cand_edges
-                    if svc_norm in _norm_tok(node_by_id[e.source_id].source_file)
-                    or svc_norm in _norm_tok(node_by_id[e.source_id].label)
-                ]
-                if narrowed:
-                    cand_edges = narrowed
-            for ce in cand_edges:
-                _credit_edge(ce, tr.source, tr.redacted_summary)
-                matched_any = True
             for tid in t_matches:
                 node_hits[tid] = node_hits.get(tid, 0) + 1
                 matched_any = True
+            cand_edges = [
+                e for e in edges if e.target_id in t_matches and e.kind in want_kinds and e.source_id in node_by_id
+            ]
+            credited_sql: list[Any] = []
+            if tr.code_filepath or tr.code_function:
+                fp_matches = [
+                    ce
+                    for ce in cand_edges
+                    if _filepath_or_func_matches(
+                        tr.code_filepath, tr.code_function, node_by_id[ce.source_id], ce.symbol_links
+                    )
+                ]
+                if len({ce.source_id for ce in fp_matches}) == 1:
+                    credited_sql = fp_matches
+            if not credited_sql and parent_sp is not None:
+                p_span_handlers = exercised_handlers_by_span.get((parent_sp.trace_id, parent_sp.span_id), set())
+                p_svc = _non_generic_svc_norm(parent_sp.service_name)
+                p_matches = [
+                    ce
+                    for ce in cand_edges
+                    if ce.source_id in p_span_handlers
+                    or (
+                        (parent_sp.code_filepath or parent_sp.code_function)
+                        and _filepath_or_func_matches(
+                            parent_sp.code_filepath, parent_sp.code_function, node_by_id[ce.source_id], ce.symbol_links
+                        )
+                    )
+                    or (p_svc and _service_matches_node(p_svc, node_by_id[ce.source_id]))
+                ]
+                if len({ce.source_id for ce in p_matches}) == 1:
+                    credited_sql = p_matches
+            svc_norm = _non_generic_svc_norm(tr.service_name)
+            if not credited_sql and svc_norm:
+                narrowed = [ce for ce in cand_edges if _service_matches_node(svc_norm, node_by_id[ce.source_id])]
+                if len({ce.source_id for ce in narrowed}) == 1:
+                    credited_sql = narrowed
+            if not credited_sql:
+                ctx_key = ("trace", tr.trace_id) if tr.trace_id else (("svc", svc_norm) if svc_norm else None)
+                exercised = exercised_handlers_by_ctx.get(ctx_key, set()) if ctx_key is not None else set()
+                ctx_narrowed = [ce for ce in cand_edges if ce.source_id in exercised]
+                if len(ctx_narrowed) == 1:
+                    credited_sql = ctx_narrowed
+            for ce in credited_sql:
+                _credit_edge(ce, tr.source, tr.redacted_summary)
+                matched_any = True
         else:
             peer_norm = _norm_tok(tr.rpc_service or tr.peer_service or tr.rpc_method)
-            caller_norm = _norm_tok(tr.code_filepath or tr.service_name)
-            for e in edges:
-                if e.kind != "calls_helper":
-                    continue
-                tgt_n = node_by_id.get(e.target_id)
-                src_n = node_by_id.get(e.source_id)
-                if tgt_n is None or src_n is None:
-                    continue
-                if (
-                    peer_norm
-                    and (peer_norm in _norm_tok(tgt_n.label) or peer_norm in _norm_tok(tgt_n.source_file))
-                    and (
-                        not caller_norm
-                        or caller_norm in _norm_tok(src_n.label)
-                        or caller_norm in _norm_tok(src_n.source_file)
-                        or caller_norm == "service"
+            caller_svc = _non_generic_svc_norm(tr.service_name)
+            rpc_cands = [
+                e
+                for e in edges
+                if e.kind == "calls_helper"
+                and e.target_id in node_by_id
+                and e.source_id in node_by_id
+                and peer_norm
+                and _service_matches_node(peer_norm, node_by_id[e.target_id])
+                and (
+                    (
+                        (tr.code_filepath or tr.code_function)
+                        and _filepath_or_func_matches(
+                            tr.code_filepath, tr.code_function, node_by_id[e.source_id], e.symbol_links
+                        )
                     )
-                ):
-                    _credit_edge(e, tr.source, tr.redacted_summary)
+                    or (caller_svc and _service_matches_node(caller_svc, node_by_id[e.source_id]))
+                )
+            ]
+            if len({e.source_id for e in rpc_cands}) == 1:
+                for rc in rpc_cands:
+                    _credit_edge(rc, tr.source, tr.redacted_summary)
                     matched_any = True
             if not matched_any and peer_norm:
                 for mn in manip_nodes:

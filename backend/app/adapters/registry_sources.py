@@ -6,6 +6,8 @@ import ast
 import json
 from pathlib import Path, PurePosixPath
 
+import yaml
+
 from app.adapters.base import ManipulatorExtractionResult, TruthExtractionResult
 from app.adapters.deployment_sources import normalize_home
 from app.adapters.inline_store_truth import _collect_str_bindings, _eval_str_expr
@@ -27,7 +29,22 @@ from app.schemas.atlas import (
 
 _COMMAND_KEYS = frozenset({"command", "argv", "script", "script_path", "entrypoint", "wrapper"})
 _REGISTRY_SECTION_KEYS = frozenset(
-    {"commands", "wrapper", "capabilities", "surfaces", "jobs", "schedules"}
+    {
+        "commands",
+        "wrapper",
+        "capabilities",
+        "surfaces",
+        "jobs",
+        "schedules",
+        "providers",
+        "seats",
+        "lanes",
+        "models",
+        "routes",
+        "policies",
+        "rules",
+        "tokens",
+    }
 )
 _REGISTRY_POLICY_FIELD_HINTS = frozenset(
     {
@@ -62,8 +79,100 @@ _REGISTRY_POLICY_FIELD_HINTS = frozenset(
         "commands",
         "jobs",
         "wrapper",
+        "providers",
+        "seats",
+        "lanes",
+        "models",
+        "routes",
+        "policies",
+        "rules",
+        "tokens",
+        "default_model",
+        "seat",
+        "lane",
+        "provider",
+        "fallback",
+        "priority",
+        "weight",
     }
 )
+_REGISTRY_FILE_SUFFIXES = (".json", ".yaml", ".yml")
+_JSON_SCHEMA_META_ONLY_KEYS = frozenset(
+    {
+        "$schema",
+        "$id",
+        "id",
+        "title",
+        "description",
+        "version",
+        "$defs",
+        "definitions",
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "examples",
+        "default",
+    }
+)
+
+
+def _is_excluded_registry_candidate(rel: str, data: object) -> bool:
+    rel_lc = rel.lower()
+    bname = PurePosixPath(rel_lc).name
+    if bname in {
+        "pnpm-lock.yaml",
+        "pnpm-lock.yml",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "composer.lock",
+        "pipfile.lock",
+        "cargo.lock",
+        "yarn.lock",
+    } or bname.endswith(
+        ("-lock.json", "-lock.yaml", "-lock.yml", ".lock.json", ".lock.yaml", ".lock.yml")
+    ):
+        return True
+    if bname.startswith(("docker-compose", "compose.", "compose-")) or bname in {
+        "compose.yml",
+        "compose.yaml",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+    }:
+        return True
+    if bname.endswith((".schema.json", ".schema.yaml", ".schema.yml")):
+        return True
+    if "/workflows/" in f"/{rel_lc}" or "/.github/" in f"/{rel_lc}":
+        return True
+    if not isinstance(data, dict):
+        return False
+    if "lockfileVersion" in data and (
+        "packages" in data or "dependencies" in data or "importers" in data
+    ):
+        return True
+    svcs = data.get("services")
+    if isinstance(svcs, dict) and svcs and all(
+        isinstance(v, dict) and bool(set(v) & {"image", "build", "ports", "volumes", "container_name"})
+        for v in svcs.values()
+    ):
+        return True
+    jobs = data.get("jobs")
+    if isinstance(jobs, dict) and jobs and any(
+        isinstance(v, dict) and ("runs-on" in v or "steps" in v or "uses" in v)
+        for v in jobs.values()
+    ):
+        return True
+    if "$schema" in data:
+        top_keys = set(data.keys())
+        if top_keys <= _JSON_SCHEMA_META_ONLY_KEYS:
+            return True
+        if (
+            data.get("type") == "object"
+            and isinstance(data.get("properties"), dict)
+            and not (top_keys & (_REGISTRY_SECTION_KEYS | _COMMAND_KEYS))
+        ):
+            return True
+    return False
 
 
 def _commands(value: object):
@@ -137,13 +246,19 @@ def _discover_registry_files(repo_root: Path) -> tuple[list[tuple[str, object, l
     found: list[tuple[str, object, list[str]]] = []
     unreadable = 0
     for dirname in ("config", "configs"):
-        files, _ = source_files(repo_root / dirname, {".json"})
+        files, _ = source_files(repo_root / dirname, set(_REGISTRY_FILE_SUFFIXES))
         for path in files:
             rel = path.relative_to(repo_root).as_posix()
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, UnicodeError, RecursionError):
+                raw_text = path.read_text(encoding="utf-8")
+                if path.suffix.lower() in {".yaml", ".yml"}:
+                    data = yaml.safe_load(raw_text)
+                else:
+                    data = json.loads(raw_text)
+            except (OSError, ValueError, UnicodeError, RecursionError, yaml.YAMLError):
                 unreadable += 1
+                continue
+            if data is None or _is_excluded_registry_candidate(rel, data):
                 continue
             cmds = list(_commands(data))
             if not cmds and not _has_registry_keys(data):
@@ -189,7 +304,7 @@ def extract_registry_truth_nodes(repo_root: Path) -> tuple[list[AtlasNode], dict
 def _match_registry_rel(
     raw: str | None, reg_rels: set[str], unique_basenames: dict[str, str]
 ) -> str | None:
-    if not raw or not raw.lower().endswith(".json"):
+    if not raw or not raw.lower().endswith(_REGISTRY_FILE_SUFFIXES):
         return None
     norm = raw.strip().replace("\\", "/").removeprefix("./")
     if norm in reg_rels:
@@ -235,7 +350,7 @@ def _analyze_scope_registry_consumption(
                     if isinstance(sub_e.func, ast.Attribute)
                     else (sub_e.func.id if isinstance(sub_e.func, ast.Name) else "")
                 )
-                if fn_e in {"load", "loads", "safe_load", "read_text"}:
+                if fn_e in {"load", "loads", "safe_load", "safe_load_all", "full_load", "read_text"}:
                     return True
             elif isinstance(sub_e, ast.Name) and sub_e.id in loaded_vars:
                 return True
@@ -349,7 +464,7 @@ def _analyze_scope_registry_consumption(
                     fn_n = s.value.func.attr if isinstance(s.value.func, ast.Attribute) else (
                         s.value.func.id if isinstance(s.value.func, ast.Name) else ""
                     )
-                    if fn_n in {"load", "loads", "safe_load"}:
+                    if fn_n in {"load", "loads", "safe_load", "safe_load_all", "full_load"}:
                         returns_loaded = True
                 elif isinstance(s.value, ast.Name) and s.value.id in loaded_vars:
                     returns_loaded = True
@@ -457,7 +572,16 @@ def _wire_python_registry_readers(
                         if isinstance(c.func, ast.Attribute)
                         else (c.func.id if isinstance(c.func, ast.Name) else "")
                     )
-                    in {"load", "loads", "read_text", "read_bytes", "open"}
+                    in {
+                        "load",
+                        "loads",
+                        "safe_load",
+                        "safe_load_all",
+                        "full_load",
+                        "read_text",
+                        "read_bytes",
+                        "open",
+                    }
                     for c in ast.walk(s)
                 )
                 if sc_name == "*" and isinstance(s, (ast.Assign, ast.AnnAssign)) and not stmt_has_io:
