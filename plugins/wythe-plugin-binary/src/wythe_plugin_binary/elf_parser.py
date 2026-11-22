@@ -101,9 +101,27 @@ def _read_elf_cstring(strtab: bytes, offset: int, limit: int = 512) -> str:
     return "".join(ch for ch in decoded if ord(ch) >= 0x20 and ord(ch) != 0x7F)
 
 
+_NON_NUL_BYTE_RE = re.compile(b"[" + bytes([94, 0]) + b"]")
+
+
 def _extract_rodata_strings(sec_bytes: bytes, *, max_items: int = MAX_RODATA_STRINGS) -> list[str]:
     out: list[str] = []
-    for part in sec_bytes.split(b"\x00"):
+    pos = 0
+    total_len = len(sec_bytes)
+    scanned_steps = 0
+    max_scan_steps = max_items * 64 + 65536
+    while pos < total_len and len(out) < max_items:
+        m = _NON_NUL_BYTE_RE.search(sec_bytes, pos)
+        if m is None:
+            break
+        pos = m.start()
+        scanned_steps += 1
+        if scanned_steps > max_scan_steps:
+            break
+        nul = sec_bytes.find(b"\x00", pos)
+        end = total_len if nul == -1 else nul
+        part = sec_bytes[pos:end]
+        pos = total_len if nul == -1 else end + 1
         if len(part) < 3 or len(part) > 512:
             continue
         try:
@@ -112,8 +130,6 @@ def _extract_rodata_strings(sec_bytes: bytes, *, max_items: int = MAX_RODATA_STR
             continue
         if all(0x20 <= ord(ch) <= 0x7E or ch == "\t" for ch in s):
             out.append(s)
-            if len(out) >= max_items:
-                break
     return out
 
 
@@ -458,9 +474,14 @@ def parse_elf_file(
     path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = MAX_BINARY_BYTES,
 ) -> RecordedBinaryCapture:
     """Safely read a non-symlink ELF64 file and parse its dynamic linkage, symbols, & capabilities."""
-    resolved, raw = read_bounded_regular_bytes(path, repo_root=repo_root, max_bytes=max_bytes)
-    side_caps = _read_sidecar_elf_capabilities(resolved, repo_root)
+    resolved, raw = read_bounded_regular_bytes(
+        path, repo_root=repo_root, allow_external=allow_external, max_bytes=max_bytes
+    )
+    side_caps = _read_sidecar_elf_capabilities(
+        resolved, repo_root if not allow_external else None
+    )
     return parse_elf_bytes(raw, source_name=resolved.name, extra_capabilities=side_caps)

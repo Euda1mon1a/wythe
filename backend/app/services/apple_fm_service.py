@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -17,6 +18,8 @@ from app.core.config import load_settings
 from app.schemas.atlas import OnDeviceEngineStatus
 
 _apple_lock = threading.Lock()
+_apple_build_lock = threading.Lock()
+_APPLE_HELPER_TIMEOUT_SEC = 45.0
 _last_apple_finish_mono = 0.0
 _apple_gap_sec = 0.25
 _apple_reason_notes = {
@@ -27,13 +30,25 @@ _apple_reason_notes = {
 
 
 def _resolve_helper_dir() -> Path:
-    db_url = load_settings().database_url
+    settings = load_settings()
+    db_url = settings.database_url
     if db_url.startswith("sqlite:///") and ":memory:" not in db_url:
         db_file = Path(db_url.removeprefix("sqlite:///")).resolve()
         bin_dir = db_file.parent / "bin"
     else:
-        bin_dir = Path(tempfile.gettempdir()) / "wythe-apple-fm-bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
+        uid_suffix = str(os.getuid()) if hasattr(os, "getuid") else "local"
+        bin_dir = Path(tempfile.gettempdir()) / f"wythe-apple-fm-bin-{uid_suffix}"
+    if bin_dir.is_symlink():
+        raise RuntimeError(f"Refusing symlinked Apple helper directory: {bin_dir}")
+    bin_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        bin_dir.chmod(0o700)
+    except OSError:
+        pass
+    if hasattr(os, "getuid"):
+        st = bin_dir.lstat()
+        if st.st_uid != os.getuid():
+            raise RuntimeError(f"Refusing foreign-owned Apple helper directory: {bin_dir}")
     return bin_dir
 
 
@@ -49,57 +64,88 @@ def _ensure_apple_helper_binary() -> tuple[Path | None, str]:
         return None, f"Apple Intelligence requires macOS 26+ (found macOS {mac_ver})."
 
     swift_src = Path(__file__).with_name("apple_fm_bridge.swift")
-    if not swift_src.is_file():
+    if not swift_src.is_file() or swift_src.is_symlink():
         return None, "Missing apple_fm_bridge.swift helper source."
 
-    digest = hashlib.sha256(swift_src.read_bytes()).hexdigest()
-    bin_dir = _resolve_helper_dir()
+    src_digest = hashlib.sha256(swift_src.read_bytes()).hexdigest()
+    try:
+        bin_dir = _resolve_helper_dir()
+    except RuntimeError as exc:
+        return None, str(exc)
+
     binary = bin_dir / "wythe-apple-fm"
     stamp = bin_dir / "wythe-apple-fm.sha256"
 
-    if (
-        binary.is_file()
-        and stamp.is_file()
-        and stamp.read_text(encoding="utf-8").strip() == digest
-    ):
-        return binary, ""
+    with _apple_build_lock:
+        if (
+            not binary.is_symlink()
+            and binary.is_file()
+            and not stamp.is_symlink()
+            and stamp.is_file()
+        ):
+            try:
+                recorded = stamp.read_text(encoding="utf-8").strip()
+                live_bin_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+                if recorded == f"{src_digest}:{live_bin_digest}":
+                    return binary, ""
+            except OSError:
+                pass
 
-    staged = bin_dir / "wythe-apple-fm.tmp"
-    cmd = [
-        "xcrun",
-        "--sdk",
-        "macosx",
-        "swiftc",
-        "-target",
-        "arm64-apple-macos26.0",
-        "-O",
-        "-suppress-warnings",
-        "-parse-as-library",
-        str(swift_src),
-        "-o",
-        str(staged),
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode != 0 or not staged.is_file():
-            err_line = (proc.stderr or proc.stdout or "swiftc failed").strip().splitlines()[0]
-            return None, f"Could not compile Apple helper ({err_line[:140]})."
-        staged.chmod(0o755)
-        subprocess.run(
-            ["/usr/bin/codesign", "--force", "--sign", "-", str(staged)],
-            capture_output=True,
-            check=False,
-        )
-        staged.replace(binary)
-        stamp.write_text(digest + "\n", encoding="utf-8")
-        return binary, ""
-    except OSError as exc:
-        return None, f"Swift toolchain unavailable ({exc})."
+        fd, tmp_name = tempfile.mkstemp(prefix=".wythe-apple-fm-", suffix=".tmp", dir=str(bin_dir))
+        os.close(fd)
+        staged = Path(tmp_name)
+        cmd = [
+            "xcrun",
+            "--sdk",
+            "macosx",
+            "swiftc",
+            "-target",
+            "arm64-apple-macos26.0",
+            "-O",
+            "-suppress-warnings",
+            "-parse-as-library",
+            str(swift_src),
+            "-o",
+            str(staged),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, check=False, timeout=90.0
+            )
+            if proc.returncode != 0 or not staged.is_file() or staged.is_symlink():
+                staged.unlink(missing_ok=True)
+                err_line = (proc.stderr or proc.stdout or "swiftc failed").strip().splitlines()[0]
+                return None, f"Could not compile Apple helper ({err_line[:140]})."
+            staged.chmod(0o700)
+            subprocess.run(
+                ["/usr/bin/codesign", "--force", "--sign", "-", str(staged)],
+                capture_output=True,
+                check=False,
+                timeout=15.0,
+            )
+            bin_digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+            staged.replace(binary)
+            stamp.write_text(f"{src_digest}:{bin_digest}\n", encoding="utf-8")
+            return binary, ""
+        except (OSError, subprocess.SubprocessError) as exc:
+            staged.unlink(missing_ok=True)
+            return None, f"Swift toolchain unavailable ({exc})."
 
 
 def _invoke_apple_helper(binary: Path, message: dict[str, Any]) -> dict[str, Any]:
+    if binary.is_symlink():
+        return {"ok": False, "error": "Refusing symlinked Apple helper binary."}
     raw_in = json.dumps(message).encode("utf-8")
-    proc = subprocess.run([str(binary)], input=raw_in, capture_output=True, check=False)
+    try:
+        proc = subprocess.run(
+            [str(binary)],
+            input=raw_in,
+            capture_output=True,
+            check=False,
+            timeout=_APPLE_HELPER_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "Apple Intelligence helper timed out."}
     out = proc.stdout.decode("utf-8", errors="replace").strip()
     if not out:
         err = proc.stderr.decode("utf-8", errors="replace").strip()

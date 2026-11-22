@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -14,6 +15,9 @@ from wythe_plugin_wiretap.otel_ebpf import (
     read_bounded_regular_bytes,
 )
 
+_MAX_BYTE_SIZE_INT_BITS = 128
+_MAX_BYTE_SIZE_DIGITS = 38
+_SCI_FLOAT_RE = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]+)?e[+-]?[0-9]+|inf(?:inity)?|nan)$", re.IGNORECASE)
 _SIZE_TOKEN_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([BKMGTP]?)(?:i?B)?$", re.IGNORECASE)
 _LEAKS_TABLE_ROW_RE = re.compile(
     r"^\s*(\d+)\s+(\d+)\s+[0-9.]+\s+([A-Za-z_][A-Za-z0-9_.:<>]*)(?:\s+\(in\s+([^)]+)\))?\s*$"
@@ -21,20 +25,83 @@ _LEAKS_TABLE_ROW_RE = re.compile(
 _LEAKS_EDGE_RE = re.compile(
     r"(0x[0-9a-fA-F]+)\s*(?:\(([^)]+)\))?\s*--([A-Za-z_]*)-->\s*(0x[0-9a-fA-F]+)\s*(?:\(([^)]+)\))?"
 )
-_QUOTED_BUFFER_RE = re.compile(r'"[^"\r\n]{1,256}"')
+_QUOTED_BUFFER_RE = re.compile(r'"[^"\r\n]+"')
+
+
+def _parse_finite_json_float(raw_float: str) -> float:
+    val = float(raw_float)
+    if not math.isfinite(val):
+        raise ValueError("Non-finite float value in heap/vmmap JSON.")
+    return val
+
+
+def _reject_nonfinite_json_const(raw_const: str) -> Any:
+    raise ValueError(f"Non-finite JSON constant {raw_const!r} is forbidden.")
+
+
+def _parse_bounded_json_int(raw_digits: str) -> int:
+    s = raw_digits.strip()
+    digits = s.removeprefix("-")
+    if len(digits) > _MAX_BYTE_SIZE_DIGITS:
+        raise ValueError("Oversized integer token in heap/vmmap JSON.")
+    return int(s)
+
+
+def _safe_nonneg_int(raw: object, *, default: int, minimum: int = 0) -> int:
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return max(minimum, int(raw))
+    if isinstance(raw, int):
+        if raw.bit_length() > _MAX_BYTE_SIZE_INT_BITS:
+            raise ValueError("Integer value exceeds maximum bit length.")
+        return max(minimum, raw)
+    if isinstance(raw, float):
+        if not math.isfinite(raw) or abs(raw) > 1e38:
+            raise ValueError("Non-finite or out-of-range numeric value.")
+        return max(minimum, int(raw))
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return default
+        if _SCI_FLOAT_RE.match(s):
+            val = float(s)
+            if not math.isfinite(val) or abs(val) > 1e38:
+                raise ValueError("Non-finite or out-of-range numeric string.")
+            return max(minimum, int(val))
+        if len(s.lstrip("+-")) > _MAX_BYTE_SIZE_DIGITS:
+            raise ValueError("Integer string exceeds maximum digit length.")
+        return max(minimum, int(s))
+    raise ValueError(f"Expected numeric count, got {type(raw).__name__}.")
 
 
 def parse_byte_size_token(raw: object) -> int:
     """Parse macOS `vmmap`/`leaks` byte counts (`48.5M`, `512K`, `4096`, `16B`) into integer bytes."""
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+    if isinstance(raw, float):
+        if not math.isfinite(raw) or abs(raw) > 1e38:
+            raise ValueError("Non-finite or out-of-range byte size float.")
         return max(0, int(raw))
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        if raw.bit_length() > _MAX_BYTE_SIZE_INT_BITS:
+            raise ValueError("Byte size integer exceeds maximum bit length.")
+        return max(0, raw)
     text = str(raw or "").strip().replace(",", "")
     if not text or text in ("-", "0", "0B", "0K"):
         return 0
+    if _SCI_FLOAT_RE.match(text):
+        val = float(text)
+        if not math.isfinite(val) or abs(val) > 1e38:
+            raise ValueError("Non-finite or out-of-range byte size token.")
+        return max(0, int(val))
     m = _SIZE_TOKEN_RE.match(text)
     if not m:
         return 0
-    val = float(m.group(1))
+    num_str = m.group(1)
+    if len(num_str.split(".", 1)[0]) > _MAX_BYTE_SIZE_DIGITS:
+        raise ValueError("Byte size token exceeds maximum digit length.")
+    val = float(num_str)
+    if not math.isfinite(val):
+        raise ValueError("Non-finite byte size token.")
     unit = m.group(2).upper()
     mult = {
         "": 1,
@@ -45,7 +112,10 @@ def parse_byte_size_token(raw: object) -> int:
         "T": 1024**4,
         "P": 1024**5,
     }.get(unit, 1)
-    return max(0, int(val * mult))
+    scaled = val * mult
+    if not math.isfinite(scaled) or scaled > 1e38:
+        raise ValueError("Byte size token overflows representable range.")
+    return max(0, int(scaled))
 
 
 @dataclass(frozen=True)
@@ -204,9 +274,12 @@ def parse_memgraph_artifact(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
 ) -> dict[str, object]:
     """Passively parse a recorded `.memgraph` / `leaks` JSON or text summary (redacting buffers)."""
-    resolved, raw_bytes = read_bounded_regular_bytes(raw_path, repo_root=repo_root)
+    resolved, raw_bytes = read_bounded_regular_bytes(
+        raw_path, repo_root=repo_root, allow_external=allow_external
+    )
     if raw_bytes.startswith(b"bplist"):
         raise ValueError(
             f"Binary plist memgraph '{resolved.name}' requires exported text/JSON summary; "
@@ -224,21 +297,44 @@ def parse_memgraph_artifact(
     stripped = text.lstrip()
     if stripped.startswith("{"):
         ensure_json_depth_bounded(stripped)
-        data = json.loads(stripped)
+        data = json.loads(
+            stripped,
+            parse_float=_parse_finite_json_float,
+            parse_constant=_reject_nonfinite_json_const,
+            parse_int=_parse_bounded_json_int,
+        )
         if not isinstance(data, Mapping):
             raise ValueError("Memgraph JSON root must be an object.")
-        for cls_item in data.get("classes", []) or data.get("allocations", []):
+        raw_classes = data.get("classes")
+        if raw_classes is None or raw_classes == []:
+            raw_allocs = data.get("allocations")
+            if raw_allocs is not None:
+                raw_classes = raw_allocs
+        if raw_classes is None:
+            raw_classes = []
+        if not isinstance(raw_classes, list):
+            raise ValueError("Memgraph JSON 'classes'/'allocations' field must be a list.")
+        for cls_item in raw_classes:
             if not isinstance(cls_item, Mapping):
                 continue
             if any(k in cls_item for k in ("raw_buffer", "string_preview", "bytes_hex", "payload")):
                 redacted_buffers += 1
             cname = str(cls_item.get("class_name") or cls_item.get("type") or "Object")
             mod = _infer_module_from_class(cname, str(cls_item.get("module") or cls_item.get("binary") or ""))
-            cnt = max(0, int(cls_item.get("instance_count") or cls_item.get("count") or 1))
+            cnt = _safe_nonneg_int(
+                cls_item.get("instance_count") or cls_item.get("count"),
+                default=1,
+                minimum=0,
+            )
             tot_b = parse_byte_size_token(cls_item.get("total_bytes") or cls_item.get("bytes") or cls_item.get("size") or 0)
             classes.append(HeapClassSummary(class_name=cname, module=mod, instance_count=cnt, total_bytes=tot_b))
 
-        for n_item in data.get("nodes", []):
+        raw_nodes = data.get("nodes", [])
+        if raw_nodes is None:
+            raw_nodes = []
+        if not isinstance(raw_nodes, list):
+            raise ValueError("Memgraph JSON 'nodes' field must be a list.")
+        for n_item in raw_nodes:
             if not isinstance(n_item, Mapping):
                 continue
             if any(k in n_item for k in ("raw_buffer", "string_preview", "string_value", "contents")):
@@ -250,7 +346,16 @@ def parse_memgraph_artifact(
             if nid:
                 graph_nodes.append(HeapGraphNode(node_id=nid, class_name=cname, module=mod, size_bytes=sz))
 
-        for e_item in data.get("edges", []) or data.get("references", []):
+        raw_edges = data.get("edges")
+        if raw_edges is None or raw_edges == []:
+            raw_refs = data.get("references")
+            if raw_refs is not None:
+                raw_edges = raw_refs
+        if raw_edges is None:
+            raw_edges = []
+        if not isinstance(raw_edges, list):
+            raise ValueError("Memgraph JSON 'edges'/'references' field must be a list.")
+        for e_item in raw_edges:
             if not isinstance(e_item, Mapping):
                 continue
             src = str(e_item.get("source") or e_item.get("source_id") or e_item.get("from") or "")
@@ -266,8 +371,8 @@ def parse_memgraph_artifact(
                 raw_line = _QUOTED_BUFFER_RE.sub('"[REDACTED_HEAP_STRING]"', raw_line)
             m_row = _LEAKS_TABLE_ROW_RE.match(raw_line)
             if m_row:
-                cnt = int(m_row.group(1))
-                tot_b = int(m_row.group(2))
+                cnt = _safe_nonneg_int(m_row.group(1), default=0, minimum=0)
+                tot_b = _safe_nonneg_int(m_row.group(2), default=0, minimum=0)
                 cname = m_row.group(3)
                 mod = _infer_module_from_class(cname, m_row.group(4) or "")
                 classes.append(
@@ -349,9 +454,12 @@ def parse_vmmap_artifact(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
 ) -> dict[str, object]:
     """Passively parse a recorded `vmmap` JSON or text region summary table."""
-    resolved, raw_bytes = read_bounded_regular_bytes(raw_path, repo_root=repo_root)
+    resolved, raw_bytes = read_bounded_regular_bytes(
+        raw_path, repo_root=repo_root, allow_external=allow_external
+    )
     text = raw_bytes.decode("utf-8-sig")
     if "\x00" in text:
         raise ValueError(f"Refusing vmmap artifact '{raw_path}' containing embedded NUL bytes.")
@@ -360,8 +468,15 @@ def parse_vmmap_artifact(
     stripped = text.lstrip()
     if stripped.startswith(("{", "[")):
         ensure_json_depth_bounded(stripped)
-        data = json.loads(stripped)
+        data = json.loads(
+            stripped,
+            parse_float=_parse_finite_json_float,
+            parse_constant=_reject_nonfinite_json_const,
+            parse_int=_parse_bounded_json_int,
+        )
         raw_list = data.get("regions", []) if isinstance(data, Mapping) else data
+        if raw_list is None:
+            raw_list = []
         if not isinstance(raw_list, list):
             raise ValueError("vmmap JSON must contain a regions list.")
         for item in raw_list:
@@ -378,7 +493,11 @@ def parse_vmmap_artifact(
                     dirty_bytes=parse_byte_size_token(item.get("dirty_bytes") or item.get("dirty") or 0),
                     wired_bytes=parse_byte_size_token(item.get("wired_bytes") or item.get("wired") or 0),
                     swapped_bytes=parse_byte_size_token(item.get("swapped_bytes") or item.get("swapped") or 0),
-                    region_count=max(1, int(item.get("region_count") or item.get("count") or 1)),
+                    region_count=_safe_nonneg_int(
+                        item.get("region_count") or item.get("count"),
+                        default=1,
+                        minimum=1,
+                    ),
                 )
             )
     else:

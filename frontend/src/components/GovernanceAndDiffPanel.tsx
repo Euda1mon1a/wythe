@@ -39,9 +39,17 @@ export function GovernanceAndDiffPanel({
 
   const { data: snapshots = [] } = useScanHistory(activeSlug);
   useEffect(() => {
+    setBaseSnapId(null);
+    setHeadSnapId(null);
+    setCommittedBaseRef('');
+    setSyncMessage(null);
+  }, [activeSlug]);
+
+  useEffect(() => {
+    const validIds = new Set(snapshots.map((s) => s.id));
     if (snapshots.length >= 2) {
-      setHeadSnapId((prev) => prev ?? snapshots[0].id);
-      setBaseSnapId((prev) => prev ?? snapshots[1].id);
+      setHeadSnapId((prev) => (prev !== null && validIds.has(prev) ? prev : snapshots[0].id));
+      setBaseSnapId((prev) => (prev !== null && validIds.has(prev) ? prev : snapshots[1].id));
     } else if (snapshots.length === 1) {
       setHeadSnapId(snapshots[0].id);
       setBaseSnapId(null);

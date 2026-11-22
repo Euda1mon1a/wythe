@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from wythe_plugin_solver_chronicle.log_parser import (
     CpSolverResponseSummary,
     IncrementalSolverLogParser,
     ParsedSolverSession,
+    open_safe_regular_fd,
     parse_cp_model_proto_file,
     parse_cp_solver_response_file,
     read_safe_companion_text,
@@ -187,7 +189,8 @@ def run_watch_solver_cli(argv: list[str]) -> int:
                     break
         elif ns.log_path:
             safe_log = resolve_safe_companion_path(ns.log_path, repo_root=repo_root)
-            with safe_log.open("r", encoding="utf-8", errors="replace") as fh:
+            fd = open_safe_regular_fd(safe_log, raw_label=ns.log_path)
+            with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
                 if not ns.follow:
                     for fline in fh:
                         inc_parser.feed_line(fline)

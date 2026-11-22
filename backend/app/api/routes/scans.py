@@ -74,10 +74,15 @@ def inspect_target(
     strict: BoolFlag = False,
     persist: BoolFlag = False,
 ) -> TruthAtlasReport:
+    if persist:
+        raise HTTPException(
+            status_code=400,
+            detail="GET /api/v1/scans/{target_slug} is read-only; use POST /api/v1/scans/{target_slug} to persist snapshots.",
+        )
     target = get_target_by_slug(db, target_slug)
     if target is None:
         raise HTTPException(status_code=404, detail=f"Target '{target_slug}' not found")
-    return run_target_scan(db, target, strict_gate=strict, persist_snapshot=persist)
+    return run_target_scan(db, target, strict_gate=strict, persist_snapshot=False)
 
 
 @router.post("/{target_slug}", response_model=TruthAtlasReport)

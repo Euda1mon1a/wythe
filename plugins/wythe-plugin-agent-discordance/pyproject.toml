@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wythe-plugin-agent-discordance"
+version = "0.1.0"
+description = "Read-only Wythe plugin auditing cross-channel agent continuity, cross-agent isolation, and missing SDK authorization/caller receipts (#117)."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["wythe>=0.2.9"]
+
+[project.entry-points."wythe.plugins"]
+agent-discordance = "wythe_plugin_agent_discordance.plugin:PLUGIN_SPEC"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wythe_plugin_agent_discordance"]

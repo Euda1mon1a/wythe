@@ -18,6 +18,7 @@ class Settings:
     api_port: int
     cors_origins: tuple[str, ...]
     state_dir: Path = DEFAULT_STATE_DIR
+    allowed_hosts: tuple[str, ...] = ("127.0.0.1", "localhost", "::1", "[::1]")
 
 
 def _env_with_legacy(primary: str, legacy: str, default: str) -> str:
@@ -50,10 +51,19 @@ def load_settings() -> Settings:
         "http://127.0.0.1:3780,http://localhost:3780",
     )
     origins = tuple(origin.strip() for origin in raw_origins.split(",") if origin.strip())
+    raw_allowed = os.getenv("WYTHE_ALLOWED_HOSTS", "")
+    host_list: list[str] = ["127.0.0.1", "localhost", "::1", "[::1]"]
+    if api_host and api_host not in ("0.0.0.0", "::", "*", *host_list):
+        host_list.append(api_host.strip().lower())
+    for item in raw_allowed.split(","):
+        cleaned = item.strip().lower()
+        if cleaned and cleaned not in host_list:
+            host_list.append(cleaned)
     return Settings(
         database_url=database_url,
         api_host=api_host,
         api_port=api_port,
         cors_origins=origins,
         state_dir=state_dir,
+        allowed_hosts=tuple(host_list),
     )

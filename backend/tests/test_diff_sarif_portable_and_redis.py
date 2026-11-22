@@ -423,12 +423,15 @@ def test_portable_governance_bundle_export_and_ci_sync_roundtrip(
     assert cli_main(["sync-config", str(repo)]) == 0
 
     with get_session_factory()() as sess_b:
-        rules_b = {r.rule_code: r for r in list_rule_policies(sess_b)}
-        assert rules_b["TRUTH-004"].blocks_gate is True
-        vocabs_b = {v.token for v in list_policy_vocabularies(sess_b)}
-        assert "TENANT_SLO_CAP" in vocabs_b
         tgt_b = get_target_by_slug(sess_b, "portable-repo")
         assert tgt_b is not None
-        assert len(list_ratchet_baselines(sess_b, tgt_b.id)) == 19
+        # Global catalog stays isolated; overrides apply per-target (`P0-3`).
+        global_rules_b = {r.rule_code: r for r in list_rule_policies(sess_b)}
+        assert global_rules_b["TRUTH-004"].blocks_gate is False
+        rules_b = {r.rule_code: r for r in list_rule_policies(sess_b, target_id=tgt_b.id)}
+        assert rules_b["TRUTH-004"].blocks_gate is True
+        vocabs_b = {v.token for v in list_policy_vocabularies(sess_b, target_id=tgt_b.id)}
+        assert "TENANT_SLO_CAP" in vocabs_b
+        assert len(list_ratchet_baselines(sess_b, tgt_b.id)) == 26
         assert len(list_rulings(sess_b, tgt_b.id)) == 1
     get_session_factory.cache_clear()

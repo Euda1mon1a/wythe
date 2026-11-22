@@ -201,7 +201,8 @@ def test_slm_slice_budget_and_tool_surface_stdio_cli_and_http(
         assert m_slm["slice"] == "slm"
         assert len(m_slm["tools"]) == 4
 
-        # Both `slm` and `full` modes execute all 4 SLM tools AND all 8 full tools cleanly
+        # `slm` slice executes the 4 SLM tools and rejects full-slice tools; `full` executes all.
+        slm_allowed = {t["name"] for t in MCP_SLM_TOOLS}
         for mode in ("slm", "full"):
             for call_name, call_args in (
                 ("wythe_context", {"target": "slm-orders", "section": "all"}),
@@ -220,6 +221,9 @@ def test_slm_slice_budget_and_tool_surface_stdio_cli_and_http(
                         "params": {"name": call_name, "arguments": call_args},
                     },
                 ).json()
+                if mode == "slm" and call_name not in slm_allowed:
+                    assert rpc["result"]["isError"] is True
+                    continue
                 assert rpc["result"]["isError"] is False
                 text_out = rpc["result"]["content"][0]["text"]
                 if call_name == "wythe_context":
@@ -393,9 +397,22 @@ def test_diff_backed_blast_radius_and_ui_focus_staleness(
                 "frontend_subdir": "frontend",
             },
         )
-        for tool_name in ("wythe_blast_radius", "wythe_check_change"):
+        slm_reject = client.post(
+            "/api/v1/mcp?slice=slm",
+            json={
+                "jsonrpc": "2.0",
+                "id": 199,
+                "method": "tools/call",
+                "params": {
+                    "name": "wythe_blast_radius",
+                    "arguments": {"target": "diff-orders", "base_ref": "WORKING"},
+                },
+            },
+        ).json()
+        assert slm_reject["result"]["isError"] is True
+        for tool_name, slice_q in (("wythe_blast_radius", "full"), ("wythe_check_change", "slm")):
             res = client.post(
-                "/api/v1/mcp?slice=slm",
+                f"/api/v1/mcp?slice={slice_q}",
                 json={
                     "jsonrpc": "2.0",
                     "id": 200,

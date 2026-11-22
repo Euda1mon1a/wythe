@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import inspect
 import json
 import os
 import re
+import stat
 import subprocess
 from collections import OrderedDict, deque
 from collections.abc import Sequence
@@ -24,6 +27,7 @@ from app.adapters.base import (
     RouteDescriptor,
     TruthExtractionResult,
 )
+from app.adapters.epistemic_confabulation import evaluate_epistemic_confabulation
 from app.adapters.legacy_snapshot_bridge import apply_legacy_snapshot_bridge
 from app.adapters.plugin_registry import (
     PluginStackProfileSpec,
@@ -37,20 +41,32 @@ from app.adapters.plugin_registry import (
 )
 from app.adapters.redis_ephemeral import augment_redis_ephemeral_lineage
 from app.adapters.typescript_nextjs import _skip_template_expr
-from app.core.clock import utc_now, valid_until_from
+from app.core.clock import utc_now, utc_today, valid_until_from
 from app.core.policy_context import policy_tokens_scope
+from app.core.safe_git import SafeGitError, run_safe_git
 from app.models import PolicyVocabulary, ScanSnapshot, StackProfile, TargetProject
 from app.schemas.atlas import (
     AtlasEdge,
     AtlasNode,
     AtlasSummaryStats,
+    AuditRulingRead,
+    BoundaryFinding,
     EndToEndChain,
     TruthAtlasReport,
 )
 from app.services.gate_service import evaluate_findings_and_gate
 from app.services.governance_service import list_rulings
+from app.services.portable_config_service import (
+    load_target_governance_allowlist,
+    load_target_governance_overrides,
+)
 from app.services.route_probe_service import apply_live_route_probe
-from app.services.ruling_metadata import apply_rulings_and_store_purpose_checks
+from app.services.ruling_metadata import (
+    _is_ruling_active,
+    _is_ruling_commit_stale,
+    _ruling_sort_key,
+    apply_rulings_and_store_purpose_checks,
+)
 from app.services.stratum_service import attach_zoom1_stratum_badges
 
 _API_VERSION_PREFIX_RE = re.compile(r"^/api/v\d+(?=/|$)")
@@ -124,6 +140,14 @@ def _call_segment_matches(call_seg: str, route_seg: str, id_valued: bool = False
     return not route_is_param and call_seg == route_seg
 
 
+def _http_method_matches(call_method: str, route_method: str) -> bool:
+    if call_method == "HEAD":
+        return route_method in ("HEAD", "GET")
+    if call_method in ("OPTIONS", "DYNAMIC"):
+        return True
+    return route_method == call_method
+
+
 def _wildcard_route_candidates(
     call: FrontendHttpCall, routes: list[RouteDescriptor]
 ) -> list[RouteDescriptor]:
@@ -140,7 +164,7 @@ def _wildcard_route_candidates(
         k += count
     found: list[RouteDescriptor] = []
     for route in routes:
-        if route.http_method != call.http_method:
+        if not _http_method_matches(call.http_method, route.http_method):
             continue
         route_segs = _strip_api_version_prefix(route.full_path).strip("/").split("/")
         if len(route_segs) == len(call_segs) and all(
@@ -153,18 +177,24 @@ def _wildcard_route_candidates(
 def _git_dirty_path_count(repo_root: Path) -> int | None:
     """Count uncommitted paths (modified, deleted, untracked; renames once), or None outside git."""
     try:
-        res = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z"],
-            cwd=repo_root,
+        res = run_safe_git(
+            repo_root,
+            "status",
+            "--porcelain=v1",
+            "--ignore-submodules=all",
+            "-z",
+            "-uall",
+            "--",
+            ".",
+            text=False,
             check=True,
-            capture_output=True,
-            timeout=15,
+            timeout=15.0,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, SafeGitError):
         return None
     count = 0
     skip_next = False
-    for token in res.stdout.split(b"\x00"):
+    for token in bytes(res.stdout).split(b"\x00"):
         if skip_next:
             skip_next = False
             continue
@@ -176,18 +206,19 @@ def _git_dirty_path_count(repo_root: Path) -> int | None:
     return count
 
 
+def _repo_has_git_marker(repo_root: Path) -> bool:
+    for anc in (repo_root, *repo_root.parents):
+        marker = anc / ".git"
+        if marker.exists() or marker.is_symlink():
+            return True
+    return False
+
+
 def _resolve_git_commit(repo_root: Path) -> str:
     try:
-        res = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        return res.stdout.strip() or "uncommitted"
-    except (OSError, subprocess.SubprocessError):
+        res = run_safe_git(repo_root, "rev-parse", "HEAD", text=True, check=True, timeout=3.0)
+        return str(res.stdout).strip() or "uncommitted"
+    except (OSError, subprocess.SubprocessError, SafeGitError):
         return "unavailable"
 
 
@@ -210,37 +241,44 @@ _EXTRACTION_CACHE_MAX = 8
 def _compute_git_worktree_fingerprint(repo_root: Path) -> tuple[str, str] | None:
     """Return `(head_sha, sha256_worktree_digest)` for git repos, or `None` outside git."""
     try:
-        head_res = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=3,
+        head_res = run_safe_git(
+            repo_root, "rev-parse", "HEAD", text=True, check=True, timeout=3.0
         )
-        status_res = subprocess.run(
-            ["git", "status", "-z", "-uall"],
-            cwd=repo_root,
+        status_res = run_safe_git(
+            repo_root,
+            "status",
+            "--ignore-submodules=all",
+            "-z",
+            "-uall",
+            "--",
+            ".",
+            text=False,
             check=True,
-            capture_output=True,
-            timeout=5,
+            timeout=5.0,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, SafeGitError):
         return None
 
-    head_sha = head_res.stdout.strip() or "uncommitted"
+    head_sha = str(head_res.stdout).strip() or "uncommitted"
+    status_bytes = bytes(status_res.stdout)
     h = hashlib.sha256()
     h.update(head_sha.encode("utf-8"))
     h.update(b"\x00")
-    h.update(status_res.stdout)
-    for token in status_res.stdout.split(b"\x00"):
+    h.update(status_bytes)
+    for token in status_bytes.split(b"\x00"):
         if not token:
             continue
         rel_bytes = token[3:] if len(token) > 3 and token[2:3] == b" " else token
         try:
             rel_str = rel_bytes.decode("utf-8", errors="surrogateescape")
-            st = os.lstat(repo_root / rel_str)
-            h.update(f"|{rel_str}:{st.st_mtime_ns}:{st.st_size}".encode("utf-8", errors="replace"))
+            cand = repo_root / rel_str
+            st = os.lstat(cand)
+            link_tgt = os.readlink(cand) if stat.S_ISLNK(st.st_mode) else ""
+            h.update(
+                f"|{rel_str}:{st.st_mtime_ns}:{st.st_size}:{link_tgt}".encode(
+                    "utf-8", errors="replace"
+                )
+            )
         except OSError:
             continue
     return head_sha, h.hexdigest()
@@ -446,11 +484,50 @@ def _solve_cross_tier_lineage(
     local_route_res = [re.compile(p) for p in disp.local_route_patterns]
 
     for call in disp.http_calls:
-        matched_routes = [
-            r
-            for r, pat in compiled_routes
-            if r.http_method == call.http_method and pat.match(call.normalized_path)
+        path_matches = [
+            r for r, pat in compiled_routes if pat.match(call.normalized_path)
         ]
+        if call.http_method == "DYNAMIC":
+            if len(path_matches) == 1:
+                matched_routes = path_matches
+            elif len(path_matches) > 1:
+                if any(rx.match(call.normalized_path) for rx in local_route_res):
+                    continue
+                shown = ", ".join(
+                    f"`{r.http_method} {r.full_path}`" for r in path_matches[:3]
+                )
+                more = f" (+{len(path_matches) - 3} more)" if len(path_matches) > 3 else ""
+                extra_findings.append(
+                    RawCandidateFinding(
+                        rule_code="DISP-006",
+                        node_id=call.caller_node_id,
+                        source_file=call.source_file,
+                        line=call.line,
+                        title=(
+                            f"Frontend `{call.http_method} {call.normalized_path}` uses a dynamic "
+                            f"HTTP method matching {len(path_matches)} backend route(s)"
+                        ),
+                        detail=(
+                            f"{call.source_file}:{call.line} calls `{call.raw_path}` with a runtime "
+                            f"HTTP method. It could dispatch to {shown}{more}, and static analysis "
+                            "cannot tell which verb is used at runtime."
+                        ),
+                        remediation="Pass an explicit literal HTTP method or confirm all matched backend handlers are intended.",
+                        http_method=call.http_method,
+                        http_path=call.normalized_path,
+                    )
+                )
+                continue
+            else:
+                matched_routes = []
+        elif call.http_method == "HEAD":
+            exact = [r for r in path_matches if r.http_method == "HEAD"]
+            matched_routes = exact or [r for r in path_matches if r.http_method == "GET"]
+        elif call.http_method == "OPTIONS":
+            exact = [r for r in path_matches if r.http_method == "OPTIONS"]
+            matched_routes = exact or path_matches
+        else:
+            matched_routes = [r for r in path_matches if r.http_method == call.http_method]
         if not matched_routes:
             if not manip.coverage_complete:
                 if not any(rx.match(call.normalized_path) for rx in local_route_res):
@@ -477,8 +554,16 @@ def _solve_cross_tier_lineage(
                 extra_findings.extend(_classify_unbacked_call(call, manip.routes, local_route_res))
             continue
 
-        kind = "queries_endpoint" if call.http_method == "GET" else "mutates_endpoint"
-        op = "read" if call.http_method == "GET" else "write"
+        if call.http_method in ("GET", "HEAD", "OPTIONS"):
+            is_read_call = True
+        elif call.http_method == "DYNAMIC":
+            is_read_call = all(
+                r.http_method in ("GET", "HEAD", "OPTIONS") for r in matched_routes
+            )
+        else:
+            is_read_call = False
+        kind = "queries_endpoint" if is_read_call else "mutates_endpoint"
+        op = "read" if is_read_call else "write"
         is_inactive = call.reachable is False
         edge_verification = "declared" if is_inactive else "verified"
         if call.entry_node_ids:
@@ -604,6 +689,48 @@ def _solve_cross_tier_lineage(
     return cross_edges, chains, extra_findings
 
 
+def _compute_zoom1_content_digest(
+    commit_sha: str,
+    nodes: Sequence[AtlasNode],
+    edges: Sequence[AtlasEdge],
+    findings: Sequence[BoundaryFinding],
+    gate_verdict: str,
+) -> str:
+    digest_src = json.dumps(
+        {
+            "commit": commit_sha,
+            "gate_verdict": gate_verdict,
+            "nodes": [[n.id, n.status] for n in nodes],
+            "edges": [
+                [
+                    e.id,
+                    e.verification,
+                    e.policy_field_consumption.state if e.policy_field_consumption else None,
+                ]
+                for e in edges
+            ],
+            "findings": sorted(
+                [f.rule_code, f.node_id or "", f.source_file, f.line, f.blocks_gate, f.title]
+                for f in findings
+            ),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
+
+
+def _apply_post_scan_findings_to_nodes(
+    nodes: Sequence[AtlasNode],
+    post_findings: Sequence[BoundaryFinding],
+) -> None:
+    if not post_findings:
+        return
+    flagged_nids = {f.node_id for f in post_findings if f.node_id}
+    for n in nodes:
+        if n.id in flagged_nids and n.status == "clean":
+            n.status = "gray_zone"
+
+
 def _reconcile_post_plugin_node_states(manip: ManipulatorExtractionResult) -> None:
     """Reconcile inert-module findings, summaries, and node statuses after manipulator plugins run."""
     manip.edges[:] = list({e.id: e for e in manip.edges}.values())
@@ -649,7 +776,7 @@ def _reconcile_post_plugin_node_states(manip: ManipulatorExtractionResult) -> No
             node.status = "clean"
         if "MANIP-001" in n_rules and node.status == "clean":
             node.status = "policy_in_code"
-        elif n_rules & {"MANIP-004", "MANIP-005", "MANIP-006"} and node.status == "clean":
+        elif n_rules & {"MANIP-004", "MANIP-005", "MANIP-006", "MANIP-007"} and node.status == "clean":
             node.status = "gray_zone"
 
 
@@ -665,38 +792,48 @@ def run_target_scan(
     probe_allow_remote: bool = False,
     local_plugin_modules: Sequence[str] | None = None,
     allow_local_plugins: bool = False,
+    source_commit_override: str | None = None,
 ) -> TruthAtlasReport:
     """Execute a 3-tier Truth Atlas scan for a registered TargetProject.
 
     `probe_url` opts into one unauthenticated GET per unbacked frontend call against a
     running backend (see `route_probe_service`) to confirm or clear DISP-004/007 findings.
     """
+    from app.services import investigation_service as _inv_svc
+
+    pre_scan_state = _inv_svc.capture_scan_input_state(session, target)
     profile_slug = (
         "fastapi-sqlalchemy-nextjs"
         if target.stack_profile_slug.endswith("-native")
         else target.stack_profile_slug
     )
-    repo_root = Path(target.repo_path).resolve()
+    repo_root = pre_scan_state[0]
     active_artifacts = get_active_stratum_artifacts()
     strict_artifact_plugins = bool(active_artifacts)
     plugin_load_notes: list[str] = []
-    discovered_specs = discover_plugins(
-        repo_root=repo_root,
-        allow_local_plugins=allow_local_plugins,
-        local_plugin_modules=local_plugin_modules,
-        strict_plugins=strict_artifact_plugins,
-        notes_out=plugin_load_notes,
-    )
+    plugin_failures: list[str] = []
+    disc_kw: dict[str, object] = {
+        "repo_root": repo_root,
+        "allow_local_plugins": allow_local_plugins,
+        "local_plugin_modules": local_plugin_modules,
+        "strict_plugins": strict_artifact_plugins,
+        "notes_out": plugin_load_notes,
+    }
+    if "failures_out" in inspect.signature(discover_plugins).parameters:
+        disc_kw["failures_out"] = plugin_failures
+    discovered_specs = discover_plugins(**disc_kw)  # type: ignore[arg-type]
     registry = build_default_registry()
-    register_plugin_tier_adapters(
-        registry,
-        repo_root=repo_root,
-        plugins=discovered_specs,
-        allow_local_plugins=allow_local_plugins,
-        local_plugin_modules=local_plugin_modules,
-        strict_plugins=strict_artifact_plugins,
-        notes_out=plugin_load_notes,
-    )
+    reg_kw: dict[str, object] = {
+        "repo_root": repo_root,
+        "plugins": discovered_specs,
+        "allow_local_plugins": allow_local_plugins,
+        "local_plugin_modules": local_plugin_modules,
+        "strict_plugins": strict_artifact_plugins,
+        "notes_out": plugin_load_notes,
+    }
+    if "failures_out" in inspect.signature(register_plugin_tier_adapters).parameters:
+        reg_kw["failures_out"] = plugin_failures
+    register_plugin_tier_adapters(registry, **reg_kw)  # type: ignore[arg-type]
 
     profile = session.scalar(
         select(StackProfile).where(StackProfile.slug == profile_slug)
@@ -737,13 +874,20 @@ def run_target_scan(
         resolved_disp_adapter = plugin_prof.display_adapter
         resolved_maturity = plugin_prof.maturity_status
 
-    enabled_tokens = tuple(
-        session.scalars(
-            select(PolicyVocabulary.token)
-            .where(PolicyVocabulary.is_enabled.is_(True))
-            .order_by(PolicyVocabulary.id)
-        ).all()
-    )
+    base_vocabs = session.scalars(
+        select(PolicyVocabulary).order_by(PolicyVocabulary.id)
+    ).all()
+    _, target_vocab_ov = load_target_governance_overrides(session, target.id or None)
+    eff_tok_map: dict[tuple[str, str], bool] = {
+        (v.domain_pack.lower(), v.token.upper()): bool(v.is_enabled) for v in base_vocabs
+    }
+    for tv in target_vocab_ov:
+        vkey = (tv.domain_pack.lower(), tv.token.upper())
+        if strict_gate and eff_tok_map.get(vkey, False):
+            # `--strict` ignores per-target vocabulary disabling
+            continue
+        eff_tok_map[vkey] = bool(tv.is_enabled)
+    enabled_tokens = tuple(tok for (_pack, tok), is_en in eff_tok_map.items() if is_en)
 
     t_adapter = registry.get_truth(resolved_truth_adapter)
     m_adapter = registry.get_manipulator(resolved_manip_adapter)
@@ -766,13 +910,42 @@ def run_target_scan(
         bool(allow_local_plugins),
         tuple(local_plugin_modules or ()),
         tuple(plugin_load_notes),
+        bool(plugin_failures),
         *artifact_sig,
     )
+    clean_override_sha = (source_commit_override or "").strip()
+    has_git = bool(clean_override_sha) or _repo_has_git_marker(repo_root)
     git_fp = (
         _compute_git_worktree_fingerprint(repo_root)
-        if pg_dsn is None and redis_dsn is None
+        if pg_dsn is None and redis_dsn is None and not clean_override_sha
         else None
     )
+    commit_sha = (
+        clean_override_sha
+        if clean_override_sha
+        else (git_fp[0] if git_fp is not None else _resolve_git_commit(repo_root))
+    )
+    rulings = list_rulings(session, target.id) if target.id else []
+    trusted_allowlist: set[str] = set()
+    if not strict_gate:
+        if target.id:
+            trusted_allowlist.update(load_target_governance_allowlist(session, target.id))
+        today = utc_today()
+        active_by_node: dict[str, list[AuditRulingRead]] = {}
+        for r in rulings:
+            if _is_ruling_active(r, today):
+                active_by_node.setdefault(r.node_id, []).append(r)
+        for node_rulings in active_by_node.values():
+            node_rulings.sort(key=_ruling_sort_key, reverse=True)
+            latest = node_rulings[0]
+            if latest.disposition in (
+                "intentional_exception",
+                "accepted_clean",
+            ) and not _is_ruling_commit_stale(latest, commit_sha, git_present=has_git):
+                for sc in latest.evidence_scope:
+                    cleaned_sc = sc.strip().removeprefix("file:").lstrip("./")
+                    if cleaned_sc:
+                        trusted_allowlist.add(cleaned_sc)
     cache_key = (
         (
             str(repo_root),
@@ -782,7 +955,10 @@ def run_target_scan(
             resolved_manip_adapter,
             resolved_disp_adapter,
             enabled_tokens,
+            bool(strict_gate),
+            tuple(sorted(trusted_allowlist)),
             git_fp[1],
+            pre_scan_state[1],
             plugin_cache_sig,
         )
         if git_fp is not None
@@ -796,9 +972,9 @@ def run_target_scan(
         obs_source = cached.obs_source
         coverage_complete = cached.coverage_complete
         all_nodes = [n.model_copy(deep=True) for n in cached.nodes]
-        all_edges = list(cached.edges)
-        chains = list(cached.chains)
-        raw_findings = list(cached.raw_findings)
+        all_edges = [e.model_copy(deep=True) for e in cached.edges]
+        chains = [c.model_copy(deep=True) for c in cached.chains]
+        raw_findings = copy.deepcopy(cached.raw_findings)
         scan_notes = list(cached.notes)
     else:
         with policy_tokens_scope(enabled_tokens):
@@ -832,6 +1008,27 @@ def run_target_scan(
         cross_edges, chains, cross_findings = _solve_cross_tier_lineage(
             truth_res, manip_res, disp_res
         )
+        epistemic_params = inspect.signature(evaluate_epistemic_confabulation).parameters
+        epistemic_kwargs: dict[str, object] = {"strict": strict_gate}
+        if "trusted_allowlist" in epistemic_params:
+            epistemic_kwargs["trusted_allowlist"] = trusted_allowlist
+        epistemic_cov: list[bool] = []
+        if "coverage_out" in epistemic_params:
+            epistemic_kwargs["coverage_out"] = epistemic_cov
+        confab_findings, confab_notes = evaluate_epistemic_confabulation(
+            repo_root,
+            target.backend_subdir,
+            target.frontend_subdir,
+            manip_res,
+            disp_res,
+            **epistemic_kwargs,  # type: ignore[arg-type]
+        )
+        if any(not c for c in epistemic_cov) or any(
+            n.strip().lower().startswith("epistemic_coverage_incomplete:")
+            or n.strip().lower() == "coverage_incomplete"
+            for n in confab_notes
+        ):
+            coverage_complete = False
         all_nodes = sorted(
             [*truth_res.nodes, *manip_res.nodes, *disp_res.nodes],
             key=lambda n: (n.tier, n.subkind, n.id),
@@ -866,8 +1063,9 @@ def run_target_scan(
             *manip_res.findings,
             *disp_res.findings,
             *cross_findings,
+            *confab_findings,
         ]
-        scan_notes = [*truth_res.notes, *manip_res.notes, *disp_res.notes]
+        scan_notes = [*truth_res.notes, *manip_res.notes, *disp_res.notes, *confab_notes]
         if (
             profile_slug == "no-coverage-fallback"
             and (repo_root / "Package.swift").is_file()
@@ -879,21 +1077,27 @@ def run_target_scan(
             )
             if swift_note not in scan_notes:
                 scan_notes.append(swift_note)
-        commit_sha = git_fp[0] if git_fp is not None else _resolve_git_commit(repo_root)
+        commit_sha = (
+            clean_override_sha
+            if clean_override_sha
+            else (git_fp[0] if git_fp is not None else _resolve_git_commit(repo_root))
+        )
         if cache_key is not None:
             _EXTRACTION_CACHE[cache_key] = _CachedStaticExtraction(
                 commit_sha=commit_sha,
                 obs_source=obs_source,
                 coverage_complete=coverage_complete,
                 nodes=[n.model_copy(deep=True) for n in all_nodes],
-                edges=list(all_edges),
-                chains=list(chains),
-                raw_findings=list(raw_findings),
+                edges=[e.model_copy(deep=True) for e in all_edges],
+                chains=[c.model_copy(deep=True) for c in chains],
+                raw_findings=copy.deepcopy(raw_findings),
                 notes=list(scan_notes),
             )
             while len(_EXTRACTION_CACHE) > _EXTRACTION_CACHE_MAX:
                 _EXTRACTION_CACHE.popitem(last=False)
 
+    if plugin_failures:
+        coverage_complete = False
     for p_note in plugin_load_notes:
         if p_note not in scan_notes:
             scan_notes.append(p_note)
@@ -911,9 +1115,14 @@ def run_target_scan(
         repo_root, target.legacy_snapshot_relpath, all_nodes
     )
 
-    rulings = list_rulings(session, target.id) if target.id else []
     raw_findings = apply_rulings_and_store_purpose_checks(
-        all_nodes, all_edges, raw_findings, rulings
+        all_nodes,
+        all_edges,
+        raw_findings,
+        rulings,
+        strict_gate=strict_gate,
+        current_commit=commit_sha,
+        git_present=has_git,
     )
 
     findings, gate = evaluate_findings_and_gate(
@@ -926,16 +1135,7 @@ def run_target_scan(
     )
 
     observed = utc_now()
-    digest_src = json.dumps(
-        {
-            "commit": commit_sha,
-            "nodes": [n.id for n in all_nodes],
-            "edges": [e.id for e in all_edges],
-            "findings": sorted(f.id for f in findings),
-        },
-        sort_keys=True,
-    )
-    digest = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
+    digest = _compute_zoom1_content_digest(commit_sha, all_nodes, all_edges, findings, gate.verdict)
 
     stats = AtlasSummaryStats(
         truth_tables=sum(
@@ -997,16 +1197,29 @@ def run_target_scan(
         rulings=rulings,
     )
 
-    post_exec = run_post_scan_plugins(
+    zoom1_post_specs = [
+        s
+        for s in discovered_specs
+        if s.kind != "stratum_inspector" and s.stratum_expand_hook is None
+    ]
+    stratum_post_specs = [
+        s
+        for s in discovered_specs
+        if s.kind == "stratum_inspector" or s.stratum_expand_hook is not None
+    ]
+
+    zoom1_post_exec = run_post_scan_plugins(
         repo_root,
         report,
-        plugins=discovered_specs,
+        plugins=zoom1_post_specs,
         allow_local_plugins=allow_local_plugins,
         local_plugin_modules=local_plugin_modules,
         strict_plugins=strict_artifact_plugins,
     )
-    if post_exec.findings:
-        raw_findings = [*raw_findings, *post_exec.findings]
+    if not report.coverage_complete and coverage_complete:
+        coverage_complete = False
+    if zoom1_post_exec.findings or not coverage_complete:
+        raw_findings = [*raw_findings, *zoom1_post_exec.findings]
         findings, gate = evaluate_findings_and_gate(
             session,
             raw_findings,
@@ -1015,21 +1228,47 @@ def run_target_scan(
             coverage_complete=coverage_complete,
             extra_plugin_rules=plugin_rules,
         )
+        _apply_post_scan_findings_to_nodes(all_nodes, findings)
+        stats.clean_nodes = sum(1 for n in all_nodes if n.status == "clean")
+        stats.flagged_nodes = sum(1 for n in all_nodes if n.status != "clean")
         stats.blocking_findings = sum(1 for f in findings if f.blocks_gate)
         stats.warning_findings = sum(1 for f in findings if not f.blocks_gate)
-        digest_src = json.dumps(
-            {
-                "commit": commit_sha,
-                "nodes": [n.id for n in all_nodes],
-                "edges": [e.id for e in all_edges],
-                "findings": sorted(f.id for f in findings),
-            },
-            sort_keys=True,
+        digest = _compute_zoom1_content_digest(
+            commit_sha, all_nodes, all_edges, findings, gate.verdict
         )
-        digest = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
         report.findings = findings
         report.gate = gate
         report.content_digest = digest
+
+    stratum_post_exec = run_post_scan_plugins(
+        repo_root,
+        report,
+        plugins=stratum_post_specs,
+        allow_local_plugins=allow_local_plugins,
+        local_plugin_modules=local_plugin_modules,
+        strict_plugins=strict_artifact_plugins,
+    )
+    if not report.coverage_complete and coverage_complete:
+        coverage_complete = False
+    if stratum_post_exec.findings or not coverage_complete:
+        # Preserve Zoom-1 `content_digest` invariance (`SECURITY.md:107-108`) while updating
+        # findings, gate verdict, and flagged node counts for optional Z=2/Z=3 artifacts.
+        raw_findings = [*raw_findings, *stratum_post_exec.findings]
+        findings, gate = evaluate_findings_and_gate(
+            session,
+            raw_findings,
+            target_id=target.id or None,
+            strict=strict_gate,
+            coverage_complete=coverage_complete,
+            extra_plugin_rules=plugin_rules,
+        )
+        _apply_post_scan_findings_to_nodes(all_nodes, findings)
+        stats.clean_nodes = sum(1 for n in all_nodes if n.status == "clean")
+        stats.flagged_nodes = sum(1 for n in all_nodes if n.status != "clean")
+        stats.blocking_findings = sum(1 for f in findings if f.blocks_gate)
+        stats.warning_findings = sum(1 for f in findings if not f.blocks_gate)
+        report.findings = findings
+        report.gate = gate
 
     attach_zoom1_stratum_badges(
         repo_root,
@@ -1039,6 +1278,22 @@ def run_target_scan(
         local_plugin_modules=local_plugin_modules,
         strict_plugins=strict_artifact_plugins,
     )
+    if not report.coverage_complete and coverage_complete:
+        coverage_complete = False
+        findings, gate = evaluate_findings_and_gate(
+            session,
+            raw_findings,
+            target_id=target.id or None,
+            strict=strict_gate,
+            coverage_complete=False,
+            extra_plugin_rules=plugin_rules,
+        )
+        report.findings = findings
+        report.gate = gate
+
+    post_scan_check = _inv_svc.capture_scan_input_state(session, target)
+    if post_scan_check == pre_scan_state:
+        _inv_svc._record_report_tree_sha(repo_root, report.content_digest, pre_scan_state[1])
 
     if persist_snapshot and target.id:
         snap = ScanSnapshot(
@@ -1060,14 +1315,15 @@ def run_target_scan(
         session.commit()
         session.refresh(snap)
         report.snapshot_id = snap.id
-        from app.services.investigation_service import record_persisted_snapshot_stamp
-
-        record_persisted_snapshot_stamp(
+        _inv_svc.record_persisted_snapshot_stamp(
             session,
             target,
             strict_gate=strict_gate,
             snapshot_id=snap.id,
             report=report,
+            pre_scan_state=pre_scan_state,
+            allow_local_plugins=allow_local_plugins,
+            local_plugin_modules=local_plugin_modules,
         )
 
     return report

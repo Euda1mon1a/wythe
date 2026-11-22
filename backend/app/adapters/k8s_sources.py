@@ -30,8 +30,17 @@ from app.adapters.dockerfile_sources import (
     DockerStage,
     ParsedDockerfile,
     _exec_invokes_shell,
+    _has_safe_path_segments,
     _is_within_root,
+    _load_bounded_yaml_all,
     _norm_container_path,
+    _read_bounded_regular_text,
+    _safe_contained_dir,
+    _safe_contained_file,
+    _safe_is_dir,
+    _safe_is_file,
+    _safe_is_symlink,
+    _safe_resolve,
     effective_node_symbol_links,
     ensure_repo_target_nodes,
     extract_command_targets_from_argv,
@@ -50,6 +59,9 @@ K8S_DIR_NAMES = frozenset(
 WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Pod"})
 CONFIG_KINDS = frozenset({"ConfigMap"})
 SUPPORTED_K8S_KINDS = WORKLOAD_KINDS | CONFIG_KINDS
+MAX_TOTAL_K8S_ENV_ENTRIES = 4096
+MAX_TOTAL_K8S_CONTAINERS = 1024
+MAX_TOTAL_K8S_RESOURCES = 1024
 
 _YAML_SUFFIXES = (".yaml", ".yml")
 _API_VERSION_RE = re.compile(r"(?m)^\s*apiVersion\s*:")
@@ -141,14 +153,28 @@ class ParsedK8sFile:
     parse_error: str | None = None
 
 
-def discover_k8s_files(repo_root: Path) -> list[tuple[Path, bool]]:
+def discover_k8s_files(
+    repo_root: Path,
+    *,
+    skipped_notes: list[str] | None = None,
+) -> list[tuple[Path, bool]]:
     """Discover candidate YAML files at `repo_root` and inside K8s manifest directories.
 
     Returns `(path, in_k8s_dir)` pairs sorted by repo-relative POSIX path.
     """
-    if repo_root.is_symlink():
+    if not _has_safe_path_segments(repo_root) or _safe_is_symlink(repo_root):
+        if skipped_notes is not None:
+            skipped_notes.append(
+                "Skipped symlink or unsafe repository root; Kubernetes manifest declarations absent."
+            )
         return []
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        if skipped_notes is not None:
+            skipped_notes.append(
+                "Skipped unreadable repository root; Kubernetes manifest declarations absent."
+            )
+        return []
     found: dict[str, tuple[Path, bool]] = {}
 
     try:
@@ -158,13 +184,26 @@ def discover_k8s_files(repo_root: Path) -> list[tuple[Path, bool]]:
 
     search_roots: list[Path] = []
     for entry in root_entries:
-        if entry.is_symlink() or not _is_within_root(entry, real_root):
+        if _safe_is_symlink(entry) or not _is_within_root(entry, real_root):
+            if skipped_notes is not None and (
+                entry.name in K8S_DIR_NAMES
+                or (entry.name.lower().endswith(_YAML_SUFFIXES) and not is_compose_filename(entry.name))
+            ):
+                skipped_notes.append(
+                    f"Skipped symlink or out-of-root Kubernetes source {entry.name}; manifest declarations absent."
+                )
             continue
-        if entry.is_file():
+        if _safe_is_file(entry):
             if entry.name.lower().endswith(_YAML_SUFFIXES) and not is_compose_filename(entry.name):
-                rel = entry.resolve().relative_to(real_root).as_posix()
-                found[rel] = (entry, False)
-        elif entry.is_dir() and entry.name not in EXCLUDED_PARTS:
+                rel = _safe_contained_file(entry, real_root)
+                if rel is not None:
+                    found[rel] = (entry, False)
+        elif entry.name.lower().endswith(_YAML_SUFFIXES) and not is_compose_filename(entry.name):
+            if skipped_notes is not None:
+                skipped_notes.append(
+                    f"Skipped non-regular Kubernetes YAML {entry.name}; manifest declarations absent."
+                )
+        elif _safe_is_dir(entry) and entry.name not in EXCLUDED_PARTS:
             if entry.name in K8S_DIR_NAMES:
                 search_roots.append(entry)
             elif not entry.name.startswith("."):
@@ -173,36 +212,64 @@ def discover_k8s_files(repo_root: Path) -> list[tuple[Path, bool]]:
                 except OSError:
                     continue
                 for sub in sub_entries:
-                    if (
-                        not sub.is_symlink()
-                        and sub.is_dir()
-                        and sub.name in K8S_DIR_NAMES
-                        and _is_within_root(sub, real_root)
+                    if sub.name in K8S_DIR_NAMES and (
+                        _safe_is_symlink(sub) or not _is_within_root(sub, real_root)
                     ):
+                        if skipped_notes is not None:
+                            skipped_notes.append(
+                                f"Skipped symlink or out-of-root Kubernetes directory {entry.name}/{sub.name}; manifest declarations absent."
+                            )
+                        continue
+                    if sub.name in K8S_DIR_NAMES and _safe_contained_dir(sub, real_root) is not None:
                         search_roots.append(sub)
 
+    walk_errors: list[OSError] = []
     for kroot in search_roots:
-        for cur_dir, dirnames, filenames in os.walk(kroot, followlinks=False):
+        for cur_dir, dirnames, filenames in os.walk(
+            kroot, followlinks=False, onerror=walk_errors.append
+        ):
             cur_path = Path(cur_dir)
-            if cur_path.is_symlink() or not _is_within_root(cur_path, real_root):
+            if _safe_contained_dir(cur_path, real_root) is None:
                 dirnames[:] = []
                 continue
-            dirnames[:] = sorted(
-                d
-                for d in dirnames
-                if (not d.startswith(".") or d == ".k8s")
-                and d not in EXCLUDED_PARTS
-                and not (cur_path / d).is_symlink()
-                and _is_within_root(cur_path / d, real_root)
-            )
+            keep_dirs: list[str] = []
+            for d in sorted(dirnames):
+                if (d.startswith(".") and d != ".k8s") or d in EXCLUDED_PARTS:
+                    continue
+                dpath = cur_path / d
+                if _safe_contained_dir(dpath, real_root) is None:
+                    if skipped_notes is not None:
+                        try:
+                            rel_d = dpath.relative_to(repo_root).as_posix()
+                        except ValueError:
+                            rel_d = d
+                        skipped_notes.append(
+                            f"Skipped symlink or out-of-root Kubernetes directory {rel_d}; manifest declarations absent."
+                        )
+                    continue
+                keep_dirs.append(d)
+            dirnames[:] = keep_dirs
             for fname in sorted(filenames):
                 if not fname.lower().endswith(_YAML_SUFFIXES) or is_compose_filename(fname):
                     continue
                 cand = cur_path / fname
-                if cand.is_symlink() or not cand.is_file() or not _is_within_root(cand, real_root):
+                rel = _safe_contained_file(cand, real_root)
+                if rel is None:
+                    if skipped_notes is not None:
+                        try:
+                            rel_c = cand.relative_to(repo_root).as_posix()
+                        except ValueError:
+                            rel_c = fname
+                        skipped_notes.append(
+                            f"Skipped symlink or non-regular Kubernetes YAML {rel_c}; manifest declarations absent."
+                        )
                     continue
-                rel = cand.resolve().relative_to(real_root).as_posix()
                 found[rel] = (cand, True)
+
+    if walk_errors and skipped_notes is not None:
+        skipped_notes.append(
+            "Skipped unreadable Kubernetes directory during manifest discovery; manifest declarations absent."
+        )
 
     return [found[k] for k in sorted(found)]
 
@@ -270,17 +337,27 @@ def _locate_k8s_lines(
     return res_lines, doc_key_maps
 
 
-def _normalize_argv_list(raw: object) -> tuple[str, ...] | None:
+def _normalize_argv_list(
+    raw: object,
+    budget: list[int] | None = None,
+) -> tuple[str, ...] | None:
     if raw is None:
         return None
     if isinstance(raw, str):
         return (raw,)
     if isinstance(raw, list):
-        return tuple(
-            str(x)
-            for x in raw
-            if isinstance(x, (str, int, float)) and not isinstance(x, bool)
-        )
+        out: list[str] = []
+        for x in raw:
+            if budget is not None:
+                if budget[0] <= 0:
+                    budget[3] = 1
+                    break
+                budget[0] -= 1
+            elif len(out) >= MAX_TOTAL_K8S_ENV_ENTRIES:
+                break
+            if isinstance(x, (str, int, float)) and not isinstance(x, bool):
+                out.append(str(x))
+        return tuple(out)
     return None
 
 
@@ -309,11 +386,18 @@ def _parse_containers(
     is_init: bool,
     key_lines: dict[str, int],
     fallback_line: int,
+    budget: list[int] | None = None,
 ) -> list[K8sContainerSpec]:
     if not isinstance(raw_list, list):
         return []
+    b = budget if budget is not None else [MAX_TOTAL_K8S_ENV_ENTRIES, MAX_TOTAL_K8S_CONTAINERS, MAX_TOTAL_K8S_RESOURCES, 0]
     specs: list[K8sContainerSpec] = []
     for idx, item in enumerate(raw_list):
+        if b[1] <= 0 or b[0] <= 0:
+            b[3] = 1
+            break
+        b[1] -= 1
+        b[0] -= 1
         if not isinstance(item, dict):
             continue
         cname_raw = item.get("name")
@@ -327,6 +411,10 @@ def _parse_containers(
         raw_env = item.get("env")
         if isinstance(raw_env, list):
             for eitem in raw_env:
+                if b[0] <= 0:
+                    b[3] = 1
+                    break
+                b[0] -= 1
                 if not isinstance(eitem, dict):
                     continue
                 ename = eitem.get("name")
@@ -354,6 +442,10 @@ def _parse_containers(
         raw_ef = item.get("envFrom")
         if isinstance(raw_ef, list):
             for ef in raw_ef:
+                if b[0] <= 0:
+                    b[3] = 1
+                    break
+                b[0] -= 1
                 if isinstance(ef, dict):
                     cmr = ef.get("configMapRef")
                     if isinstance(cmr, dict) and isinstance(cmr.get("name"), str) and cmr["name"].strip():
@@ -364,8 +456,8 @@ def _parse_containers(
                 name=cname,
                 is_init=is_init,
                 image=image,
-                command=_normalize_argv_list(item.get("command")),
-                args=_normalize_argv_list(item.get("args")),
+                command=_normalize_argv_list(item.get("command"), b),
+                args=_normalize_argv_list(item.get("args"), b),
                 working_dir=wdir,
                 env=tuple(env_entries),
                 env_from_configmaps=tuple(env_from_cms),
@@ -380,7 +472,12 @@ def _extract_resource_spec(
     res_lines: dict[tuple[str, str], int],
     key_lines: dict[str, int],
     default_line: int,
+    budget: list[int] | None = None,
 ) -> K8sResourceSpec | None:
+    b = budget if budget is not None else [MAX_TOTAL_K8S_ENV_ENTRIES, MAX_TOTAL_K8S_CONTAINERS, MAX_TOTAL_K8S_RESOURCES, 0]
+    if b[2] <= 0 or b[0] <= 0:
+        b[3] = 1
+        return None
     kind = doc.get("kind")
     if not isinstance(kind, str) or kind not in SUPPORTED_K8S_KINDS:
         return None
@@ -392,6 +489,8 @@ def _extract_resource_spec(
     mname = meta.get("name")
     if not isinstance(mname, str) or not mname.strip():
         return None
+    b[2] -= 1
+    b[0] -= 1
     name_clean = mname.strip()
     ns_raw = meta.get("namespace")
     ns_clean = ns_raw.strip() if isinstance(ns_raw, str) and ns_raw.strip() else None
@@ -402,6 +501,10 @@ def _extract_resource_spec(
         raw_data = doc.get("data")
         if isinstance(raw_data, dict):
             for k, v in raw_data.items():
+                if b[0] <= 0:
+                    b[3] = 1
+                    break
+                b[0] -= 1
                 if isinstance(k, str) and k.strip():
                     k_clean = k.strip()
                     cdata.append((k_clean, v, key_lines.get(k_clean, rline)))
@@ -421,13 +524,17 @@ def _extract_resource_spec(
         )
 
     containers = [
-        *_parse_containers(pod_spec.get("initContainers"), True, key_lines, rline),
-        *_parse_containers(pod_spec.get("containers"), False, key_lines, rline),
+        *_parse_containers(pod_spec.get("initContainers"), True, key_lines, rline, b),
+        *_parse_containers(pod_spec.get("containers"), False, key_lines, rline, b),
     ]
     vol_cms: list[str] = []
     raw_vols = pod_spec.get("volumes")
     if isinstance(raw_vols, list):
         for vol in raw_vols:
+            if b[0] <= 0:
+                b[3] = 1
+                break
+            b[0] -= 1
             if isinstance(vol, dict):
                 cmv = vol.get("configMap")
                 if isinstance(cmv, dict) and isinstance(cmv.get("name"), str) and cmv["name"].strip():
@@ -451,20 +558,27 @@ def parse_k8s_manifests(
     in_k8s_dir: bool = True,
 ) -> ParsedK8sFile:
     """Statically parse a candidate YAML file for supported Kubernetes resources."""
-    real_root = repo_root.resolve()
-    if (
-        manifest_path.is_symlink()
-        or not manifest_path.is_file()
-        or not _is_within_root(manifest_path, real_root)
-    ):
-        return ParsedK8sFile(rel_path="")
-
-    rel_path = manifest_path.resolve().relative_to(real_root).as_posix()
+    real_root = _safe_resolve(repo_root)
+    rel_path = _safe_contained_file(manifest_path, real_root) if real_root is not None else None
+    if rel_path is None:
+        try:
+            safe_rel = manifest_path.relative_to(repo_root).as_posix()
+        except ValueError:
+            safe_rel = manifest_path.name
+        return ParsedK8sFile(
+            rel_path=safe_rel,
+            parse_error=f"Skipped symlink or non-regular Kubernetes YAML {safe_rel}; manifest declarations absent.",
+        )
     try:
-        if manifest_path.stat().st_size > 1_048_576:
-            return ParsedK8sFile(rel_path=rel_path)
-        text = manifest_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+        text = _read_bounded_regular_text(
+            manifest_path, max_bytes=1_048_576, real_root=real_root
+        )
+    except (OSError, UnicodeError, ValueError):
+        if in_k8s_dir:
+            return ParsedK8sFile(
+                rel_path=rel_path,
+                parse_error=f"Could not read Kubernetes YAML {rel_path}; manifest declarations absent.",
+            )
         return ParsedK8sFile(rel_path=rel_path)
 
     looks_like_k8s = bool(_API_VERSION_RE.search(text) and _KIND_RE.search(text))
@@ -477,18 +591,19 @@ def parse_k8s_manifests(
         return ParsedK8sFile(rel_path=rel_path)
 
     try:
-        raw_docs = list(yaml.safe_load_all(text))
-    except yaml.YAMLError:
-        if in_k8s_dir:
-            return ParsedK8sFile(
-                rel_path=rel_path,
-                parse_error=f"Could not parse Kubernetes YAML {rel_path}; manifest declarations absent.",
-            )
-        return ParsedK8sFile(rel_path=rel_path)
+        raw_docs = _load_bounded_yaml_all(text, max_nodes=4096, max_depth=64)
+    except (yaml.YAMLError, RecursionError, ValueError):
+        return ParsedK8sFile(
+            rel_path=rel_path,
+            parse_error=f"Could not parse Kubernetes YAML {rel_path}; manifest declarations absent.",
+        )
 
     res_lines, doc_key_maps = _locate_k8s_lines(text)
     resources: list[K8sResourceSpec] = []
+    budget = [MAX_TOTAL_K8S_ENV_ENTRIES, MAX_TOTAL_K8S_CONTAINERS, MAX_TOTAL_K8S_RESOURCES, 0]
     for doc_idx, raw_doc in enumerate(raw_docs):
+        if budget[3]:
+            break
         if not isinstance(raw_doc, dict):
             continue
         default_line, key_lines = (
@@ -498,16 +613,30 @@ def parse_k8s_manifests(
         )
         if raw_doc.get("kind") == "List" and isinstance(raw_doc.get("items"), list):
             for item in raw_doc["items"]:
+                if budget[2] <= 0 or budget[0] <= 0:
+                    budget[3] = 1
+                    break
                 if isinstance(item, dict):
-                    rspec = _extract_resource_spec(item, rel_path, res_lines, key_lines, default_line)
+                    rspec = _extract_resource_spec(
+                        item, rel_path, res_lines, key_lines, default_line, budget
+                    )
                     if rspec is not None:
                         resources.append(rspec)
+                if budget[3]:
+                    break
         else:
-            rspec = _extract_resource_spec(raw_doc, rel_path, res_lines, key_lines, default_line)
+            rspec = _extract_resource_spec(
+                raw_doc, rel_path, res_lines, key_lines, default_line, budget
+            )
             if rspec is not None:
                 resources.append(rspec)
 
-    return ParsedK8sFile(rel_path=rel_path, resources=tuple(resources))
+    trunc_err = (
+        f"Truncated Kubernetes YAML {rel_path} after exceeding entry budget ({MAX_TOTAL_K8S_ENV_ENTRIES}); manifest declarations partial."
+        if budget[3]
+        else None
+    )
+    return ParsedK8sFile(rel_path=rel_path, resources=tuple(resources), parse_error=trunc_err)
 
 
 def _normalize_image_repo(image: str | None) -> tuple[str | None, str | None]:
@@ -537,20 +666,27 @@ def _build_compose_dockerfile_bridge(
         parsed_cf, _ = parse_compose_file(cpath, repo_root)
         if parsed_cf is None:
             continue
-        cdir = cpath.parent.resolve()
+        cdir = _safe_resolve(cpath.parent) or real_root
         for svc in parsed_cf.services:
             if svc.build_context is None:
                 continue
-            ctx_dir = (cdir / svc.build_context).resolve()
-            if not _is_within_root(ctx_dir, real_root) or not ctx_dir.is_dir():
+            ctx_dir = (
+                _safe_contained_dir(cdir / svc.build_context, real_root)
+                if _has_safe_path_segments(svc.build_context)
+                else None
+            )
+            if ctx_dir is None:
                 continue
             df_name = svc.build_dockerfile or "Dockerfile"
-            df_cand = ctx_dir / df_name
-            if not df_cand.is_file():
-                df_cand = cdir / df_name
-            if df_cand.is_symlink() or not df_cand.is_file() or not _is_within_root(df_cand, real_root):
+            if not _has_safe_path_segments(df_name):
                 continue
-            df_rel = df_cand.resolve().relative_to(real_root).as_posix()
+            df_cand = ctx_dir / df_name
+            df_rel = _safe_contained_file(df_cand, real_root)
+            if df_rel is None:
+                df_cand = cdir / df_name
+                df_rel = _safe_contained_file(df_cand, real_root)
+            if df_rel is None:
+                continue
             svc_to_df.setdefault(svc.name.lower(), df_rel)
             img_repo, _ = _normalize_image_repo(svc.image)
             if img_repo:
@@ -810,7 +946,13 @@ def augment_k8s_sources(
     dockerfiles: dict[str, object] | None = None,
 ) -> None:
     """Discover Kubernetes manifests, emit `m:k8s:*` nodes/edges, and flag K8s drift/policy findings."""
-    candidates = discover_k8s_files(repo_root)
+    skipped_notes: list[str] = []
+    candidates = discover_k8s_files(repo_root, skipped_notes=skipped_notes)
+    if skipped_notes:
+        object.__setattr__(result, "coverage_complete", False)
+        for sn in skipped_notes:
+            if sn not in result.notes:
+                result.notes.append(sn)
     if not candidates:
         return
 
@@ -820,6 +962,7 @@ def augment_k8s_sources(
         pf = parse_k8s_manifests(mpath, repo_root, in_k8s_dir=in_k8s_dir)
         if pf.parse_error:
             result.notes.append(pf.parse_error)
+            object.__setattr__(result, "coverage_complete", False)
         if pf.skipped_template:
             skipped_templates.append(pf.rel_path)
             continue
@@ -829,7 +972,10 @@ def augment_k8s_sources(
     if not parsed_files and not skipped_templates:
         return
 
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        object.__setattr__(result, "coverage_complete", False)
+        return
     df_cache: dict[str, ParsedDockerfile] = {
         k: v for k, v in (dockerfiles or {}).items() if isinstance(v, ParsedDockerfile)
     }
@@ -948,8 +1094,12 @@ def augment_k8s_sources(
                 result.nodes.append(node)
             workload_records.append((res, node, cont_matches))
 
-    bdir = (repo_root / backend_subdir).resolve() if backend_subdir else real_root
-    has_bdir = _is_within_root(bdir, real_root) and bdir.is_dir()
+    bdir = (
+        _safe_contained_dir(repo_root / backend_subdir, real_root)
+        if backend_subdir
+        else real_root
+    )
+    has_bdir = bdir is not None
 
     for res, wnode, cont_matches in workload_records:
         kind_l = res.kind.lower()
@@ -993,7 +1143,7 @@ def augment_k8s_sources(
                 fallback_roots.append(parsed_df.context_root)
             if real_root not in fallback_roots:
                 fallback_roots.append(real_root)
-            if has_bdir and bdir not in fallback_roots:
+            if has_bdir and bdir is not None and bdir not in fallback_roots:
                 fallback_roots.append(bdir)
 
             resolved_triples = resolve_command_targets_with_symbols(

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from app.adapters import plugin_registry
+from app.adapters.base import RawCandidateFinding
 from app.adapters.plugin_registry import PluginRuleSpec, WythePluginSpec
 from app.schemas.atlas import (
     StratumExpansionResult,
@@ -185,11 +186,11 @@ def _evaluate_wiretap_bundle(
     transitions: list[ObservedRuntimeTransition] = []
     redacted_fields = 0
     for ot_p in inputs.otel_traces:
-        ot_list, r_cnt = parse_otel_traces(ot_p)
+        ot_list, r_cnt = parse_otel_traces(ot_p, allow_external=True)
         transitions.extend(ot_list)
         redacted_fields += r_cnt
     for eb_p in inputs.ebpf_flows:
-        eb_list, r_cnt = parse_ebpf_flows(eb_p)
+        eb_list, r_cnt = parse_ebpf_flows(eb_p, allow_external=True)
         transitions.extend(eb_list)
         redacted_fields += r_cnt
 
@@ -217,8 +218,8 @@ def _evaluate_wiretap_bundle(
         }
     )
 
-    memgraph_summaries = [parse_memgraph_artifact(mp) for mp in inputs.memgraph]
-    vmmap_summaries = [parse_vmmap_artifact(vp) for vp in inputs.vmmap]
+    memgraph_summaries = [parse_memgraph_artifact(mp, allow_external=True) for mp in inputs.memgraph]
+    vmmap_summaries = [parse_vmmap_artifact(vp, allow_external=True) for vp in inputs.vmmap]
     merged_memgraph: dict[str, Any] | None = None
     if memgraph_summaries:
         merged_memgraph = {
@@ -329,7 +330,10 @@ def summarize_wiretap_zoom1_badges(
     inputs = get_active_wiretap_inputs()
     if not inputs.any_active:
         return {}
-    bundle = _evaluate_wiretap_bundle(repo_root, report, inputs)
+    try:
+        bundle = _evaluate_wiretap_bundle(repo_root, report, inputs)
+    except (OSError, ValueError):
+        return {}
     out: dict[str, list[StratumSummaryBadge]] = {}
     for node in report.nodes:
         b_list = _badges_for_node(node.id, bundle)
@@ -560,7 +564,29 @@ def correlate_wiretap_companions(
             "redacted_field_count": 0,
             "traces_and_flows": None,
             "heap": {"memgraph": None, "vmmap": None, "by_node": {}},
-            "port_occupancy": correlate_port_occupancy(root_p, report),
+            "port_occupancy": {
+                "present": False,
+                "declared_port_count": 0,
+                "observed_listener_count": 0,
+                "declared_ports": [],
+                "counts": {
+                    "corroborated": 0,
+                    "squatter_conflict": 0,
+                    "bind_exposure_drift": 0,
+                    "dark_listener": 0,
+                    "unlistening_declared": 0,
+                },
+                "entries": [],
+                "findings": [],
+                "provenance": {
+                    "capture_mode": "none",
+                    "source_paths": [],
+                    "parser_formats": [],
+                    "captured_at": None,
+                    "subprocesses_invoked": 0,
+                    "redacted_os_users": True,
+                },
+            },
             "findings": [],
             "explorer_overlay_lens": {
                 "lens_key": "wiretap_runtime",
@@ -635,6 +661,62 @@ def correlate_wiretap_companions(
     }
 
 
+def check_wiretap_post_scan(
+    repo_root: Path,
+    report: TruthAtlasReport,
+) -> dict[str, object]:
+    """Emit `PORT-001` / `PORT-002` `RawCandidateFinding` entries when port captures are active."""
+    inputs = get_active_wiretap_inputs()
+    if not inputs.any_active or (not inputs.port_listeners and not inputs.probe_local_ports):
+        return {
+            "wiretap_detected": False,
+            "findings": [],
+            "notes": [],
+        }
+
+    try:
+        port_occ = correlate_port_occupancy(
+            repo_root,
+            report,
+            port_listeners_paths=inputs.port_listeners,
+            probe_local_ports=inputs.probe_local_ports,
+        )
+    except (OSError, ValueError) as exc:
+        return {
+            "wiretap_detected": False,
+            "findings": [],
+            "notes": [f"Wiretap port occupancy check skipped invalid artifact: {exc}"],
+        }
+    existing_keys = {(f.rule_code, f.source_file, f.line) for f in report.findings}
+    cand_findings: list[RawCandidateFinding] = []
+    for raw_f in port_occ.get("findings", []):
+        if not isinstance(raw_f, Mapping):
+            continue
+        rc = str(raw_f.get("rule_code") or "")
+        sf = str(raw_f.get("source_file") or "")
+        ln = int(raw_f.get("line") or 1)
+        if not rc or (rc, sf, ln) in existing_keys:
+            continue
+        cand_findings.append(
+            RawCandidateFinding(
+                rule_code=rc,
+                node_id=str(raw_f["node_id"]) if raw_f.get("node_id") else None,
+                source_file=sf,
+                line=ln,
+                title=str(raw_f.get("title") or rc),
+                detail=str(raw_f.get("detail") or ""),
+                remediation=str(raw_f.get("remediation") or ""),
+                confidence="confirmed",
+                evidence_strength="structural_match",
+            )
+        )
+    return {
+        "wiretap_detected": True,
+        "findings": cand_findings,
+        "notes": [],
+    }
+
+
 WIRETAP_PLUGIN = WythePluginSpec(
     name="wiretap",
     kind="stratum_inspector",
@@ -646,6 +728,7 @@ WIRETAP_PLUGIN = WythePluginSpec(
     ),
     enabled_by_default=True,
     supported_zooms=(3,),
+    post_scan_hook=check_wiretap_post_scan,
     stratum_badge_hook=summarize_wiretap_zoom1_badges,
     stratum_expand_hook=expand_wiretap_zoom3_stratum,
     rules=(PORT_001_RULE, PORT_002_RULE),

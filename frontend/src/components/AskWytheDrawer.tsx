@@ -5,6 +5,7 @@ import { Bot, Copy, Cpu, Download, Eye, RefreshCw, Send, Sparkles, Trash2, X } f
 import {
   atlasApi,
   type AskChatTurn,
+  type AskExecutionOrigin,
   type AtlasNode,
   type ContextBudgetSummary,
   type FollowState,
@@ -14,7 +15,6 @@ import {
   type InvestigationTurnRead,
   type UiFocusExplainRead,
   type UiFocusStatePayload,
-  type UiFocusSyncAck,
   type ValidatedReferenceRead,
 } from '@/api/atlas';
 import {
@@ -24,13 +24,14 @@ import {
 } from '@/components/InvestigationCollabControls';
 import { UnderstandingChainPanel } from '@/components/UnderstandingChainPanel';
 import { useAskEngines, useAskWythe } from '@/hooks/useAtlas';
-import { post } from '@/lib/api';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { useDialogFocusTrap } from '@/lib/wytheDialogFocus';
 import { resolveTabInvestigationIdentity } from '@/lib/wytheInvestigationSession';
 import type { LiveViewportDigest } from '@/lib/wytheVisionBridge';
 import {
   bumpViewportCameraRevision,
+  isLoopbackClientUrl,
+  normalizeClientV1Url,
   probeBrowserLocalOpenAi,
   probeChromeBuiltInModel,
   runBrowserLocalOpenAiAsk,
@@ -58,6 +59,11 @@ interface QaTurn {
   status: 'answered' | 'unresolved';
   authoredBy: 'model' | 'scanner_brief' | 'none';
   engineBadge: string;
+  executionOrigin: AskExecutionOrigin | null;
+  endpointOrigin: string | null;
+  requestedModelId: string | null;
+  resolvedModelId: string | null;
+  fallbackFrom: string | null;
   executedTools: string[];
   usedVision: boolean;
   imageSupplied: boolean;
@@ -118,6 +124,11 @@ function mapStoredTurnToQaTurn(
     status: isUnresolved ? 'unresolved' : 'answered',
     authoredBy: t.authored_by ?? (isUnresolved ? 'none' : 'model'),
     engineBadge,
+    executionOrigin: null,
+    endpointOrigin: null,
+    requestedModelId: t.model_id ?? null,
+    resolvedModelId: t.model_id ?? null,
+    fallbackFrom: null,
     executedTools: [],
     usedVision: Boolean(t.used_vision),
     imageSupplied: Boolean(t.image_supplied),
@@ -312,7 +323,19 @@ export function AskWytheDrawer({
   const effectiveClientId = clientId || fallbackIdentity?.clientId || null;
 
   useEffect(() => {
-    if (!sessionData) return;
+    setTurns([]);
+    setActiveError(null);
+  }, [activeSlug, effectiveSessionId]);
+
+  useEffect(() => {
+    if (!sessionData) {
+      setTurns([]);
+      setActiveError(null);
+      return;
+    }
+    if (sessionData.target_slug && activeSlug && sessionData.target_slug !== activeSlug) {
+      return;
+    }
     const latestRev = sessionData.latest_evidence?.evidence_revision_id ?? null;
     const combined: InvestigationTurnRead[] = [...sessionData.turns];
     const seenIds = new Set(combined.map((t) => t.turn_id));
@@ -330,6 +353,12 @@ export function AskWytheDrawer({
         if (!existing) return mapped;
         return {
           ...mapped,
+          engineBadge: existing.engineBadge || mapped.engineBadge,
+          executionOrigin: existing.executionOrigin ?? mapped.executionOrigin,
+          endpointOrigin: existing.endpointOrigin ?? mapped.endpointOrigin,
+          requestedModelId: existing.requestedModelId ?? mapped.requestedModelId,
+          resolvedModelId: existing.resolvedModelId ?? mapped.resolvedModelId,
+          fallbackFrom: existing.fallbackFrom ?? mapped.fallbackFrom,
           executedTools:
             existing.executedTools.length > 0 ? existing.executedTools : mapped.executedTools,
           contextBudget: existing.contextBudget ?? mapped.contextBudget,
@@ -371,7 +400,7 @@ export function AskWytheDrawer({
       ...(liveDigest?.markdownBrief ? { live_viewport_brief: liveDigest.markdownBrief } : {}),
     };
     try {
-      await post<UiFocusSyncAck>('/ui-focus', syncPayload);
+      await atlasApi.syncUiFocus(syncPayload as UiFocusStatePayload);
     } catch {
       // Keep zero-backend Chrome mode working when server is offline
     }
@@ -399,7 +428,9 @@ export function AskWytheDrawer({
   const anyLocalReady = browserLocalProbe.state === 'ready' || localSt?.state === 'ready';
   const localStatusLabel =
     browserLocalProbe.state === 'ready'
-      ? 'ready · this Mac'
+      ? isLoopbackClientUrl(browserLocalProbe.baseUrl)
+        ? 'ready · loopback'
+        : 'ready · private /v1'
       : localSt?.state === 'ready'
         ? 'ready · server'
         : (localSt?.state ?? '…');
@@ -466,6 +497,11 @@ export function AskWytheDrawer({
         status: 'answered',
         authoredBy: 'scanner_brief',
         engineBadge: 'Scanner Brief (no model running)',
+        executionOrigin: 'browser_client',
+        endpointOrigin: null,
+        requestedModelId: 'wythe-scanner-brief',
+        resolvedModelId: 'wythe-scanner-brief',
+        fallbackFrom: null,
         executedTools: [],
         usedVision: false,
         imageSupplied: false,
@@ -542,6 +578,7 @@ export function AskWytheDrawer({
         ((hasAttachedFrame && chromeProbe.supportsVision) ||
           (!anyVlmReady && appleSt?.state !== 'ready')));
 
+    let clientFallbackFrom: string | null = null;
     if (useChrome) {
       setIsRunningClientModel(true);
       try {
@@ -552,6 +589,7 @@ export function AskWytheDrawer({
           history: sessionHistory,
         });
         const refs = matchReferencedNodeIds(out.answerMarkdown, focusedNodeId, nodesById);
+        const turnUsedVision = Boolean(out.used_vision_snapshot ?? out.usedVision);
         setTurns((prev) => [
           {
             id: `turn-${prev.length + 1}`,
@@ -559,12 +597,17 @@ export function AskWytheDrawer({
             answerMarkdown: out.answerMarkdown,
             status: 'answered',
             authoredBy: 'model',
-            engineBadge: 'chrome · gemini-nano-in-browser',
+            engineBadge: `chrome · ${out.resolved_model_id ?? 'gemini-nano-in-browser'}`,
+            executionOrigin: out.execution_origin,
+            endpointOrigin: out.endpoint_origin,
+            requestedModelId: out.requested_model_id,
+            resolvedModelId: out.resolved_model_id,
+            fallbackFrom: out.fallback_from,
             executedTools: [],
-            usedVision: out.usedVision,
+            usedVision: turnUsedVision,
             imageSupplied: hasAttachedFrame,
             fallbackReason:
-              hasAttachedFrame && !out.usedVision
+              hasAttachedFrame && !turnUsedVision
                 ? 'Viewport WebP available, but Chrome model answered in text-only mode.'
                 : null,
             failureReason: null,
@@ -580,8 +623,8 @@ export function AskWytheDrawer({
           question: trimmed,
           answerMarkdown: out.answerMarkdown,
           engine: 'chrome',
-          modelId: 'gemini-nano-in-browser',
-          usedVision: out.usedVision,
+          modelId: out.resolved_model_id ?? 'gemini-nano-in-browser',
+          usedVision: turnUsedVision,
           imageSupplied: hasAttachedFrame,
           authoredBy: 'model',
           referencedIds: refs,
@@ -606,14 +649,29 @@ export function AskWytheDrawer({
           });
           return;
         }
+        clientFallbackFrom = 'chrome';
       }
     }
 
+    let normalizedCustomUrl: string | undefined;
+    if (customLocalUrl.trim()) {
+      try {
+        normalizedCustomUrl = normalizeClientV1Url(customLocalUrl);
+      } catch (err) {
+        if (engineChoice === 'local' || engineChoice === 'auto') {
+          setActiveError((err as Error).message);
+          return;
+        }
+      }
+    }
+
+    const customMatchesProbe =
+      !normalizedCustomUrl || browserLocalProbe.baseUrl === normalizedCustomUrl;
     const useBrowserLocal =
-      !effectiveSessionId &&
       localSt?.state !== 'ready' &&
-      !customLocalUrl.trim() &&
+      !questionRequestsMcpTools(trimmed) &&
       browserLocalProbe.state === 'ready' &&
+      customMatchesProbe &&
       (engineChoice === 'local' ||
         (engineChoice === 'auto' &&
           ((hasAttachedFrame && browserLocalProbe.supportsVision) ||
@@ -629,8 +687,10 @@ export function AskWytheDrawer({
           snapshotDataUrl: liveFrameUrl,
           history: sessionHistory,
         });
-        const dispModel = browserLocalProbe.displayModel ?? 'default_model';
+        const dispModel = out.resolved_model_id ?? browserLocalProbe.displayModel ?? 'default_model';
         const refs = matchReferencedNodeIds(out.answerMarkdown, focusedNodeId, nodesById);
+        const turnUsedVision = Boolean(out.used_vision_snapshot ?? out.usedVision);
+        const turnFallbackFrom = out.fallback_from ?? clientFallbackFrom;
         setTurns((prev) => [
           {
             id: `turn-${prev.length + 1}`,
@@ -639,11 +699,16 @@ export function AskWytheDrawer({
             status: 'answered',
             authoredBy: 'model',
             engineBadge: `local · ${dispModel}`,
+            executionOrigin: out.execution_origin,
+            endpointOrigin: out.endpoint_origin,
+            requestedModelId: out.requested_model_id,
+            resolvedModelId: out.resolved_model_id,
+            fallbackFrom: turnFallbackFrom,
             executedTools: [],
-            usedVision: out.usedVision,
+            usedVision: turnUsedVision,
             imageSupplied: hasAttachedFrame,
             fallbackReason:
-              hasAttachedFrame && !out.usedVision
+              hasAttachedFrame && !turnUsedVision
                 ? 'Viewport WebP available, but local /v1 model answered in text-only mode.'
                 : null,
             failureReason: null,
@@ -660,7 +725,7 @@ export function AskWytheDrawer({
           answerMarkdown: out.answerMarkdown,
           engine: 'local',
           modelId: dispModel,
-          usedVision: out.usedVision,
+          usedVision: turnUsedVision,
           imageSupplied: hasAttachedFrame,
           authoredBy: 'model',
           referencedIds: refs,
@@ -685,6 +750,7 @@ export function AskWytheDrawer({
           });
           return;
         }
+        clientFallbackFrom = clientFallbackFrom ?? 'browser_local';
       }
     }
 
@@ -698,7 +764,7 @@ export function AskWytheDrawer({
         selected_node_id: focusedNodeId ?? undefined,
         selected_finding_id: selectedFindingId ?? undefined,
         selected_edge_id: selectedEdgeId ?? undefined,
-        local_base_url: customLocalUrl.trim() || undefined,
+        local_base_url: normalizedCustomUrl || customLocalUrl.trim() || undefined,
         include_vision_snapshot: true,
         history: sessionHistory,
         live_viewport_brief: liveDigest?.markdownBrief ?? undefined,
@@ -707,6 +773,7 @@ export function AskWytheDrawer({
       {
         onSuccess: (res) => {
           const isScanner = res.authored_by === 'scanner_brief';
+          const effectiveModel = res.resolved_model_id || res.model_id;
           setTurns((prev) => [
             {
               id: res.turn_id ?? `turn-${prev.length + 1}`,
@@ -716,9 +783,14 @@ export function AskWytheDrawer({
               authoredBy: res.authored_by ?? 'model',
               engineBadge: isScanner
                 ? 'Scanner Brief (no model running)'
-                : `${res.engine_used} · ${res.model_id}`,
+                : `${res.engine_used} · ${effectiveModel}`,
+              executionOrigin: res.execution_origin ?? 'wythe_server',
+              endpointOrigin: res.endpoint_origin ?? null,
+              requestedModelId: res.requested_model_id ?? null,
+              resolvedModelId: res.resolved_model_id ?? res.model_id ?? null,
+              fallbackFrom: res.fallback_from ?? clientFallbackFrom ?? null,
               executedTools: res.executed_tools ?? [],
-              usedVision: res.used_vision_snapshot,
+              usedVision: Boolean(res.used_vision_snapshot),
               imageSupplied: Boolean(res.image_supplied ?? hasAttachedFrame),
               fallbackReason: res.fallback_reason ?? null,
               failureReason: null,
@@ -862,7 +934,7 @@ export function AskWytheDrawer({
                 type="button"
                 onClick={() => {
                   void refetchEngines();
-                  void probeBrowserLocalOpenAi(customLocalUrl.trim() || undefined).then(setBrowserLocalProbe);
+                  void probeBrowserLocalOpenAi(customLocalUrl.trim() || undefined, true).then(setBrowserLocalProbe);
                 }}
                 className="inline-flex min-h-6 min-w-6 items-center justify-center border border-teal-500/40 bg-teal-500/15 px-2 py-1 font-mono text-[11px] text-teal-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
               >
@@ -1046,6 +1118,31 @@ export function AskWytheDrawer({
                     <span className="border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-slate-200">
                       {t.usedVision ? 'Vision: WebP' : 'Text-only'}
                     </span>
+                    {t.executionOrigin && (
+                      <span
+                        data-testid="ask-provenance-origin"
+                        className="border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-slate-200"
+                      >
+                        {t.executionOrigin}
+                        {t.endpointOrigin ? ` @ ${t.endpointOrigin}` : ''}
+                      </span>
+                    )}
+                    {t.requestedModelId && t.resolvedModelId && t.requestedModelId !== t.resolvedModelId && (
+                      <span
+                        data-testid="ask-provenance-alias"
+                        className="border border-sky-500/40 bg-sky-950/60 px-1.5 py-0.5 text-sky-200"
+                      >
+                        alias: {t.requestedModelId} → {t.resolvedModelId}
+                      </span>
+                    )}
+                    {t.fallbackFrom && (
+                      <span
+                        data-testid="ask-provenance-fallback"
+                        className="border border-amber-500/45 bg-amber-950/60 px-1.5 py-0.5 text-amber-200"
+                      >
+                        fallback: {t.fallbackFrom}
+                      </span>
+                    )}
                     {t.needsRevalidation && (
                       <span className="border border-amber-500/50 bg-amber-950/60 px-1.5 py-0.5 text-amber-200">
                         [historical / needs revalidation]

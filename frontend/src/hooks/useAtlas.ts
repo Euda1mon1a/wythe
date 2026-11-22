@@ -33,10 +33,38 @@ export const atlasKeys = {
     ['node-strata', slug, nodeId, zoom, unfilteredIr] as const,
   viewportState: (slug: string, sessionId?: string | null) =>
     ['viewport-state', slug, sessionId ?? ''] as const,
+  healthz: ['healthz'] as const,
   slots: ['adapter-slots'] as const,
   plugins: ['adapter-plugins'] as const,
   profiles: ['stack-profiles'] as const,
 };
+
+export const WYTHE_STATIC_VERSION = '0.2.9';
+
+export function useWytheVersion() {
+  return useQuery({
+    queryKey: atlasKeys.healthz,
+    queryFn: async () => {
+      try {
+        const res = await atlasApi.getHealthz();
+        return {
+          status: res.status || 'ok',
+          version: res.version?.trim() || WYTHE_STATIC_VERSION,
+        };
+      } catch {
+        return {
+          status: 'offline',
+          version: WYTHE_STATIC_VERSION,
+        };
+      }
+    },
+    initialData: { status: 'ok', version: WYTHE_STATIC_VERSION },
+    initialDataUpdatedAt: 0,
+    staleTime: 60_000,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+}
 
 export function useTargets() {
   return useQuery({

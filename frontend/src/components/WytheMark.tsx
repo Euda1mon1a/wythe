@@ -74,6 +74,92 @@ export function WytheMark({
   );
 }
 
+export function WytheBrandLockup({
+  palette,
+  version,
+  size = 28,
+  showTagline = true,
+}: {
+  palette: WythePaletteColors;
+  version?: string | null;
+  size?: number;
+  showTagline?: boolean;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  const tooltipId = useId();
+
+  const resolvedVersion = (version ?? '').trim() || '0.2.9';
+  const versionLabel = resolvedVersion.startsWith('v')
+    ? resolvedVersion
+    : `v${resolvedVersion}`;
+  const tooltipOpen = !dismissed && (hovered || focused);
+
+  useEffect(() => {
+    if (!tooltipOpen) return;
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') {
+        setDismissed(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [tooltipOpen]);
+
+  return (
+    <div
+      tabIndex={0}
+      aria-label={`WYTHE ${versionLabel}`}
+      title={`Wythe ${versionLabel}`}
+      aria-describedby={tooltipOpen ? tooltipId : undefined}
+      onMouseEnter={() => {
+        setDismissed(false);
+        setHovered(true);
+      }}
+      onMouseLeave={() => {
+        setHovered(false);
+        setDismissed(false);
+      }}
+      onFocus={() => {
+        setDismissed(false);
+        setFocused(true);
+      }}
+      onBlur={() => {
+        setFocused(false);
+        setDismissed(false);
+      }}
+      onKeyDown={(ev) => {
+        if (ev.key === 'Escape' && tooltipOpen) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          setDismissed(true);
+        }
+      }}
+      className="relative inline-flex items-center gap-2.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+    >
+      <WytheMark palette={palette} size={size} />
+      <span className="font-mono text-sm font-bold tracking-wider text-slate-100">
+        WYTHE
+      </span>
+      {showTagline && (
+        <span className="hidden border border-slate-800 bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-slate-300 2xl:inline-block">
+          Why · ∴ · 3-Tier
+        </span>
+      )}
+      {tooltipOpen && (
+        <div
+          id={tooltipId}
+          role="tooltip"
+          className="pointer-events-none absolute left-0 top-full z-50 mt-1.5 whitespace-nowrap border border-slate-700 bg-slate-900 px-2.5 py-1 font-mono text-[11px] font-medium text-slate-100 shadow-lg"
+        >
+          Wythe {versionLabel}
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface WytheAppearanceControlProps {
   appearance: AppearanceMode;
   preset: WythePresetId;

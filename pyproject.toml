@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wythe"
-version = "0.2.7"
+version = "0.2.9"
 description = "Why -> Therefore: 3-tier architecture verifier, cross-boundary lineage solver, and 3D WebGL atlas."
 readme = "README.md"
 license = "MIT"
@@ -100,6 +100,7 @@ pythonpath = [
   "plugins/wythe-plugin-solver-internals/src",
   "plugins/wythe-plugin-binary/src",
   "plugins/wythe-plugin-wiretap/src",
+  "plugins/wythe-plugin-agent-discordance/src",
 ]
 
 [tool.ruff]
@@ -113,6 +114,10 @@ src = [
   "plugins/wythe-plugin-solver-internals/src",
   "plugins/wythe-plugin-binary/src",
   "plugins/wythe-plugin-wiretap/src",
+  "plugins/wythe-plugin-agent-discordance/src",
 ]
 target-version = "py312"
 line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+"backend/tests/*.py" = ["E402"]

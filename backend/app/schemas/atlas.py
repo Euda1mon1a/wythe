@@ -502,6 +502,7 @@ class PortableRulingItem(StrictSchema):
     store_purpose: StorePurposeDeclaration | None = None
     evidence_scope: list[str] = Field(default_factory=list)
     audited_commit: str
+    effective_until: date | None = None
     recorded_by: str
 
 
@@ -524,6 +525,7 @@ class PortableGovernanceBundle(StrictSchema):
     ratchet_baselines: list[PortableRatchetItem] = Field(default_factory=list)
     audit_rulings: list[PortableRulingItem] = Field(default_factory=list)
     reference_exemplars: list[PortableReferenceExemplar] = Field(default_factory=list)
+    fabricated_fallback_allowlist: list[str] = Field(default_factory=list)
 
 
 class GovernanceSyncReceipt(StrictSchema):
@@ -542,6 +544,20 @@ class LlmBriefRead(StrictSchema):
     source_commit: str
     approx_tokens: int
     markdown: str
+    observed_at: datetime | None = None
+    source_observed_at: datetime | None = None
+    valid_until: datetime | None = None
+    observation_source: str | None = ""
+    coverage_complete: bool | None = True
+    unobserved_tiers: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _sync_observed_timestamps(self) -> LlmBriefRead:
+        if self.source_observed_at is None and self.observed_at is not None:
+            self.source_observed_at = self.observed_at
+        elif self.observed_at is None and self.source_observed_at is not None:
+            self.observed_at = self.source_observed_at
+        return self
 
 
 class LlmNodePointer(StrictSchema):
@@ -553,6 +569,7 @@ class LlmNodePointer(StrictSchema):
     status: NodeStatus
     columns: list[str] = Field(default_factory=list)
     http_paths: list[str] = Field(default_factory=list)
+    omitted_http_path_count: int = 0
 
 
 class ConeEdgeSummary(StrictSchema):
@@ -664,6 +681,20 @@ class LlmContextConeReport(StrictSchema):
     completeness: ConeCompleteness | None = None
     approx_tokens: int = 0
     markdown: str = ""
+    observed_at: datetime | None = None
+    source_observed_at: datetime | None = None
+    valid_until: datetime | None = None
+    observation_source: str | None = ""
+    coverage_complete: bool | None = True
+    unobserved_tiers: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _sync_observed_timestamps(self) -> LlmContextConeReport:
+        if self.source_observed_at is None and self.observed_at is not None:
+            self.source_observed_at = self.observed_at
+        elif self.observed_at is None and self.source_observed_at is not None:
+            self.observed_at = self.source_observed_at
+        return self
 
 
 LineageConeSlice = LlmContextConeReport
@@ -943,9 +974,14 @@ class AskWytheResponse(StrictSchema):
     authored_by: Literal["model", "scanner_brief"] = "model"
     engine_used: Literal["apple", "local"]
     model_id: str
-    used_vision_snapshot: bool = False
+    used_vision_snapshot: bool | None = False
     image_supplied: bool = False
     fallback_reason: str | None = None
+    execution_origin: Literal["browser_client", "wythe_server"] | None = None
+    endpoint_origin: str | None = None
+    requested_model_id: str | None = None
+    resolved_model_id: str | None = None
+    fallback_from: str | None = None
     context_headline: str
     answer_markdown: str
     executed_tools: list[str] = Field(default_factory=list)
@@ -1074,18 +1110,22 @@ def _pop_flagged_only_alias(raw: Any) -> Any:
     return raw
 
 _CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_ALL_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_DANGEROUS_HTML_TAGS = frozenset({"script", "iframe", "object", "embed"})
+_EVENT_HANDLER_ATTR_RE = re.compile(r"""(?:[\s/"'>])on[a-zA-Z]{2,}\s*=""", re.IGNORECASE)
+_FORBIDDEN_URI_SCHEME_RE = re.compile(
+    r"(?:(?:javascript|vbscript):|data:(?:text/html|image/svg\+xml|application/xhtml\+xml))",
+    re.IGNORECASE,
+)
 _EXECUTABLE_TEXT_RE = re.compile(
     r"<\s*/?\s*(?:script|iframe|object|embed)\b"
     r"|\b(?:javascript|vbscript)\s*:"
-    r"|\bdata\s*:\s*text/html"
-    r"|<\s*[a-zA-Z][^>]*\bon[a-zA-Z]+\s*=",
+    r"|\bdata\s*:\s*(?:text/html|image/svg\+xml|application/xhtml\+xml)",
     re.IGNORECASE,
 )
-_HTML_TAG_RE = re.compile(
-    r"<(?:!--[\s\S]*?--|![a-zA-Z][^>]*|\?[^>]*|/\s*[a-zA-Z][a-zA-Z0-9:-]*\s*"
-    r"|[a-zA-Z][a-zA-Z0-9:-]*(?:\s[^<>]*)?/?)>"
+_DANGEROUS_SPACED_OPEN_RE = re.compile(
+    r"^<\s*/?\s*(?:script|iframe|object|embed)\b", re.IGNORECASE
 )
-_UNCLOSED_HTML_TAG_RE = re.compile(r"<(?:/\s*)?[a-zA-Z][a-zA-Z0-9:-]*(?:\s[^<>]*)?$")
 _NUMERIC_SCALAR_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
 _NUMERIC_TUPLE_RE = re.compile(
     r"^[\[\(\{]?\s*[+-]?(?:\d+\.?\d*|\.\d+)"
@@ -1097,36 +1137,153 @@ _COORD_SMUGGLE_RE = re.compile(
     r"|(?:^|[,;\s])[xyz]\s*=\s*[+-]?(?:\d|\.\d)",
     re.IGNORECASE,
 )
+_UNPAIRED_GT_RE = re.compile(r"(?<!-)>")
+
+
+def _is_html_tag_start(text: str, idx: int) -> bool:
+    """Return True when `text[idx]` (`<`) begins an HTML/XML tag, comment, or spaced dangerous tag."""
+    n = len(text)
+    if idx + 1 >= n:
+        return False
+    nxt = text[idx + 1]
+    if nxt.isascii() and nxt.isalpha():
+        return True
+    if nxt in ("!", "?"):
+        return True
+    if nxt == "/":
+        j = idx + 2
+        while j < n and text[j].isspace():
+            j += 1
+        return j < n and text[j].isascii() and text[j].isalpha()
+    return bool(_DANGEROUS_SPACED_OPEN_RE.match(text[idx : idx + 24]))
+
+
+def _iter_html_tag_spans(text: str) -> list[tuple[int, int]]:
+    """Locate HTML/XML tag spans using a quote-aware state machine (`src=">"` stays inside tag)."""
+    spans: list[tuple[int, int]] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "<" or not _is_html_tag_start(text, i):
+            i += 1
+            continue
+        if text.startswith("<!--", i):
+            end_comment = text.find("-->", i + 4)
+            end = n if end_comment < 0 else end_comment + 3
+            spans.append((i, end))
+            i = end
+            continue
+        quote: str | None = None
+        j = i + 1
+        restarted = False
+        while j < n:
+            ch = text[j]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+                j += 1
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                j += 1
+                continue
+            if ch == "<" and _is_html_tag_start(text, j):
+                # Restart on the inner tag so `<scr<a>ipt>` strips inner `<a>` first.
+                i = j
+                restarted = True
+                break
+            if ch == ">":
+                spans.append((i, j + 1))
+                i = j + 1
+                restarted = True
+                break
+            j += 1
+        if not restarted:
+            spans.append((i, n))
+            break
+    return spans
+
+
+def _tag_span_is_executable(tag_text: str) -> bool:
+    """Return True if a tag span names an active tag or carries an `on*=` handler or script URI."""
+    m = re.match(r"^<\s*/?\s*([a-zA-Z][a-zA-Z0-9:-]*)", tag_text)
+    if m and m.group(1).lower() in _DANGEROUS_HTML_TAGS:
+        return True
+    if _EVENT_HANDLER_ATTR_RE.search(tag_text):
+        return True
+    compact = re.sub(r"[\x00-\x20\x7f]+", "", tag_text)
+    return bool(_FORBIDDEN_URI_SCHEME_RE.search(compact))
+
+
+def _contains_executable_markup_or_uri(text: str, spans: list[tuple[int, int]] | None = None) -> bool:
+    """Detect script/handler markup and control-char-obfuscated executable URIs."""
+    compact = re.sub(r"[\x00-\x20\x7f]+", "", text)
+    if _FORBIDDEN_URI_SCHEME_RE.search(compact):
+        return True
+    ctrl_normalized = _ALL_CTRL_CHARS_RE.sub(" ", text)
+    if _EXECUTABLE_TEXT_RE.search(ctrl_normalized):
+        return True
+    tag_spans = spans if spans is not None else _iter_html_tag_spans(text)
+    return any(_tag_span_is_executable(text[start:end]) for start, end in tag_spans)
+
+
+def _strip_html_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            parts.append(text[cursor:start])
+        cursor = max(cursor, end)
+    if cursor < len(text):
+        parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def sanitize_viewport_plain_text(value: str, *, field_name: str = "text") -> str:
-    """Strip HTML tags to plain text and reject script/executable URI payloads."""
-    cleaned = _CTRL_CHARS_RE.sub("", value)
-    if _EXECUTABLE_TEXT_RE.search(cleaned):
+    """Strip benign HTML tags to plain text and reject script/handler/executable URI payloads."""
+    if _contains_executable_markup_or_uri(value):
         raise ValueError(
             f"Unsafe executable markup or script URI rejected in `{field_name}`."
         )
-    while True:
-        nxt = _HTML_TAG_RE.sub("", cleaned)
-        nxt = _UNCLOSED_HTML_TAG_RE.sub("", nxt)
-        if _EXECUTABLE_TEXT_RE.search(nxt):
+    cleaned = _CTRL_CHARS_RE.sub("", value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    for _ in range(32):
+        spans = _iter_html_tag_spans(cleaned)
+        if _contains_executable_markup_or_uri(cleaned, spans):
+            raise ValueError(
+                f"Unsafe executable markup or script URI rejected in `{field_name}`."
+            )
+        if not spans:
+            break
+        nxt = _strip_html_spans(cleaned, spans)
+        if _contains_executable_markup_or_uri(nxt):
             raise ValueError(
                 f"Unsafe executable markup or script URI rejected in `{field_name}`."
             )
         if nxt == cleaned:
             break
         cleaned = nxt
+    else:
+        raise ValueError(f"Excessively nested HTML markup rejected in `{field_name}`.")
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def validate_semantic_atlas_id(raw_id: str, *, field_name: str = "id") -> str:
-    """Enforce semantic Atlas IDs and reject raw numeric coordinate smuggling."""
-    cleaned = _CTRL_CHARS_RE.sub("", raw_id).strip()
+    """Enforce semantic Atlas IDs and reject raw numeric coordinate smuggling or markup."""
+    if _contains_executable_markup_or_uri(raw_id):
+        raise ValueError(f"Markup or script content is forbidden in `{field_name}`.")
+    cleaned = _ALL_CTRL_CHARS_RE.sub("", raw_id).strip()
     if not cleaned:
         raise ValueError(f"`{field_name}` entries must be non-empty semantic identifiers.")
     if len(cleaned) > 200:
         raise ValueError(f"`{field_name}` entry exceeds 200 characters.")
-    if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
+    if (
+        _contains_executable_markup_or_uri(cleaned)
+        or _iter_html_tag_spans(cleaned)
+        or "<" in cleaned
+        or _UNPAIRED_GT_RE.search(cleaned)
+    ):
         raise ValueError(f"Markup or script content is forbidden in `{field_name}`.")
     if (
         _NUMERIC_SCALAR_RE.match(cleaned)
@@ -1272,6 +1429,32 @@ class ChronicleFrame(StrictSchema):
         ]
 
 
+def _clean_strict_identifier(
+    value: str,
+    *,
+    field_name: str,
+    allow_empty: bool = False,
+    reject_coords: bool = False,
+) -> str | None:
+    if _contains_executable_markup_or_uri(value):
+        raise ValueError(f"Markup or script content is forbidden in `{field_name}`.")
+    cleaned = _ALL_CTRL_CHARS_RE.sub("", value).strip()
+    if not cleaned:
+        if allow_empty:
+            return None
+        raise ValueError(f"`{field_name}` must be non-empty.")
+    if (
+        _contains_executable_markup_or_uri(cleaned)
+        or _iter_html_tag_spans(cleaned)
+        or "<" in cleaned
+        or _UNPAIRED_GT_RE.search(cleaned)
+    ):
+        raise ValueError(f"Markup or script content is forbidden in `{field_name}`.")
+    if reject_coords and (_NUMERIC_TUPLE_RE.match(cleaned) or _COORD_SMUGGLE_RE.search(cleaned)):
+        raise ValueError(f"Markup or coordinate tuples are forbidden in `{field_name}`.")
+    return cleaned
+
+
 class ChronicleTimeline(StrictSchema):
     timeline_id: str = Field(min_length=1, max_length=64)
     target_slug: str = Field(min_length=1, max_length=64)
@@ -1286,19 +1469,9 @@ class ChronicleTimeline(StrictSchema):
     def _clean_timeline_identifiers(cls, value: Any, info: Any) -> Any:
         if not isinstance(value, str):
             return value
-        fname = str(info.field_name)
-        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
-        if not cleaned:
-            raise ValueError(f"`{fname}` must be non-empty.")
-        if (
-            _EXECUTABLE_TEXT_RE.search(cleaned)
-            or _HTML_TAG_RE.search(cleaned)
-            or _UNCLOSED_HTML_TAG_RE.search(cleaned)
-            or _NUMERIC_TUPLE_RE.match(cleaned)
-            or _COORD_SMUGGLE_RE.search(cleaned)
-        ):
-            raise ValueError(f"Markup or coordinate tuples are forbidden in `{fname}`.")
-        return cleaned
+        return _clean_strict_identifier(
+            value, field_name=str(info.field_name), allow_empty=False, reject_coords=True
+        )
 
     @field_validator("title", mode="before")
     @classmethod
@@ -1393,24 +1566,15 @@ class ViewportCommand(StrictSchema):
             return _new_command_id()
         if not isinstance(value, str):
             return value
-        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
-        if not cleaned:
-            return _new_command_id()
-        if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
-            raise ValueError("Markup or script content is forbidden in `command_id`.")
-        return cleaned
+        cleaned = _clean_strict_identifier(value, field_name="command_id", allow_empty=True)
+        return cleaned if cleaned is not None else _new_command_id()
 
     @field_validator("correlation_id", "expected_evidence_revision", mode="before")
     @classmethod
     def _clean_optional_identifiers(cls, value: Any, info: Any) -> Any:
         if value is None or not isinstance(value, str):
             return value
-        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
-        if not cleaned:
-            return None
-        if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
-            raise ValueError(f"Markup or script content is forbidden in `{info.field_name}`.")
-        return cleaned
+        return _clean_strict_identifier(value, field_name=str(info.field_name), allow_empty=True)
 
     @field_validator("zoom_stratum", "neighborhood_hops", mode="before")
     @classmethod
@@ -1424,30 +1588,16 @@ class ViewportCommand(StrictSchema):
     def _clean_target_slug(cls, value: Any) -> Any:
         if not isinstance(value, str):
             return value
-        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
-        if not cleaned:
-            raise ValueError("`target_slug` must be non-empty.")
-        if (
-            _EXECUTABLE_TEXT_RE.search(cleaned)
-            or _HTML_TAG_RE.search(cleaned)
-            or _UNCLOSED_HTML_TAG_RE.search(cleaned)
-            or _NUMERIC_TUPLE_RE.match(cleaned)
-            or _COORD_SMUGGLE_RE.search(cleaned)
-        ):
-            raise ValueError("Markup or coordinate tuples are forbidden in `target_slug`.")
-        return cleaned
+        return _clean_strict_identifier(
+            value, field_name="target_slug", allow_empty=False, reject_coords=True
+        )
 
     @field_validator("session_id", "refresh_session_id", mode="before")
     @classmethod
     def _clean_session_id(cls, value: Any, info: Any) -> Any:
         if value is None or not isinstance(value, str):
             return value
-        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
-        if not cleaned:
-            return None
-        if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
-            raise ValueError(f"Markup or script content is forbidden in `{info.field_name}`.")
-        return cleaned
+        return _clean_strict_identifier(value, field_name=str(info.field_name), allow_empty=True)
 
     @field_validator(
         "caption", "search_query", "subkind_filter", "edge_filter", "diff_base_ref", mode="before"
@@ -1519,12 +1669,34 @@ class ViewportCommandReceiptCreate(StrictSchema):
     applied_focus_revision: int | None = Field(default=None, ge=0)
     note: str = Field(default="", max_length=400)
 
+    @field_validator("command_id", "client_id", "target_slug", mode="before")
+    @classmethod
+    def _clean_required_receipt_ids(cls, value: Any, info: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return _clean_strict_identifier(
+            value,
+            field_name=str(info.field_name),
+            allow_empty=False,
+            reject_coords=(str(info.field_name) == "target_slug"),
+        )
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def _clean_receipt_session_id(cls, value: Any) -> Any:
+        if value is None or not isinstance(value, str):
+            return value
+        return _clean_strict_identifier(value, field_name="session_id", allow_empty=True)
+
     @field_validator("note", mode="before")
     @classmethod
     def _clean_receipt_note(cls, value: Any) -> Any:
         if not isinstance(value, str):
             return value
         return sanitize_viewport_plain_text(value, field_name="note")
+
+
+ViewportReceiptCreate = ViewportCommandReceiptCreate
 
 
 class ViewportCommandReceiptRead(StrictSchema):
@@ -1676,12 +1848,7 @@ class InvestigationCreateRequest(StrictSchema):
     def _clean_create_session_id(cls, value: Any) -> Any:
         if value is None or not isinstance(value, str):
             return value
-        cleaned = _CTRL_CHARS_RE.sub("", value).strip()
-        if not cleaned:
-            return None
-        if _EXECUTABLE_TEXT_RE.search(cleaned) or _HTML_TAG_RE.search(cleaned) or _UNCLOSED_HTML_TAG_RE.search(cleaned):
-            raise ValueError("Markup or script content is forbidden in `session_id`.")
-        return cleaned
+        return _clean_strict_identifier(value, field_name="session_id", allow_empty=True)
 
 
 class InvestigationSummaryRead(StrictSchema):

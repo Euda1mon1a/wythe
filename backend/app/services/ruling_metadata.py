@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, date, datetime
 
 from pydantic import ValidationError
 
 from app.adapters.base import RawCandidateFinding
+from app.core.clock import utc_today
 from app.schemas.atlas import (
     AtlasEdge,
     AtlasNode,
@@ -23,6 +25,17 @@ _generic_stems = frozenset(
 _derived_uses = frozenset(
     {"derived_cache", "read_replica", "materialized_view", "historical_snapshot"}
 )
+_ACTIVE_PURPOSE_DISPOSITIONS = frozenset(
+    {
+        "accepted_clean",
+        "intentional_exception",
+        "intentional_copy",
+        "confirmed_owner_intent",
+        "deferred_cutover",
+    }
+)
+_NON_COMMIT_SENTINELS = frozenset({"", "unavailable", "uncommitted", "unknown", "none"})
+_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
 
 
 def pack_ruling_cutover_payload(
@@ -179,11 +192,59 @@ def _recompute_node_status(node: AtlasNode, remaining_findings: list[RawCandidat
         node.status = "gray_zone"
 
 
+def _is_ruling_active(ruling: AuditRulingRead, today: date) -> bool:
+    if ruling.effective_from > today:
+        return False
+    return not (ruling.effective_until is not None and ruling.effective_until < today)
+
+
+def _ruling_sort_key(ruling: AuditRulingRead) -> tuple[datetime, date, date, int]:
+    created = (
+        ruling.created_at.replace(tzinfo=UTC)
+        if ruling.created_at.tzinfo is None
+        else ruling.created_at.astimezone(UTC)
+    )
+    return (created, ruling.audited_at, ruling.effective_from, ruling.id)
+
+
+def _is_ruling_commit_stale(
+    ruling: AuditRulingRead | str | None,
+    current_commit: str | None,
+    *,
+    git_present: bool = True,
+) -> bool:
+    raw_aud = ruling if isinstance(ruling, str) else getattr(ruling, "audited_commit", None)
+    aud = (raw_aud or "").strip()
+    cur = (current_commit or "").strip()
+    if not git_present:
+        return True
+    if aud.lower() in _NON_COMMIT_SENTINELS:
+        return True
+    if cur.lower() in _NON_COMMIT_SENTINELS:
+        return True
+    if aud.lower() == cur.lower():
+        return False
+    if (
+        len(aud) >= 7
+        and len(cur) >= 7
+        and all(ch in _HEX_CHARS for ch in aud)
+        and all(ch in _HEX_CHARS for ch in cur)
+    ):
+        short, long_ = (aud.lower(), cur.lower()) if len(aud) <= len(cur) else (cur.lower(), aud.lower())
+        if long_.startswith(short):
+            return False
+    return True
+
+
 def apply_rulings_and_store_purpose_checks(
     all_nodes: list[AtlasNode],
     all_edges: list[AtlasEdge],
     raw_findings: list[RawCandidateFinding],
     rulings: list[AuditRulingRead],
+    *,
+    strict_gate: bool = False,
+    current_commit: str | None = None,
+    git_present: bool = True,
 ) -> list[RawCandidateFinding]:
     """Hydrate scoped rulings & store purpose declarations without silencing independent checks."""
     nodes_by_id = {n.id: n for n in all_nodes}
@@ -196,9 +257,13 @@ def apply_rulings_and_store_purpose_checks(
             if st and st not in _generic_stems:
                 sql_writers_by_stem[st] = n
 
+    today = utc_today()
     rulings_by_node: dict[str, list[AuditRulingRead]] = {}
     for r in rulings:
-        rulings_by_node.setdefault(r.node_id, []).append(r)
+        if _is_ruling_active(r, today):
+            rulings_by_node.setdefault(r.node_id, []).append(r)
+    for node_list in rulings_by_node.values():
+        node_list.sort(key=_ruling_sort_key, reverse=True)
 
     waived_indices: set[int] = set()
     updated_findings = list(raw_findings)
@@ -218,12 +283,28 @@ def apply_rulings_and_store_purpose_checks(
             continue
 
         latest = node_rulings[0]
-        node.ruling_summary = f"[{latest.disposition}] {latest.summary}"
+        latest_stale = _is_ruling_commit_stale(latest, current_commit, git_present=git_present)
+        allow_waivers = (not strict_gate) and (not latest_stale)
+        stale_tag = f" (stale @ {latest.audited_commit[:12]})" if latest_stale else ""
+        node.ruling_summary = f"[{latest.disposition}] {latest.summary}{stale_tag}"
         node.ruling_audited_at = latest.audited_at
         if latest.cutover_history:
             node.cutover_history = latest.cutover_history
 
-        purpose_ruling = next((r for r in node_rulings if r.store_purpose is not None), None)
+        if latest.disposition not in _ACTIVE_PURPOSE_DISPOSITIONS or latest_stale:
+            purpose_ruling = None
+        elif latest.store_purpose is not None:
+            purpose_ruling = latest
+        else:
+            purpose_ruling = None
+            for r in node_rulings[1:]:
+                if r.disposition not in _ACTIVE_PURPOSE_DISPOSITIONS:
+                    break
+                if r.store_purpose is not None and not _is_ruling_commit_stale(
+                    r, current_commit, git_present=git_present
+                ):
+                    purpose_ruling = r
+                    break
         sp = (
             purpose_ruling.store_purpose.model_copy(deep=True)
             if (purpose_ruling and purpose_ruling.store_purpose)
@@ -240,31 +321,32 @@ def apply_rulings_and_store_purpose_checks(
         # Derived copy declaring its authoritative SQL source is not a "second authority".
         if sp is not None and sp.intended_use in _derived_uses:
             if sp.authoritative_source:
-                src_stem = _domain_stem(sp.authoritative_source)
-                for idx in rel_indices:
-                    f = updated_findings[idx]
-                    if f.rule_code == "TRUTH-004" and "second authority" in f.detail.lower():
-                        src_ok = (matched_src is not None and matched_src.id in f.detail) or (
-                            src_stem and src_stem in f.detail.lower()
-                        )
-                        if src_ok:
-                            updated_findings[idx] = RawCandidateFinding(
-                                rule_code=f.rule_code,
-                                node_id=f.node_id,
-                                target_node_id=f.target_node_id,
-                                source_file=f.source_file,
-                                line=f.line,
-                                title=f.title,
-                                detail=(
-                                    f"{f.source_file}:{f.line} writes declared derived copy "
-                                    f"`{node.label}` (source `{sp.authoritative_source}`) without "
-                                    "verified TTL or explicit invalidation."
-                                ),
-                                remediation=(
-                                    "Add TTL or explicit invalidation (`delete`/`unlink`) to keep "
-                                    f"derived copy `{node.label}` fresh."
-                                ),
+                if allow_waivers:
+                    src_stem = _domain_stem(sp.authoritative_source)
+                    for idx in rel_indices:
+                        f = updated_findings[idx]
+                        if f.rule_code == "TRUTH-004" and "second authority" in f.detail.lower():
+                            src_ok = (matched_src is not None and matched_src.id in f.detail) or (
+                                src_stem and src_stem in f.detail.lower()
                             )
+                            if src_ok:
+                                updated_findings[idx] = RawCandidateFinding(
+                                    rule_code=f.rule_code,
+                                    node_id=f.node_id,
+                                    target_node_id=f.target_node_id,
+                                    source_file=f.source_file,
+                                    line=f.line,
+                                    title=f.title,
+                                    detail=(
+                                        f"{f.source_file}:{f.line} writes declared derived copy "
+                                        f"`{node.label}` (source `{sp.authoritative_source}`) without "
+                                        "verified TTL or explicit invalidation."
+                                    ),
+                                    remediation=(
+                                        "Add TTL or explicit invalidation (`delete`/`unlink`) to keep "
+                                        f"derived copy `{node.label}` fresh."
+                                    ),
+                                )
             elif not rel_indices:
                 updated_findings.append(
                     RawCandidateFinding(
@@ -300,8 +382,9 @@ def apply_rulings_and_store_purpose_checks(
                 ):
                     continue
                 if sp.recovery_expectation and sp.recovery_expectation.strip():
-                    waived_indices.add(idx)
-                else:
+                    if allow_waivers:
+                        waived_indices.add(idx)
+                elif allow_waivers:
                     updated_findings[idx] = RawCandidateFinding(
                         rule_code=f.rule_code,
                         node_id=f.node_id,
@@ -319,24 +402,22 @@ def apply_rulings_and_store_purpose_checks(
                         ),
                     )
 
-        for r in node_rulings:
-            if r.disposition != "accepted_clean":
-                continue
-            r_ks = r.store_purpose.keyspace_scope if r.store_purpose else None
-            has_explicit_scope = bool(r.evidence_scope) or bool(r_ks)
-            if (node.subkind == "cache_store" or node.id == "t:redis:default") and not (
-                has_explicit_scope
+        if allow_waivers and latest.disposition == "accepted_clean":
+            r_ks = latest.store_purpose.keyspace_scope if latest.store_purpose else None
+            has_explicit_scope = bool(latest.evidence_scope) or bool(r_ks)
+            if not (
+                (node.subkind == "cache_store" or node.id == "t:redis:default")
+                and not has_explicit_scope
             ):
-                continue
-            for idx in rel_indices:
-                if idx in waived_indices:
-                    continue
-                f = updated_findings[idx]
-                if has_explicit_scope:
-                    if _finding_matches_scope(f, r.evidence_scope, r_ks):
+                for idx in rel_indices:
+                    if idx in waived_indices:
+                        continue
+                    f = updated_findings[idx]
+                    if has_explicit_scope:
+                        if _finding_matches_scope(f, latest.evidence_scope, r_ks):
+                            waived_indices.add(idx)
+                    elif sp is None:
                         waived_indices.add(idx)
-                elif sp is None:
-                    waived_indices.add(idx)
 
         remaining_for_node = [
             updated_findings[idx] for idx in rel_indices if idx not in waived_indices
@@ -350,13 +431,16 @@ def apply_rulings_and_store_purpose_checks(
             node.store_purpose = sp
             node.verification_note = v_note
 
-        has_clean_ruling = any(r.disposition == "accepted_clean" for r in node_rulings)
+        has_clean_ruling = latest.disposition == "accepted_clean"
         if remaining_for_node:
             _recompute_node_status(node, remaining_for_node)
-        elif (has_clean_ruling and (node.subkind != "cache_store" or sp is None)) or (
-            sp is not None
-            and sp.intended_use == "persistent_config"
-            and sp.recovery_expectation
+        elif allow_waivers and (
+            (has_clean_ruling and (node.subkind != "cache_store" or sp is None))
+            or (
+                sp is not None
+                and sp.intended_use == "persistent_config"
+                and sp.recovery_expectation
+            )
         ):
             node.status = "clean"
 

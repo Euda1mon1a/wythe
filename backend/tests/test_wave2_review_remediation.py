@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -70,6 +72,10 @@ def test_cross_process_cli_mcp_sqlite_bus_live_sse_and_server_url_fail_closed(
     state_a.mkdir()
     state_b.mkdir()
     repo_dir = _make_target_repo(tmp_path / "ipc-target")
+    resolved_repo = repo_dir.resolve()
+    base_slug = re.sub(r"[^a-z0-9-_]", "-", resolved_repo.name.lower()).strip("-") or "mcp-target"
+    path_digest = hashlib.sha256(str(resolved_repo).encode("utf-8")).hexdigest()[:8]
+    expected_slug = f"unregistered-{base_slug[:36].strip('-') or 'target'}-{path_digest}"
 
     env_a = {
         **os.environ,
@@ -105,7 +111,7 @@ def test_cross_process_cli_mcp_sqlite_bus_live_sse_and_server_url_fail_closed(
     no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def _read_live_sse() -> None:
-        url = f"{base_url}/api/v1/viewport/stream?target_slug=ipc-target"
+        url = f"{base_url}/api/v1/viewport/stream?target_slug={expected_slug}"
         with no_proxy_opener.open(url, timeout=10.0) as resp:
             cur_id: int | None = None
             cur_data: str | None = None
@@ -171,7 +177,7 @@ def test_cross_process_cli_mcp_sqlite_bus_live_sse_and_server_url_fail_closed(
         assert rpc_1["result"]["isError"] is False
 
         with no_proxy_opener.open(
-            f"{base_url}/api/v1/viewport/state?target_slug=ipc-target", timeout=5.0
+            f"{base_url}/api/v1/viewport/state?target_slug={expected_slug}", timeout=5.0
         ) as st_resp:
             st_1 = json.loads(st_resp.read().decode("utf-8"))
         assert st_1["latest"] is not None
@@ -261,9 +267,9 @@ def test_cross_process_cli_mcp_sqlite_bus_live_sse_and_server_url_fail_closed(
 
     # Verify `clear_viewport_state` and dynamic `WYTHE_STATE_DIR` switching
     monkeypatch.setenv("WYTHE_STATE_DIR", str(state_a))
-    assert get_viewport_state("ipc-target").latest is not None
-    clear_viewport_state("ipc-target")
-    assert get_viewport_state("ipc-target").latest is None
+    assert get_viewport_state(expected_slug).latest is not None
+    clear_viewport_state(expected_slug)
+    assert get_viewport_state(expected_slug).latest is None
 
     # Verify `viewport_delivery_scope` enforces `server_url` and `local_only` for zero-kwarg callers
     with (
@@ -412,6 +418,10 @@ def test_iterative_stratum_compaction_deep_chains_and_cycles_via_drilldown(
             ]
             return StratumExpansionResult(nodes=nodes, edges=edges)
 
+    import sysconfig
+
+    _purelib = Path(sysconfig.get_path("purelib"))
+
     class _EP:
         name = "deep-cyclic-ir"
         value = "pkg:deep"
@@ -419,6 +429,11 @@ def test_iterative_stratum_compaction_deep_chains_and_cycles_via_drilldown(
 
         class dist:
             version = "1.0.0"
+            _path = _purelib / "pkg_deep-1.0.0.dist-info"
+
+            @classmethod
+            def locate_file(cls, path: str) -> Path:
+                return cls._path.parent / path
 
         def load(self):
             return _DeepCyclicStratumPlugin()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.adapters.plugin_registry import collect_enabled_plugin_stack_profiles
+from app.adapters.python_layout import discover_python_app
 from app.models import StackProfile
 from app.schemas.atlas import StackDetectionResult
 
@@ -160,6 +162,69 @@ def _has_dir_sources(
     return False
 
 
+_MODULE_SCRIPT_RE = re.compile(r"<script\b[^>]*\btype\s*=\s*(?:\"module\"|'module'|module\b)", re.IGNORECASE)
+_VANILLA_UI_SUBDIRS = ("views", "core", "utils", "shared")
+_VANILLA_UI_ENTRY_FILES = ("app.js", "main.js", "app.mjs", "main.mjs")
+
+
+def _is_vanilla_es_ui_dir(base_dir: Path) -> bool:
+    """Return True when `base_dir` holds a zero-build vanilla ES-module UI (`index.html` + modules)."""
+    if not base_dir.is_dir() or base_dir.is_symlink():
+        return False
+    has_module_html = False
+    for html_cand in (base_dir / "index.html", base_dir / "src" / "index.html"):
+        if (
+            html_cand.is_file()
+            and not html_cand.is_symlink()
+            and _MODULE_SCRIPT_RE.search(_read_lower(html_cand))
+        ):
+            has_module_html = True
+            break
+    if not has_module_html:
+        return False
+    roots = [base_dir]
+    if (base_dir / "src").is_dir() and not (base_dir / "src").is_symlink():
+        roots.append(base_dir / "src")
+    for root in roots:
+        if any((root / name).is_file() and not (root / name).is_symlink() for name in _VANILLA_UI_ENTRY_FILES):
+            return True
+        if any(_has_dir_sources(root / sub, (".js", ".mjs")) for sub in _VANILLA_UI_SUBDIRS):
+            return True
+    return False
+
+
+def _is_ui_subdir(cand: Path) -> bool:
+    if not cand.is_dir() or cand.is_symlink():
+        return False
+    if (cand / "package.json").is_file() or (cand / "Cargo.toml").is_file():
+        return True
+    if any((cand / cfg).is_file() for cfg in _UI_CONFIG_FILES):
+        return True
+    if _is_vanilla_es_ui_dir(cand):
+        return True
+    return _has_dir_sources(
+        cand, (".ts", ".tsx", ".js", ".jsx", ".mjs", ".vue", ".svelte", ".html", ".htm")
+    )
+
+
+def _is_static_ui_subdir(cand: Path) -> bool:
+    if not cand.is_dir() or cand.is_symlink():
+        return False
+    if _is_vanilla_es_ui_dir(cand) or any((cand / cfg).is_file() for cfg in _UI_CONFIG_FILES):
+        return True
+    deps = _pkg_deps(cand / "package.json")
+    return bool(deps & _UI_FRAMEWORK_DEPS)
+
+
+def _has_root_primary_ui(repo_root: Path, root_deps: set[str]) -> bool:
+    return (
+        bool(root_deps & _UI_FRAMEWORK_DEPS)
+        or any((repo_root / cfg).is_file() for cfg in _UI_CONFIG_FILES)
+        or _is_vanilla_es_ui_dir(repo_root)
+        or _has_dir_sources(repo_root / "src", (".tsx", ".jsx", ".vue", ".svelte"))
+    )
+
+
 def _is_frontend_subapp_dir(cand: Path) -> tuple[bool, set[str]]:
     if not cand.is_dir() or cand.is_symlink():
         return False, set()
@@ -167,9 +232,10 @@ def _is_frontend_subapp_dir(cand: Path) -> tuple[bool, set[str]]:
     has_ui_deps = bool(deps & _UI_FRAMEWORK_DEPS)
     has_ui_cfg = any((cand / cfg).is_file() for cfg in _UI_CONFIG_FILES)
     has_ui_src = _has_dir_sources(cand, (".tsx", ".jsx", ".vue", ".svelte"))
-    if (deps & _NODE_BACKEND_DEPS) and not has_ui_deps and not has_ui_src:
+    has_vanilla_ui = _is_vanilla_es_ui_dir(cand)
+    if (deps & _NODE_BACKEND_DEPS) and not has_ui_deps and not has_ui_src and not has_vanilla_ui:
         return False, set()
-    return (has_ui_deps or has_ui_cfg or has_ui_src), deps
+    return (has_ui_deps or has_ui_cfg or has_ui_src or has_vanilla_ui), deps
 
 
 def _resolve_nested_frontend(
@@ -182,7 +248,11 @@ def _resolve_nested_frontend(
     or arbitrarily dropping sibling apps when multiple UI apps exist."""
     if frontend_sub != ".":
         fe_cand = repo_root / frontend_sub
-        if (fe_cand / "package.json").is_file() or (fe_cand / "Cargo.toml").is_file():
+        if (
+            (fe_cand / "package.json").is_file()
+            or (fe_cand / "Cargo.toml").is_file()
+            or _is_vanilla_es_ui_dir(fe_cand)
+        ):
             return frontend_sub, set(), [], False
         matched: list[tuple[Path, set[str]]] = []
         if fe_cand.is_dir() and not fe_cand.is_symlink():
@@ -208,7 +278,7 @@ def _resolve_nested_frontend(
             return frontend_sub, react_only_deps, dirs, True
         return frontend_sub, set(), [], False
 
-    if root_deps & _UI_FRAMEWORK_DEPS:
+    if _has_root_primary_ui(repo_root, root_deps):
         return frontend_sub, set(), [], False
 
     apps_dir = repo_root / "apps"
@@ -261,45 +331,112 @@ def _has_python_backend_source_evidence(repo_root: Path, py_deps: str) -> bool:
     """Return True only on positive Python backend/daemon/store evidence (never standalone `.sql` files alone)."""
     if any(
         tok in py_deps
-        for tok in ("sqlite3", "aiosqlite", "psycopg", "asyncpg", "sqlalchemy", "sqlmodel", "mcp", "fastmcp")
+        for tok in (
+            "sqlite3",
+            "aiosqlite",
+            "psycopg",
+            "asyncpg",
+            "sqlalchemy",
+            "sqlmodel",
+            "mcp",
+            "fastmcp",
+            "fastapi",
+            "starlette",
+            "uvicorn",
+            "aiohttp",
+            "flask",
+        )
     ):
         return True
+    skip_parts = {
+        ".git",
+        ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        "dist",
+        "build",
+        "tests",
+        "test",
+        "examples",
+        "example",
+        "docs",
+    }
+    markers = (
+        "sqlite3",
+        "aiosqlite",
+        "psycopg",
+        "asyncpg",
+        "create table",
+        ".jsonl",
+        "basehttprequesthandler",
+        "httpserver",
+        "threadinghttpserver",
+        "socketserver",
+        "asyncio.start_server",
+        "@mcp.tool",
+        "fastmcp",
+        "mcp.server",
+        "fastapi(",
+        "apirouter(",
+        "starlette(",
+        "uvicorn.run",
+        "add_api_route(",
+        "add_route(",
+        "@app.get(",
+        "@app.post(",
+        "@router.get(",
+        "@router.post(",
+        "http.server",
+        "aiohttp.web",
+        "flask(",
+    )
     checked = 0
-    for scan_dir in dict.fromkeys([repo_root / "scripts", repo_root / "src", repo_root]):
+    seen_files: set[Path] = set()
+    priority_dirs = [repo_root / "scripts", repo_root / "src", repo_root / "daemons", repo_root / "services"]
+    for scan_dir in [*priority_dirs, repo_root]:
         if not scan_dir.is_dir() or scan_dir.is_symlink():
             continue
-        it = scan_dir.glob("*.py") if scan_dir == repo_root else scan_dir.rglob("*.py")
+        it = scan_dir.rglob("*.py")
         for py_file in sorted(it):
+            if py_file in seen_files:
+                continue
             rel_parts = py_file.relative_to(repo_root).parts if py_file.is_relative_to(repo_root) else py_file.parts
-            if any(p in rel_parts for p in (".git", ".venv", "venv", "node_modules", "tests", "test", "examples", "example")):
+            if any(
+                p in skip_parts or (p.startswith(".") and p != ".docker")
+                for p in rel_parts[:-1]
+            ):
                 continue
             if not py_file.is_file() or py_file.is_symlink():
                 continue
+            seen_files.add(py_file)
             checked += 1
             low = _read_lower(py_file)
-            if any(
-                m in low
-                for m in (
-                    "sqlite3",
-                    "aiosqlite",
-                    "psycopg",
-                    "asyncpg",
-                    "create table",
-                    ".jsonl",
-                    "basehttprequesthandler",
-                    "httpserver",
-                    "threadinghttpserver",
-                    "socketserver",
-                    "asyncio.start_server",
-                    "@mcp.tool",
-                    "fastmcp",
-                    "mcp.server",
-                )
-            ):
+            if any(m in low for m in markers):
                 return True
-            if checked >= 120:
+            if checked >= 600:
                 return False
     return False
+
+
+def _count_python_service_sources(repo_root: Path) -> tuple[int, bool]:
+    """Return `(py_count, has_service_units)` across non-test/non-example repository directories."""
+    skip = {".git", ".venv", "venv", "env", "node_modules", "dist", "build", "tests", "test", "examples", "example", "docs"}
+    py_count = 0
+    has_units = False
+    for p in repo_root.rglob("*"):
+        if not p.is_file() or p.is_symlink():
+            continue
+        rel_parts = p.relative_to(repo_root).parts if p.is_relative_to(repo_root) else p.parts
+        if any(part in skip or (part.startswith(".") and part != ".docker") for part in rel_parts[:-1]):
+            continue
+        if p.suffix == ".py":
+            py_count += 1
+        elif p.suffix == ".service" or (p.suffix == ".plist" and p.name.lower() != "info.plist"):
+            has_units = True
+        if py_count >= 12 and has_units:
+            break
+    return py_count, has_units
 
 
 def _has_standalone_sql_files(repo_root: Path, be_dir: Path) -> bool:
@@ -326,10 +463,29 @@ def detect_repository_stack(
         repo_root,
         ("backend", "server", "api", "src-tauri", "apps/desktop/src-tauri", "apps/api", "apps/server", "apps/backend"),
     )
-    frontend_sub = _find_subdir(
-        repo_root,
-        ("frontend", "web", "client", "ui", "apps/web", "apps/frontend", "apps/client", "apps/desktop"),
-    )
+    root_deps = _pkg_deps(repo_root / "package.json")
+    frontend_sub = "."
+    for cand_name in ("frontend", "web", "client", "ui"):
+        cand_dir = repo_root / cand_name
+        if _is_ui_subdir(cand_dir):
+            resolved_sub = cand_dir.resolve()
+            if resolved_sub.is_relative_to(repo_root) and resolved_sub != repo_root:
+                frontend_sub = resolved_sub.relative_to(repo_root).as_posix()
+                break
+    has_root_ui = _has_root_primary_ui(repo_root, root_deps)
+    if frontend_sub == "." and not has_root_ui:
+        for cand_name in ("static", "public"):
+            cand_dir = repo_root / cand_name
+            if _is_static_ui_subdir(cand_dir):
+                resolved_sub = cand_dir.resolve()
+                if resolved_sub.is_relative_to(repo_root) and resolved_sub != repo_root:
+                    frontend_sub = resolved_sub.relative_to(repo_root).as_posix()
+                    break
+    if frontend_sub == "." and not has_root_ui:
+        frontend_sub = _find_subdir(
+            repo_root,
+            ("apps/web", "apps/frontend", "apps/client", "apps/desktop"),
+        )
 
     if (repo_root / "manage.py").is_file():
         backend_sub = "."
@@ -345,7 +501,6 @@ def detect_repository_stack(
             frontend_sub = rel_c
             break
 
-    root_deps = _pkg_deps(repo_root / "package.json")
     frontend_sub, nested_fe_deps, nested_fe_dirs, multi_fe_apps = _resolve_nested_frontend(
         repo_root, frontend_sub, backend_sub, root_deps
     )
@@ -362,6 +517,10 @@ def detect_repository_stack(
         for pjson in sorted(repo_root.glob(pat)):
             ws_pkgs_deps.update(_pkg_deps(pjson))
 
+    py_svc_count, has_svc_units = _count_python_service_sources(repo_root)
+    has_py_source_ev = _has_python_backend_source_evidence(repo_root, "")
+    is_predom_py_services = py_svc_count >= 10 or has_svc_units or has_py_source_ev
+
     # Avoid cross-contaminating a Node backend dir with an unrelated root/auxiliary Python manifest,
     # unless backend/package.json lacks Node backend/ORM deps or Python FastAPI source already exists.
     node_be_markers = _NODE_BACKEND_DEPS | {
@@ -376,11 +535,16 @@ def detect_repository_stack(
             and _has_python_project_deps(_read_lower(be_dir / "pyproject.toml"), "")
         )
     )
+    effective_be_node_deps = (
+        be_deps
+        if (be_dir == repo_root and is_predom_py_services and not (be_deps & node_be_markers))
+        else (be_deps | ws_pkgs_deps)
+    )
     node_owned_backend = (
         (be_dir / "package.json").is_file()
         and not has_be_py_runtime_manifest
         and (
-            bool((be_deps | ws_pkgs_deps) & node_be_markers)
+            bool(effective_be_node_deps & node_be_markers)
             or (
                 be_dir != repo_root
                 and not _has_python_project_deps(_read_lower(repo_root / "pyproject.toml"), _read_lower(repo_root / "requirements.txt"))
@@ -431,10 +595,19 @@ def detect_repository_stack(
     elif (
         bool(all_fe_deps & _JS_FRONTEND_DEPS)
         or any((d / f).is_file() for d in fe_cfg_dirs for f in ("vite.config.ts", "vite.config.js", "vite.config.mts"))
-        or (frontend_sub != "." and _has_dir_sources(fe_dir, (".ts", ".tsx", ".js", ".jsx")))
+        or (frontend_sub != "." and _has_dir_sources(fe_dir, (".ts", ".tsx", ".js", ".jsx", ".mjs", ".html")))
     ):
         disp_adapter = "typescript-react"
         signals.append("Display: React SPA / Vite markers")
+    elif (
+        "@angular/core" not in all_fe_deps
+        and (
+            _is_vanilla_es_ui_dir(fe_dir)
+            or any(_is_vanilla_es_ui_dir(d) for d in nested_fe_dirs)
+        )
+    ):
+        disp_adapter = "typescript-react"
+        signals.append("Display: Zero-build vanilla ES-module UI")
     elif _has_dir_sources(
         fe_dir,
         (".tsx", ".jsx"),
@@ -471,7 +644,18 @@ def detect_repository_stack(
         or (be_dir / "app" / "models.py").is_file()
         or (be_dir / "app" / "models").is_dir()
     )
-    has_fastapi = not node_owned_backend and ("fastapi" in py_deps or (be_dir / "app" / "main.py").is_file())
+    has_app_py_dir = (
+        (be_dir / "app").is_dir()
+        and not (be_dir / "app").is_symlink()
+        and _has_dir_sources(be_dir / "app", (".py",))
+    )
+    discovered_py_app = None
+    if not node_owned_backend and not has_django and not has_rust and not has_go and "fastapi" in py_deps:
+        discovered_py_app, _ = discover_python_app(be_dir)
+    has_fastapi = not node_owned_backend and (
+        (be_dir / "app" / "main.py").is_file()
+        or ("fastapi" in py_deps and (has_app_py_dir or discovered_py_app is not None))
+    )
     has_python_app_layout = (
         not node_owned_backend
         and not has_django
@@ -479,7 +663,7 @@ def detect_repository_stack(
         and not has_go
         and (
             has_fastapi
-            or ((has_sqla_evidence or disp_ev) and (be_dir / "app").is_dir() and _has_dir_sources(be_dir / "app", (".py",)))
+            or (has_sqla_evidence and has_app_py_dir)
         )
     )
     # Compute TypeScript / Node ORM markers ahead of Tier-2 Manipulate resolution so
@@ -515,8 +699,13 @@ def detect_repository_stack(
         has_kysely = False
     has_ts_orm = has_prisma or has_drizzle or has_sql_tools or has_kysely
 
+    ws_node_backend_deps = (
+        set()
+        if (be_dir == repo_root and is_predom_py_services and not (all_be_js_deps & _NODE_BACKEND_DEPS))
+        else ws_pkgs_deps
+    )
     has_node_backend = (
-        bool((all_be_js_deps | ws_pkgs_deps) & _NODE_BACKEND_DEPS)
+        bool((all_be_js_deps | ws_node_backend_deps) & _NODE_BACKEND_DEPS)
         or _has_next_api_handlers(fe_dir)
         or (fe_dir != repo_root and _has_next_api_handlers(repo_root))
         or _has_sveltekit_server_routes(fe_dir)
@@ -533,7 +722,7 @@ def detect_repository_stack(
         )
         or (backend_sub != "." and not has_django and not has_python_app_layout and ((be_dir / "package.json").is_file() or _has_dir_sources(be_dir, (".ts", ".js"))))
     )
-    has_py_backend_src_ev = _has_python_backend_source_evidence(repo_root, py_deps)
+    has_py_backend_src_ev = has_py_source_ev or _has_python_backend_source_evidence(repo_root, py_deps)
     has_py_project_deps = _has_python_project_deps(pyproj, reqs)
     pkg_swift_file = repo_root / "Package.swift"
     has_swift_package = pkg_swift_file.is_file() and not pkg_swift_file.is_symlink()
@@ -600,18 +789,24 @@ def detect_repository_stack(
             detected_signals=signals,
         )
 
+    has_standalone_sql = _has_standalone_sql_files(repo_root, be_dir)
+    has_substantial_py_services = py_svc_count >= 2 or (
+        py_svc_count >= 1 and (has_svc_units or has_standalone_sql)
+    )
     has_python_services = (
         not node_owned_backend
         and not has_python_app_layout
         and (
-            (has_py_project_deps or has_py_backend_src_ev)
-            if disp_adapter != "no-display"
-            else (
-                has_py_project_deps
-                or has_py_backend_src_ev
-                or any(repo_root.glob("*.py"))
-                or ((repo_root / "scripts").is_dir() and _has_dir_sources(repo_root / "scripts", (".py",)))
-                or ((repo_root / "src").is_dir() and _has_dir_sources(repo_root / "src", (".py",)))
+            has_py_project_deps
+            or has_py_backend_src_ev
+            or has_substantial_py_services
+            or (
+                disp_adapter == "no-display"
+                and (
+                    any(repo_root.glob("*.py"))
+                    or ((repo_root / "scripts").is_dir() and _has_dir_sources(repo_root / "scripts", (".py",)))
+                    or ((repo_root / "src").is_dir() and _has_dir_sources(repo_root / "src", (".py",)))
+                )
             )
         )
     )

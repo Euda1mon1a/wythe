@@ -18,12 +18,14 @@ from xml.parsers import expat
 
 from wythe_plugin_wiretap.otel_ebpf import (
     MAX_WIRETAP_BYTES,
+    _check_safe_path_segments,
     ensure_json_depth_bounded,
     read_bounded_regular_bytes,
     validate_non_symlink_path,
 )
 
 MAX_PLIST_BYTES = 1 * 1024 * 1024
+MAX_TOTAL_PORT_ENTRIES = 4096
 _SKIP_REPO_DIRS: frozenset[str] = frozenset(
     {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "out", "tests", "Tests"}
 )
@@ -106,6 +108,19 @@ def canonical_bind_ip(raw_bind: str | None) -> str | None:
     return raw_bind.strip() if raw_bind else None
 
 
+def _safe_scalar_str(val: Any) -> str:
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if isinstance(val, int) and val.bit_length() > 128:
+            return ""
+        try:
+            return str(val)
+        except ValueError:
+            return ""
+    return ""
+
+
 def parse_safe_plist_xml(raw_bytes: bytes) -> dict[str, Any]:
     """Parse an XML `.plist` safely while rejecting XXE `<!ENTITY`/`<!DOCTYPE` payloads."""
     if len(raw_bytes) > MAX_PLIST_BYTES:
@@ -148,8 +163,11 @@ def parse_safe_plist_xml(raw_bytes: bytes) -> dict[str, Any]:
     guard.StartElementHandler = _start
     guard.EndElementHandler = _end
     guard.Parse(stripped.encode("utf-8"), True)
-    parsed = plistlib.loads(stripped.encode("utf-8"), fmt=plistlib.FMT_XML)
-    return {str(k): v for k, v in parsed.items()} if isinstance(parsed, dict) else {}
+    try:
+        parsed = plistlib.loads(stripped.encode("utf-8"), fmt=plistlib.FMT_XML)
+    except (OverflowError, RecursionError) as exc:
+        raise ValueError("Refusing malformed or oversized XML plist scalar.") from exc
+    return {_safe_scalar_str(k): v for k, v in parsed.items() if isinstance(k, str)} if isinstance(parsed, dict) else {}
 
 
 def _parse_publish_spec(spec_str: str) -> tuple[str | None, int | None, str]:
@@ -163,13 +181,25 @@ def _parse_publish_spec(spec_str: str) -> tuple[str | None, int | None, str]:
     if raw.startswith("[") and "]:" in raw:
         ip_part, rest = raw[1:].split("]:", 1)
         host_p = rest.split(":", 1)[0]
-        return canonical_bind_ip(ip_part), (int(host_p) if host_p.isdigit() else None), proto
+        return (
+            canonical_bind_ip(ip_part),
+            (int(host_p) if host_p.isascii() and host_p.isdigit() and len(host_p) <= 5 else None),
+            proto,
+        )
     parts = raw.split(":")
     if len(parts) == 3:
-        return canonical_bind_ip(parts[0]), (int(parts[1]) if parts[1].isdigit() else None), proto
+        return (
+            canonical_bind_ip(parts[0]),
+            (int(parts[1]) if parts[1].isascii() and parts[1].isdigit() and len(parts[1]) <= 5 else None),
+            proto,
+        )
     if len(parts) == 2:
-        return None, (int(parts[0]) if parts[0].isdigit() else None), proto
-    if len(parts) == 1 and parts[0].isdigit():
+        return (
+            None,
+            (int(parts[0]) if parts[0].isascii() and parts[0].isdigit() and len(parts[0]) <= 5 else None),
+            proto,
+        )
+    if len(parts) == 1 and parts[0].isascii() and parts[0].isdigit() and len(parts[0]) <= 5:
         return None, int(parts[0]), proto
     return None, None, proto
 
@@ -183,7 +213,7 @@ def _parse_cli_uvicorn_flags(cmd_text: str) -> tuple[str | None, int | None]:
             host = canonical_bind_ip(tokens[idx + 1].strip("'\""))
         elif tok == "--port" and idx + 1 < len(tokens):
             p_raw = tokens[idx + 1].strip("'\"")
-            if p_raw.isdigit():
+            if p_raw.isascii() and p_raw.isdigit() and len(p_raw) <= 5:
                 port = int(p_raw)
     return host, port
 
@@ -193,16 +223,92 @@ def _load_yaml_docs(text: str) -> list[Any]:
         import yaml  # type: ignore[import-untyped]
     except ImportError:
         return []
+    max_nodes = 4096
+    max_depth = 64
+
+    class _BoundedSafeLoader(yaml.SafeLoader):  # type: ignore[misc, name-defined]
+        def __init__(self, stream: Any) -> None:
+            super().__init__(stream)
+            self._node_count = 0
+            self._alias_count = 0
+            self._merge_steps = 0
+            self._cur_depth = 0
+
+        def compose_node(self, parent: Any, index: Any) -> Any:
+            if self.check_event(yaml.AliasEvent):
+                self._alias_count += 1
+                if (self._node_count + self._alias_count) > max_nodes:
+                    raise yaml.YAMLError(
+                        f"YAML alias expansion exceeds budget ({max_nodes})."
+                    )
+                return super().compose_node(parent, index)
+            self._node_count += 1
+            if (self._node_count + self._alias_count) > max_nodes:
+                raise yaml.YAMLError(f"YAML node count exceeds budget ({max_nodes}).")
+            self._cur_depth += 1
+            if self._cur_depth > max_depth:
+                raise yaml.YAMLError(
+                    f"YAML structure exceeds maximum nesting depth ({max_depth})."
+                )
+            try:
+                return super().compose_node(parent, index)
+            finally:
+                self._cur_depth -= 1
+
+        def flatten_mapping(self, node: Any) -> None:
+            self._merge_steps += 1
+            if self._merge_steps > max_nodes:
+                raise yaml.YAMLError(
+                    f"YAML mapping merge exceeds budget ({max_nodes})."
+                )
+            raw_pairs = getattr(node, "value", ())
+            projected = len(raw_pairs)
+            if projected > max_nodes:
+                raise yaml.YAMLError(
+                    f"YAML merged mapping exceeds budget ({max_nodes})."
+                )
+            for k_node, v_node in raw_pairs:
+                if getattr(k_node, "tag", "") == "tag:yaml.org,2002:merge":
+                    if isinstance(v_node, yaml.MappingNode):
+                        self.flatten_mapping(v_node)
+                        projected += len(v_node.value)
+                    elif isinstance(v_node, yaml.SequenceNode):
+                        for subnode in v_node.value:
+                            if isinstance(subnode, yaml.MappingNode):
+                                self.flatten_mapping(subnode)
+                                projected += len(subnode.value)
+                    if projected > max_nodes:
+                        raise yaml.YAMLError(
+                            f"YAML merged mapping exceeds budget ({max_nodes})."
+                        )
+            super().flatten_mapping(node)
+            if len(getattr(node, "value", ())) > max_nodes:
+                raise yaml.YAMLError(
+                    f"YAML merged mapping exceeds budget ({max_nodes})."
+                )
+
+        def construct_yaml_int(self, node: Any) -> int:
+            if isinstance(node.value, str) and len(node.value) > 4096:
+                raise yaml.YAMLError("YAML integer exceeds maximum bit length")
+            val = super().construct_yaml_int(node)
+            if isinstance(val, int) and not isinstance(val, bool) and val.bit_length() > 4096:
+                raise yaml.YAMLError("YAML integer exceeds maximum bit length")
+            return val
+
+    _BoundedSafeLoader.add_constructor(  # type: ignore[attr-defined]
+        "tag:yaml.org,2002:int", _BoundedSafeLoader.construct_yaml_int
+    )
+
     try:
-        return [d for d in yaml.safe_load_all(text) if d is not None]
-    except yaml.YAMLError:
+        return [d for d in yaml.load_all(text, Loader=_BoundedSafeLoader) if d is not None]
+    except (yaml.YAMLError, RecursionError, ValueError):
         return []
 
 
 def _extract_python_ports(text: str, rel_path: str, node_id: str | None) -> list[DeclaredPortSpec]:
     try:
         tree = ast.parse(text)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError):
         return []
     consts: dict[str, int | str] = {}
     for stmt in tree.body:
@@ -241,7 +347,7 @@ def _extract_python_ports(text: str, rel_path: str, node_id: str | None) -> list
             kw_map = {kw.arg: _val(kw.value) for kw in node.keywords if kw.arg}
             port_v = kw_map.get("port")
             host_v = kw_map.get("host")
-            if isinstance(port_v, int) and 1 <= port_v <= 65535:
+            if isinstance(port_v, int) and not isinstance(port_v, bool) and 1 <= port_v <= 65535:
                 exp_bind = canonical_bind_ip(str(host_v)) if isinstance(host_v, str) else "127.0.0.1"
                 out.append(
                     DeclaredPortSpec(
@@ -260,7 +366,7 @@ def _extract_python_ports(text: str, rel_path: str, node_id: str | None) -> list
             if isinstance(addr, (ast.Tuple, ast.List)) and len(addr.elts) == 2:
                 h_v = _val(addr.elts[0])
                 p_v = _val(addr.elts[1])
-                if isinstance(p_v, int) and 1 <= p_v <= 65535:
+                if isinstance(p_v, int) and not isinstance(p_v, bool) and 1 <= p_v <= 65535:
                     exp_bind = canonical_bind_ip(str(h_v) if h_v != "" else "0.0.0.0") if isinstance(h_v, str) else None
                     out.append(
                         DeclaredPortSpec(
@@ -281,23 +387,37 @@ def _extract_yaml_ports(text: str, rel_path: str, fname_low: str, node_id: str |
     out: list[DeclaredPortSpec] = []
     docs = _load_yaml_docs(text)
     is_compose_name = "compose" in fname_low
+    steps = 0
     for doc in docs:
+        if len(out) >= MAX_TOTAL_PORT_ENTRIES or steps >= MAX_TOTAL_PORT_ENTRIES:
+            break
+        steps += 1
         if not isinstance(doc, Mapping):
             continue
         if isinstance(doc.get("services"), Mapping):
             for svc_name, svc_cfg in doc["services"].items():
+                if len(out) >= MAX_TOTAL_PORT_ENTRIES or steps >= MAX_TOTAL_PORT_ENTRIES:
+                    break
+                steps += 1
                 if not isinstance(svc_cfg, Mapping):
                     continue
-                for p_entry in svc_cfg.get("ports", []) or []:
-                    if isinstance(p_entry, (str, int)):
-                        b_ip, h_port, proto = _parse_publish_spec(str(p_entry))
+                raw_ports = svc_cfg.get("ports")
+                if not isinstance(raw_ports, list):
+                    raw_ports = []
+                for p_entry in raw_ports:
+                    if len(out) >= MAX_TOTAL_PORT_ENTRIES or steps >= MAX_TOTAL_PORT_ENTRIES:
+                        break
+                    steps += 1
+                    if isinstance(p_entry, (str, int)) and not isinstance(p_entry, bool):
+                        p_scalar = _safe_scalar_str(p_entry)
+                        b_ip, h_port, proto = _parse_publish_spec(p_scalar)
                         if h_port and 1 <= h_port <= 65535:
                             out.append(
                                 DeclaredPortSpec(
                                     port=h_port,
                                     protocol=proto,
                                     expected_bind=b_ip,
-                                    process_hint=str(svc_name),
+                                    process_hint=_safe_scalar_str(svc_name) or "compose-service",
                                     declaration_kind="compose_ports",
                                     source_file=rel_path,
                                     line=1,
@@ -306,13 +426,15 @@ def _extract_yaml_ports(text: str, rel_path: str, fname_low: str, node_id: str |
                             )
                     elif isinstance(p_entry, Mapping):
                         pub = p_entry.get("published") or p_entry.get("target")
-                        if isinstance(pub, int) and 1 <= pub <= 65535:
+                        if isinstance(pub, int) and not isinstance(pub, bool) and 1 <= pub <= 65535:
+                            raw_proto = _safe_scalar_str(p_entry.get("protocol")).strip().lower() or "tcp"
+                            raw_hip = _safe_scalar_str(p_entry.get("host_ip")).strip()
                             out.append(
                                 DeclaredPortSpec(
                                     port=pub,
-                                    protocol=str(p_entry.get("protocol") or "tcp").lower(),
-                                    expected_bind=canonical_bind_ip(str(p_entry["host_ip"])) if p_entry.get("host_ip") else None,
-                                    process_hint=str(svc_name),
+                                    protocol=raw_proto,
+                                    expected_bind=canonical_bind_ip(raw_hip) if raw_hip else None,
+                                    process_hint=_safe_scalar_str(svc_name) or "compose-service",
                                     declaration_kind="compose_ports",
                                     source_file=rel_path,
                                     line=1,
@@ -320,25 +442,44 @@ def _extract_yaml_ports(text: str, rel_path: str, fname_low: str, node_id: str |
                                 )
                             )
         elif "apiVersion" in doc and "kind" in doc:
-            meta_name = str((doc.get("metadata") or {}).get("name") or "k8s-workload")
+            raw_meta = doc.get("metadata")
+            meta_name = (
+                _safe_scalar_str(raw_meta.get("name")).strip() or "k8s-workload"
+                if isinstance(raw_meta, Mapping)
+                else "k8s-workload"
+            )
+            visited: set[int] = set()
             stack: list[tuple[Any, int]] = [(doc.get("spec"), 0)]
-            while stack:
+            while stack and len(out) < MAX_TOTAL_PORT_ENTRIES and steps < MAX_TOTAL_PORT_ENTRIES:
                 cur, d = stack.pop()
                 if d > 24:
                     continue
+                if isinstance(cur, (Mapping, list)):
+                    oid = id(cur)
+                    if oid in visited:
+                        continue
+                    visited.add(oid)
+                    steps += 1
+                    if len(visited) > MAX_TOTAL_PORT_ENTRIES:
+                        break
                 if isinstance(cur, Mapping):
                     if isinstance(cur.get("ports"), list):
-                        c_name = str(cur.get("name") or meta_name)
+                        c_name = _safe_scalar_str(cur.get("name")).strip() or meta_name
                         for kp in cur["ports"]:
+                            if len(out) >= MAX_TOTAL_PORT_ENTRIES or steps >= MAX_TOTAL_PORT_ENTRIES:
+                                break
+                            steps += 1
                             if not isinstance(kp, Mapping):
                                 continue
                             p_num = kp.get("hostPort") or kp.get("nodePort") or kp.get("containerPort") or kp.get("port")
-                            if isinstance(p_num, int) and 1 <= p_num <= 65535:
-                                h_ip = canonical_bind_ip(str(kp["hostIP"])) if kp.get("hostIP") else None
+                            if isinstance(p_num, int) and not isinstance(p_num, bool) and 1 <= p_num <= 65535:
+                                raw_khip = _safe_scalar_str(kp.get("hostIP")).strip()
+                                h_ip = canonical_bind_ip(raw_khip) if raw_khip else None
+                                raw_kproto = _safe_scalar_str(kp.get("protocol")).strip().lower() or "tcp"
                                 out.append(
                                     DeclaredPortSpec(
                                         port=p_num,
-                                        protocol=str(kp.get("protocol") or "tcp").lower(),
+                                        protocol=raw_kproto,
                                         expected_bind=h_ip,
                                         process_hint=c_name,
                                         declaration_kind="k8s_manifest",
@@ -348,15 +489,19 @@ def _extract_yaml_ports(text: str, rel_path: str, fname_low: str, node_id: str |
                                     )
                                 )
                     for v in cur.values():
-                        stack.append((v, d + 1))
+                        if isinstance(v, (Mapping, list)) and id(v) not in visited:
+                            stack.append((v, d + 1))
                 elif isinstance(cur, list):
-                    for item in cur:
-                        stack.append((item, d + 1))
+                    for item in cur[:MAX_TOTAL_PORT_ENTRIES]:
+                        if isinstance(item, (Mapping, list)) and id(item) not in visited:
+                            stack.append((item, d + 1))
 
     # Fallback line scan when PyYAML is unavailable in an isolated wheel environment
-    if not out and is_compose_name:
+    if not out and is_compose_name and steps < MAX_TOTAL_PORT_ENTRIES:
         cur_svc = "compose-service"
-        for idx, line in enumerate(text.splitlines(), start=1):
+        for idx, line in enumerate(text.splitlines()[:MAX_TOTAL_PORT_ENTRIES], start=1):
+            if len(out) >= MAX_TOTAL_PORT_ENTRIES:
+                break
             s = line.strip()
             if line.startswith("  ") and not line.startswith("    ") and s.endswith(":"):
                 cand_s = s[:-1].strip()
@@ -377,12 +522,17 @@ def _extract_yaml_ports(text: str, rel_path: str, fname_low: str, node_id: str |
                             node_id=node_id,
                         )
                     )
-    return out
+    return out[:MAX_TOTAL_PORT_ENTRIES]
 
 
 def extract_declared_ports(repo_root: Path, report: Any = None) -> list[DeclaredPortSpec]:
     """Extract `Z=0` static port and bind declarations across containers, plists, and code."""
-    if not repo_root.exists():
+    _check_safe_path_segments(repo_root, str(repo_root))
+    try:
+        exists = repo_root.exists()
+    except OSError as exc:
+        raise ValueError(f"Invalid repository path '{repo_root}': {exc}") from exc
+    if not exists:
         return []
     validate_non_symlink_path(repo_root)
     real_root = repo_root.resolve()
@@ -400,25 +550,36 @@ def extract_declared_ports(repo_root: Path, report: Any = None) -> list[Declared
         for entry in entries:
             if entry.name in _SKIP_REPO_DIRS:
                 continue
-            if entry.is_symlink():
-                raise ValueError(f"Refusing symlinked repository entry: '{entry.path}'.")
-            p = Path(entry.path)
-            if entry.is_dir(follow_symlinks=False):
-                _walk_dir(p, depth + 1)
+            try:
+                if entry.is_symlink():
+                    continue
+                p = Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    _walk_dir(p, depth + 1)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                f_sz = entry.stat(follow_symlinks=False).st_size
+                rel = p.resolve().relative_to(real_root).as_posix()
+            except (OSError, ValueError):
                 continue
-            if not entry.is_file(follow_symlinks=False):
-                continue
-            rel = p.resolve().relative_to(real_root).as_posix()
             nid = node_by_file.get(rel)
             fname_low = entry.name.lower()
 
             if fname_low.endswith(".plist"):
-                _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=MAX_PLIST_BYTES)
-                plist_d = parse_safe_plist_xml(raw_b)
-                lbl = str(plist_d.get("Label") or p.stem)
+                if f_sz > MAX_PLIST_BYTES:
+                    continue
+                try:
+                    _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=MAX_PLIST_BYTES)
+                    plist_d = parse_safe_plist_xml(raw_b)
+                except (OSError, ValueError, expat.ExpatError, plistlib.InvalidFileException):
+                    continue
+                lbl = _safe_scalar_str(plist_d.get("Label")).strip() or p.stem
                 prog_args = plist_d.get("ProgramArguments")
                 if isinstance(prog_args, list):
-                    joined = " ".join(str(x) for x in prog_args)
+                    joined = " ".join(
+                        s for x in prog_args[:128] if (s := _safe_scalar_str(x))
+                    )
                     if "uvicorn" in joined or "--port" in joined:
                         h_ip, p_num = _parse_cli_uvicorn_flags(joined)
                         if p_num:
@@ -442,24 +603,42 @@ def extract_declared_ports(repo_root: Path, report: Any = None) -> list[Declared
                             if not isinstance(si, Mapping):
                                 continue
                             s_port = si.get("SockServiceName")
-                            if isinstance(s_port, int) or (isinstance(s_port, str) and s_port.isdigit()):
+                            p_int: int | None = None
+                            if (
+                                isinstance(s_port, int)
+                                and not isinstance(s_port, bool)
+                                and s_port.bit_length() <= 32
+                            ):
+                                p_int = s_port
+                            elif (
+                                isinstance(s_port, str)
+                                and s_port.isascii()
+                                and s_port.isdigit()
+                                and len(s_port) <= 5
+                            ):
                                 p_int = int(s_port)
-                                if 1 <= p_int <= 65535:
-                                    node_nm = si.get("SockNodeName")
-                                    found.append(
-                                        DeclaredPortSpec(
-                                            port=p_int,
-                                            protocol=str(si.get("SockType") or "tcp").lower(),
-                                            expected_bind=canonical_bind_ip(str(node_nm)) if node_nm else "0.0.0.0",
-                                            process_hint=lbl,
-                                            declaration_kind="launchd_plist",
-                                            source_file=rel,
-                                            line=1,
-                                            node_id=nid,
-                                        )
+                            if p_int is not None and 1 <= p_int <= 65535:
+                                node_nm = _safe_scalar_str(si.get("SockNodeName")).strip()
+                                sock_type = _safe_scalar_str(si.get("SockType")).strip().lower() or "tcp"
+                                found.append(
+                                    DeclaredPortSpec(
+                                        port=p_int,
+                                        protocol=sock_type,
+                                        expected_bind=canonical_bind_ip(node_nm) if node_nm else "0.0.0.0",
+                                        process_hint=lbl,
+                                        declaration_kind="launchd_plist",
+                                        source_file=rel,
+                                        line=1,
+                                        node_id=nid,
                                     )
+                                )
             elif fname_low.startswith(("dockerfile", "containerfile")) or fname_low.endswith((".dockerfile", ".containerfile")):
-                _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=2 * 1024 * 1024)
+                if f_sz > 2 * 1024 * 1024:
+                    continue
+                try:
+                    _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=2 * 1024 * 1024)
+                except (OSError, ValueError):
+                    continue
                 txt = raw_b.decode("utf-8-sig", errors="replace")
                 for ln_no, ln in enumerate(txt.splitlines(), start=1):
                     m_exp = _DOCKERFILE_EXPOSE_RE.match(ln)
@@ -495,13 +674,28 @@ def extract_declared_ports(repo_root: Path, report: Any = None) -> list[Declared
                                 )
                             )
             elif fname_low.endswith((".yaml", ".yml")):
-                _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=2 * 1024 * 1024)
+                if f_sz > 2 * 1024 * 1024:
+                    continue
+                try:
+                    _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=2 * 1024 * 1024)
+                except (OSError, ValueError):
+                    continue
                 found.extend(_extract_yaml_ports(raw_b.decode("utf-8-sig", errors="replace"), rel, fname_low, nid))
             elif fname_low.endswith(".py"):
-                _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=2 * 1024 * 1024)
+                if f_sz > 2 * 1024 * 1024:
+                    continue
+                try:
+                    _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=2 * 1024 * 1024)
+                except (OSError, ValueError):
+                    continue
                 found.extend(_extract_python_ports(raw_b.decode("utf-8-sig", errors="replace"), rel, nid))
             elif fname_low.endswith((".sh", ".bash", ".zsh")) or entry.name in ("Makefile", "Justfile"):
-                _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=2 * 1024 * 1024)
+                if f_sz > 2 * 1024 * 1024:
+                    continue
+                try:
+                    _, raw_b = read_bounded_regular_bytes(p, repo_root=real_root, max_bytes=2 * 1024 * 1024)
+                except (OSError, ValueError):
+                    continue
                 txt = raw_b.decode("utf-8-sig", errors="replace")
                 for ln_no, ln in enumerate(txt.splitlines(), start=1):
                     for m_run in _RUN_PUBLISH_FLAG_RE.finditer(ln):
@@ -521,20 +715,40 @@ def extract_declared_ports(repo_root: Path, report: Any = None) -> list[Declared
                             )
 
     _walk_dir(real_root, 0)
-    return found
+    return found[:MAX_TOTAL_PORT_ENTRIES]
 
 
 _SS_PROC_RE = re.compile(r'\(\("([^"]+)",pid=(\d+)')
+
+
+def _safe_nonneg_int(raw: object, *, max_digits: int = 10) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if 0 <= raw < (10**max_digits) else None
+    if isinstance(raw, float):
+        return None
+    s = str(raw).strip()
+    if not s or not s.isascii() or not s.isdigit() or len(s) > max_digits:
+        return None
+    return int(s)
+
+
+def _parse_bounded_json_int(raw_digits: str) -> int:
+    s = raw_digits.strip()
+    if s.startswith("-"):
+        return 0
+    return int(s) if len(s) <= 10 else 0
 
 
 def _split_addr_port(addr_port: str) -> tuple[str, int | None]:
     s = addr_port.strip()
     if s.startswith("[") and "]:" in s:
         h, p_s = s[1:].rsplit("]:", 1)
-        return h, (int(p_s) if p_s.isdigit() else None)
+        return h, (int(p_s) if p_s.isascii() and p_s.isdigit() and len(p_s) <= 5 else None)
     if ":" in s:
         h, p_s = s.rsplit(":", 1)
-        return h, (int(p_s) if p_s.isdigit() else None)
+        return h, (int(p_s) if p_s.isascii() and p_s.isdigit() and len(p_s) <= 5 else None)
     return s, None
 
 
@@ -548,16 +762,16 @@ def parse_port_listeners_text(raw_text: str) -> tuple[list[ObservedPortListener]
 
     if stripped.startswith(("{", "[")):
         ensure_json_depth_bounded(stripped)
-        data = json.loads(stripped)
+        data = json.loads(stripped, parse_int=_parse_bounded_json_int)
         captured_at = str(data.get("captured_at")) if isinstance(data, Mapping) and data.get("captured_at") else None
         items = data.get("listeners", []) if isinstance(data, Mapping) else data
         if not isinstance(items, list):
             raise ValueError("Listener JSON capture must contain a listeners list.")
         out_json: list[ObservedPortListener] = []
-        for item in items:
+        for item in items[:MAX_TOTAL_PORT_ENTRIES]:
             if not isinstance(item, Mapping):
                 continue
-            p_num = int(item.get("port") or 0)
+            p_num = _safe_nonneg_int(item.get("port"), max_digits=5) or 0
             if not (1 <= p_num <= 65535):
                 continue
             b_addr = str(item.get("bind_address") or item.get("host") or "0.0.0.0")
@@ -569,7 +783,7 @@ def parse_port_listeners_text(raw_text: str) -> tuple[list[ObservedPortListener]
                     bind_address=b_addr,
                     normalized_bind=norm_b,
                     command=str(item.get("command") or item.get("process") or "unknown"),
-                    pid=max(0, int(item.get("pid") or 0)),
+                    pid=_safe_nonneg_int(item.get("pid"), max_digits=10) or 0,
                     user="[REDACTED_USER]",
                     source_format="json",
                 )
@@ -580,6 +794,8 @@ def parse_port_listeners_text(raw_text: str) -> tuple[list[ObservedPortListener]
     out: list[ObservedPortListener] = []
     detected_fmt = "lsof"
     for line in lines[:16384]:
+        if len(out) >= MAX_TOTAL_PORT_ENTRIES:
+            break
         s = line.strip()
         if not s or s.startswith(("COMMAND", "Netid", "State")):
             if s.startswith("Netid"):
@@ -587,10 +803,14 @@ def parse_port_listeners_text(raw_text: str) -> tuple[list[ObservedPortListener]
             continue
         toks = s.split()
         # `lsof -nP -iTCP -sTCP:LISTEN`: `Python 41822 user 6u IPv4 ... TCP 127.0.0.1:8780 (LISTEN)`
-        if len(toks) >= 9 and toks[1].isdigit() and ("TCP" in toks or "UDP" in toks):
+        if len(toks) >= 9 and toks[1].isascii() and toks[1].isdigit() and ("TCP" in toks or "UDP" in toks):
             detected_fmt = "lsof"
+            if not any(t.upper() == "(LISTEN)" for t in toks):
+                continue
+            pid_val = _safe_nonneg_int(toks[1], max_digits=10)
+            if pid_val is None:
+                continue
             cmd = toks[0]
-            pid = int(toks[1])
             proto_idx = toks.index("TCP") if "TCP" in toks else toks.index("UDP")
             proto = toks[proto_idx].lower()
             addr_tok = toks[proto_idx + 1] if proto_idx + 1 < len(toks) else ""
@@ -603,7 +823,7 @@ def parse_port_listeners_text(raw_text: str) -> tuple[list[ObservedPortListener]
                         bind_address=b_addr,
                         normalized_bind=normalize_bind_category(b_addr) or "wildcard",
                         command=cmd,
-                        pid=pid,
+                        pid=pid_val,
                         user="[REDACTED_USER]",
                         source_format="lsof",
                     )
@@ -612,13 +832,15 @@ def parse_port_listeners_text(raw_text: str) -> tuple[list[ObservedPortListener]
         # `ss -tulnp`: `tcp LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:(("uvicorn",pid=4210,fd=3))`
         if len(toks) >= 5 and toks[0].lower() in ("tcp", "udp", "tcp6", "udp6"):
             detected_fmt = "ss"
+            if toks[1].upper() != "LISTEN":
+                continue
             proto = "udp" if toks[0].lower().startswith("udp") else "tcp"
-            local_tok = toks[4] if toks[1].upper() in ("LISTEN", "UNCONN", "ESTAB") else toks[3]
+            local_tok = toks[4]
             b_addr, p_num = _split_addr_port(local_tok)
             if p_num and 1 <= p_num <= 65535:
                 m_pr = _SS_PROC_RE.search(s)
                 cmd = m_pr.group(1) if m_pr else "unknown"
-                pid = int(m_pr.group(2)) if m_pr else 0
+                pid = (_safe_nonneg_int(m_pr.group(2), max_digits=10) or 0) if m_pr else 0
                 out.append(
                     ObservedPortListener(
                         port=p_num,
@@ -639,10 +861,14 @@ def parse_port_listeners_file(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
 ) -> tuple[Path, list[ObservedPortListener], str, str | None]:
     """Read and parse a recorded listener file (`<= 32 MiB`, non-symlink)."""
     resolved, raw_b = read_bounded_regular_bytes(
-        raw_path, repo_root=repo_root, max_bytes=MAX_WIRETAP_BYTES
+        raw_path,
+        repo_root=repo_root,
+        allow_external=allow_external,
+        max_bytes=MAX_WIRETAP_BYTES,
     )
     listeners, fmt, cap_at = parse_port_listeners_text(raw_b.decode("utf-8-sig"))
     return resolved, listeners, fmt, cap_at
@@ -720,9 +946,14 @@ def correlate_port_occupancy(
     captured_timestamps: list[str] = []
     subprocesses_invoked = 0
 
+    truncated = len(declared) >= MAX_TOTAL_PORT_ENTRIES
     for raw_p in port_listeners_paths:
         res_p, parsed_l, fmt, cap_at = parse_port_listeners_file(raw_p, repo_root=None)
-        listeners.extend(parsed_l)
+        rem = MAX_TOTAL_PORT_ENTRIES - len(listeners)
+        if rem > 0:
+            listeners.extend(parsed_l[:rem])
+        if len(parsed_l) > max(0, rem):
+            truncated = True
         source_paths.append(str(res_p))
         if fmt not in formats:
             formats.append(fmt)
@@ -732,7 +963,11 @@ def correlate_port_occupancy(
     if probe_local_ports:
         live_l, live_fmt, live_at = capture_local_port_listeners()
         subprocesses_invoked += 1
-        listeners.extend(live_l)
+        rem_live = MAX_TOTAL_PORT_ENTRIES - len(listeners)
+        if rem_live > 0:
+            listeners.extend(live_l[:rem_live])
+        if len(live_l) > max(0, rem_live):
+            truncated = True
         if live_fmt not in formats:
             formats.append(live_fmt)
         captured_timestamps.append(live_at)
@@ -818,14 +1053,33 @@ def correlate_port_occupancy(
                 continue
 
             exp_cat = normalize_bind_category(primary_decl.expected_bind)
-            obs_primary = matching_proc[0]
-            if (
-                exp_cat in ("loopback", "wildcard")
-                and obs_primary.normalized_bind in ("loopback", "wildcard")
-                and exp_cat != obs_primary.normalized_bind
-            ):
-                exp_ip = canonical_bind_ip(primary_decl.expected_bind) or "127.0.0.1"
-                obs_ip = canonical_bind_ip(obs_primary.bind_address) or obs_primary.bind_address
+            obs_cats = {o.normalized_bind for o in matching_proc}
+            drift_obs: ObservedPortListener | None = None
+            if exp_cat == "loopback":
+                drift_obs = next(
+                    (o for o in matching_proc if o.normalized_bind in ("wildcard", "specific")),
+                    None,
+                )
+            elif exp_cat == "wildcard":
+                if obs_cats == {"loopback"}:
+                    drift_obs = matching_proc[0]
+            elif exp_cat == "specific":
+                exp_norm_ip = canonical_bind_ip(primary_decl.expected_bind)
+                drift_obs = next(
+                    (
+                        o
+                        for o in matching_proc
+                        if o.normalized_bind == "wildcard"
+                        or canonical_bind_ip(o.bind_address) != exp_norm_ip
+                    ),
+                    None,
+                )
+            elif exp_cat is None:
+                drift_obs = next((o for o in matching_proc if o.normalized_bind == "specific"), None)
+
+            if drift_obs is not None:
+                exp_ip = canonical_bind_ip(primary_decl.expected_bind) or "loopback/wildcard"
+                obs_ip = canonical_bind_ip(drift_obs.bind_address) or drift_obs.bind_address
                 entries.append(
                     {
                         "port": port,
@@ -849,11 +1103,11 @@ def correlate_port_occupancy(
                         "line": primary_decl.line,
                         "title": (
                             f"Port {port}/{proto} bind exposure drifts: declared `{exp_ip}` "
-                            f"vs runtime `{obs_ip}` (`{obs_primary.command}`)"
+                            f"vs runtime `{obs_ip}` (`{drift_obs.command}`)"
                         ),
                         "detail": (
                             f"{primary_decl.source_file}:{primary_decl.line} expects `{exp_ip}:{port}`, "
-                            f"but runtime listener `{obs_primary.command}` binds `{obs_primary.bind_address}:{port}` ({obs_ip})."
+                            f"but runtime listener `{drift_obs.command}` binds `{drift_obs.bind_address}:{port}` ({obs_ip})."
                         ),
                         "remediation": (
                             f"Align runtime `--host` / publish bind address with `{exp_ip}` "
@@ -904,6 +1158,7 @@ def correlate_port_occupancy(
             "captured_at": captured_timestamps[0] if captured_timestamps else None,
             "subprocesses_invoked": subprocesses_invoked,
             "redacted_os_users": True,
+            "truncated": truncated,
             "sampling_note": (
                 "Listener snapshot reflects point-in-time socket occupancy; "
                 "unlistening_declared ports may belong to on-demand or unstarted services."

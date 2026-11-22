@@ -10,11 +10,14 @@ AST imports under `source_roots` and intra-repo `calls_helper` edges against
 from __future__ import annotations
 
 import ast
-import fnmatch
-import re
+import functools
+import os
+import stat
 import tomllib
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from app.adapters.base import ManipulatorExtractionResult, RawCandidateFinding
 from app.adapters.service_sources import source_files
@@ -58,31 +61,568 @@ class TachConfig:
     exclude_patterns: tuple[str, ...] = ()
 
 
+_MAX_TACH_PATTERN_LEN = 256
+_MAX_TACH_CANDIDATE_LEN = 2048
+_MAX_NFA_STATES = 256
+_MAX_REGEX_DEPTH = 16
+_MAX_QUANTIFIER_REPEAT = 16
+_MAX_TACH_FILE_BYTES = 512 * 1024
+
+
+class _NfaBudgetError(Exception):
+    pass
+
+
+class _RegexSyntaxError(Exception):
+    pass
+
+
+def _read_bounded_regular_text(
+    path: Path,
+    *,
+    max_bytes: int = _MAX_TACH_FILE_BYTES,
+    encoding: str = "utf-8-sig",
+) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("Not a regular file")
+        if st.st_size > max_bytes:
+            raise ValueError(f"File exceeds {max_bytes}-byte limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"File exceeds {max_bytes}-byte limit")
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode(encoding)
+
+
+def _match_shorthand(code: str, ch: str) -> bool:
+    if code == "d":
+        return "0" <= ch <= "9"
+    if code == "D":
+        return not ("0" <= ch <= "9")
+    if code == "w":
+        return ch == "_" or ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9")
+    if code == "W":
+        return not (ch == "_" or ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9"))
+    if code == "s":
+        return ch in " \t\n\r\f\v"
+    if code == "S":
+        return ch not in " \t\n\r\f\v"
+    return False
+
+
+def _match_char_pred(pred: tuple[Any, ...], ch: str) -> bool:
+    kind = pred[0]
+    if kind == "lit":
+        return ch == pred[1]
+    if kind == "dot":
+        return ch != "\n"
+    if kind == "sh":
+        return _match_shorthand(pred[1], ch)
+    if kind == "cls":
+        _, neg, chars, ranges, shorthands = pred
+        hit = (
+            ch in chars
+            or any(lo <= ch <= hi for lo, hi in ranges)
+            or any(_match_shorthand(sc, ch) for sc in shorthands)
+        )
+        return not hit if neg else hit
+    return False
+
+
+class _BoundedRegexParser:
+    def __init__(self, pattern: str) -> None:
+        self.p = pattern
+        self.n = len(pattern)
+        self.i = 0
+
+    def parse(self) -> tuple[Any, ...]:
+        node = self._parse_alt(0)
+        if self.i != self.n:
+            raise _RegexSyntaxError("unexpected trailing character")
+        return node
+
+    def _parse_alt(self, depth: int) -> tuple[Any, ...]:
+        if depth > _MAX_REGEX_DEPTH:
+            raise _NfaBudgetError("regex nesting depth exceeded")
+        branches = [self._parse_concat(depth)]
+        while self.i < self.n and self.p[self.i] == "|":
+            self.i += 1
+            branches.append(self._parse_concat(depth))
+        if len(branches) == 1:
+            return branches[0]
+        return ("alt", tuple(branches))
+
+    def _parse_concat(self, depth: int) -> tuple[Any, ...]:
+        items: list[tuple[Any, ...]] = []
+        while self.i < self.n and self.p[self.i] not in "|)":
+            items.append(self._parse_quantified(depth))
+        if not items:
+            return ("empty",)
+        if len(items) == 1:
+            return items[0]
+        return ("concat", tuple(items))
+
+    def _parse_quantified(self, depth: int) -> tuple[Any, ...]:
+        atom = self._parse_atom(depth)
+        if atom[0] in ("anchor",):
+            return atom
+        while self.i < self.n and self.p[self.i] in "*+?{":
+            ch = self.p[self.i]
+            if ch == "*":
+                self.i += 1
+                if self.i < self.n and self.p[self.i] == "?":
+                    self.i += 1
+                atom = ("rep", atom, 0, None)
+            elif ch == "+":
+                self.i += 1
+                if self.i < self.n and self.p[self.i] == "?":
+                    self.i += 1
+                atom = ("rep", atom, 1, None)
+            elif ch == "?":
+                self.i += 1
+                if self.i < self.n and self.p[self.i] == "?":
+                    self.i += 1
+                atom = ("rep", atom, 0, 1)
+            else:
+                close = self.p.find("}", self.i + 1)
+                if close == -1:
+                    raise _RegexSyntaxError("unclosed {")
+                body = self.p[self.i + 1 : close]
+                if "," in body:
+                    lo_s, hi_s = body.split(",", 1)
+                    if not (lo_s.isascii() and lo_s.isdigit()) or (
+                        hi_s and not (hi_s.isascii() and hi_s.isdigit())
+                    ):
+                        raise _RegexSyntaxError("invalid quantifier")
+                    if len(lo_s) > 5 or (hi_s and len(hi_s) > 5):
+                        raise _NfaBudgetError("quantifier bound exceeded")
+                    lo = int(lo_s)
+                    hi = int(hi_s) if hi_s else None
+                    if hi is not None and hi < lo:
+                        raise _RegexSyntaxError("invalid range")
+                elif body.isascii() and body.isdigit():
+                    if len(body) > 5:
+                        raise _NfaBudgetError("quantifier bound exceeded")
+                    lo = int(body)
+                    hi = lo
+                else:
+                    raise _RegexSyntaxError("invalid quantifier")
+                if lo > _MAX_QUANTIFIER_REPEAT or (hi is not None and hi > _MAX_QUANTIFIER_REPEAT):
+                    raise _NfaBudgetError("quantifier bound exceeded")
+                self.i = close + 1
+                if self.i < self.n and self.p[self.i] == "?":
+                    self.i += 1
+                atom = ("rep", atom, lo, hi)
+        return atom
+
+    def _parse_atom(self, depth: int) -> tuple[Any, ...]:
+        ch = self.p[self.i]
+        if ch in "*+?":
+            raise _RegexSyntaxError("nothing to repeat")
+        if ch == "(":
+            self.i += 1
+            if self.i < self.n and self.p[self.i] == "?":
+                if self.p[self.i : self.i + 2] == "?:":
+                    self.i += 2
+                else:
+                    raise _NfaBudgetError("unsupported group extension")
+            inner = self._parse_alt(depth + 1)
+            if self.i >= self.n or self.p[self.i] != ")":
+                raise _RegexSyntaxError("unclosed group")
+            self.i += 1
+            return inner
+        if ch == "[":
+            return self._parse_class()
+        if ch == ".":
+            self.i += 1
+            return ("dot",)
+        if ch == "^":
+            self.i += 1
+            return ("anchor", "^")
+        if ch == "$":
+            self.i += 1
+            return ("anchor", "$")
+        if ch == "\\":
+            self.i += 1
+            if self.i >= self.n:
+                raise _RegexSyntaxError("trailing backslash")
+            esc = self.p[self.i]
+            self.i += 1
+            if esc in "dDwWsS":
+                return ("sh", esc)
+            if "1" <= esc <= "9":
+                raise _NfaBudgetError("backreference unsupported")
+            return ("lit", esc)
+        self.i += 1
+        return ("lit", ch)
+
+    def _parse_class(self) -> tuple[Any, ...]:
+        self.i += 1  # skip '['
+        neg = False
+        if self.i < self.n and self.p[self.i] == "^":
+            neg = True
+            self.i += 1
+        chars: set[str] = set()
+        ranges: list[tuple[str, str]] = []
+        shorthands: list[str] = []
+        items: list[tuple[str, str]] = []  # ("char", c) or ("sh", code)
+        first = True
+        while self.i < self.n:
+            c = self.p[self.i]
+            if c == "]" and not first:
+                self.i += 1
+                break
+            first = False
+            if c == "\\":
+                self.i += 1
+                if self.i >= self.n:
+                    raise _RegexSyntaxError("trailing backslash in class")
+                esc = self.p[self.i]
+                self.i += 1
+                if esc in "dDwWsS":
+                    items.append(("sh", esc))
+                else:
+                    items.append(("char", esc))
+            else:
+                self.i += 1
+                items.append(("char", c))
+        else:
+            raise _RegexSyntaxError("unclosed character class")
+
+        idx = 0
+        while idx < len(items):
+            kind, val = items[idx]
+            if (
+                kind == "char"
+                and idx + 2 < len(items)
+                and items[idx + 1] == ("char", "-")
+                and items[idx + 2][0] == "char"
+            ):
+                hi = items[idx + 2][1]
+                if ord(val) > ord(hi):
+                    raise _RegexSyntaxError("bad character range")
+                ranges.append((val, hi))
+                idx += 3
+            elif kind == "sh":
+                shorthands.append(val)
+                idx += 1
+            else:
+                chars.add(val)
+                idx += 1
+        return ("cls", neg, frozenset(chars), tuple(ranges), tuple(shorthands))
+
+
+@dataclass
+class _NfaState:
+    eps: list[int] = field(default_factory=list)
+    anchor: str | None = None
+    edge: tuple[tuple[Any, ...], int] | None = None
+
+
+def _compile_nfa(ast_node: tuple[Any, ...]) -> tuple[list[_NfaState], int, int]:
+    states: list[_NfaState] = []
+
+    def _new() -> int:
+        if len(states) >= _MAX_NFA_STATES:
+            raise _NfaBudgetError("NFA state limit exceeded")
+        states.append(_NfaState())
+        return len(states) - 1
+
+    def _build(node: tuple[Any, ...]) -> tuple[int, int]:
+        kind = node[0]
+        if kind == "empty":
+            s = _new()
+            return s, s
+        if kind == "anchor":
+            s = _new()
+            e = _new()
+            states[s].anchor = node[1]
+            states[s].eps.append(e)
+            return s, e
+        if kind in ("lit", "dot", "sh", "cls"):
+            s = _new()
+            e = _new()
+            states[s].edge = (node, e)
+            return s, e
+        if kind == "concat":
+            items = node[1]
+            start, end = _build(items[0])
+            for nxt in items[1:]:
+                ns, ne = _build(nxt)
+                states[end].eps.append(ns)
+                end = ne
+            return start, end
+        if kind == "alt":
+            s = _new()
+            e = _new()
+            for br in node[1]:
+                bs, be = _build(br)
+                states[s].eps.append(bs)
+                states[be].eps.append(e)
+            return s, e
+        if kind == "rep":
+            _, sub, lo, hi = node
+            if lo == 0 and hi == 1:
+                s = _new()
+                e = _new()
+                bs, be = _build(sub)
+                states[s].eps.extend([bs, e])
+                states[be].eps.append(e)
+                return s, e
+            if lo == 0 and hi is None:
+                s = _new()
+                e = _new()
+                bs, be = _build(sub)
+                states[s].eps.extend([bs, e])
+                states[be].eps.extend([bs, e])
+                return s, e
+            if lo == 1 and hi is None:
+                s = _new()
+                e = _new()
+                bs, be = _build(sub)
+                states[s].eps.append(bs)
+                states[be].eps.extend([bs, e])
+                return s, e
+            cur_s = _new()
+            cur_e = cur_s
+            for _ in range(lo):
+                bs, be = _build(sub)
+                states[cur_e].eps.append(bs)
+                cur_e = be
+            if hi is None:
+                star_s, star_e = _build(("rep", sub, 0, None))
+                states[cur_e].eps.append(star_s)
+                cur_e = star_e
+            else:
+                for _ in range(hi - lo):
+                    opt_s, opt_e = _build(("rep", sub, 0, 1))
+                    states[cur_e].eps.append(opt_s)
+                    cur_e = opt_e
+            return cur_s, cur_e
+        raise _NfaBudgetError("unknown AST node")
+
+    start_id, end_id = _build(ast_node)
+    return states, start_id, end_id
+
+
+@dataclass(frozen=True)
+class _FrozenNfaState:
+    eps: tuple[int, ...] = ()
+    anchor: str | None = None
+    edge: tuple[tuple[Any, ...], int] | None = None
+
+
+@functools.lru_cache(maxsize=2048)
+def _compile_cached_nfa(pattern: str) -> tuple[tuple[_FrozenNfaState, ...], int, int]:
+    ast_node = _BoundedRegexParser(pattern).parse()
+    states, start_id, end_id = _compile_nfa(ast_node)
+    frozen = tuple(_FrozenNfaState(tuple(s.eps), s.anchor, s.edge) for s in states)
+    return frozen, start_id, end_id
+
+
+def _thompson_nfa_fullmatch(pattern: str, candidate: str) -> bool:
+    states, start_id, end_id = _compile_cached_nfa(pattern)
+    n = len(candidate)
+
+    def _eps_closure(seed: set[int], pos: int) -> set[int]:
+        seen = set(seed)
+        q = deque(seed)
+        while q:
+            sid = q.popleft()
+            st = states[sid]
+            if st.anchor == "^" and pos != 0:
+                continue
+            if st.anchor == "$" and pos != n:
+                continue
+            for nxt in st.eps:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    q.append(nxt)
+        return seen
+
+    active = _eps_closure({start_id}, 0)
+    for idx, ch in enumerate(candidate):
+        nxt_seed: set[int] = set()
+        for sid in active:
+            edge = states[sid].edge
+            if edge is not None and _match_char_pred(edge[0], ch):
+                nxt_seed.add(edge[1])
+        if not nxt_seed:
+            return False
+        active = _eps_closure(nxt_seed, idx + 1)
+    return end_id in active
+
+
+@functools.lru_cache(maxsize=2048)
+def _compile_glob_tokens(pattern: str) -> tuple[tuple[Any, ...], ...]:
+    tokens: list[tuple[Any, ...]] = []
+    i = 0
+    pn = len(pattern)
+    while i < pn:
+        ch = pattern[i]
+        if ch == "*":
+            if not tokens or tokens[-1][0] != "star":
+                tokens.append(("star",))
+            i += 1
+        elif ch == "?":
+            tokens.append(("any",))
+            i += 1
+        elif ch == "[":
+            end = pattern.find("]", i + 1)
+            if end == -1:
+                tokens.append(("lit", "["))
+                i += 1
+            else:
+                body = pattern[i + 1 : end]
+                neg = body.startswith(("!", "^"))
+                if neg:
+                    body = body[1:]
+                if not body:
+                    tokens.append(("lit", "["))
+                    i += 1
+                else:
+                    chars: set[str] = set()
+                    ranges: list[tuple[str, str]] = []
+                    j = 0
+                    while j < len(body):
+                        if j + 2 < len(body) and body[j + 1] == "-":
+                            lo, hi = body[j], body[j + 2]
+                            if ord(lo) <= ord(hi):
+                                ranges.append((lo, hi))
+                            j += 3
+                        else:
+                            chars.add(body[j])
+                            j += 1
+                    tokens.append(("cls", neg, frozenset(chars), tuple(ranges), ()))
+                    i = end + 1
+        else:
+            tokens.append(("lit", ch))
+            i += 1
+    return tuple(tokens)
+
+
+def _dp_glob_match(pattern: str, candidate: str) -> bool:
+    # Linear-time glob matcher supporting '*', '?', and '[...]' without backtracking regex.
+    tokens = _compile_glob_tokens(pattern)
+    ti = 0
+    si = 0
+    tn = len(tokens)
+    sn = len(candidate)
+    star_ti = -1
+    star_si = 0
+    while si < sn:
+        if ti < tn and tokens[ti][0] == "star":
+            star_ti = ti
+            star_si = si
+            ti += 1
+        elif ti < tn and (
+            tokens[ti][0] == "any" or _match_char_pred(tokens[ti], candidate[si])
+        ):
+            ti += 1
+            si += 1
+        elif star_ti != -1:
+            ti = star_ti + 1
+            star_si += 1
+            si = star_si
+        else:
+            return False
+    while ti < tn and tokens[ti][0] == "star":
+        ti += 1
+    return ti == tn
+
+
 def _pattern_matches(pattern: str, candidate: str) -> bool:
     if pattern in ("*", ".*"):
         return True
     if pattern == candidate:
         return True
+    if len(pattern) > _MAX_TACH_PATTERN_LEN or len(candidate) > _MAX_TACH_CANDIDATE_LEN:
+        return False
     try:
-        if re.fullmatch(pattern, candidate) is not None:
+        if _thompson_nfa_fullmatch(pattern, candidate):
             return True
-    except re.error:
+    except _NfaBudgetError:
+        return False
+    except _RegexSyntaxError:
         pass
-    return fnmatch.fnmatchcase(candidate, pattern)
+    return _dp_glob_match(pattern, candidate)
 
 
-def _find_tach_toml(repo_root: Path, backend_subdir: str) -> Path | None:
-    resolved_root = repo_root.resolve()
+def _has_safe_path_segments(path_or_str: Path | str, *, max_segment_bytes: int = 255) -> bool:
+    if isinstance(path_or_str, str):
+        if not path_or_str or "\x00" in path_or_str:
+            return False
+        path_obj = Path(path_or_str)
+    else:
+        raw_s = str(path_or_str)
+        if not raw_s or "\x00" in raw_s:
+            return False
+        path_obj = path_or_str
+    anchor = path_obj.anchor
+    for part in path_obj.parts:
+        if part == anchor or part in ("", "."):
+            continue
+        if "\x00" in part or len(part.encode("utf-8", errors="surrogateescape")) > max_segment_bytes:
+            return False
+    return True
+
+
+def _find_tach_toml(
+    repo_root: Path,
+    backend_subdir: str,
+    *,
+    skipped_notes: list[str] | None = None,
+) -> Path | None:
+    if "\x00" in str(repo_root):
+        return None
+    try:
+        resolved_root = repo_root.resolve()
+    except (OSError, ValueError):
+        return None
     candidates = [repo_root / "tach.toml"]
     clean_sub = backend_subdir.strip().strip("/")
-    if clean_sub and clean_sub != ".":
+    if clean_sub and clean_sub != "." and _has_safe_path_segments(clean_sub):
         candidates.append(repo_root / clean_sub / "tach.toml")
     for cand in candidates:
-        if cand.is_symlink() or not cand.is_file():
+        if not _has_safe_path_segments(cand):
             continue
-        resolved = cand.resolve()
-        if resolved.is_relative_to(resolved_root):
+        try:
+            is_sym = cand.is_symlink()
+            exists = cand.exists()
+            is_file = cand.is_file()
+        except (OSError, ValueError):
+            continue
+        if is_sym or (exists and not is_file):
+            if skipped_notes is not None:
+                skipped_notes.append(
+                    f"Tach boundary parse skipped ({cand.name}): symlink or non-regular file."
+                )
+            continue
+        if not exists:
+            continue
+        try:
+            resolved = cand.resolve()
+            in_root = resolved.is_relative_to(resolved_root)
+        except (OSError, ValueError):
+            continue
+        if in_root:
             return resolved
+        if skipped_notes is not None:
+            skipped_notes.append(
+                f"Tach boundary parse skipped ({cand.name}): escapes repository root."
+            )
     return None
 
 
@@ -119,9 +659,16 @@ def _as_str_tuple(raw: object) -> tuple[str, ...] | None:
 def parse_tach_toml(config_path: Path, repo_root: Path) -> TachConfig:
     """Parse a validated `tach.toml` file into `TachConfig`."""
     resolved_root = repo_root.resolve()
-    data = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
+    try:
+        data = tomllib.loads(
+            _read_bounded_regular_text(
+                config_path, max_bytes=_MAX_TACH_FILE_BYTES, encoding="utf-8-sig"
+            )
+        )
+    except RecursionError as exc:
+        raise ValueError(f"Tach configuration exceeds maximum nesting depth: {exc}") from exc
     config_dir = config_path.parent.resolve()
-    config_rel = config_path.relative_to(resolved_root).as_posix()
+    config_rel = config_path.resolve().relative_to(resolved_root).as_posix()
 
     raw_roots = data.get("source_roots")
     if raw_roots is None:
@@ -132,9 +679,15 @@ def parse_tach_toml(config_path: Path, repo_root: Path) -> TachConfig:
         for entry in raw_roots:
             if not isinstance(entry, str) or not entry.strip():
                 continue
-            cand = (config_dir / entry.strip()).resolve()
-            if cand.is_relative_to(resolved_root) and cand.is_dir() and not cand.is_symlink():
-                roots.append(cand)
+            entry_s = entry.strip()
+            if not _has_safe_path_segments(entry_s):
+                continue
+            try:
+                cand = (config_dir / entry_s).resolve()
+                if cand.is_relative_to(resolved_root) and cand.is_dir() and not cand.is_symlink():
+                    roots.append(cand)
+            except (OSError, ValueError):
+                continue
     if not roots:
         roots.append(config_dir)
     # Longest path first so nested source roots bind to their most specific root.
@@ -145,8 +698,9 @@ def parse_tach_toml(config_path: Path, repo_root: Path) -> TachConfig:
 
     modules: dict[str, TachModuleRule] = {}
     raw_modules = data.get("modules", [])
-    if isinstance(raw_modules, list):
-        for entry in raw_modules:
+    if not isinstance(raw_modules, list):
+        raise TypeError("`modules` in tach.toml must be an array of tables")
+    for entry in raw_modules:
             if not isinstance(entry, dict):
                 continue
             mod_paths: list[str] = []
@@ -173,22 +727,23 @@ def parse_tach_toml(config_path: Path, repo_root: Path) -> TachConfig:
 
     interfaces: list[TachInterfaceRule] = []
     raw_ifaces = data.get("interfaces", [])
-    if isinstance(raw_ifaces, list):
-        for entry in raw_ifaces:
-            if not isinstance(entry, dict):
-                continue
-            from_mods = _as_str_tuple(entry.get("from")) or ()
-            expose_list = _as_str_tuple(entry.get("expose")) or ()
-            if not from_mods:
-                continue
-            interfaces.append(
-                TachInterfaceRule(
-                    from_modules=from_mods,
-                    expose=expose_list,
-                    visibility=_as_str_tuple(entry.get("visibility")),
-                    exclusive=bool(entry.get("exclusive", False)),
-                )
+    if not isinstance(raw_ifaces, list):
+        raise TypeError("`interfaces` in tach.toml must be an array of tables")
+    for entry in raw_ifaces:
+        if not isinstance(entry, dict):
+            continue
+        from_mods = _as_str_tuple(entry.get("from")) or ()
+        expose_list = _as_str_tuple(entry.get("expose")) or ()
+        if not from_mods:
+            continue
+        interfaces.append(
+            TachInterfaceRule(
+                from_modules=from_mods,
+                expose=expose_list,
+                visibility=_as_str_tuple(entry.get("visibility")),
+                exclusive=bool(entry.get("exclusive", False)),
             )
+        )
 
     return TachConfig(
         config_path=config_path,
@@ -430,6 +985,22 @@ def _sub_prefix_under_owner(base_mod: str, callee_owner: str, sr_prefix: str) ->
     return ""
 
 
+def _type_checking_excluded_ids(tree: ast.Module) -> set[int]:
+    """Return AST node IDs inside `if TYPE_CHECKING:` / `if typing.TYPE_CHECKING:` blocks."""
+    excluded: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        is_tc = (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+            isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+        )
+        if is_tc:
+            for sub in node.body:
+                excluded.update(id(c) for c in ast.walk(sub))
+    return excluded
+
+
 def _iter_ast_import_refs(
     tree: ast.Module,
     mod_dotted: str,
@@ -443,8 +1014,11 @@ def _iter_ast_import_refs(
     mod_parts = [] if mod_dotted == "<root>" else mod_dotted.split(".")
     pkg_parts = mod_parts if is_pkg_init else mod_parts[:-1]
     imported_mod_aliases: dict[str, str] = {}
+    excluded = _type_checking_excluded_ids(tree)
 
     for node in ast.walk(tree):
+        if id(node) in excluded:
+            continue
         if isinstance(node, ast.Import):
             for alias in node.names:
                 raw_name = alias.name.strip()
@@ -497,7 +1071,7 @@ def _iter_ast_import_refs(
 
     if imported_mod_aliases and config.interfaces:
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Attribute):
+            if id(node) in excluded or not isinstance(node, ast.Attribute):
                 continue
             chain = _dotted_expr(node.value)
             if chain is None:
@@ -589,18 +1163,21 @@ _TACH_ROUTER_MOUNT_ATTRS = frozenset(
 
 def _extract_top_level_callables(stmts: list[ast.stmt]) -> frozenset[str]:
     names: set[str] = set()
-    for stmt in stmts:
+    try_types = (ast.Try, *((ast.TryStar,) if hasattr(ast, "TryStar") else ()))
+    stack: list[ast.stmt] = list(reversed(stmts))
+    while stack:
+        stmt = stack.pop()
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(stmt.name)
         elif isinstance(stmt, ast.If):
-            names.update(_extract_top_level_callables(stmt.body))
-            names.update(_extract_top_level_callables(stmt.orelse))
-        elif isinstance(stmt, ast.Try):
-            names.update(_extract_top_level_callables(stmt.body))
-            for handler in stmt.handlers:
-                names.update(_extract_top_level_callables(handler.body))
-            names.update(_extract_top_level_callables(stmt.orelse))
-            names.update(_extract_top_level_callables(stmt.finalbody))
+            stack.extend(reversed(stmt.orelse))
+            stack.extend(reversed(stmt.body))
+        elif isinstance(stmt, try_types):
+            stack.extend(reversed(stmt.finalbody))
+            stack.extend(reversed(stmt.orelse))
+            for handler in reversed(stmt.handlers):
+                stack.extend(reversed(handler.body))
+            stack.extend(reversed(stmt.body))
     return frozenset(names)
 
 
@@ -619,24 +1196,71 @@ def augment_tach_boundaries(
     result: ManipulatorExtractionResult,
 ) -> None:
     """Annotate Tier-2 nodes with `tach.toml` domains and flag forbidden boundary imports."""
-    tach_path = _find_tach_toml(repo_root, backend_subdir)
+    skipped_tach: list[str] = []
+    tach_path = _find_tach_toml(repo_root, backend_subdir, skipped_notes=skipped_tach)
+    if skipped_tach:
+        object.__setattr__(result, "coverage_complete", False)
+        for sn in skipped_tach:
+            if sn not in result.notes:
+                result.notes.append(sn)
     if tach_path is None:
         return
 
-    resolved_root = repo_root.resolve()
+    try:
+        resolved_root = repo_root.resolve()
+    except (OSError, ValueError) as exc:
+        object.__setattr__(result, "coverage_complete", False)
+        result.notes.append(f"Tach boundary parse skipped: {exc}")
+        return
     try:
         config = parse_tach_toml(tach_path, resolved_root)
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValueError) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        tomllib.TOMLDecodeError,
+        TypeError,
+        ValueError,
+        RecursionError,
+    ) as exc:
         rel_err = tach_path.relative_to(resolved_root).as_posix()
+        object.__setattr__(result, "coverage_complete", False)
         result.notes.append(f"Tach boundary parse skipped ({rel_err}): {exc}")
         return
 
     py_files: list[Path] = []
     seen_files: set[Path] = set()
     for sr in config.source_roots:
-        found, _ = source_files(sr, {".py"})
+        skipped_sr: list[str] = []
+        try:
+            found, _ = source_files(sr, {".py"}, skipped_out=skipped_sr)
+        except OSError as exc:
+            object.__setattr__(result, "coverage_complete", False)
+            try:
+                sr_label = sr.relative_to(resolved_root).as_posix() or "."
+            except ValueError:
+                sr_label = sr.name or "."
+            note = f"Tach boundary source discovery incomplete ({sr_label}): {exc}"
+            if note not in result.notes:
+                result.notes.append(note)
+            continue
+        if skipped_sr:
+            object.__setattr__(result, "coverage_complete", False)
+            try:
+                sr_label = sr.relative_to(resolved_root).as_posix() or "."
+            except ValueError:
+                sr_label = sr.name or "."
+            note = (
+                f"Tach boundary source discovery skipped {len(skipped_sr)} "
+                f"unsafe or unreadable path(s) ({sr_label})."
+            )
+            if note not in result.notes:
+                result.notes.append(note)
         for fp in found:
-            resolved_fp = fp.resolve()
+            try:
+                resolved_fp = fp.resolve()
+            except (OSError, ValueError):
+                object.__setattr__(result, "coverage_complete", False)
+                continue
             if resolved_fp in seen_files or not resolved_fp.is_relative_to(resolved_root):
                 continue
             rel_posix = resolved_fp.relative_to(resolved_root).as_posix()
@@ -669,8 +1293,14 @@ def augment_tach_boundaries(
         owner = resolve_owning_tach_module(dotted, config, sr_prefix)
         file_meta[rel_posix] = (dotted, sr_prefix, is_pkg_init, owner)
         try:
-            tree = ast.parse(fp.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, SyntaxError, ValueError):
+            tree = ast.parse(
+                _read_bounded_regular_text(
+                    fp, max_bytes=_MAX_TACH_FILE_BYTES, encoding="utf-8-sig"
+                )
+            )
+        except (OSError, UnicodeError, SyntaxError, ValueError, RecursionError) as exc:
+            object.__setattr__(result, "coverage_complete", False)
+            result.notes.append(f"Tach skipped unparseable Python file `{rel_posix}`: {exc}")
             continue
         parsed_trees[rel_posix] = tree
         callable_defs_by_rel[rel_posix] = (
@@ -696,9 +1326,12 @@ def augment_tach_boundaries(
             continue
         meta = file_meta.get(node.source_file)
         owner = meta[3] if meta else None
-        if owner is None:
-            abs_cand = (resolved_root / PurePosixPath(node.source_file)).resolve()
-            info = _dotted_for_file(abs_cand, config) if abs_cand.is_relative_to(resolved_root) else None
+        if owner is None and _has_safe_path_segments(node.source_file):
+            try:
+                abs_cand = (resolved_root / PurePosixPath(node.source_file)).resolve()
+                info = _dotted_for_file(abs_cand, config) if abs_cand.is_relative_to(resolved_root) else None
+            except (OSError, ValueError):
+                info = None
             if info is not None:
                 owner = resolve_owning_tach_module(info[0], config, info[1])
         if owner is None:
@@ -940,8 +1573,13 @@ def _resolve_node_owner(
     meta = file_meta.get(rel_file)
     if meta is not None:
         return meta[3]
-    abs_cand = (resolved_root / PurePosixPath(rel_file)).resolve()
-    if not abs_cand.is_relative_to(resolved_root):
+    if not _has_safe_path_segments(rel_file):
+        return None
+    try:
+        abs_cand = (resolved_root / PurePosixPath(rel_file)).resolve()
+        if not abs_cand.is_relative_to(resolved_root):
+            return None
+    except (OSError, ValueError):
         return None
     info = _dotted_for_file(abs_cand, config)
     if info is None:

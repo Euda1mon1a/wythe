@@ -117,14 +117,19 @@ def inspect_single_artifact_file(
     file_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = MAX_BINARY_BYTES,
 ) -> tuple[Path, RecordedBinaryCapture]:
     """Passively inspect one regular file (Mach-O 64/Universal, ELF64, or recorded fixture)."""
-    resolved, raw = read_bounded_regular_bytes(file_path, repo_root=repo_root, max_bytes=max_bytes)
+    resolved, raw = read_bounded_regular_bytes(
+        file_path, repo_root=repo_root, allow_external=allow_external, max_bytes=max_bytes
+    )
     if is_macho_magic(raw):
         return resolved, parse_macho_bytes(raw, source_name=resolved.name)
     if is_elf_magic(raw):
-        side_caps = _read_sidecar_elf_capabilities(resolved, repo_root)
+        side_caps = _read_sidecar_elf_capabilities(
+            resolved, repo_root if not allow_external else None
+        )
         return resolved, parse_elf_bytes(
             raw,
             source_name=resolved.name,
@@ -135,11 +140,35 @@ def inspect_single_artifact_file(
     return resolved, parse_recorded_fixture(raw, source_name=resolved.name)
 
 
+def _probe_looks_like_xml_xxe(probe: bytes) -> bool:
+    head = probe[:8192]
+    upper_raw = head.upper()
+    if b"<!ENTITY" in upper_raw or b"<!DOCTYPE" in upper_raw:
+        return True
+    encodings: list[str] = []
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings.append("utf-16")
+    elif head.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        encodings.append("utf-32")
+    elif b"\x00" in head[:64]:
+        encodings.extend(["utf-16-le", "utf-16-be"])
+    encodings.extend(["utf-8", "latin-1"])
+    for enc in encodings:
+        try:
+            dec = head.decode(enc, errors="ignore").upper()
+        except LookupError:
+            continue
+        if "<!ENTITY" in dec or "<!DOCTYPE" in dec:
+            return True
+    return False
+
+
 def inspect_binary_artifacts(
     repo_root: Path,
     binary_paths: Sequence[str | Path],
     *,
     source_specs: Sequence[SourceEntitlementSpec] | None = None,
+    allow_external: bool = False,
 ) -> tuple[list[InspectedBinaryBundleItem], list[SourceEntitlementSpec]]:
     """Inspect all explicit files, `.app`/`.xpc` bundles, or unpacked ELF directories."""
     specs = list(source_specs) if source_specs is not None else discover_repo_entitlements(repo_root)
@@ -147,7 +176,9 @@ def inspect_binary_artifacts(
     seen_files: set[str] = set()
 
     for raw_target in binary_paths:
-        target_files = collect_target_artifact_files(raw_target, repo_root=repo_root)
+        target_files = collect_target_artifact_files(
+            raw_target, repo_root=repo_root, allow_external=allow_external
+        )
         raw_p = Path(str(raw_target))
         is_dir_scan = len(target_files) > 1 or (raw_p.exists() and raw_p.is_dir())
         is_bundle = str(raw_target).lower().rstrip("/").endswith((".app", ".xpc"))
@@ -159,17 +190,20 @@ def inspect_binary_artifacts(
                 parsed_in_target += 1
                 continue
             try:
-                resolved, cap = inspect_single_artifact_file(fpath, repo_root=repo_root)
+                resolved, cap = inspect_single_artifact_file(
+                    fpath, repo_root=repo_root, allow_external=allow_external
+                )
             except ValueError:
                 if not is_dir_scan or is_bundle:
                     raise
                 # Inside an unpacked rootfs directory, still fail closed on corrupt binaries/XXE
-                _, probe = read_bounded_regular_bytes(fpath, repo_root=repo_root)
+                _, probe = read_bounded_regular_bytes(
+                    fpath, repo_root=repo_root, allow_external=allow_external
+                )
                 if (
                     is_macho_magic(probe)
                     or is_elf_magic(probe)
-                    or b"<!ENTITY" in probe.upper()
-                    or b"<!DOCTYPE" in probe.upper()
+                    or _probe_looks_like_xml_xxe(probe)
                 ):
                     raise
                 continue
@@ -184,6 +218,7 @@ def inspect_binary_artifacts(
                 binary_format=cap.binary_format,
                 slice_entitlements=cap.slice_entitlements,
                 slice_has_entitlements_blob=cap.slice_has_entitlements_blob,
+                slice_der_only_entitlements=cap.slice_der_only_entitlements,
             )
             items.append(
                 InspectedBinaryBundleItem(
@@ -217,6 +252,19 @@ def _caller_tokens_for_node(node: AtlasNode, report: TruthAtlasReport) -> set[st
     return {t for t in tokens if t}
 
 
+def _symbol_matches_caller_tokens(demangled_name: str, caller_toks: set[str]) -> bool:
+    dem_low = demangled_name.lower()
+    tail = dem_low.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
+    if tail in caller_toks:
+        return True
+    dem_parts = {t for t in re.split(r"[^a-z0-9_]+", dem_low) if len(t) >= 4}
+    dem_norm_parts = {re.sub(r"[^a-z0-9]+", "", t) for t in re.split(r"[^a-z0-9]+", dem_low) if t}
+    if any(ct in dem_parts or ct in dem_norm_parts for ct in caller_toks if len(ct) >= 4):
+        return True
+    dem_norm = re.sub(r"[^a-z0-9]+", "", dem_low)
+    return any(len(ct) >= 10 and (ct in dem_low or ct in dem_norm) for ct in caller_toks)
+
+
 def _matching_symbols_for_node(
     node: AtlasNode,
     report: TruthAtlasReport,
@@ -225,12 +273,7 @@ def _matching_symbols_for_node(
     caller_toks = _caller_tokens_for_node(node, report)
     matched_syms: list[str] = []
     for sym in item.capture.exported_symbols:
-        dem_low = sym.demangled_name.lower()
-        dem_norm = re.sub(r"[^a-z0-9]+", "", dem_low)
-        tail = dem_low.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
-        if tail in caller_toks or any(
-            len(ct) >= 4 and (ct in dem_low or ct in dem_norm) for ct in caller_toks
-        ):
+        if _symbol_matches_caller_tokens(sym.demangled_name, caller_toks):
             matched_syms.append(sym.demangled_name)
     for refl in item.capture.reflection_descriptors:
         r_low = refl.name.lower()
@@ -375,7 +418,7 @@ def summarize_binary_zoom1_badges(
     active_paths = get_active_binary_paths()
     if not active_paths:
         return {}
-    items, _ = inspect_binary_artifacts(repo_root, active_paths)
+    items, _ = inspect_binary_artifacts(repo_root, active_paths, allow_external=True)
     badges_by_node: dict[str, list[StratumSummaryBadge]] = {}
     for node in report.nodes:
         matched = _select_artifacts_for_node(node, report, items)
@@ -403,7 +446,7 @@ def expand_binary_zoom3_stratum(
     if parent is None:
         return StratumExpansionResult()
 
-    items, _ = inspect_binary_artifacts(repo_root, active_paths)
+    items, _ = inspect_binary_artifacts(repo_root, active_paths, allow_external=True)
     matched_items = _select_artifacts_for_node(parent, report, items)
     if not matched_items:
         return StratumExpansionResult()
@@ -497,11 +540,10 @@ def expand_binary_zoom3_stratum(
                     evidence_note=f"`{sym.raw_name}` -> `{sym.demangled_name}`",
                 )
             )
-            if sym.binding == "exported":
-                dem_low = sym.demangled_name.lower()
-                tail = dem_low.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
-                if tail in caller_toks or any(len(ct) >= 4 and ct in dem_low for ct in caller_toks):
-                    micro_edges.append(
+            if sym.binding == "exported" and _symbol_matches_caller_tokens(
+                sym.demangled_name, caller_toks
+            ):
+                micro_edges.append(
                         StratumMicroEdge(
                             id=f"e:{node_id}->ffi_sym:{b_idx}:{s_idx}",
                             source_id=node_id,
@@ -627,7 +669,7 @@ def check_binary_post_scan(
             "notes": [],
         }
 
-    items, _ = inspect_binary_artifacts(repo_root, active_paths)
+    items, _ = inspect_binary_artifacts(repo_root, active_paths, allow_external=True)
     cand_findings, warn_notes = _build_drift_findings_and_notes(repo_root, report, items)
     existing_keys = {(f.rule_code, f.source_file, f.line) for f in report.findings}
     filtered = [
@@ -678,7 +720,7 @@ def correlate_binary_companions(
             "wall_ties": [],
         }
 
-    items, specs = inspect_binary_artifacts(root_p, resolved_args)
+    items, specs = inspect_binary_artifacts(root_p, resolved_args, allow_external=True)
     cand_findings, warn_notes = _build_drift_findings_and_notes(root_p, report, items)
 
     artifacts_out: list[dict[str, object]] = []

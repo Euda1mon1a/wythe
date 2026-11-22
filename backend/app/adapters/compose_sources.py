@@ -22,8 +22,15 @@ from app.adapters.dockerfile_sources import (
     DockerStage,
     ParsedDockerfile,
     StageCopyMapping,
-    _is_within_root,
+    _has_safe_path_segments,
+    _load_bounded_yaml,
     _norm_container_path,
+    _read_bounded_regular_text,
+    _safe_contained_dir,
+    _safe_contained_entry,
+    _safe_contained_file,
+    _safe_is_symlink,
+    _safe_resolve,
     augment_dockerfile_sources,
     effective_node_symbol_links,
     ensure_repo_target_nodes,
@@ -39,6 +46,8 @@ from app.core.policy_context import get_active_policy_tokens, name_has_policy_to
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
 _COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+MAX_TOTAL_COMPOSE_ENV_ENTRIES = 4096
+MAX_TOTAL_COMPOSE_SERVICES = 512
 _DB_BACKING_IMAGES = frozenset(
     {"postgres", "postgresql", "postgis", "pgvector", "timescaledb", "mysql", "mariadb"}
 )
@@ -78,40 +87,67 @@ class ParsedComposeFile:
     services: list[ComposeServiceSpec] = field(default_factory=list)
 
 
-def discover_compose_files(repo_root: Path) -> list[Path]:
+def discover_compose_files(
+    repo_root: Path,
+    *,
+    skipped_notes: list[str] | None = None,
+) -> list[Path]:
     """Discover compose files at `repo_root` and immediate 1-level subdirectories (incl. `.docker`)."""
-    if repo_root.is_symlink():
+    if not _has_safe_path_segments(repo_root) or _safe_is_symlink(repo_root):
+        if skipped_notes is not None:
+            skipped_notes.append(
+                "Skipped symlink or unsafe repository root; compose declarations absent."
+            )
         return []
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        if skipped_notes is not None:
+            skipped_notes.append(
+                "Skipped unreadable repository root; compose declarations absent."
+            )
+        return []
     dirs_to_check = [repo_root]
     try:
         for child in sorted(repo_root.iterdir()):
+            if child.name in ALLOWED_CONTAINER_DOT_DIRS and (
+                _safe_contained_dir(child, real_root) is None
+            ):
+                if skipped_notes is not None:
+                    skipped_notes.append(
+                        f"Skipped symlink or out-of-root directory {child.name}; compose declarations absent."
+                    )
+                continue
             if (
-                not child.is_symlink()
-                and child.is_dir()
+                _safe_contained_dir(child, real_root) is not None
                 and (not child.name.startswith(".") or child.name in ALLOWED_CONTAINER_DOT_DIRS)
                 and child.name not in EXCLUDED_PARTS
-                and _is_within_root(child, real_root)
             ):
                 dirs_to_check.append(child)
     except OSError:
         return []
 
-    found: list[Path] = []
+    found: list[tuple[str, Path]] = []
     for sdir in dirs_to_check:
         try:
             entries = sorted(sdir.iterdir())
         except OSError:
             continue
         for cand in entries:
-            if (
-                is_compose_filename(cand.name)
-                and not cand.is_symlink()
-                and cand.is_file()
-                and _is_within_root(cand, real_root)
-            ):
-                found.append(cand)
-    return sorted(found, key=lambda p: p.resolve().relative_to(real_root).as_posix())
+            if not is_compose_filename(cand.name):
+                continue
+            rel = _safe_contained_file(cand, real_root)
+            if rel is None:
+                if skipped_notes is not None:
+                    try:
+                        rel_c = cand.relative_to(repo_root).as_posix()
+                    except ValueError:
+                        rel_c = cand.name
+                    skipped_notes.append(
+                        f"Skipped symlink or non-regular compose file {rel_c}; service declarations absent."
+                    )
+                continue
+            found.append((rel, cand))
+    return [cand for _, cand in sorted(found, key=lambda item: item[0])]
 
 
 def _locate_compose_lines(text: str, service_names: set[str]) -> tuple[dict[str, int], dict[tuple[str, str], int]]:
@@ -178,21 +214,56 @@ def classify_backing_image(image: str | None) -> str | None:
 _classify_backing_image = classify_backing_image
 
 
-def _normalize_command_field(raw: object) -> str | list[str] | None:
+def _normalize_command_field(
+    raw: object,
+    budget: list[int] | None = None,
+) -> str | list[str] | None:
     if isinstance(raw, str):
         return raw.strip() or None
     if isinstance(raw, list):
-        items = [str(x) for x in raw if isinstance(x, (str, int, float)) and not isinstance(x, bool)]
+        items: list[str] = []
+        for x in raw:
+            if budget is not None:
+                if budget[0] <= 0:
+                    budget[1] = 1
+                    break
+                budget[0] -= 1
+            elif len(items) >= MAX_TOTAL_COMPOSE_ENV_ENTRIES:
+                break
+            if isinstance(x, (str, int, float)) and not isinstance(x, bool):
+                items.append(str(x))
         return items or None
     return None
 
 
-def _extract_depends_on(raw: object) -> tuple[str, ...]:
+def _extract_depends_on(
+    raw: object,
+    budget: list[int] | None = None,
+) -> tuple[str, ...]:
+    out: list[str] = []
     if isinstance(raw, list):
-        return tuple(str(x).strip() for x in raw if isinstance(x, str) and x.strip())
-    if isinstance(raw, dict):
-        return tuple(str(k).strip() for k in raw if isinstance(k, str) and k.strip())
-    return ()
+        for x in raw:
+            if budget is not None:
+                if budget[0] <= 0:
+                    budget[1] = 1
+                    break
+                budget[0] -= 1
+            elif len(out) >= MAX_TOTAL_COMPOSE_ENV_ENTRIES:
+                break
+            if isinstance(x, str) and x.strip():
+                out.append(x.strip())
+    elif isinstance(raw, dict):
+        for k in raw:
+            if budget is not None:
+                if budget[0] <= 0:
+                    budget[1] = 1
+                    break
+                budget[0] -= 1
+            elif len(out) >= MAX_TOTAL_COMPOSE_ENV_ENTRIES:
+                break
+            if isinstance(k, str) and k.strip():
+                out.append(k.strip())
+    return tuple(out)
 
 
 def _extract_environment(
@@ -200,10 +271,16 @@ def _extract_environment(
     svc_name: str,
     svc_line: int,
     env_lines: dict[tuple[str, str], int],
+    budget: list[int] | None = None,
 ) -> tuple[tuple[str, object, int], ...]:
+    b = budget if budget is not None else [MAX_TOTAL_COMPOSE_ENV_ENTRIES, 0]
     items: list[tuple[str, object, int]] = []
     if isinstance(raw, dict):
         for k, v in raw.items():
+            if b[0] <= 0:
+                b[1] = 1
+                break
+            b[0] -= 1
             if not isinstance(k, str) or not k.strip():
                 continue
             key = k.strip()
@@ -211,6 +288,10 @@ def _extract_environment(
             items.append((key, v, line))
     elif isinstance(raw, list):
         for entry in raw:
+            if b[0] <= 0:
+                b[1] = 1
+                break
+            b[0] -= 1
             if not isinstance(entry, str):
                 continue
             s = entry.strip()
@@ -228,11 +309,19 @@ def _extract_environment(
     return tuple(items)
 
 
-def _extract_bind_mounts(raw: object) -> tuple[tuple[str, str], ...]:
+def _extract_bind_mounts(
+    raw: object,
+    budget: list[int] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    b = budget if budget is not None else [MAX_TOTAL_COMPOSE_ENV_ENTRIES, 0]
     mounts: list[tuple[str, str]] = []
     if not isinstance(raw, list):
         return ()
     for item in raw:
+        if b[0] <= 0:
+            b[1] = 1
+            break
+        b[0] -= 1
         if isinstance(item, str):
             parts = item.split(":")
             if len(parts) >= 2 and (
@@ -240,7 +329,12 @@ def _extract_bind_mounts(raw: object) -> tuple[tuple[str, str], ...]:
             ):
                 mounts.append((parts[0].strip(), parts[1].strip()))
         elif isinstance(item, dict):
-            vtype = str(item.get("type") or "bind").lower()
+            raw_vtype = item.get("type")
+            vtype = (
+                "bind"
+                if raw_vtype is None
+                else (raw_vtype.strip().lower() if isinstance(raw_vtype, str) else "")
+            )
             src = item.get("source")
             tgt = item.get("target")
             if vtype == "bind" and isinstance(src, str) and isinstance(tgt, str) and src and tgt:
@@ -252,14 +346,20 @@ def parse_compose_file(
     compose_path: Path,
     repo_root: Path,
 ) -> tuple[ParsedComposeFile | None, str | None]:
-    real_root = repo_root.resolve()
-    if compose_path.is_symlink() or not compose_path.is_file() or not _is_within_root(compose_path, real_root):
-        return None, None
-    rel_path = compose_path.resolve().relative_to(real_root).as_posix()
+    real_root = _safe_resolve(repo_root)
+    rel_path = _safe_contained_file(compose_path, real_root) if real_root is not None else None
+    if rel_path is None:
+        try:
+            safe_rel = compose_path.relative_to(repo_root).as_posix()
+        except ValueError:
+            safe_rel = compose_path.name
+        return None, f"Skipped symlink or non-regular compose file {safe_rel}; service declarations absent."
     try:
-        text = compose_path.read_text(encoding="utf-8")
-        data = yaml.safe_load(text)
-    except (OSError, UnicodeError, yaml.YAMLError):
+        text = _read_bounded_regular_text(
+            compose_path, max_bytes=1_048_576, real_root=real_root
+        )
+        data = _load_bounded_yaml(text, max_nodes=4096, max_depth=64)
+    except (OSError, UnicodeError, ValueError, RecursionError, yaml.YAMLError):
         return None, f"Could not parse compose file {rel_path}; service declarations absent."
 
     if data is None:
@@ -272,9 +372,14 @@ def parse_compose_file(
     svc_lines, env_lines = _locate_compose_lines(text, svc_names)
 
     specs: list[ComposeServiceSpec] = []
+    budget = [MAX_TOTAL_COMPOSE_ENV_ENTRIES, 0]
     for svc_name, cfg in raw_services.items():
+        if len(specs) >= MAX_TOTAL_COMPOSE_SERVICES or budget[0] <= 0:
+            budget[1] = 1
+            break
         if not isinstance(svc_name, str) or not isinstance(cfg, dict):
             continue
+        budget[0] -= 1
         line = svc_lines.get(svc_name, 1)
         b_ctx: str | None = None
         b_df: str | None = None
@@ -284,8 +389,12 @@ def parse_compose_file(
             b_ctx = build.strip()
             b_df = "Dockerfile"
         elif isinstance(build, dict):
-            b_ctx = str(build.get("context") or ".").strip()
-            b_df = str(build.get("dockerfile") or "Dockerfile").strip()
+            raw_ctx_val = build.get("context")
+            raw_df_val = build.get("dockerfile")
+            b_ctx = (raw_ctx_val if isinstance(raw_ctx_val, str) and raw_ctx_val else ".").strip()
+            b_df = (
+                raw_df_val if isinstance(raw_df_val, str) and raw_df_val else "Dockerfile"
+            ).strip()
             if isinstance(build.get("target"), str) and build["target"].strip():
                 b_target = build["target"].strip()
 
@@ -302,15 +411,22 @@ def parse_compose_file(
                 build_dockerfile=b_df,
                 build_target=b_target,
                 image=image_str,
-                command=_normalize_command_field(cfg.get("command")),
-                entrypoint=_normalize_command_field(cfg.get("entrypoint")),
+                command=_normalize_command_field(cfg.get("command"), budget),
+                entrypoint=_normalize_command_field(cfg.get("entrypoint"), budget),
                 working_dir=wd_str,
-                depends_on=_extract_depends_on(cfg.get("depends_on")),
-                environment=_extract_environment(cfg.get("environment"), svc_name, line, env_lines),
-                bind_mounts=_extract_bind_mounts(cfg.get("volumes")),
+                depends_on=_extract_depends_on(cfg.get("depends_on"), budget),
+                environment=_extract_environment(cfg.get("environment"), svc_name, line, env_lines, budget),
+                bind_mounts=_extract_bind_mounts(cfg.get("volumes"), budget),
             )
         )
-    return ParsedComposeFile(rel_path=rel_path, abs_path=compose_path, services=specs), None
+        if budget[1]:
+            break
+    err_note = (
+        f"Truncated compose file {rel_path} after exceeding entry budget ({MAX_TOTAL_COMPOSE_ENV_ENTRIES}); service declarations partial."
+        if budget[1]
+        else None
+    )
+    return ParsedComposeFile(rel_path=rel_path, abs_path=compose_path, services=specs), err_note
 
 
 def policy_literal_sample(
@@ -323,7 +439,11 @@ def policy_literal_sample(
         return None
     if raw_val is None or isinstance(raw_val, bool):
         return None
-    if isinstance(raw_val, (int, float)):
+    if isinstance(raw_val, int):
+        if raw_val.bit_length() > 4096:
+            return None
+        return repr(raw_val)
+    if isinstance(raw_val, float):
         return repr(raw_val)
     if isinstance(raw_val, (list, dict)):
         return f"collection[{len(raw_val)}]" if len(raw_val) >= 2 else None
@@ -371,16 +491,18 @@ def _effective_compose_stage(
         if isinstance(v, (str, int, float)) and not isinstance(v, bool):
             eff.env[k] = str(v)
     for host_src, cont_tgt in svc.bind_mounts:
-        hpath = (compose_dir / host_src).resolve()
-        if hpath.is_symlink() or not _is_within_root(hpath, real_root) or not hpath.exists():
+        if not _has_safe_path_segments(host_src):
             continue
-        repo_rel = "." if hpath == real_root else hpath.relative_to(real_root).as_posix()
+        entry_info = _safe_contained_entry(compose_dir / host_src, real_root)
+        if entry_info is None:
+            continue
+        repo_rel, _is_file, is_dir_flag = entry_info
         c_dest = _norm_container_path(cont_tgt, eff.workdir)
         eff.mappings.append(
             StageCopyMapping(
                 container_path=c_dest,
                 repo_rel=repo_rel,
-                is_dir=hpath.is_dir(),
+                is_dir=is_dir_flag,
                 context_rel_root=".",
                 ignore_spec=DockerIgnoreSpec(),
             )
@@ -412,11 +534,20 @@ def augment_compose_sources(
     dockerfiles: dict[str, object] | None = None,
 ) -> None:
     """Discover compose files, add `m:compose:*` nodes/edges, and flag hardcoded policy env vars."""
-    cpaths = discover_compose_files(repo_root)
+    skipped_notes: list[str] = []
+    cpaths = discover_compose_files(repo_root, skipped_notes=skipped_notes)
+    if skipped_notes:
+        object.__setattr__(result, "coverage_complete", False)
+        for sn in skipped_notes:
+            if sn not in result.notes:
+                result.notes.append(sn)
     if not cpaths:
         return
 
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        object.__setattr__(result, "coverage_complete", False)
+        return
     df_cache: dict[str, ParsedDockerfile] = {
         k: v for k, v in (dockerfiles or {}).items() if isinstance(v, ParsedDockerfile)
     }
@@ -435,11 +566,12 @@ def augment_compose_sources(
         parsed_cf, err_note = parse_compose_file(cpath, repo_root)
         if err_note:
             result.notes.append(err_note)
+            object.__setattr__(result, "coverage_complete", False)
         if parsed_cf is None or not parsed_cf.services:
             continue
         file_count += 1
         rel = parsed_cf.rel_path
-        compose_dir = cpath.parent.resolve()
+        compose_dir = _safe_resolve(cpath.parent) or real_root
 
         svc_node_map: dict[str, AtlasNode] = {}
         svc_resolved_df: dict[str, tuple[str | None, ParsedDockerfile | None, Path | None]] = {}
@@ -453,15 +585,24 @@ def augment_compose_sources(
             parsed_df: ParsedDockerfile | None = None
             ctx_dir: Path | None = None
             if svc.build_context is not None:
-                cand_ctx = (compose_dir / svc.build_context).resolve()
-                if _is_within_root(cand_ctx, real_root) and cand_ctx.is_dir():
+                cand_ctx = (
+                    _safe_contained_dir(compose_dir / svc.build_context, real_root)
+                    if _has_safe_path_segments(svc.build_context)
+                    else None
+                )
+                if cand_ctx is not None:
                     ctx_dir = cand_ctx
                     df_name = svc.build_dockerfile or "Dockerfile"
                     df_cand = ctx_dir / df_name
-                    if not df_cand.is_file():
+                    df_rel = (
+                        _safe_contained_file(df_cand, real_root)
+                        if _has_safe_path_segments(df_name)
+                        else None
+                    )
+                    if df_rel is None and _has_safe_path_segments(df_name):
                         df_cand = compose_dir / df_name
-                    if not df_cand.is_symlink() and df_cand.is_file() and _is_within_root(df_cand, real_root):
-                        df_rel = df_cand.resolve().relative_to(real_root).as_posix()
+                        df_rel = _safe_contained_file(df_cand, real_root)
+                    if df_rel is not None:
                         parsed_df = df_cache.get(df_rel)
                         if parsed_df is None:
                             parsed_df = parse_dockerfile(df_cand, repo_root, context_override=ctx_dir)
@@ -598,8 +739,12 @@ def augment_compose_sources(
                 fallback_roots.append(ctx_dir)
             if compose_dir not in fallback_roots:
                 fallback_roots.append(compose_dir)
-            bdir = (repo_root / backend_subdir).resolve() if backend_subdir else real_root
-            if _is_within_root(bdir, real_root) and bdir.is_dir() and bdir not in fallback_roots:
+            bdir = (
+                _safe_contained_dir(repo_root / backend_subdir, real_root)
+                if backend_subdir
+                else real_root
+            )
+            if bdir is not None and bdir not in fallback_roots:
                 fallback_roots.append(bdir)
 
             resolved_triples = resolve_command_targets_with_symbols(

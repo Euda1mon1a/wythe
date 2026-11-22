@@ -14,8 +14,10 @@ All evaluators in this module are strictly read-only, deterministic, and non-exe
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
+import re
 import stat
 from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, date, datetime
@@ -26,9 +28,20 @@ from pydantic import Field
 
 from app.core.clock import utc_now
 from app.schemas.atlas import StrictSchema
+from app.services.understanding_discordance import (
+    FirstDivergencePoint,
+    PerturbationCaseResult,
+    RulePredictionComparison,
+    VerdictClause,
+    evaluate_first_divergence,
+    evaluate_perturbation_matrix,
+    evaluate_rule_prediction_comparisons,
+    evaluate_verdict_clauses,
+)
 
 _MAX_BUNDLE_BYTES = 8 * 1024 * 1024  # 8 MiB ceiling for companion JSON receipts
 _MAX_JSON_DEPTH = 64
+_MAX_ANALYZED_TEXT_CHARS = 16_384
 _BLOCKED_BUNDLE_PARTS = frozenset({".git", "secrets", ".secrets", "node_modules"})
 _BLOCKED_BUNDLE_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx", ".sqlite", ".db", ".der"})
 
@@ -88,14 +101,91 @@ def _check_json_depth(value: Any, *, max_depth: int = _MAX_JSON_DEPTH) -> None:
                     stack.append((child, depth + 1))
 
 
-def _reject_symlink_components(candidate: Path, *, stop_at: Path | None = None) -> None:
-    """Reject symlinks on every path component before calling `.resolve()`."""
-    expanded = candidate.expanduser()
-    if "\x00" in str(expanded):
+def _check_raw_json_nesting(raw_bytes: bytes, *, max_depth: int = _MAX_JSON_DEPTH) -> None:
+    """Linear-time pre-parse bracket-nesting check preventing `json.loads` `RecursionError`."""
+    depth = 0
+    in_str = False
+    esc = False
+    for b in raw_bytes:
+        if in_str:
+            if esc:
+                esc = False
+            elif b == 0x5C:  # '\\'
+                esc = True
+            elif b == 0x22:  # '"'
+                in_str = False
+            continue
+        if b == 0x22:
+            in_str = True
+        elif b in (0x5B, 0x7B):  # '[', '{'
+            depth += 1
+            if depth > max_depth:
+                raise ValueError(f"JSON nesting depth exceeds maximum ({max_depth}).")
+        elif b in (0x5D, 0x7D) and depth > 0:  # ']', '}'
+            depth -= 1
+
+
+def _canonicalize_macos_system_prefix(path: Path) -> Path:
+    """Canonicalize macOS `/tmp`, `/var`, `/etc` -> `/private/...` without following user symlinks."""
+    if not path.is_absolute():
+        return path
+    parts = path.parts
+    if len(parts) >= 2 and parts[1] in ("tmp", "var", "etc"):
+        sys_link = Path("/") / parts[1]
+        priv_dir = Path("/private") / parts[1]
+        try:
+            if sys_link.is_symlink() and os.readlink(sys_link) == f"private/{parts[1]}" and priv_dir.is_dir():
+                return priv_dir.joinpath(*parts[2:])
+        except OSError:
+            pass
+    return path
+
+
+def _reject_symlink_components(
+    candidate: Path,
+    *,
+    stop_at: Path | None = None,
+    allow_expanduser: bool = True,
+) -> Path:
+    """Reject symlinks on every path component before calling `.resolve()`, returning canonical path."""
+    raw_str = str(candidate)
+    if "\x00" in raw_str:
         raise ValueError("Null byte in bundle path is forbidden.")
-    stop_resolved = stop_at.expanduser().resolve(strict=True) if stop_at is not None else None
-    cur = Path(expanded.anchor) if expanded.is_absolute() else Path.cwd()
-    parts = expanded.parts[1:] if expanded.is_absolute() else expanded.parts
+    if not allow_expanduser and raw_str.lstrip().startswith("~"):
+        raise ValueError("Home-directory expansion ('~') is forbidden in bundle_path.")
+    expanded = candidate.expanduser() if allow_expanduser else candidate
+    norm_cand = _canonicalize_macos_system_prefix(expanded)
+
+    if stop_at is not None:
+        stop_exp = stop_at.expanduser() if allow_expanduser else stop_at
+        if stop_exp.is_symlink():
+            raise ValueError(f"Symlink repository root rejected: {stop_at}")
+        stop_resolved = stop_exp.resolve(strict=True)
+        if not norm_cand.is_absolute():
+            rel_parts = norm_cand.parts
+        else:
+            if any(p == ".." for p in norm_cand.parts):
+                raise ValueError("Parent directory traversal ('..') is forbidden in bundle path.")
+            try:
+                rel_parts = norm_cand.relative_to(stop_resolved).parts
+            except ValueError as exc:
+                raise ValueError("Bundle path escapes repository root.") from exc
+        cur = stop_resolved
+        for part in rel_parts:
+            if part in ("", "."):
+                continue
+            if part == "..":
+                raise ValueError("Parent directory traversal ('..') is forbidden in bundle path.")
+            cur = cur / part
+            if cur.is_symlink():
+                raise ValueError(f"Symlink component rejected in bundle path: {cur}")
+        resolved = cur.resolve(strict=True)
+        if not resolved.is_relative_to(stop_resolved):
+            raise ValueError("Bundle path escapes repository root.")
+        return resolved
+
+    cur = Path(norm_cand.anchor) if norm_cand.is_absolute() else _canonicalize_macos_system_prefix(Path.cwd())
+    parts = norm_cand.parts[1:] if norm_cand.is_absolute() else norm_cand.parts
     for part in parts:
         if part in ("", "."):
             continue
@@ -104,25 +194,27 @@ def _reject_symlink_components(candidate: Path, *, stop_at: Path | None = None) 
         cur = cur / part
         if cur.is_symlink():
             raise ValueError(f"Symlink component rejected in bundle path: {cur}")
-    resolved = cur.resolve(strict=True)
-    if stop_resolved is not None and not resolved.is_relative_to(stop_resolved):
-        raise ValueError("Bundle path escapes repository root.")
+    return cur.resolve(strict=True)
 
 
 def read_understanding_bundle_file(
     bundle_path: Path | str,
     *,
     root_dir: Path | None = None,
+    allow_expanduser: bool = True,
 ) -> dict[str, Any]:
     """Safely read a bounded regular `.json` understanding bundle without following symlinks."""
     raw_str = str(bundle_path).strip()
     if not raw_str:
         raise ValueError("Empty bundle_path.")
+    if not allow_expanduser and raw_str.startswith("~"):
+        raise ValueError("Home-directory expansion ('~') is forbidden in bundle_path.")
     target_path = (
         (root_dir / raw_str) if (root_dir is not None and not Path(raw_str).is_absolute()) else Path(raw_str)
     )
-    _reject_symlink_components(target_path, stop_at=root_dir)
-    resolved = target_path.expanduser().resolve(strict=True)
+    resolved = _reject_symlink_components(
+        target_path, stop_at=root_dir, allow_expanduser=allow_expanduser
+    )
     if resolved.suffix.lower() != ".json" or resolved.suffix.lower() in _BLOCKED_BUNDLE_SUFFIXES:
         raise ValueError("Understanding bundle must be a regular .json file.")
     rel_parts = resolved.relative_to(root_dir.resolve()).parts if root_dir is not None else resolved.parts
@@ -142,6 +234,7 @@ def read_understanding_bundle_file(
         raw_bytes = handle.read(_MAX_BUNDLE_BYTES + 1)
     if len(raw_bytes) > _MAX_BUNDLE_BYTES:
         raise ValueError("Understanding bundle exceeds 8 MiB ceiling.")
+    _check_raw_json_nesting(raw_bytes, max_depth=_MAX_JSON_DEPTH)
     parsed = json.loads(raw_bytes.decode("utf-8"))
     if not isinstance(parsed, dict):
         raise TypeError("Top-level understanding bundle JSON must be an object.")
@@ -453,6 +546,8 @@ class OutcomeLifecycleExplanation(StrictSchema):
     outcome_id: str
     subject_id: str
     producer_claimed_stage: str | None = None
+    producer_claimed_delivery_status: str | None = None
+    producer_claimed_terminal_state: str | None = None
     last_proven_stage: OutcomeStage
     current_stage: OutcomeStage
     settlement_state: Literal[
@@ -476,6 +571,8 @@ class OutcomeLifecycleExplanation(StrictSchema):
         "failed",
         "unknown",
     ] = "unknown"
+    positive_commit_established: bool = False
+    positive_delivery_established: bool = False
     blind_retry_prohibited: bool = False
     retry_guidance: str = ""
     predecessor_chain_verified: bool = False
@@ -620,6 +717,12 @@ class UnderstandingChainReport(StrictSchema):
     evaluated_at: str
     consequence_headline: str
     last_supported_cause: str
+    verdict_sentence: str = ""
+    verdict_markdown: str = ""
+    verdict_clauses: list[VerdictClause] = Field(default_factory=list)
+    first_divergence: FirstDivergencePoint | None = None
+    rule_prediction_comparisons: list[RulePredictionComparison] = Field(default_factory=list)
+    perturbation_matrix: list[PerturbationCaseResult] = Field(default_factory=list)
     overall_missing_joins: list[str] = Field(default_factory=list)
     links: list[UnderstandingChainLink] = Field(default_factory=list)
     effective_authority: list[EffectiveAuthorityExplanation] = Field(default_factory=list)
@@ -775,7 +878,7 @@ def _evaluate_temporal_interpretation(
         dated_snap = _find_snapshot_for_date(cdate)
         cur_meanings = _pick(current_snap or {}, "meanings", "tokens", default={}) or {}
         cur_meaning = cur_meanings.get(token) if isinstance(cur_meanings, Mapping) else None
-        has_dated_attach = bool(_pick(raw_cell, "dated_snapshot_attached", default=True))
+        has_dated_attach = _strict_bool(_pick(raw_cell, "dated_snapshot_attached", default=True), default=True)
 
         if dated_snap is not None and has_dated_attach:
             ds_id = str(_pick(dated_snap, "snapshot_id", "id", default="dated"))
@@ -843,7 +946,7 @@ def _evaluate_temporal_interpretation(
     elif reinterpreted_any or (
         art_date is not None
         and recorded_snap_id is None
-        and bool(_pick(raw_item, "artifact_bytes_only", default=False))
+        and _strict_bool(_pick(raw_item, "artifact_bytes_only", default=False), default=False)
     ):
         mode = "reinterpreted_under_current_vocabulary_warning"
         missing.append("pinned_historical_vocabulary_snapshot")
@@ -939,7 +1042,7 @@ def explain_effective_authority(
     ] = "none"
     fallback_activated = False
     fallback_source: str | None = None
-    review_candidate = bool(_pick(raw_item, "review_candidate", default=False))
+    review_candidate = _strict_bool(_pick(raw_item, "review_candidate", default=False), default=False)
 
     # Group narrowest scope conflicts when candidates carry `specificity` or same `scope_label`
     scope_values: dict[str, set[str]] = {}
@@ -1153,7 +1256,10 @@ def _evaluate_consumers_and_lanes(
         stage = str(_pick(rc, "stage", default="consumer"))
         raw_state = str(_pick(rc, "effect_state", "state", default="source_inference"))
         mech = str(_pick(rc, "mechanism", default="unspecified"))
-        reached = bool(_pick(rc, "reached_compiled_input", default=(raw_state == "demonstrated_effect")))
+        reached = _strict_bool(
+            _pick(rc, "reached_compiled_input", default=(raw_state == "demonstrated_effect")),
+            default=(raw_state == "demonstrated_effect"),
+        )
         if mech in ("constant_or_fallback_wins", "field_ignored_after_table_read") or raw_state == "bypassed":
             eff_state: EffectiveEvidenceState = "bypassed"
             reached = False
@@ -1161,7 +1267,9 @@ def _evaluate_consumers_and_lanes(
             eff_state = "unresolved"
             reached = False
             missing_joins.append(f"opaque_consumer_handoff:{cid}")
-        elif stage == "resolver" and not bool(_pick(rc, "verified_downstream_output", default=False)):
+        elif stage == "resolver" and not _strict_bool(
+            _pick(rc, "verified_downstream_output", default=False), default=False
+        ):
             # Audit rule: resolver return-value check alone is never full solve/export proof.
             eff_state = "recorded_selection"
         elif raw_state in ("demonstrated_effect", "recorded_selection", "source_inference"):
@@ -1185,13 +1293,14 @@ def _evaluate_consumers_and_lanes(
         if not isinstance(rl, Mapping):
             continue
         lane_name = str(_pick(rl, "lane", "lane_key", default="unknown_lane"))
-        registered = bool(_pick(rl, "registered", default=True))
-        admitted = bool(_pick(rl, "admitted_by_policy", "admitted", default=True))
-        offered = bool(_pick(rl, "offered_in_request", "offered", default=False))
+        registered = _strict_bool(_pick(rl, "registered", default=True), default=True)
+        admitted = _strict_bool(_pick(rl, "admitted_by_policy", "admitted", default=True), default=True)
+        offered = _strict_bool(_pick(rl, "offered_in_request", "offered", default=False), default=False)
         selected = _pick(rl, "selected_by_model", "selected")
         executed = _pick(rl, "executed")
-        req_grant = bool(_pick(rl, "requires_grant", default=False))
-        has_grant = bool(_pick(rl, "grant_present", default=not req_grant))
+        executed_b = _strict_bool(executed, default=False) if executed is not None else None
+        req_grant = _strict_bool(_pick(rl, "requires_grant", default=False), default=False)
+        has_grant = _strict_bool(_pick(rl, "grant_present", default=not req_grant), default=not req_grant)
         m_vis = str(_pick(rl, "model_visible_result", default="not_applicable"))
         a_rep = str(_pick(rl, "authored_reply_state", "answer_grounding", default="not_recorded"))
         d_st = str(_pick(rl, "delivery_state", "delivery_status", default="not_recorded"))
@@ -1212,13 +1321,13 @@ def _evaluate_consumers_and_lanes(
             verdict = "offered_without_execution_grant"
             lane_missing.append(f"lane:{lane_name}:execution_broker_grant")
             missing_joins.extend(lane_missing)
-        elif executed is True and (a_rep == "not_recorded" or d_st == "not_recorded"):
+        elif executed_b is True and (a_rep == "not_recorded" or d_st == "not_recorded"):
             auth_state = "authorized_and_executed"
             verdict = "executed_delivery_unrecorded"
             lane_missing.append(f"lane:{lane_name}:authored_reply_and_delivery")
             missing_joins.extend(lane_missing)
         elif offered:
-            auth_state = "authorized_and_executed" if executed else "not_invoked"
+            auth_state = "authorized_and_executed" if executed_b else "not_invoked"
             verdict = "preserved_and_offered"
         else:
             auth_state = "unresolved"
@@ -1230,8 +1339,8 @@ def _evaluate_consumers_and_lanes(
                 registered=registered,
                 admitted_by_policy=admitted,
                 offered_in_request=offered,
-                selected_by_model=bool(selected) if selected is not None else None,
-                executed=bool(executed) if executed is not None else None,
+                selected_by_model=_strict_bool(selected, default=False) if selected is not None else None,
+                executed=executed_b,
                 execution_authority_state=auth_state,  # type: ignore[arg-type]
                 model_visible_result=m_vis if m_vis in ("included", "missing", "not_applicable", "not_recorded") else "not_recorded",  # type: ignore[arg-type]
                 authored_reply_state=a_rep if a_rep in ("grounded", "unsupported", "not_recorded", "not_applicable") else "not_recorded",  # type: ignore[arg-type]
@@ -1374,8 +1483,8 @@ def evaluate_runtime_provenance(
         )
     ]
     rec_mods = int(_pick(raw_ic, "recorded_modules_count", default=0) or 0)
-    fe_covered = bool(_pick(raw_ic, "frontend_assets_covered", default=False))
-    fe_in_workflow = bool(_pick(raw_item, "workflow_touches_frontend", default=False))
+    fe_covered = _strict_bool(_pick(raw_ic, "frontend_assets_covered", default=False), default=False)
+    fe_in_workflow = _strict_bool(_pick(raw_item, "workflow_touches_frontend", default=False), default=False)
     ic_mode_raw = _pick(raw_ic, "coverage", default=None) or _pick(raw_item, "import_closure_coverage")
 
     if ic_mode_raw in (
@@ -1665,6 +1774,7 @@ _NEGATIVE_SETTLEMENT_VALUES: frozenset[str] = frozenset(
         "false",
         "no",
         "0",
+        "0.0",
     }
 )
 _POSITIVE_SETTLED_RECEIPT_STATUSES: frozenset[str] = frozenset(
@@ -1696,13 +1806,15 @@ _RECEIPT_ID_SCALAR_KEYS: tuple[str, ...] = (
     "settlement_lock_id",
     "publication_lock_id",
 )
-_INNER_RECEIPT_ID_KEYS: tuple[str, ...] = (
-    "receipt_id",
-    "settlement_receipt_id",
-    "lock_id",
-    "settlement_lock_id",
-    "publication_lock_id",
-    "id",
+_INNER_RECEIPT_ID_KEYS: frozenset[str] = frozenset(
+    {
+        "receipt_id",
+        "settlement_receipt_id",
+        "lock_id",
+        "settlement_lock_id",
+        "publication_lock_id",
+        "id",
+    }
 )
 _RECEIPT_BOOL_POSITIVE_KEYS: frozenset[str] = frozenset(
     {
@@ -1760,6 +1872,1084 @@ def _is_valid_settlement_id_value(val: Any) -> str | None:
     return s
 
 
+def _strict_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "0.0", "no", "none", "null", ""):
+            return False
+    return default
+
+
+def _is_explicit_false_bool(value: Any) -> bool:
+    if value is False:
+        return True
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0:
+        return True
+    return bool(isinstance(value, str) and value.strip().lower() in ("false", "0", "0.0", "no"))
+
+
+def _strict_positive_bool(val: Any) -> bool:
+    return _strict_bool(val, default=False)
+
+
+_NEGATIVE_DELIVERY_STATUSES = frozenset(
+    {
+        "failed",
+        "error",
+        "undelivered",
+        "undeliverable",
+        "not_delivered",
+        "not delivered",
+        "not_rendered",
+        "not rendered",
+        "not_acknowledged",
+        "not acknowledged",
+        "not_sent",
+        "not sent",
+        "not_ok",
+        "not-ok",
+        "not ok",
+        "rate_limit",
+        "rate-limit",
+        "rate limit",
+        "rate_limited",
+        "rate-limited",
+        "rate limited",
+        "ratelimited",
+        "rate_limit_exceeded",
+        "rate-limit-exceeded",
+        "rate limit exceeded",
+        "delivery_failed",
+        "delivery-failed",
+        "delivery failed",
+        "send_failed",
+        "send-failed",
+        "send failed",
+        "render_failed",
+        "render-failed",
+        "render failed",
+        "forbidden",
+        "unauthorized",
+        "bad_gateway",
+        "gateway_timeout",
+        "declined",
+        "throttled",
+        "rejected",
+        "dropped",
+        "cancelled",
+        "canceled",
+        "bounced",
+        "expired",
+        "nack",
+        "timeout",
+        "timed_out",
+        "queued",
+        "queued_not_rendered",
+        "not_recorded",
+        "unknown",
+        "pending",
+        "unverified",
+    }
+)
+_POSITIVE_DELIVERY_STATUSES = frozenset(
+    {"delivered", "rendered", "acknowledged", "applied_by_browser", "displayed", "ok"}
+)
+_POSITIVE_DELIVERY_BOOL_STRINGS = frozenset(
+    {
+        "true",
+        "1",
+        "yes",
+        "ok",
+        "sent",
+        "delivered",
+        "rendered",
+        "acknowledged",
+        "applied_by_browser",
+        "displayed",
+        "verified",
+        "valid",
+        "matched",
+        "confirmed",
+        "settled",
+        "reconciled",
+        "committed",
+        "accepted",
+    }
+)
+_REASON_FAILURE_TOKENS = frozenset(
+    {
+        "fail",
+        "failed",
+        "failing",
+        "failure",
+        "error",
+        "errors",
+        "err",
+        "boom",
+        "crash",
+        "crashed",
+        "reject",
+        "rejected",
+        "decline",
+        "declined",
+        "throttle",
+        "throttled",
+        "undelivered",
+        "undeliverable",
+        "unrendered",
+        "unacknowledged",
+        "unsent",
+        "timeout",
+        "bounce",
+        "bounced",
+        "nack",
+        "denied",
+        "refused",
+        "abort",
+        "aborted",
+        "rollback",
+        "rolled",
+        "exception",
+        "exceptions",
+        "invalid",
+        "unavailable",
+        "unreachable",
+        "dropped",
+        "expired",
+        "cancelled",
+        "canceled",
+        "blocked",
+        "forbidden",
+        "unauthorized",
+        "pending",
+        "queued",
+        "leak",
+        "leaked",
+        "leaking",
+        "leaks",
+        "leakage",
+        "exfiltrate",
+        "exfiltrated",
+        "exfiltrating",
+        "exfiltration",
+        "expose",
+        "exposed",
+        "exposing",
+        "exposure",
+        "disclose",
+        "disclosed",
+        "disclosing",
+        "disclosure",
+        "breach",
+        "breached",
+        "breaches",
+        "breaching",
+    }
+)
+_BREACH_ERR_PREFIX_TOKENS = _REASON_FAILURE_TOKENS | frozenset(
+    {
+        "failures",
+        "compromise",
+        "compromised",
+        "compromising",
+        "violation",
+        "violated",
+        "violations",
+        "bypass",
+        "bypassed",
+        "bypassing",
+        "bypasses",
+        "unredacted",
+        "unmasked",
+        "unblocked",
+        "unverified",
+    }
+)
+_DELIVERY_NEG_WORDS = (
+    r"not|never|no|non|without|zero|cannot"
+    r"|wasn'?t|isn'?t|didn'?t|couldn'?t|wouldn'?t|shouldn'?t"
+    r"|haven'?t|hasn'?t|hadn'?t|weren'?t|aren'?t|won'?t|can'?t"
+)
+_DELIVERY_CONTRACTION_NEG_RE = re.compile(
+    r"(?<![a-z0-9])(?:wasn'?t|isn'?t|didn'?t|couldn'?t|wouldn'?t|shouldn'?t"
+    r"|haven'?t|hasn'?t|hadn'?t|weren'?t|aren'?t|won'?t|can'?t|cannot|don'?t|doesn'?t)(?![a-z0-9])"
+)
+_DELIVERY_NO_LONGER_RE = re.compile(r"(?<![a-z0-9])no[\s_-]+longer(?![a-z0-9])")
+_DELIVERY_GERUND_ADV_MODS = (
+    r"(?:(?:ever|actually|even|yet|really|still|explicitly|"
+    r"properly|successfully|directly|fully|just|also|only)[\s_-]+){0,2}"
+)
+_DELIVERY_NEG_VERB_MODS = (
+    r"(?:(?:be|been|being|have|having|ever|actually|even|yet|really|still|explicitly|"
+    r"properly|successfully|directly|fully|just|also|only|to|any|a|an|the)[\s_-]+){0,5}"
+)
+_DELIVERY_NEG_NOUN_MODS = (
+    r"(?:(?:have|had|having|any|a|an|the|ever|actually|even|yet|really|still|explicitly|"
+    r"properly|successfully|directly|fully|just|also|only|"
+    r"actual|valid|proper|explicit|direct|full|real|authoritative|"
+    r"authenticated|client|human|final|positive|successful|recorded)[\s_-]+){0,5}"
+)
+_DELIVERY_NEG_CORE_VERBS = (
+    r"(?:deliver(?:ed|ing)?|receiv(?:e|ed|ing)|sent|send(?:ing)?|render(?:ed|ing)?|"
+    r"dispatch(?:ed|ing)?|ack(?:ed|ing)?|acknowledg(?:e|ed|ing)|verif(?:y|ied|ying)|"
+    r"accept(?:ed|ing)?|confirm(?:ed|ing)?|settl(?:e|ed|ing)|"
+    r"authoriz(?:e|ed|ing)|permit(?:ted|ting)?|allow(?:ed|ing)?|ok)"
+)
+_DELIVERY_NEG_NOUNS = (
+    r"(?:delivery|deliveries|acks?|acknowledg(?:e)?ments?|confirmations?|"
+    r"settlements?|renderings?|verifications?|acceptances?|receipts?|success|"
+    r"authorizations?|permissions?)"
+    r"(?![\s_-]+(?:errors?|failures?|faults?|issues?|problems?)(?![a-z0-9]))"
+)
+_DELIVERY_NEG_VERB_TARGET = (
+    _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:be|been|being|get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?"
+    + _DELIVERY_NEG_CORE_VERBS
+)
+_DELIVERY_NEG_NOUN_TARGET = (
+    r"(?:(?:be|been|being|get|getting|got)[\s_-]+)?"
+    + _DELIVERY_NEG_NOUN_MODS
+    + _DELIVERY_NEG_NOUNS
+)
+_NEGATED_DELIVERY_PHRASE_RE = re.compile(
+    r"(?<![a-z0-9])(?:not|never|no|un|wasn'?t|weren'?t|isn'?t|aren'?t|didn'?t|doesn'?t|don'?t|can'?t|cannot|couldn'?t|could[\s_-]+not|won'?t|wouldn'?t|hasn'?t|haven'?t|hadn'?t|shouldn'?t|should[\s_-]+not)[\s_-]+"
+    + _DELIVERY_NEG_VERB_TARGET
+    + r"(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:not|never|no|wasn'?t|weren'?t|isn'?t|aren'?t|hasn'?t|haven'?t|hadn'?t|cannot|can'?t|couldn'?t|could[\s_-]+not|won'?t|wouldn'?t|shouldn'?t|should[\s_-]+not)[\s_-]+"
+    + _DELIVERY_NEG_NOUN_TARGET
+    + r"(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:couldn'?t|could[\s_-]+not|didn'?t|did[\s_-]+not|doesn'?t|does[\s_-]+not|don'?t|do[\s_-]+not|can'?t|cannot|unable[\s_-]+to|fail(?:ed|ing)[\s_-]+to|"
+    r"(?:not|never|wasn'?t|weren'?t|isn'?t|aren'?t|hasn'?t|haven'?t|hadn'?t|couldn'?t|wouldn'?t|shouldn'?t|won'?t|can'?t)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?able[\s_-]+to|"
+    r"without[\s_-]+(?:(?:being|having|getting)[\s_-]+)?"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?able[\s_-]+to)[\s_-]+"
+    + r"(?:" + _DELIVERY_NEG_VERB_TARGET + r"|" + _DELIVERY_NEG_NOUN_TARGET + r")"
+    + r"(?![a-z0-9])"
+    r"|(?<![a-z0-9])without[\s_-]+"
+    + r"(?:" + _DELIVERY_NEG_VERB_TARGET + r"|" + _DELIVERY_NEG_NOUN_TARGET + r")"
+    + r"(?![a-z0-9])"
+    r"|(?<![a-z0-9])no[\s_-]+longer[\s_-]+"
+    + r"(?:" + _DELIVERY_NEG_VERB_TARGET + r"|" + _DELIVERY_NEG_NOUN_TARGET + r")"
+    + r"(?![a-z0-9])"
+)
+_RATE_LIMITED_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    r"rate[\s_-]+limit(?:ed|(?:s|ing)?[\s_-]+(?:(?:have|has|had|will|would|could|should|may|might|must|can|do|does|did|were|was|is|are|be|been|being|get|getting|got)[\s_-]+){0,4}(?:exceeded|exceeding|triggered|triggering|hit|hitting|reached|reaching|applied|applying))?"
+    r"|(?:exceed(?:ing|ed)?|trigger(?:ing|ed)?|hit(?:ting)?|reach(?:ing|ed)?|appl(?:y|ying|ied))[\s_-]+(?:(?:by|via|from|through|with)[\s_-]+)?(?:(?:any|a|an|the)[\s_-]+)?rate[\s_-]+limit(?:s|ed|ing)?"
+    r")(?![a-z0-9])"
+)
+_NEGATED_RATE_LIMIT_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    + _DELIVERY_NEG_WORDS
+    + r")[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"rate[\s_-]+limit(?:s|ed|ing)?(?:[\s_-]+(?:exceeded|triggered|hit|reached|applied))?(?![a-z0-9])"
+    r"|(?<![a-z0-9])rate[\s_-]+limit(?:s|ed|ing)?[\s_-]+(?:(?:was|were|is|are|has|have|had|will|would|could|should|may|might|must|can|do|does|did)[\s_-]+)?(?:"
+    r"(?:"
+    + _DELIVERY_NEG_WORDS
+    + r")[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:(?:get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?able[\s_-]+to[\s_-]+)?(?:(?:be|been|being|get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?"
+    + r"|(?:been[\s_-]+)?(?:unable|failed|failing)[\s_-]+to[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:be|been|being|get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")(?:exceeded|reached|hit|triggered|applied)(?![a-z0-9])"
+    r"|(?<![a-z0-9])rate[\s_-]+limit(?:s|ed|ing)?[\s_-]+(?:"
+    r"(?:(?:do|does|did|can|could|will|would|may|might|must|should)[\s_-]+(?:not|never)|didn'?t|couldn'?t|wouldn'?t|shouldn'?t|doesn'?t|don'?t|can'?t|cannot|won'?t|not|never)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:(?:get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?able[\s_-]+to[\s_-]+)?"
+    + r"|(?:(?:was|were|is|are|has|have|had)[\s_-]+(?:not|never)|wasn'?t|weren'?t|isn'?t|aren'?t|hasn'?t|haven'?t|hadn'?t)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?able[\s_-]+to[\s_-]+"
+    + r"|(?:(?:was|were|is|are|has|have|had|get|getting|got)[\s_-]+(?:been[\s_-]+)?)?(?:unable|failed|failing)[\s_-]+to[\s_-]+"
+    + r"|without[\s_-]+(?:(?:being|having|getting)[\s_-]+)?"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?able[\s_-]+to[\s_-]+"
+    + r")"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:exceed|reach|hit|trigger|apply)(?![a-z0-9])"
+    r"|(?<![a-z0-9])rate[\s_-]+limit(?:s|ed|ing)?[\s_-]+(?:(?:was|were|is|are|has|have|had)[\s_-]+(?:not|never)|wasn'?t|weren'?t|isn'?t|aren'?t|hasn'?t|haven'?t|hadn'?t|not|never|without)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:been[\s_-]+)?"
+    + r"(?:exceeding|reaching|hitting|triggering|applying)(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:"
+    r"(?:(?:do|does|did|can|could|will|would|may|might|must|should|was|were|is|are|has|have|had)[\s_-]+)?(?:not|never|without|cannot|can'?t|won'?t|don'?t|doesn'?t|didn'?t|couldn'?t|wouldn'?t|shouldn'?t|wasn'?t|weren'?t|isn'?t|aren'?t|hasn'?t|haven'?t|hadn'?t)[\s_-]+"
+    r"|(?:(?:was|were|is|are|has|have|had|get|getting|got)[\s_-]+(?:been[\s_-]+)?)?(?:unable|failed|failing)[\s_-]+to[\s_-]+"
+    r"|(?:(?:was|were|is|are|has|have|had)[\s_-]+)?(?:(?:not|never)[\s_-]+|without[\s_-]+(?:(?:being|having|getting)[\s_-]+)?)"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?able[\s_-]+to[\s_-]+"
+    r")"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:exceed(?:ing|ed)?|reach(?:ing|ed)?|hit(?:ting)?|trigger(?:ing|ed)?|appl(?:y|ying|ied))[\s_-]+"
+    + r"(?:(?:any|a|an|the)[\s_-]+)?rate[\s_-]+limit(?:s|ed|ing)?(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:"
+    r"(?:(?:was|were|is|are|has|have|had|will|would|could|should|may|might|must|can|do|does|did)[\s_-]+)?(?:not|never|without|cannot|can'?t|won'?t|don'?t|doesn'?t|didn'?t|couldn'?t|wouldn'?t|shouldn'?t|wasn'?t|weren'?t|isn'?t|aren'?t|hasn'?t|haven'?t|hadn'?t)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:be|been|being|get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?"
+    r"|(?:(?:was|were|is|are|has|have|had|get|getting|got)[\s_-]+(?:been[\s_-]+)?)?(?:unable|failed|failing)[\s_-]+to[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:be|been|being|get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"|(?:(?:was|were|is|are|has|have|had)[\s_-]+)?(?:(?:not|never)[\s_-]+|without[\s_-]+(?:(?:being|having|getting)[\s_-]+)?)"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?able[\s_-]+to[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:be|get)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")"
+    + r"(?:exceeded|reached|hit|triggered|applied)[\s_-]+"
+    + r"(?:by|via|from|through|with)[\s_-]+(?:(?:any|a|an|the)[\s_-]+)?rate[\s_-]+limit(?:s|ed|ing)?(?![a-z0-9])"
+)
+_HORIZ_WS_RE = re.compile(r"[^\S\n]+")
+_ALNUM_WORD_RE = re.compile(r"[a-z0-9]+")
+_ZERO_FLOAT_STR_RE = re.compile(r"0+(?:\.0+)?")
+_KEY_NEG_PREFIX_TOKENS = frozenset(
+    {"not", "non", "no", "un", "dis", "never", "without", "zero"}
+)
+_GATEWAY_OR_TIMED_FAILURE_RE = re.compile(
+    r"(?<![a-z0-9])(?:bad[\s_-]+gateway|gateway[\s_-]+time[\s_-]*out|tim(?:ed|ing)[\s_-]+out)(?![a-z0-9])"
+)
+_NEGATED_GATEWAY_OR_TIMED_RE = re.compile(
+    r"(?<![a-z0-9])(?:" + _DELIVERY_NEG_WORDS + r"|no[\s_-]+longer)[\s_-]+"
+    r"(?:(?:ever|actually|even|yet|really|still|have|had|be|been|being|get|getting|got|any|a|an|the)[\s_-]+){0,4}"
+    r"(?:bad[\s_-]+gateway|gateway[\s_-]+time[\s_-]*out|tim(?:ed|ing)[\s_-]+out)(?![a-z0-9])"
+)
+_BENIGN_DELIVERY_FAILURE_NEGATION_RE = re.compile(
+    r"(?<![a-z0-9])(?:error|errors|err|failure|failures|fault|faults|exception|exceptions|failing|leak|leaks|breach|breaches|exposure|disclosure|exfiltration|pending|queued)[\s_-]*free(?![a-z0-9]|\s*[:=]\s*['\"]?(?:false|0+(?:\.0+)?|none|null|no)(?![a-z0-9_]|(?:\.\d)))"
+    r"|(?<![a-z0-9])(?:no|without|zero|non|not)[\s_-]+(?:(?:have|had|having|get|getting|got|any|a|an|the)[\s_-]+){0,3}(?:delivery[\s_-]+)?(?:errors?|failures?|faults?|exceptions?|leaks?)(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:not|never|without|no)[\s_-]+(?:(?:ever|actually|even|yet|really|still|have|be|been|being|get|getting|got)[\s_-]+){0,4}fail(?:ed|ing)?(?![\s_-]+to(?![a-z0-9])|\s*[:=])(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:no|without|zero|non|not|never)[\s_-]+"
+    r"(?:(?:any|a|an|the|be|been|being|was|were|is|are|get|getting|got|have|ever|actually|even|yet|really|still|explicitly|properly|successfully|directly|fully|just|also|only|to|"
+    r"data|secret|secrets|pii|credential|credentials|token|tokens|key|keys|record|records|row|rows|field|fields|item|items|file|files|payload|payloads|info|information)[\s_-]+){0,4}"
+    r"(?:leak(?:s|ed|ing)?|leakage|expos(?:e|ed|es|ing|ure)|disclos(?:e|ed|es|ing|ure)|exfiltrat(?:e|ed|es|ing|ion)|breach(?:ed|es|ing)?)"
+    r"(?![a-z0-9]|[\s_-]*free(?![a-z0-9])|[_-]+(?:err|error|errors|fail|failed|failure|failures)(?![a-z0-9]))"
+    r"|(?<![a-z0-9])(?:no[\s_-]+longer|" + _DELIVERY_NEG_WORDS + r")[\s_-]+(?:pending|queued)(?![a-z0-9])"
+    r"|(?<![A-Za-z0-9_-])(?P<ekq>['\"]?)(?P<err_prefix>(?:[a-z0-9]{1,48}[_-]{1,4}){0,8})?(?P<err_body>(?:error|errors|err)(?:[\s_-]*(?:code|count))?(?P=ekq)[\s_:=-]+|(?:failure|failures|fail|failed)[\s_-]*(?:code|count)(?P=ekq)[\s_:=-]+|(?:failure|failures|fail|failed)(?P=ekq)\s*[:=]\s*)(?P<evq>['\"]?)(?:0+(?:\.0+)?|none|null|false|ok)(?P=evq)(?![a-z0-9_]|(?:\.\d))"
+)
+_DELIVERY_POSITIVE_KEY_FALSE_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<kq>['\"]?)"
+    r"(?P<kprefix>(?:[a-z0-9]{1,48}[-_]{1,4}){0,8})?"
+    r"(?P<key>delivered|confirmed|verified|acknowledged|rendered|sent|dispatched|settled|reconciled|committed|ok|success|succeeded|accepted|served|authorized|allowed|permitted|granted|passed|valid|matched)"
+    r"(?P=kq)\s*[:=]\s*(?P<vq>['\"]?)(?:false|0+(?:\.0+)?|none|null|no)(?P=vq)(?![a-z0-9_]|(?:\.\d))"
+)
+
+
+def _has_delivery_positive_key_false(text: str) -> bool:
+    for m in _DELIVERY_POSITIVE_KEY_FALSE_RE.finditer(text):
+        kprefix = m.group("kprefix") or ""
+        if kprefix and (set(_ALNUM_WORD_RE.findall(kprefix)) & _KEY_NEG_PREFIX_TOKENS):
+            continue
+        return True
+    return False
+
+
+def _benign_delivery_failure_negation_repl(match: re.Match[str]) -> str:
+    err_prefix = match.group("err_prefix")
+    if err_prefix:
+        prefix_tokens = set(_ALNUM_WORD_RE.findall(err_prefix))
+        if prefix_tokens & _BREACH_ERR_PREFIX_TOKENS:
+            return match.group(0)
+    return " "
+
+
+def _strip_benign_delivery_failure_negations(text: str) -> str:
+    return _BENIGN_DELIVERY_FAILURE_NEGATION_RE.sub(
+        _benign_delivery_failure_negation_repl, text
+    )
+_NEGATIVE_RECEIPT_ID_RE = re.compile(
+    r"(?<![a-z0-9])(?:(?:delivery|send|render|request|message|ack|receipt)[\s_-]+)?"
+    r"(?:fail(?:ed|ure|ures)?|err(?:or|ors)?|denied|refused|blocked|unavailable|unreachable|expired"
+    r"|invalid|exceptions?|crash(?:ed)?|pending|queued"
+    r"|rejected|declined|aborted|dropped|cancelled|canceled"
+    r"|timed[\s_-]*out|timeout|bad[\s_-]*gateway|gateway[\s_-]*time[\s_-]*out"
+    r"|undelivered|undeliverable|unrendered|unacknowledged|unsent"
+    r"|throttled|rate[\s_-]*limit(?:ed|[\s_-]*exceeded)?|not[\s_-]*(?:delivered|authorized|ok)"
+    r"|nack|bounced|unverified|forbidden|unauthorized)"
+    r"(?![a-z0-9])"
+)
+_DELIVERY_HTTP_PREFIX = (
+    r"(?:http(?:/\d+(?:\.\d+)?)?[\s_:=-]+"
+    r"|(?:http[-_]status[-_]code|http[-_]status|response[-_]status|response[-_]code|status[-_]code|http[-_]code|status|code)[\s_:=-]+)"
+)
+_DELIVERY_EXPLICIT_HTTP_STATUS_PREFIX = (
+    r"(?:http(?:/\d+(?:\.\d+)?)?[\s_:=-]+"
+    r"|(?:http[-_]status[-_]code|http[-_]status|response[-_]status|response[-_]code|status[-_]code|http[-_]code)[\s_:=-]+)"
+)
+_HTTP_STATUS_VALUE_RE = re.compile(
+    r"^(?:" + _DELIVERY_HTTP_PREFIX + r")?(?:\(\s*(-?\d+(?:\.\d+)?)\s*\)|(-?\d+(?:\.\d+)?))(?:[\s,:;_/-]|$)",
+    re.IGNORECASE,
+)
+_DELIVERY_2XX_CODE = r"(?:\(\s*(?:200|201|202|204)\s*\)|(?:200|201|202|204))"
+_DELIVERY_2XX_REASON_SUFFIX = (
+    r"(?:[\s_-]+(?:ok|created|accepted|no[\s_-]+content|success|succeeded|served))?"
+)
+_DELIVERY_4XX_5XX_CODE = r"(?:\(\s*(?:4\d\d|5\d\d)\s*\)|(?:4\d\d|5\d\d))"
+_DELIVERY_LOW_CODE = r"(?:\(\s*(-?(?:[01]\d\d|\d{1,2})(?:\.\d+)?)\s*\)|(-?(?:[01]\d\d|\d{1,2})(?:\.\d+)?))"
+_DELIVERY_HTTP_REASON_SUFFIX = (
+    r"(?:[\s_:-]+(?:(?:forbidden|unauthorized|bad[\s_-]+request|not[\s_-]+found"
+    r"|method[\s_-]+not[\s_-]+allowed|(?:internal[\s_-]+)?server|(?:bad[\s_-]+)?gateway"
+    r"|service[\s_-]+unavailable|gateway[\s_-]+timeout|too[\s_-]+many[\s_-]+requests"
+    r"|request[\s_-]+timeout|conflict|unprocessable[\s_-]+(?:entity|content))"
+    r"(?:[\s_-]+error)?|error))?"
+)
+_DELIVERY_OUTCOME_VERBS = (
+    r"(?:return(?:ed|ing)?|responded|respond(?:ing)?|repl(?:y|ied|ying)"
+    r"|deliver(?:ed|ing)?|receiv(?:e|ed|ing)|achiev(?:e|ed|ing)|observ(?:e|ed|ing)"
+    r"|creat(?:e|ed|ing)|accept(?:ed|ing)?"
+    r"|emit(?:ted|ting)?|yield(?:ed|ing)?|produce(?:d|ing)?|send(?:ing)?|sent"
+    r"|giv(?:e|en|ing)|gave|got(?:ten)?|get(?:ting)?|serv(?:e|ed|ing))"
+)
+_DELIVERY_OUTCOME_BASE_VERBS = (
+    r"(?:return|respond|reply|deliver|receive|achieve|observe|create|accept|emit|yield|produce|send|give|get|serve)"
+)
+_DELIVERY_OUTCOME_GERUND_VERBS = (
+    r"(?:returning|responding|replying|delivering|receiving|achieving|observing|creating|accepting|emitting|yielding|producing|sending|giving|getting|serving)"
+)
+_DELIVERY_NEG_ALLOWED_TO_PREFIX = (
+    r"(?:(?:not|never|without)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:be|been|being|get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?"
+    + r"|(?:"
+    + _DELIVERY_NEG_WORDS
+    + r")[\s_-]+(?:(?:be|been|being|get|getting|got)[\s_-]+)?)"
+)
+_DELIVERY_UNIT_WORDS = (
+    r"ms|us|ns|bytes|kb|mb|gb|items|rows|chars|tokens|records|words|lines|pages|users"
+)
+_DELIVERY_CLAUSE_DELIM_RE = re.compile(
+    r"(?:[;,\n]|(?<!\d)\.(?!\d))+|\b(?:and|but|however|yet|though|although|while)\b"
+)
+_DELIVERY_NEG_ABLE_TO_CLAUSE = (
+    r"(?:unable|failed|failing"
+    r"|(?:(?:not|never)[\s_-]+|without[\s_-]+(?:(?:being|having|getting)[\s_-]+)?)"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:get|getting|got)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?able"
+    r")[\s_-]+to[\s_-]+"
+)
+_DELIVERY_NEG_YET_PREFIX_RE = re.compile(
+    r"(?<![a-z0-9])(?:not|never|without|no[ \t_-]+longer|(?:unable|failed|(?:(?:not|never)[ \t_-]+|without[ \t_-]+(?:(?:being|having|getting)[ \t_-]+)?)(?:(?:be|been|being|have|having|get|getting|got|ever|actually|even|really|still|explicitly|properly|successfully|directly|fully|just|also|only|to)[ \t_-]+){0,5}able)[ \t_-]+to)[ \t_-]+"
+    r"(?:(?:be|been|being|have|having|get|getting|got|ever|actually|even|really|still|"
+    r"explicitly|properly|successfully|directly|fully|just|also|only|to)[ \t_-]+){0,5}$"
+)
+
+
+def _split_delivery_clauses(text: str, *, include_delims: bool = False) -> list[str]:
+    parts: list[str] = []
+    last = 0
+    for match in _DELIVERY_CLAUSE_DELIM_RE.finditer(text):
+        if match.group(0) == "yet":
+            win_start = max(0, match.start() - 120)
+            win_low = text[win_start : match.start()].lower()
+            if (
+                "not" in win_low
+                or "never" in win_low
+                or "without" in win_low
+                or "longer" in win_low
+                or "unable" in win_low
+                or "failed" in win_low
+            ):
+                if win_start > 0 and text[win_start - 1].isalnum():
+                    win_low = "a" + win_low
+                if _DELIVERY_NEG_YET_PREFIX_RE.search(win_low):
+                    continue
+        parts.append(text[last : match.start()])
+        if include_delims:
+            parts.append(match.group(0))
+        last = match.end()
+    parts.append(text[last:])
+    return parts
+_DELIVERY_REF_NO_RE = re.compile(
+    r"(?<![a-z0-9])(?:receipt|order|invoice|ticket|case|ref|item|id|task|request|attempt|run|build|step|line|page|record|row)"
+    r"[\s_-]+no(?![\s_-]+(?:ok|created|accepted|content|success|succeeded|served|http|status))(?![a-z0-9])"
+)
+_NEGATED_HTTP_4XX_5XX_RE = re.compile(
+    r"(?<![a-z0-9])(?:" + _DELIVERY_NEG_WORDS + r")[\s_-]+"
+    r"(?:(?:any|a|an|the)[\s_-]+)?"
+    r"(?:" + _DELIVERY_HTTP_PREFIX + r")?"
+    + _DELIVERY_4XX_5XX_CODE
+    + _DELIVERY_HTTP_REASON_SUFFIX
+    + r"(?![a-z0-9])"
+)
+_NEGATED_VERB_HTTP_4XX_5XX_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    r"(?:not|never)[\s_-]+" + _DELIVERY_NEG_VERB_MODS + _DELIVERY_OUTCOME_VERBS
+    + r"|" + _DELIVERY_NEG_ABLE_TO_CLAUSE
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:" + _DELIVERY_OUTCOME_BASE_VERBS + r"|(?:be|get)[\s_-]+" + _DELIVERY_NEG_VERB_MODS + _DELIVERY_OUTCOME_VERBS + r")"
+    + r"|" + _DELIVERY_NEG_ALLOWED_TO_PREFIX + r"(?:allowed|permitted|authorized|granted|accepted)[\s_-]+to[\s_-]+(?:" + _DELIVERY_OUTCOME_BASE_VERBS + r"|(?:be|get)[\s_-]+" + _DELIVERY_OUTCOME_VERBS + r")"
+    + r"|without[\s_-]+(?:" + _DELIVERY_NEG_VERB_MODS + _DELIVERY_OUTCOME_VERBS + r"|" + _DELIVERY_GERUND_ADV_MODS + _DELIVERY_OUTCOME_GERUND_VERBS + r")"
+    + r")[\s_-]+(?:with[\s_-]+)?"
+    r"(?:(?:any|a|an|the)[\s_-]+)?"
+    r"(?:" + _DELIVERY_HTTP_PREFIX + r")?"
+    + _DELIVERY_4XX_5XX_CODE
+    + _DELIVERY_HTTP_REASON_SUFFIX
+    + r"(?![a-z0-9])"
+)
+_NEGATED_EXPLICIT_LOW_HTTP_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    + r"(?:" + _DELIVERY_NEG_WORDS + r")[\s_-]+"
+    + r"|(?:not|never)[\s_-]+" + _DELIVERY_NEG_VERB_MODS + _DELIVERY_OUTCOME_VERBS + r"[\s_-]+(?:with[\s_-]+)?"
+    + r"|" + _DELIVERY_NEG_ALLOWED_TO_PREFIX + r"(?:allowed|permitted|authorized|granted|accepted)[\s_-]+to[\s_-]+(?:" + _DELIVERY_OUTCOME_BASE_VERBS + r"|(?:be|get)[\s_-]+" + _DELIVERY_OUTCOME_VERBS + r")[\s_-]+(?:with[\s_-]+)?"
+    + r"|without[\s_-]+(?:" + _DELIVERY_NEG_VERB_MODS + _DELIVERY_OUTCOME_VERBS + r"|" + _DELIVERY_GERUND_ADV_MODS + _DELIVERY_OUTCOME_GERUND_VERBS + r")[\s_-]+(?:with[\s_-]+)?"
+    + r")"
+    r"(?:(?:any|a|an|the)[\s_-]+)?"
+    + _DELIVERY_EXPLICIT_HTTP_STATUS_PREFIX
+    + _DELIVERY_LOW_CODE
+    + r"(?![a-z0-9.])"
+)
+_NEGATED_HTTP_2XX_RE = re.compile(
+    r"(?<![a-z0-9])(?:" + _DELIVERY_NEG_WORDS + r")[\s_-]+"
+    r"(?:(?:any|a|an|the)[\s_-]+)?"
+    r"(?:"
+    + _DELIVERY_HTTP_PREFIX + _DELIVERY_2XX_CODE + _DELIVERY_2XX_REASON_SUFFIX
+    + r"|"
+    + _DELIVERY_2XX_CODE
+    + _DELIVERY_2XX_REASON_SUFFIX
+    + r"(?![\s_-]+(?:" + _DELIVERY_UNIT_WORDS + r")(?![a-z0-9]))"
+    + r")(?![a-z0-9])"
+)
+_NEGATED_HTTP_2XX_STRICT_ID_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    + r"(?:" + _DELIVERY_NEG_WORDS + r")[\s_-]+" + _DELIVERY_HTTP_PREFIX + _DELIVERY_2XX_CODE + _DELIVERY_2XX_REASON_SUFFIX
+    + r"|(?:not|never|without|zero|cannot|wasn'?t|isn'?t|didn'?t|couldn'?t|wouldn'?t|shouldn'?t|haven'?t|hasn'?t|hadn'?t|weren'?t|aren'?t|won'?t|can'?t)[\s_-]+"
+    + _DELIVERY_2XX_CODE
+    + _DELIVERY_2XX_REASON_SUFFIX
+    + r"(?![\s_-]+(?:" + _DELIVERY_UNIT_WORDS + r")(?![a-z0-9]))"
+    + r")(?![a-z0-9])"
+)
+_NEGATED_VERB_HTTP_2XX_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    r"(?:not|never)[\s_-]+" + _DELIVERY_NEG_VERB_MODS + _DELIVERY_OUTCOME_VERBS
+    + r"|" + _DELIVERY_NEG_ABLE_TO_CLAUSE
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:" + _DELIVERY_OUTCOME_BASE_VERBS + r"|(?:be|get)[\s_-]+" + _DELIVERY_NEG_VERB_MODS + _DELIVERY_OUTCOME_VERBS + r")"
+    + r"|" + _DELIVERY_NEG_ALLOWED_TO_PREFIX + r"(?:allowed|permitted|authorized|granted|accepted)[\s_-]+to[\s_-]+(?:" + _DELIVERY_OUTCOME_BASE_VERBS + r"|(?:be|get)[\s_-]+" + _DELIVERY_OUTCOME_VERBS + r")"
+    + r"|without[\s_-]+(?:" + _DELIVERY_NEG_VERB_MODS + _DELIVERY_OUTCOME_VERBS + r"|" + _DELIVERY_GERUND_ADV_MODS + _DELIVERY_OUTCOME_GERUND_VERBS + r")"
+    + r")[\s_-]+(?:with[\s_-]+)?"
+    + r"(?:(?:any|a|an|the)[\s_-]+)?"
+    + r"(?:" + _DELIVERY_HTTP_PREFIX + r")?"
+    + _DELIVERY_2XX_CODE
+    + _DELIVERY_2XX_REASON_SUFFIX
+    + r"(?![a-z0-9])"
+)
+_PASSIVE_NEGATED_4XX_5XX_RE = re.compile(
+    r"(?<![a-z0-9])(?:" + _DELIVERY_HTTP_PREFIX + r")?"
+    + _DELIVERY_4XX_5XX_CODE
+    + _DELIVERY_HTTP_REASON_SUFFIX
+    + r"[\s_-]+(?:"
+    + r"(?:(?:was|were|is|are|has|have|had|did|could|would|should)[\s_-]+)?(?:not|never)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:be|been|being|get|getting|got|gotten)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?"
+    + r"|without[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:be|been|being|get|getting|got|gotten)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"|(?:(?:was|were|is|are|has|have|had|did|could|would|should)[\s_-]+)?" + _DELIVERY_NEG_ABLE_TO_CLAUSE
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:be|get)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")"
+    + r"(?:returned|received|delivered|sent|served|emitted|produced|yielded|given|achieved|observed|seen|triggered|reached|applied|issued|raised)(?![a-z0-9])"
+)
+_PASSIVE_NEGATED_2XX_RE = re.compile(
+    r"(?<![a-z0-9])(?:" + _DELIVERY_HTTP_PREFIX + r")?"
+    + _DELIVERY_2XX_CODE
+    + _DELIVERY_2XX_REASON_SUFFIX
+    + r"[\s_-]+(?:"
+    + r"(?:(?:was|were|is|are|has|have|had|did|could|would|should)[\s_-]+)?(?:not|never)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:(?:be|been|being|get|getting|got|gotten)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")?"
+    + r"|without[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:be|been|being|get|getting|got|gotten)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r"|(?:(?:was|were|is|are|has|have|had|did|could|would|should)[\s_-]+)?" + _DELIVERY_NEG_ABLE_TO_CLAUSE
+    + _DELIVERY_NEG_VERB_MODS
+    + r"(?:be|get)[\s_-]+"
+    + _DELIVERY_NEG_VERB_MODS
+    + r")"
+    + r"(?:returned|received|delivered|sent|served|created|accepted|emitted|produced|yielded|given|achieved|observed|seen|triggered|reached|issued)(?![a-z0-9])"
+)
+_HTTP_4XX_5XX_EXPR_RE = re.compile(
+    r"(?<![a-z0-9])" + _DELIVERY_HTTP_PREFIX + _DELIVERY_4XX_5XX_CODE + r"(?![a-z0-9])"
+)
+_EXPLICIT_LOW_HTTP_CODE_RE = re.compile(
+    r"(?<![a-z0-9])" + _DELIVERY_EXPLICIT_HTTP_STATUS_PREFIX + _DELIVERY_LOW_CODE + r"(?![a-z0-9.])"
+)
+_BARE_DELIVERY_ERR_CODE_ALT = r"(?:400|401|403|404|408|409|422|429|500|502|503|504)"
+_BARE_4XX_5XX_DELIVERY_RE = re.compile(
+    r"(?:"
+    r"(?:^|[;,:\s=])\(\s*(?:4\d\d|5\d\d)\s*\)"
+    r"|(?:^|[;,:=]|(?<!\d\d\d/)(?<!\s)\s+)"
+    r"(?>(?:(?!" + _BARE_DELIVERY_ERR_CODE_ALT + r"(?![0-9]))\d{3}[ \t]*/[ \t]*)*)"
+    r"(?<![a-z0-9_-])" + _BARE_DELIVERY_ERR_CODE_ALT + r"(?![a-z0-9_-])"
+    r"(?>(?:[ \t]*/[ \t]*\d{3})*)(?![a-z0-9_-]|[ \t]*/)"
+    r")(?=$|[;,:\s]|\.(?:$|\s))"
+    r"(?![\s_-]+(?:" + _DELIVERY_UNIT_WORDS + r")(?![a-z0-9]))"
+)
+
+
+def _parse_http_status_num(match: re.Match[str]) -> float:
+    return float(match.group(1) or match.group(2))
+
+
+def _strip_negated_delivery_4xx_5xx(text_low: str) -> str:
+    norm = _HORIZ_WS_RE.sub(
+        " ",
+        _DELIVERY_NO_LONGER_RE.sub("not", _DELIVERY_CONTRACTION_NEG_RE.sub("not", text_low)),
+    ).strip()
+    parts = _split_delivery_clauses(norm, include_delims=True)
+    return "".join(
+        _PASSIVE_NEGATED_4XX_5XX_RE.sub(
+            " ",
+            _NEGATED_EXPLICIT_LOW_HTTP_RE.sub(
+                " ",
+                _NEGATED_VERB_HTTP_4XX_5XX_RE.sub(" ", _NEGATED_HTTP_4XX_5XX_RE.sub(" ", part)),
+            ),
+        )
+        if idx % 2 == 0
+        else part
+        for idx, part in enumerate(parts)
+    )
+
+
+def _has_negated_delivery_2xx(text_low: str, *, id_mode: bool = False) -> bool:
+    norm = _HORIZ_WS_RE.sub(
+        " ",
+        _DELIVERY_REF_NO_RE.sub(
+            " ",
+            _DELIVERY_NO_LONGER_RE.sub("not", _DELIVERY_CONTRACTION_NEG_RE.sub("not", text_low)),
+        ),
+    ).strip()
+    for idx, part in enumerate(_split_delivery_clauses(norm, include_delims=True)):
+        if idx % 2 != 0:
+            continue
+        if _NEGATED_VERB_HTTP_2XX_RE.search(part) or _PASSIVE_NEGATED_2XX_RE.search(part):
+            return True
+        if id_mode:
+            if _NEGATED_HTTP_2XX_STRICT_ID_RE.search(part):
+                return True
+        elif _NEGATED_HTTP_2XX_RE.search(part):
+            return True
+    return False
+
+
+def _has_negative_delivery_text(text_low: str) -> bool:
+    if len(text_low) > _MAX_ANALYZED_TEXT_CHARS:
+        return True
+    text_no_neg_http = _strip_negated_delivery_4xx_5xx(text_low)
+    text_no_neg_rl = _NEGATED_RATE_LIMIT_RE.sub(" ", text_no_neg_http)
+    text_no_neg_gw = _NEGATED_GATEWAY_OR_TIMED_RE.sub(" ", text_no_neg_rl)
+    cleaned = _strip_benign_delivery_failure_negations(text_no_neg_gw)
+    return (
+        text_low in _NEGATIVE_DELIVERY_STATUSES
+        or _terminal_polarity(text_low) == "negative"
+        or bool(_NEGATED_DELIVERY_PHRASE_RE.search(text_no_neg_http))
+        or _has_negated_delivery_2xx(text_low, id_mode=False)
+        or bool(_RATE_LIMITED_RE.search(text_no_neg_rl))
+        or bool(_GATEWAY_OR_TIMED_FAILURE_RE.search(cleaned))
+        or bool(_HTTP_4XX_5XX_EXPR_RE.search(text_no_neg_http))
+        or bool(_EXPLICIT_LOW_HTTP_CODE_RE.search(text_no_neg_http))
+        or bool(_BARE_4XX_5XX_DELIVERY_RE.search(text_no_neg_http))
+        or _has_delivery_positive_key_false(text_no_neg_http)
+        or bool(set(_ALNUM_WORD_RE.findall(cleaned)) & _REASON_FAILURE_TOKENS)
+    )
+
+
+def _is_negative_positive_bool_tree(val: Any, *, _depth: int = 0) -> bool:
+    if _depth > 32 or val is None:
+        return True
+    if isinstance(val, bool):
+        return val is False
+    if isinstance(val, (int, float)):
+        return val != 1
+    if isinstance(val, str):
+        return val.strip().lower() not in _POSITIVE_DELIVERY_BOOL_STRINGS
+    if isinstance(val, Mapping):
+        if not val:
+            return True
+        return any(_is_negative_positive_bool_tree(v, _depth=_depth + 1) for v in val.values())
+    if isinstance(val, Sequence) and not isinstance(val, (bytes, bytearray)):
+        if not val:
+            return True
+        return any(_is_negative_positive_bool_tree(item, _depth=_depth + 1) for item in val)
+    return True
+
+
+def _validate_positive_bool_sequence(
+    seq: Sequence[Any],
+    *,
+    is_strong_pos_key: bool,
+    depth: int,
+) -> tuple[bool, bool]:
+    if depth > 32 or not seq:
+        return (False, True)
+    has_pos = False
+    for item in seq:
+        if item is None:
+            return (False, True)
+        if isinstance(item, bool):
+            if item is False:
+                return (False, True)
+            if is_strong_pos_key:
+                has_pos = True
+        elif isinstance(item, (int, float)):
+            if item == 1:
+                if is_strong_pos_key:
+                    has_pos = True
+            else:
+                return (False, True)
+        elif isinstance(item, str):
+            if item.strip().lower() not in _POSITIVE_DELIVERY_BOOL_STRINGS:
+                return (False, True)
+            if is_strong_pos_key:
+                has_pos = True
+        elif isinstance(item, Mapping):
+            c_pos, c_neg = _scan_delivery_receipt_node(item, _depth=depth + 1)
+            if c_neg:
+                return (False, True)
+            has_pos = has_pos or c_pos
+        elif isinstance(item, Sequence) and not isinstance(item, (bytes, bytearray)):
+            c_pos, c_neg = _validate_positive_bool_sequence(
+                item,
+                is_strong_pos_key=is_strong_pos_key,
+                depth=depth + 1,
+            )
+            if c_neg:
+                return (False, True)
+            has_pos = has_pos or c_pos
+        else:
+            return (False, True)
+    return (has_pos, False)
+
+
+def _is_valid_http_status_element(val: Any, *, _depth: int = 0) -> bool:
+    if _depth > 16 or val is None or isinstance(val, bool):
+        return False
+    if isinstance(val, (int, float)):
+        return 200 <= val < 400
+    if isinstance(val, str):
+        sc_s = val.strip()
+        if not sc_s or sc_s.lower() in _NEGATIVE_SETTLEMENT_VALUES:
+            return False
+        sc_match = _HTTP_STATUS_VALUE_RE.match(sc_s)
+        if sc_match is not None:
+            try:
+                sc_num = _parse_http_status_num(sc_match)
+            except ValueError:
+                return False
+            return (200 <= sc_num < 400) and not _has_negative_delivery_text(sc_s.lower())
+        return not _has_negative_delivery_text(sc_s.lower())
+    if isinstance(val, Mapping):
+        if not val:
+            return False
+        _c_pos, c_neg = _scan_delivery_receipt_node(val, _depth=_depth + 1)
+        if c_neg:
+            return False
+        for raw_sub_k, sub_v in val.items():
+            if isinstance(sub_v, bool):
+                sub_kl = str(raw_sub_k).strip().lower().replace("-", "_")
+                if sub_v is False and (
+                    sub_kl not in _BENIGN_FALSE_RECEIPT_KEYS
+                    and not _is_error_like_receipt_key(sub_kl)
+                ):
+                    return False
+                continue
+            if not _is_valid_http_status_element(sub_v, _depth=_depth + 1):
+                return False
+        return True
+    if isinstance(val, Collection) and not isinstance(val, (str, bytes, bytearray, Mapping)):
+        return bool(val) and all(
+            _is_valid_http_status_element(elem, _depth=_depth + 1) for elem in val
+        )
+    return False
+def _scan_delivery_receipt_node(node: Any, *, _depth: int = 0) -> tuple[bool, bool]:
+    if _depth > 32:
+        return (False, True)
+    if isinstance(node, Mapping):
+        if not node:
+            return (False, True)
+        has_pos = False
+        for raw_k, raw_v in node.items():
+            kl = str(raw_k).strip().lower().replace("-", "_")
+            if (
+                raw_v is False
+                and kl not in _BENIGN_FALSE_RECEIPT_KEYS
+                and not _is_error_like_receipt_key(kl)
+            ):
+                return (False, True)
+            if (
+                kl
+                in (
+                    _RECEIPT_BOOL_POSITIVE_KEYS
+                    | {
+                        "delivered",
+                        "rendered",
+                        "delivery_verified",
+                        "sent",
+                        "dispatched",
+                        "delivery_ok",
+                        "success",
+                        "succeeded",
+                    }
+                )
+                or kl.endswith("_free")
+            ):
+                is_strong_pos_key = kl in (
+                    "delivered",
+                    "rendered",
+                    "acknowledged",
+                    "verified",
+                    "delivery_verified",
+                )
+                if raw_v is None:
+                    return (False, True)
+                if isinstance(raw_v, bool):
+                    if raw_v is True and is_strong_pos_key:
+                        has_pos = True
+                elif isinstance(raw_v, (int, float)):
+                    if raw_v == 1:
+                        if is_strong_pos_key:
+                            has_pos = True
+                    else:
+                        return (False, True)
+                elif isinstance(raw_v, str):
+                    if raw_v.strip().lower() not in _POSITIVE_DELIVERY_BOOL_STRINGS:
+                        return (False, True)
+                    if is_strong_pos_key:
+                        has_pos = True
+                elif isinstance(raw_v, Mapping):
+                    if kl.endswith("_free") and _is_negative_positive_bool_tree(raw_v):
+                        return (False, True)
+                elif isinstance(raw_v, Sequence) and not isinstance(raw_v, (bytes, bytearray)):
+                    if kl.endswith("_free") and _is_negative_positive_bool_tree(raw_v):
+                        return (False, True)
+                    seq_pos, seq_neg = _validate_positive_bool_sequence(
+                        raw_v,
+                        is_strong_pos_key=is_strong_pos_key,
+                        depth=_depth + 1,
+                    )
+                    if seq_neg:
+                        return (False, True)
+                    has_pos = has_pos or seq_pos
+                else:
+                    return (False, True)
+            if _is_error_like_receipt_key(kl):
+                if _is_negative_error_receipt_value(raw_v):
+                    return (False, True)
+                if isinstance(raw_v, Mapping) or (
+                    isinstance(raw_v, Sequence) and not isinstance(raw_v, (str, bytes, bytearray))
+                ):
+                    continue
+            if kl in _RECEIPT_BOOL_NEGATIVE_KEYS:
+                if raw_v is True:
+                    return (False, True)
+                if isinstance(raw_v, (int, float)) and not isinstance(raw_v, bool) and raw_v != 0:
+                    return (False, True)
+                if isinstance(raw_v, str):
+                    err_s_low = raw_v.strip().lower()
+                    if (
+                        err_s_low
+                        and err_s_low not in ("none", "null", "false", "ok")
+                        and not _ZERO_FLOAT_STR_RE.fullmatch(err_s_low)
+                    ):
+                        return (False, True)
+                if isinstance(raw_v, Collection) and not isinstance(raw_v, (str, bytes, bytearray, Mapping)) and len(raw_v) > 0:
+                    return (False, True)
+                if isinstance(raw_v, Mapping) and len(raw_v) > 0:
+                    return (False, True)
+            if kl == "reason":
+                if raw_v is True:
+                    return (False, True)
+                if isinstance(raw_v, (int, float)) and not isinstance(raw_v, bool) and raw_v != 0:
+                    return (False, True)
+                if isinstance(raw_v, str) and raw_v.strip() and _has_negative_delivery_text(raw_v.strip().lower()):
+                    return (False, True)
+            if kl in (
+                "status_code",
+                "http_status",
+                "http_status_code",
+                "response_status",
+                "response_code",
+                "code",
+                "http_code",
+            ):
+                if not _is_valid_http_status_element(raw_v, _depth=_depth + 1):
+                    return (False, True)
+                continue
+            if (
+                kl
+                in (
+                    "detail",
+                    "details",
+                    "message",
+                    "msg",
+                    "note",
+                    "description",
+                    "summary",
+                    "error_detail",
+                    "status_detail",
+                    "status_message",
+                    "delivery_detail",
+                    "delivery_message",
+                )
+                and isinstance(raw_v, str)
+                and raw_v.strip()
+                and _has_negative_delivery_text(raw_v.strip().lower())
+            ):
+                return (False, True)
+            if kl in (_RECEIPT_STATUS_KEYS | {"delivery_status", "delivery", "delivery_state"}):
+                if isinstance(raw_v, Mapping):
+                    c_pos, c_neg = _scan_delivery_receipt_node(raw_v, _depth=_depth + 1)
+                    if c_neg:
+                        return (False, True)
+                    has_pos = has_pos or c_pos
+                else:
+                    if not isinstance(raw_v, str):
+                        return (False, True)
+                    st_clean = raw_v.strip()
+                    st_low = st_clean.lower()
+                    if not st_low or st_low in _NEGATIVE_SETTLEMENT_VALUES or _has_negative_delivery_text(st_low):
+                        return (False, True)
+                    st_code_match = _HTTP_STATUS_VALUE_RE.match(st_clean)
+                    if st_code_match is not None:
+                        try:
+                            st_num = _parse_http_status_num(st_code_match)
+                        except ValueError:
+                            return (False, True)
+                        if not (200 <= st_num < 400):
+                            return (False, True)
+                    if st_low in _POSITIVE_DELIVERY_STATUSES:
+                        has_pos = True
+            elif kl in (
+                _INNER_RECEIPT_ID_KEYS
+                | {"delivery_receipt_id", "delivery_receipt_ref", "receipt_ref", "delivery_id"}
+            ):
+                if isinstance(raw_v, Mapping):
+                    c_pos, c_neg = _scan_delivery_receipt_node(raw_v, _depth=_depth + 1)
+                    if c_neg:
+                        return (False, True)
+                    has_pos = has_pos or c_pos
+                else:
+                    s_id = _is_valid_settlement_id_value(raw_v)
+                    if s_id is None or len(s_id) > _MAX_ANALYZED_TEXT_CHARS:
+                        return (False, True)
+                    id_low = s_id.lower()
+                    id_no_neg_http = _strip_negated_delivery_4xx_5xx(id_low)
+                    id_no_neg_rl = _NEGATED_RATE_LIMIT_RE.sub(" ", id_no_neg_http)
+                    id_no_neg_gw = _NEGATED_GATEWAY_OR_TIMED_RE.sub(" ", id_no_neg_rl)
+                    id_cleaned = _strip_benign_delivery_failure_negations(id_no_neg_gw)
+                    if (
+                        id_low in _NEGATIVE_DELIVERY_STATUSES
+                        or _terminal_polarity(s_id) == "negative"
+                        or _NEGATED_DELIVERY_PHRASE_RE.search(id_no_neg_http)
+                        or _has_negated_delivery_2xx(id_low, id_mode=True)
+                        or _RATE_LIMITED_RE.search(id_no_neg_rl)
+                        or _GATEWAY_OR_TIMED_FAILURE_RE.search(id_cleaned)
+                        or _HTTP_4XX_5XX_EXPR_RE.search(id_no_neg_http)
+                        or _EXPLICIT_LOW_HTTP_CODE_RE.search(id_no_neg_http)
+                        or _has_delivery_positive_key_false(id_no_neg_http)
+                        or _NEGATIVE_RECEIPT_ID_RE.search(id_cleaned)
+                    ):
+                        return (False, True)
+                    has_pos = True
+            elif isinstance(raw_v, Mapping) or (
+                isinstance(raw_v, Collection) and not isinstance(raw_v, (str, bytes, bytearray))
+            ):
+                c_pos, c_neg = _scan_delivery_receipt_node(raw_v, _depth=_depth + 1)
+                if c_neg:
+                    return (False, True)
+                has_pos = has_pos or c_pos
+        return (has_pos, False)
+    if isinstance(node, Collection) and not isinstance(node, (str, bytes, bytearray, Mapping)):
+        has_pos = False
+        for item in node:
+            if isinstance(item, Mapping) or (
+                isinstance(item, Collection) and not isinstance(item, (str, bytes, bytearray))
+            ):
+                c_pos, c_neg = _scan_delivery_receipt_node(item, _depth=_depth + 1)
+                if c_neg:
+                    return (False, True)
+                has_pos = has_pos or c_pos
+            elif (
+                item is False
+                or item is None
+                or (isinstance(item, (int, float)) and not isinstance(item, bool) and item <= 0)
+            ):
+                return (False, True)
+            elif isinstance(item, str):
+                s_low = item.strip().lower()
+                if (
+                    not s_low
+                    or s_low in _NEGATIVE_SETTLEMENT_VALUES
+                    or s_low == "0.0"
+                    or _has_negative_delivery_text(s_low)
+                ):
+                    return (False, True)
+        return (has_pos, False)
+    return (False, False)
+
+
+def _is_positive_delivery_receipt_value(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val is True
+    if val is None or isinstance(val, (int, float)):
+        return False
+    if isinstance(val, str):
+        s_clean = _is_valid_settlement_id_value(val)
+        if s_clean is None or len(s_clean) > _MAX_ANALYZED_TEXT_CHARS:
+            return False
+        return not _has_negative_delivery_text(s_clean.lower())
+    if isinstance(val, Mapping):
+        has_pos, has_neg = _scan_delivery_receipt_node(val)
+        return has_pos and not has_neg
+    if isinstance(val, Collection) and not isinstance(val, (bytes, bytearray, str, Mapping)):
+        return bool(val) and all(_is_positive_delivery_receipt_value(item) for item in val)
+    return False
+
+
 def _is_nonempty_settlement_value(val: Any) -> bool:
     if val is None or isinstance(val, bool):
         return val is True
@@ -1805,15 +2995,102 @@ _BENIGN_FALSE_RECEIPT_KEYS: frozenset[str] = frozenset(
 _ERROR_LIKE_RECEIPT_KEYS: frozenset[str] = frozenset(
     {
         "error",
+        "errors",
         "error_code",
+        "error_count",
         "err",
+        "err_code",
+        "err_count",
         "failure",
+        "failures",
         "failure_code",
+        "failure_count",
+        "fail_count",
+        "errors_count",
+        "failures_count",
+        "failed_count",
         "failure_reason",
         "rejection_reason",
         "timeout_reason",
     }
 )
+_ERROR_DETAIL_RECEIPT_KEYS: frozenset[str] = frozenset(
+    {
+        "error_message",
+        "error_msg",
+        "error_reason",
+        "err_reason",
+        "error_desc",
+        "error_description",
+        "error_detail",
+        "error_details",
+        "err_msg",
+        "err_message",
+        "err_detail",
+        "err_details",
+        "err_desc",
+        "err_description",
+        "failure_message",
+        "failure_msg",
+        "failure_detail",
+        "failure_details",
+        "exception",
+        "exceptions",
+    }
+)
+
+
+def _is_error_like_receipt_key(kl: str) -> bool:
+    if kl in _ERROR_LIKE_RECEIPT_KEYS or kl in _ERROR_DETAIL_RECEIPT_KEYS:
+        return True
+    if kl.startswith(("no_", "without_", "zero_")) or kl.endswith("_free"):
+        return False
+    return (
+        kl.startswith(
+            (
+                "error_",
+                "errors_",
+                "err_",
+                "failure_",
+                "failures_",
+                "fail_",
+                "failed_",
+                "exception_",
+                "exceptions_",
+            )
+        )
+        or "error_code" in kl
+        or "err_code" in kl
+        or "error_count" in kl
+        or "err_count" in kl
+        or "failure_count" in kl
+        or "fail_count" in kl
+        or "errors_count" in kl
+        or "failures_count" in kl
+        or "failed_count" in kl
+        or kl.endswith(
+            ("_error", "_errors", "_failure", "_failures", "_err", "_exception", "_exceptions")
+        )
+    )
+
+
+def _is_negative_error_receipt_value(raw_v: Any) -> bool:
+    if raw_v is None or raw_v is False:
+        return False
+    if raw_v is True:
+        return True
+    if isinstance(raw_v, (int, float)):
+        return raw_v != 0
+    if isinstance(raw_v, str):
+        err_s_low = raw_v.strip().lower()
+        if not err_s_low or err_s_low in ("none", "null", "false", "ok"):
+            return False
+        return not bool(_ZERO_FLOAT_STR_RE.fullmatch(err_s_low))
+    if isinstance(raw_v, Sequence) and not isinstance(raw_v, (bytes, bytearray)):
+        return len(raw_v) > 0
+    if isinstance(raw_v, Mapping):
+        return len(raw_v) > 0
+    return True
 
 
 def _inspect_receipt_tree(
@@ -1835,6 +3112,8 @@ def _inspect_receipt_tree(
     if node is True:
         return False
     if isinstance(node, (int, float)):
+        if node == 0 and settled_terminal in _POSITIVE_TERMINAL_STATES:
+            receipt_polarities.add("negative")
         return True
     if isinstance(node, str):
         pol = _terminal_polarity(node)
@@ -1862,26 +3141,62 @@ def _inspect_receipt_tree(
         if allow_positive_capture:
             structured_maps.append(node)
         for raw_k, raw_v in node.items():
-            kl = str(raw_k).strip().lower()
-            if raw_v is False:
+            kl = str(raw_k).strip().lower().replace("-", "_")
+            if _is_error_like_receipt_key(kl):
+                if _is_negative_error_receipt_value(raw_v):
+                    neg = True
+                continue
+            if kl.endswith("_free"):
+                if isinstance(raw_v, Sequence) and not isinstance(
+                    raw_v, (str, bytes, bytearray)
+                ):
+                    if (
+                        _validate_positive_bool_sequence(
+                            raw_v, is_strong_pos_key=False, depth=0
+                        )[1]
+                        or _is_negative_positive_bool_tree(raw_v)
+                    ):
+                        neg = True
+                        if settled_terminal in _POSITIVE_TERMINAL_STATES:
+                            receipt_polarities.add("negative")
+                elif _is_negative_positive_bool_tree(raw_v) or (
+                    isinstance(raw_v, Mapping)
+                    and (
+                        _inspect_receipt_tree(
+                            raw_v,
+                            settled_terminal=settled_terminal,
+                            structured_maps=structured_maps,
+                            receipt_ids=receipt_ids,
+                            lock_ids=lock_ids,
+                            receipt_polarities=receipt_polarities,
+                            allow_positive_capture=False,
+                        )
+                        or _scan_delivery_receipt_node(raw_v)[1]
+                    )
+                ):
+                    neg = True
+                    if settled_terminal in _POSITIVE_TERMINAL_STATES:
+                        receipt_polarities.add("negative")
+                continue
+            if _is_explicit_false_bool(raw_v):
                 if kl not in _BENIGN_FALSE_RECEIPT_KEYS:
                     neg = True
-                    if kl in _RECEIPT_BOOL_POSITIVE_KEYS and settled_terminal in _POSITIVE_TERMINAL_STATES:
+                    if (
+                        kl in _RECEIPT_BOOL_POSITIVE_KEYS
+                        and settled_terminal in _POSITIVE_TERMINAL_STATES
+                    ):
                         receipt_polarities.add("negative")
-            elif raw_v is True and (kl in _RECEIPT_BOOL_NEGATIVE_KEYS or kl in _ERROR_LIKE_RECEIPT_KEYS):
+            elif kl in _RECEIPT_BOOL_NEGATIVE_KEYS and (
+                raw_v is True
+                or (isinstance(raw_v, (int, float)) and not isinstance(raw_v, bool) and raw_v != 0)
+            ):
                 neg = True
             elif isinstance(raw_v, str):
                 s_clean = raw_v.strip()
                 s_low = s_clean.lower()
-                if kl in _RECEIPT_BOOL_POSITIVE_KEYS and s_low in ("false", "0", "no"):
-                    neg = True
-                    if settled_terminal in _POSITIVE_TERMINAL_STATES:
-                        receipt_polarities.add("negative")
-                elif (kl in _RECEIPT_BOOL_NEGATIVE_KEYS and s_low in ("true", "1", "yes")) or (
-                    kl in _ERROR_LIKE_RECEIPT_KEYS
-                    and s_clean
-                    and s_low not in ("none", "null", "0", "false", "ok")
-                ) or (kl not in _ERROR_LIKE_RECEIPT_KEYS and _is_valid_settlement_id_value(raw_v) is None):
+                if (kl in _RECEIPT_BOOL_NEGATIVE_KEYS and s_low in ("true", "1", "yes")) or (
+                    _is_valid_settlement_id_value(raw_v) is None
+                ):
                     neg = True
             if kl == "stage" and raw_v is not None and (
                 not isinstance(raw_v, str)
@@ -1945,7 +3260,7 @@ def _validate_post_loss_settlement(
     post_loss_sources: list[Mapping[str, Any]] = [raw_item]
     non_post_loss_transitions: list[Mapping[str, Any]] = []
     for t_idx, (st_l, rt) in enumerate(zip(raw_transition_stages, raw_transition_maps, strict=False)):
-        rt_lost = bool(_pick(rt, "transport_timeout_or_lost_reply", "lost_reply", default=False))
+        rt_lost = _strict_bool(_pick(rt, "transport_timeout_or_lost_reply", "lost_reply", default=False), default=False)
         if t_idx > last_loss_idx and not rt_lost and st_l in (
             "authoritatively_settled",
             "settled_committed",
@@ -1994,26 +3309,50 @@ def _validate_post_loss_settlement(
                 else:
                     receipt_ids.add(cid)
         for bk in _RECEIPT_BOOL_POSITIVE_KEYS:
-            if src_m.get(bk) is False or (
-                isinstance(src_m.get(bk), str)
-                and str(src_m[bk]).strip().lower() in ("false", "0", "no")
-            ):
+            if bk in src_m and _is_explicit_false_bool(src_m.get(bk)):
                 has_negative = True
                 if settled_terminal in _POSITIVE_TERMINAL_STATES:
                     receipt_polarities.add("negative")
         for nk in _RECEIPT_BOOL_NEGATIVE_KEYS:
             if nk in ("lost_reply", "timed_out") and src_m is raw_item:
                 continue
-            if src_m.get(nk) is True:
+            if _strict_bool(src_m.get(nk), default=False):
                 has_negative = True
-        for ek in _ERROR_LIKE_RECEIPT_KEYS | {"settlement_error", "reconciliation_error"}:
-            ev_err = src_m.get(ek)
-            if ev_err is True or (
-                isinstance(ev_err, str)
-                and ev_err.strip()
-                and ev_err.strip().lower() not in ("none", "null", "0", "false", "ok")
+        for raw_ek, ev_err in src_m.items():
+            ek_l = str(raw_ek).strip().lower().replace("-", "_")
+            if (
+                _is_error_like_receipt_key(ek_l)
+                or ek_l in ("settlement_error", "reconciliation_error")
+            ) and _is_negative_error_receipt_value(ev_err):
+                has_negative = True
+            elif ek_l.endswith("_free") and (
+                (
+                    isinstance(ev_err, Sequence)
+                    and not isinstance(ev_err, (str, bytes, bytearray))
+                    and _validate_positive_bool_sequence(
+                        ev_err, is_strong_pos_key=False, depth=0
+                    )[1]
+                )
+                or _is_negative_positive_bool_tree(ev_err)
+                or (
+                    isinstance(ev_err, Mapping)
+                    and (
+                        _inspect_receipt_tree(
+                            ev_err,
+                            settled_terminal=settled_terminal,
+                            structured_maps=structured_maps,
+                            receipt_ids=receipt_ids,
+                            lock_ids=lock_ids,
+                            receipt_polarities=receipt_polarities,
+                            allow_positive_capture=False,
+                        )
+                        or _scan_delivery_receipt_node(ev_err)[1]
+                    )
+                )
             ):
                 has_negative = True
+                if settled_terminal in _POSITIVE_TERMINAL_STATES:
+                    receipt_polarities.add("negative")
         status_keys = _RECEIPT_STATUS_KEYS - ({"state"} if src_m is raw_item else set())
         for sk in status_keys:
             if sk in src_m and src_m[sk] is not None:
@@ -2126,7 +3465,7 @@ def _validate_post_loss_settlement(
     pre_top_dig = _is_valid_settlement_id_value(raw_item.get("pre_loss_state_digest"))
     if pre_top_dig is not None:
         all_pre_loss_digests.add(pre_top_dig)
-    if not transitions and not top_term_digests:
+    if not transitions:
         raw_st_dig = _is_valid_settlement_id_value(raw_item.get("state_digest"))
         if raw_st_dig is not None:
             all_pre_loss_digests.add(raw_st_dig)
@@ -2174,7 +3513,7 @@ def _validate_post_loss_settlement(
     for t_idx, (st_l, rt, t) in enumerate(
         zip(raw_transition_stages, raw_transition_maps, transitions, strict=False)
     ):
-        rt_lost = bool(_pick(rt, "transport_timeout_or_lost_reply", "lost_reply", default=False))
+        rt_lost = _strict_bool(_pick(rt, "transport_timeout_or_lost_reply", "lost_reply", default=False), default=False)
         if (
             t_idx <= last_loss_idx
             or rt_lost
@@ -2226,7 +3565,16 @@ def _validate_post_loss_settlement(
             or _is_valid_settlement_id_value(_pick(rm, "predecessor_state_digest", "predecessor_digest"))
             in all_pre_loss_digests
         )
-        if has_rm_id and has_pos_status and rm_linked:
+        rm_has_term_digest = any(
+            _is_valid_settlement_id_value(rm.get(dk)) is not None
+            for dk in ("settlement_digest", "after_image_digest", "terminal_digest", "state_digest")
+        )
+        if (
+            has_rm_id
+            and has_pos_status
+            and rm_linked
+            and (settled_terminal not in _POSITIVE_TERMINAL_STATES or rm_has_term_digest)
+        ):
             path_b_ok = True
             break
 
@@ -2256,7 +3604,7 @@ def explain_outcome_lifecycle(
     terminal_conflict = False
     predecessor_ok = True
     prev_state_digest: str | None = None
-    proximity_rejected = bool(_pick(raw_item, "temporal_proximity_only", default=False))
+    proximity_rejected = _strict_bool(_pick(raw_item, "temporal_proximity_only", default=False), default=False)
     missing_joins: list[str] = [str(m) for m in (_pick(raw_item, "missing_joins", default=[]) or [])]
 
     seen_req_ids: set[str] = set()
@@ -2273,7 +3621,7 @@ def explain_outcome_lifecycle(
             if st_low in _VALID_OUTCOME_STAGES
             else ("authoritatively_settled" if st_low in _POSITIVE_TERMINAL_STATES else ("rejected" if st_low in _NEGATIVE_TERMINAL_STATES else "unknown"))
         )
-        rt_lost = bool(_pick(rt, "transport_timeout_or_lost_reply", "lost_reply", default=False))
+        rt_lost = _strict_bool(_pick(rt, "transport_timeout_or_lost_reply", "lost_reply", default=False), default=False)
         if rt_lost or st_low == "committed_unacknowledged":
             last_loss_idx = t_idx
         req_id = _pick(rt, "request_or_attempt_id", "request_id", "attempt_id")
@@ -2320,7 +3668,7 @@ def explain_outcome_lifecycle(
                 if cur_dig != prev_deliv_dig and pred_dig != prev_deliv_dig:
                     terminal_conflict = True
             delivery_digests.append((pred_dig, cur_dig))
-        if bool(_pick(rt, "joined_by_timestamp_only", default=False)):
+        if _strict_bool(_pick(rt, "joined_by_timestamp_only", default=False), default=False):
             proximity_rejected = True
         if t_idx > 0 and prev_state_digest is not None and pred_dig is not None and pred_dig != prev_state_digest:
             predecessor_ok = False
@@ -2341,14 +3689,54 @@ def explain_outcome_lifecycle(
             )
         )
 
-    if len(seen_req_ids) > 1 and not bool(_pick(raw_item, "explicit_cross_request_link", default=False)):
+    if len(seen_req_ids) > 1 and not _strict_bool(
+        _pick(raw_item, "explicit_cross_request_link", default=False), default=False
+    ):
         proximity_rejected = True
         missing_joins.append("unlinked_request_ids_temporal_proximity_rejected")
     if proximity_rejected:
         missing_joins.append("explicit_request_or_predecessor_join")
 
-    has_pred_vectors = any(t.predecessor_state_digest or t.state_digest for t in transitions)
-    predecessor_verified = bool(has_pred_vectors and predecessor_ok and not proximity_rejected)
+    contiguous_chain_ok = True
+    prev_obs_dt: datetime | None = _parse_iso_ts(transitions[0].observed_at) if transitions else None
+    if len(transitions) >= 2:
+        for step_idx in range(1, len(transitions)):
+            prev_tr = transitions[step_idx - 1]
+            cur_tr = transitions[step_idx]
+            cur_obs_dt = _parse_iso_ts(cur_tr.observed_at)
+            if prev_obs_dt is not None and cur_obs_dt is not None and cur_obs_dt < prev_obs_dt:
+                predecessor_ok = False
+                contiguous_chain_ok = False
+                missing_joins.append(f"non_monotonic_transition_timestamp_at_step_{step_idx + 1}")
+            if cur_obs_dt is not None:
+                prev_obs_dt = cur_obs_dt
+            digest_linked = (
+                _is_valid_settlement_id_value(cur_tr.predecessor_state_digest) is not None
+                and _is_valid_settlement_id_value(prev_tr.state_digest) is not None
+                and cur_tr.predecessor_state_digest == prev_tr.state_digest
+            )
+            req_linked = (
+                cur_tr.request_or_attempt_id is not None
+                and prev_tr.request_or_attempt_id is not None
+                and cur_tr.request_or_attempt_id == prev_tr.request_or_attempt_id
+            )
+            if not digest_linked:
+                contiguous_chain_ok = False
+                missing_joins.append(
+                    f"unlinked_transition_step_{step_idx + 1}"
+                    if not req_linked
+                    else f"missing_predecessor_digest_at_step_{step_idx + 1}"
+                )
+
+    has_pred_vectors = len(transitions) >= 2 and all(
+        _is_valid_settlement_id_value(t.predecessor_state_digest) is not None
+        and _is_valid_settlement_id_value(prev.state_digest) is not None
+        and t.predecessor_state_digest == prev.state_digest
+        for prev, t in itertools.pairwise(transitions)
+    )
+    predecessor_verified = bool(
+        has_pred_vectors and predecessor_ok and contiguous_chain_ok and not proximity_rejected
+    )
 
     # Infer or normalize stage from explicit producer fields while enforcing lost-reply invariants
     raw_claimed_val = _pick(raw_item, "current_stage", "stage")
@@ -2357,19 +3745,35 @@ def explain_outcome_lifecycle(
         if raw_claimed_val is not None and str(raw_claimed_val).strip() != ""
         else None
     )
+    raw_claimed_deliv = _pick(raw_item, "delivery_status", "delivery")
+    producer_claimed_delivery = (
+        str(raw_claimed_deliv).strip()
+        if raw_claimed_deliv is not None and str(raw_claimed_deliv).strip() != ""
+        else None
+    )
+    raw_claimed_term = _pick(raw_item, "authoritative_terminal_state", "terminal_state", "final_state")
+    producer_claimed_terminal = (
+        str(raw_claimed_term).strip()
+        if raw_claimed_term is not None and str(raw_claimed_term).strip() != ""
+        else None
+    )
     explicit_stage = producer_claimed_stage or ""
     explicit_stage_low = explicit_stage.lower()
     tool_executed = _pick(raw_item, "tool_executed", "executed")
+    tool_exec_bool = _strict_bool(tool_executed, default=False)
     followup_included = _pick(raw_item, "tool_result_included_in_followup", "model_visible_data_included")
+    followup_bool = (
+        _strict_bool(followup_included, default=True) if followup_included is not None else None
+    )
     ans_ground_raw = str(_pick(raw_item, "answer_grounding", default="not_applicable"))
     deliv_raw = str(_pick(raw_item, "delivery_status", "delivery", default="unknown"))
     lost_reply = bool(
-        _pick(raw_item, "transport_timeout_or_lost_reply", "lost_reply", default=False)
+        _strict_bool(_pick(raw_item, "transport_timeout_or_lost_reply", "lost_reply", default=False), default=False)
         or last_loss_idx >= 0
     )
-    sealed_only = bool(_pick(raw_item, "candidate_sealed_only", default=False))
-    grant_only = bool(_pick(raw_item, "grant_issued_not_executed", default=False))
-    queued_only = bool(_pick(raw_item, "queued_not_rendered", default=False))
+    sealed_only = _strict_bool(_pick(raw_item, "candidate_sealed_only", default=False), default=False)
+    grant_only = _strict_bool(_pick(raw_item, "grant_issued_not_executed", default=False), default=False)
+    queued_only = _strict_bool(_pick(raw_item, "queued_not_rendered", default=False), default=False)
     settled_terminal_raw = _pick(raw_item, "authoritative_terminal_state")
     settled_terminal = (
         str(settled_terminal_raw).strip().lower()
@@ -2392,8 +3796,15 @@ def explain_outcome_lifecycle(
     if deliv_raw == "failed" and explicit_stage_low == "delivered_to_human":
         polarities.add("negative")
     if (
-        any(raw_item.get(k) is False for k in _EXPLICIT_RECEIPT_BOOL_KEYS)
-        or any(rt.get(k) is False for rt in raw_transition_maps for k in _EXPLICIT_RECEIPT_BOOL_KEYS)
+        any(
+            k in raw_item and _is_explicit_false_bool(raw_item.get(k))
+            for k in _EXPLICIT_RECEIPT_BOOL_KEYS
+        )
+        or any(
+            k in rt and _is_explicit_false_bool(rt.get(k))
+            for rt in raw_transition_maps
+            for k in _EXPLICIT_RECEIPT_BOOL_KEYS
+        )
     ) and (settled_terminal in _POSITIVE_TERMINAL_STATES):
         polarities.add("negative")
     if "positive" in polarities and "negative" in polarities:
@@ -2439,20 +3850,51 @@ def explain_outcome_lifecycle(
     )
     if receipt_conflict:
         terminal_conflict = True
+    content_eq_only = _strict_positive_bool(_pick(raw_item, "content_equality_only", default=False))
     has_settlement_metadata = bool(
         validated_post_loss_settlement
-        and not bool(_pick(raw_item, "content_equality_only", default=False))
+        and not content_eq_only
         and not proximity_rejected
         and predecessor_ok
+        and contiguous_chain_ok
     )
     authoritative_settlement_valid = bool(
         settled_terminal in _AUTHORITATIVE_TERMINAL_STATES
         and has_settlement_metadata
         and not terminal_conflict
     )
+    claims_positive_settlement = bool(
+        settled_terminal in _POSITIVE_TERMINAL_STATES
+        or explicit_stage_low in _POSITIVE_TERMINAL_STATES
+    )
+    has_any_positive_commit_backing = bool(
+        validated_post_loss_settlement
+        or _strict_positive_bool(_pick(raw_item, "authenticated_writer_receipt"))
+        or any(
+            _is_nonempty_settlement_value(raw_item.get(dk))
+            for dk in ("settlement_digest", "after_image_digest", "terminal_digest")
+        )
+        or any(
+            t.stage in ("executed", "authoritatively_settled", "delivered_to_human")
+            and _is_valid_settlement_id_value(t.state_digest) is not None
+            for t in transitions
+        )
+    )
+    claims_authoritative_settlement = bool(
+        settled_terminal in _AUTHORITATIVE_TERMINAL_STATES
+        or explicit_stage_low in (_AUTHORITATIVE_TERMINAL_STATES | {"authoritatively_settled"})
+        or any(
+            st in (_AUTHORITATIVE_TERMINAL_STATES | {"authoritatively_settled"})
+            for st in raw_transition_stages
+        )
+    )
+    broken_multi_step_chain = bool(len(transitions) >= 2 and not contiguous_chain_ok)
     force_indeterminate_settlement = (
-        lost_reply and not authoritative_settlement_valid
-    ) or terminal_conflict
+        (lost_reply and not authoritative_settlement_valid)
+        or terminal_conflict
+        or (claims_authoritative_settlement and (broken_multi_step_chain or proximity_rejected))
+        or (claims_positive_settlement and (content_eq_only or not has_any_positive_commit_backing))
+    )
 
     if force_indeterminate_settlement:
         current_stage: OutcomeStage = "committed_unacknowledged"
@@ -2477,9 +3919,9 @@ def explain_outcome_lifecycle(
         current_stage = "granted_not_executed"
     elif queued_only or deliv_raw == "queued_not_rendered":
         current_stage = "queued_not_rendered"
-    elif tool_executed is True and followup_included is False:
+    elif tool_exec_bool is True and followup_bool is False:
         current_stage = "executed_missing_followup_grounding"
-    elif tool_executed is True and (
+    elif tool_exec_bool is True and (
         ans_ground_raw in ("not_recorded", "unsupported_or_omitted")
         or deliv_raw in ("not_recorded", "unknown")
     ):
@@ -2562,14 +4004,24 @@ def explain_outcome_lifecycle(
             "indeterminate_settlement_blind_retry_prohibited_until_authoritative_reconciliation"
         )
     elif current_stage == "authoritatively_settled":
-        settlement_state = (
-            "settled_aborted" if settled_terminal in _NEGATIVE_TERMINAL_STATES else "settled_committed"
-        )
-        if deliv_raw != "delivered":
+        if settled_terminal in _NEGATIVE_TERMINAL_STATES:
+            settlement_state = "settled_aborted"
+        elif settled_terminal in _POSITIVE_TERMINAL_STATES:
+            settlement_state = "settled_committed"
+        else:
+            settlement_state = "unknown"
+            uncertainty.append(
+                "Stage claimed 'authoritatively_settled' without a positive authoritative terminal state."
+            )
+            missing_joins.append("authoritative_terminal_settlement_state")
+        if settlement_state == "settled_committed" and deliv_raw != "delivered":
             uncertainty.append("Database state settled, but downstream timeline/workbook refresh is separate.")
             missing_joins.append("consumer_timeline_or_workbook_refresh_receipt")
     elif current_stage == "delivered_to_human" and settled_terminal in _POSITIVE_TERMINAL_STATES:
         settlement_state = "settled_committed"
+    elif current_stage == "rejected":
+        uncertainty.append("Outcome was explicitly rejected before state commitment.")
+        missing_joins.append("rejected_outcome_no_commit")
     elif current_stage == "granted_not_executed":
         uncertainty.append("Broker/capability grant was issued, which does not establish execution.")
         missing_joins.append("execution_invocation_receipt")
@@ -2607,10 +4059,104 @@ def explain_outcome_lifecycle(
     )
     # Equality of current file/workbook bytes never establishes writer authorship by itself
     authorship = bool(
-        _pick(raw_item, "authenticated_writer_receipt", default=False)
-        and not bool(_pick(raw_item, "content_equality_only", default=False))
+        _strict_positive_bool(_pick(raw_item, "authenticated_writer_receipt"))
+        and not content_eq_only
         and not force_indeterminate_settlement
     )
+    deliv_receipt_keys = (
+        "delivery_receipt",
+        "delivery_receipt_id",
+        "delivery_receipt_ref",
+        "client_delivery_receipt",
+    )
+    has_negative_deliv_receipt = any(
+        dk in raw_item
+        and raw_item[dk] is not None
+        and not _is_positive_delivery_receipt_value(raw_item[dk])
+        for dk in deliv_receipt_keys
+    )
+    has_explicit_deliv_receipt = not has_negative_deliv_receipt and any(
+        _is_positive_delivery_receipt_value(raw_item.get(dk)) for dk in deliv_receipt_keys
+    )
+    if has_negative_deliv_receipt and deliv_status == "delivered":
+        deliv_status = "unknown"
+    has_delivery_backing = bool(
+        not has_negative_deliv_receipt
+        and (
+            has_explicit_deliv_receipt
+            or authorship
+            or (
+                predecessor_verified
+                and any(
+                    t.stage == "delivered_to_human"
+                    and _is_valid_settlement_id_value(t.state_digest) is not None
+                    for t in transitions
+                )
+            )
+        )
+    )
+    positive_delivery_established = bool(
+        current_stage == "delivered_to_human"
+        and deliv_status == "delivered"
+        and ans_ground in ("grounded", "not_applicable")
+        and has_delivery_backing
+        and not force_indeterminate_settlement
+        and not proximity_rejected
+        and contiguous_chain_ok
+    )
+    if current_stage == "delivered_to_human" and not positive_delivery_established:
+        uncertainty.append(
+            "Stage claimed 'delivered_to_human' without positive verified delivery evidence."
+        )
+        missing_joins.append("positive_human_delivery_receipt")
+
+    has_positive_exec_or_commit = bool(
+        settlement_state == "settled_committed"
+        or tool_exec_bool is True
+        or (
+            len(transitions) == 1
+            and transitions[0].stage in ("executed", "authoritatively_settled")
+            and _is_valid_settlement_id_value(transitions[0].state_digest) is not None
+        )
+        or (
+            len(transitions) >= 2
+            and predecessor_verified
+            and any(
+                t.stage in ("executed", "authoritatively_settled", "delivered_to_human")
+                for t in transitions
+            )
+        )
+    )
+    positive_commit_established = bool(
+        has_positive_exec_or_commit
+        and current_stage
+        in (
+            "executed",
+            "executed_missing_followup_grounding",
+            "supplied_answer_unrecorded",
+            "queued_not_rendered",
+            "authoritatively_settled",
+            "delivered_to_human",
+        )
+        and settlement_state
+        not in (
+            "uncommitted_candidate",
+            "indeterminate_requires_settlement",
+            "settled_aborted",
+            "unknown",
+        )
+        and not force_indeterminate_settlement
+        and not proximity_rejected
+        and contiguous_chain_ok
+    )
+    if (
+        not positive_commit_established
+        and settlement_state != "settled_aborted"
+        and current_stage not in ("rejected", "candidate_sealed", "granted_not_executed")
+        and not force_indeterminate_settlement
+    ):
+        missing_joins.append("positive_commit_or_execution_evidence")
+
     default_reason = f"Lifecycle reached '{current_stage}' (last proven: '{last_proven}')."
     if force_indeterminate_settlement:
         claimed_note = (
@@ -2673,11 +4219,15 @@ def explain_outcome_lifecycle(
         outcome_id=outcome_id,
         subject_id=subj_id,
         producer_claimed_stage=producer_claimed_stage,
+        producer_claimed_delivery_status=producer_claimed_delivery,
+        producer_claimed_terminal_state=producer_claimed_terminal,
         last_proven_stage=last_proven,
         current_stage=current_stage,
         settlement_state=settlement_state,
         answer_grounding=ans_ground,
         delivery_status=deliv_status,
+        positive_commit_established=positive_commit_established,
+        positive_delivery_established=positive_delivery_established,
         blind_retry_prohibited=blind_retry_prohibited,
         retry_guidance=retry_guidance,
         predecessor_chain_verified=predecessor_verified,
@@ -2705,7 +4255,7 @@ def _lane_cap_present(evidence: Mapping[str, Any], lane: str, cap: str) -> bool 
     if isinstance(entry, Mapping):
         if "offered_capabilities" in entry and isinstance(entry["offered_capabilities"], Sequence):
             return cap in entry["offered_capabilities"]
-        return bool(entry[cap]) if cap in entry else False
+        return _strict_bool(entry[cap], default=False) if cap in entry else False
     if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
         return cap in entry
     return None
@@ -2728,8 +4278,9 @@ def evaluate_preservation_contract(
     cand_ev = _pick(raw_item, "candidate_evidence", "candidate", default={}) or {}
     base_rev = str(_pick(base_ev, "source_commit", "source_revision", default=default_revision))
     cand_rev = str(_pick(cand_ev, "source_commit", "source_revision", default=default_revision))
-    git_unchanged = bool(
-        _pick(raw_item, "git_code_unchanged", default=(base_rev == cand_rev and base_rev != "unpinned"))
+    git_unchanged = _strict_bool(
+        _pick(raw_item, "git_code_unchanged", default=(base_rev == cand_rev and base_rev != "unpinned")),
+        default=(base_rev == cand_rev and base_rev != "unpinned"),
     )
 
     # Non-Git semantic drift check (Case 10)
@@ -2849,7 +4400,9 @@ def evaluate_preservation_contract(
         verdict = "failed_regression"
     elif ql_comp.status == "latency_only_quality_unscored":
         verdict = "inconclusive_missing_quality_evidence"
-    elif non_git_drift and not bool(_pick(raw_item, "intentional_non_git_change", default=False)):
+    elif non_git_drift and not _strict_bool(
+        _pick(raw_item, "intentional_non_git_change", default=False), default=False
+    ):
         verdict = "non_git_drift_requires_review"
     elif solver_comp and solver_comp.verdict == "equivalent_valid_alternatives":
         verdict = "equivalent_valid_alternatives"
@@ -2910,29 +4463,41 @@ def _evaluate_solver_comparison(
     c_sol = _pick(cand_ev, "solver_run", "solver")
     if not isinstance(b_sol, Mapping) or not isinstance(c_sol, Mapping):
         return None
-    raw_eq = bool(
-        _pick(
-            c_sol,
-            "raw_schedule_equal",
-            default=(
-                _pick(b_sol, "assignments_digest", "raw_assignments")
-                == _pick(c_sol, "assignments_digest", "raw_assignments")
-            ),
-        )
+    _solver_signal_keys = (
+        "assignments_digest",
+        "raw_assignments",
+        "raw_schedule_equal",
+        "admitted_policy_digest",
+        "selected_bindings",
+        "locked_facts_digest",
+        "locked_facts_preserved",
+        "export_semantic_digest",
+        "export_meaning",
+        "total_objective",
+        "objective_value",
+        "active_objective_channels",
     )
-    hard_ok = bool(_pick(b_sol, "hard_constraints_valid", default=True)) and bool(
-        _pick(c_sol, "hard_constraints_valid", default=True)
+    if not any(_pick(m, *_solver_signal_keys) is not None for m in (b_sol, c_sol)) and not disconnected:
+        return None
+    raw_eq_default = (
+        _pick(b_sol, "assignments_digest", "raw_assignments")
+        == _pick(c_sol, "assignments_digest", "raw_assignments")
     )
+    raw_eq = _strict_bool(
+        _pick(c_sol, "raw_schedule_equal", default=raw_eq_default),
+        default=raw_eq_default,
+    )
+    hard_ok = _strict_bool(
+        _pick(b_sol, "hard_constraints_valid", default=True), default=True
+    ) and _strict_bool(_pick(c_sol, "hard_constraints_valid", default=True), default=True)
     pol_eq = _pick(b_sol, "admitted_policy_digest") == _pick(c_sol, "admitted_policy_digest")
     bind_eq = _pick(b_sol, "selected_bindings") == _pick(c_sol, "selected_bindings")
-    locked_ok = bool(
-        _pick(
-            c_sol,
-            "locked_facts_preserved",
-            default=(_pick(b_sol, "locked_facts_digest") == _pick(c_sol, "locked_facts_digest")),
-        )
+    locked_default = _pick(b_sol, "locked_facts_digest") == _pick(c_sol, "locked_facts_digest")
+    locked_ok = _strict_bool(
+        _pick(c_sol, "locked_facts_preserved", default=locked_default),
+        default=locked_default,
     )
-    complete_ok = bool(_pick(c_sol, "candidate_complete", default=True))
+    complete_ok = _strict_bool(_pick(c_sol, "candidate_complete", default=True), default=True)
     exp_eq = _pick(b_sol, "export_semantic_digest", "export_meaning") == _pick(
         c_sol, "export_semantic_digest", "export_meaning"
     )
@@ -2999,9 +4564,13 @@ def _evaluate_quality_latency(
     c_lat = float(c_lat_r) if isinstance(c_lat_r, (int, float)) else None
     b_q = float(b_q_r) if isinstance(b_q_r, (int, float)) else None
     c_q = float(c_q_r) if isinstance(c_q_r, (int, float)) else None
-    static_only = bool(_pick(cand_ev, "static_schema_budget_only", default=False))
+    static_only = _strict_bool(_pick(cand_ev, "static_schema_budget_only", default=False), default=False)
     scored_flag = _pick(cand_ev, "answer_quality_scored")
-    scored = bool(scored_flag) if scored_flag is not None else (b_q is not None and c_q is not None)
+    scored = (
+        _strict_bool(scored_flag, default=False)
+        if scored_flag is not None
+        else (b_q is not None and c_q is not None)
+    )
 
     if b_lat is None and c_lat is None and b_q is None and c_q is None and not static_only:
         return QualityLatencyComparison()
@@ -3088,11 +4657,12 @@ def evaluate_documentation_claims(
         ]
         found_syms = sorted(set(expected_syms) | (live_syms & set(_pick(item, "check_symbols", default=[]) or [])))
         rem_phases = [str(p) for p in (_pick(item, "unverified_remaining_phases", default=[]) or [])]
-        claims_unimplemented = bool(
-            _pick(item, "claims_unimplemented", default=("not implemented" in hist_claim.lower()))
+        claims_unimplemented = _strict_bool(
+            _pick(item, "claims_unimplemented", default=("not implemented" in hist_claim.lower())),
+            default=("not implemented" in hist_claim.lower()),
         )
         source_changed = bool(
-            _pick(item, "source_or_evidence_changed", default=False)
+            _strict_bool(_pick(item, "source_or_evidence_changed", default=False), default=False)
             or (claim_rev not in ("historical", "unpinned", current_revision) and current_revision != "unpinned")
             or (claim_dig and current_digest and claim_dig != current_digest)
         )
@@ -3114,7 +4684,7 @@ def evaluate_documentation_claims(
             )
             safe = False
             missing = ["revalidate_explanation_against_current_revision"]
-        elif found_syms or bool(_pick(item, "corroborated", default=False)):
+        elif found_syms or _strict_bool(_pick(item, "corroborated", default=False), default=False):
             status = "current_and_corroborated"
             safe = True
             missing = []
@@ -3170,38 +4740,58 @@ _NON_CERTIFICATION_NOTICE = (
 )
 
 
-def _load_session_corrections(session_id: str | None) -> list[AttachedHumanCorrection]:
-    """Optionally bridge human corrections from Wave 5 `investigation_service` when present."""
-    if not session_id:
+def _load_session_corrections(
+    session_id: str | None,
+    *,
+    expected_target_slug: str | None = None,
+    strict_target_match: bool = False,
+) -> list[AttachedHumanCorrection]:
+    """Optionally bridge human corrections from Wave 5 `investigation_service` when target matches."""
+    clean_sid = (session_id or "").strip()
+    clean_expected = (expected_target_slug or "").strip()
+    if not clean_sid:
         return []
     try:
         from app.services import investigation_service  # type: ignore[attr-defined]
 
         getter = getattr(investigation_service, "get_investigation_session", None)
-        if callable(getter):
-            sess = getter(session_id)
-            raw_corrs = getattr(sess, "corrections", None) or []
-            out: list[AttachedHumanCorrection] = []
-            for idx, c in enumerate(raw_corrs):
-                cid = str(getattr(c, "correction_id", None) or getattr(c, "id", f"corr-{idx + 1}"))
-                out.append(
-                    AttachedHumanCorrection(
-                        correction_id=cid,
-                        actor=str(getattr(c, "actor", "human")),
-                        target_ref_id=getattr(c, "target_ref_id", None),
-                        kind=str(getattr(c, "kind", "expectation_clarification")),
-                        note=str(getattr(c, "note", "")),
-                        recorded_at=(
-                            str(getattr(c, "created_at", "")) if getattr(c, "created_at", None) else None
-                        ),
-                        evidence_revision=getattr(c, "evidence_revision_id", None),
-                        promoted_to_policy=False,
-                    )
-                )
-            return out
+        if not callable(getter):
+            return []
+        sess = getter(clean_sid)
+        if sess is None:
+            return []
+        sess_slug = str(getattr(sess, "target_slug", "") or "").strip()
     except Exception:  # noqa: BLE001 - optional cross-slice lookup must fail closed/empty
         return []
-    return []
+    if clean_expected:
+        if sess_slug != clean_expected:
+            if strict_target_match:
+                raise ValueError(
+                    f"Cross-target mismatch: session `{clean_sid}` belongs to "
+                    f"`{sess_slug}`, not `{clean_expected}`."
+                )
+            return []
+    elif sess_slug:
+        return []
+    raw_corrs = getattr(sess, "corrections", None) or []
+    out: list[AttachedHumanCorrection] = []
+    for idx, c in enumerate(raw_corrs):
+        cid = str(getattr(c, "correction_id", None) or getattr(c, "id", f"corr-{idx + 1}"))
+        out.append(
+            AttachedHumanCorrection(
+                correction_id=cid,
+                actor=str(getattr(c, "actor", "human")),
+                target_ref_id=getattr(c, "target_ref_id", None),
+                kind=str(getattr(c, "kind", "expectation_clarification")),
+                note=str(getattr(c, "note", "")),
+                recorded_at=(
+                    str(getattr(c, "created_at", "")) if getattr(c, "created_at", None) else None
+                ),
+                evidence_revision=getattr(c, "evidence_revision_id", None),
+                promoted_to_policy=False,
+            )
+        )
+    return out
 
 
 def _synthesize_six_links(
@@ -3320,12 +4910,15 @@ def _synthesize_six_links(
     else:
         if has_indeterminate_retry_ban:
             comm_state = "unresolved"
-        elif any(o.settlement_state == "settled_aborted" for o in outcomes):
+        elif any(
+            o.settlement_state == "settled_aborted" or o.current_stage == "rejected"
+            for o in outcomes
+        ):
             comm_state = "degraded_or_drifted"
-        elif any(o.current_stage in ("declared", "granted_not_executed", "candidate_sealed") for o in outcomes):
-            comm_state = "unverified"
-        else:
+        elif all(o.positive_commit_established for o in outcomes):
             comm_state = "supported"
+        else:
+            comm_state = "unverified"
         comm_sum = " ".join(
             f"{o.outcome_id}: stage='{o.current_stage}'"
             + (
@@ -3344,15 +4937,16 @@ def _synthesize_six_links(
         )
         if has_indeterminate_retry_ban:
             vis_state = "unresolved"
-        elif all(
-            o.current_stage == "delivered_to_human"
-            and o.answer_grounding in ("grounded", "not_applicable")
-            for o in outcomes
-        ):
+        elif all(o.positive_delivery_established for o in outcomes):
             vis_state = "supported"
         elif any(
             o.current_stage
-            in ("executed_missing_followup_grounding", "supplied_answer_unrecorded", "queued_not_rendered")
+            in (
+                "executed_missing_followup_grounding",
+                "supplied_answer_unrecorded",
+                "queued_not_rendered",
+                "delivered_to_human",
+            )
             for o in outcomes
         ):
             vis_state = "unverified"
@@ -3432,14 +5026,26 @@ def _synthesize_six_links(
 
     links = [link1, link2, link3, link4, link5, link6]
     overall_missing = list(dict.fromkeys(m for lnk in links for m in lnk.missing_joins))
+    headline, last_supported = _compute_headline_and_last_supported(links, outcomes, question)
+    return links, headline, last_supported, overall_missing
 
-    # Determine last supported cause before the first degraded/unverified/unresolved boundary
-    last_supported = link1.consequence_summary
+
+def _compute_headline_and_last_supported(
+    links: Sequence[UnderstandingChainLink],
+    outcomes: Sequence[OutcomeLifecycleExplanation],
+    question: str,
+) -> tuple[str, str]:
+    """Compute consequence_headline & last_supported_cause from the 6 understanding links."""
+    has_indeterminate_retry_ban = any(
+        o.settlement_state == "indeterminate_requires_settlement" or o.blind_retry_prohibited
+        for o in outcomes
+    )
+    last_supported = links[0].consequence_summary
     first_gap_link: UnderstandingChainLink | None = None
     for lnk in links:
-        if lnk.state == "supported":
+        if first_gap_link is None and lnk.state == "supported":
             last_supported = f"[{lnk.label}] {lnk.consequence_summary}"
-        elif first_gap_link is None:
+        elif first_gap_link is None and lnk.state != "supported":
             first_gap_link = lnk
 
     if has_indeterminate_retry_ban:
@@ -3463,12 +5069,13 @@ def _synthesize_six_links(
         else f"All six understanding links supported within declared evidence boundaries for: {question}"
     )
     if has_indeterminate_retry_ban and "blind write retries are prohibited" not in headline.lower():
+        link4 = links[3]
         headline = (
             f"{headline} [{link4.label} ({link4.state})] Settlement is indeterminate "
             "(indeterminate_requires_settlement) and blind write retries are prohibited until "
             "authoritative terminal state is reconciled."
         )
-    return links, headline, last_supported, overall_missing
+    return headline, last_supported
 
 
 def _extract_report_authority_items(
@@ -3546,6 +5153,7 @@ def analyze_understanding_bundle(
     request: UnderstandingAnalyzeRequest | Mapping[str, Any],
     *,
     db: Any | None = None,
+    allow_unrooted_cli_bundle: bool = False,
 ) -> UnderstandingChainReport:
     """Analyze an uploaded/referenced bundle, shipped example, or registered target."""
     req = (
@@ -3571,7 +5179,9 @@ def analyze_understanding_bundle(
             live_scan = run_target_scan(db, target, strict_gate=False, persist_snapshot=False)
             default_companion = repo_root / ".wythe" / "understanding_bundle.json"
             if req.bundle is None and req.bundle_path is None and default_companion.is_file():
-                raw_bundle = read_understanding_bundle_file(default_companion, root_dir=repo_root)
+                raw_bundle = read_understanding_bundle_file(
+                    default_companion, root_dir=repo_root, allow_expanduser=False
+                )
 
     # 2. Resolve explicit example_slug (or fallback when target_slug names a shipped example)
     chosen_example = req.example_slug
@@ -3590,7 +5200,15 @@ def analyze_understanding_bundle(
 
     # 3. Explicit bundle_path or inline bundle overrides
     if req.bundle_path:
-        raw_bundle = read_understanding_bundle_file(req.bundle_path, root_dir=repo_root)
+        if not allow_unrooted_cli_bundle and repo_root is None:
+            raise ValueError(
+                "bundle_path requires a registered target_slug and must reside within that repository."
+            )
+        raw_bundle = read_understanding_bundle_file(
+            req.bundle_path,
+            root_dir=repo_root,
+            allow_expanduser=allow_unrooted_cli_bundle,
+        )
     if req.bundle is not None:
         _check_json_depth(req.bundle)
         raw_bundle = dict(req.bundle)
@@ -3697,8 +5315,13 @@ def analyze_understanding_bundle(
         current_digest=live_digest,
     )
 
-    # Human corrections (never silently promoted to policy!)
-    corrections: list[AttachedHumanCorrection] = _load_session_corrections(req.session_id)
+    # Human corrections (never silently promoted to policy; strictly scoped to matching target!)
+    eff_corr_target = req.target_slug or chosen_example
+    corrections: list[AttachedHumanCorrection] = _load_session_corrections(
+        req.session_id,
+        expected_target_slug=eff_corr_target,
+        strict_target_match=bool(req.target_slug),
+    )
     for idx, rc in enumerate(
         [*(_pick(raw_bundle, "human_corrections", default=[]) or []), *req.human_corrections]
     ):
@@ -3716,6 +5339,19 @@ def analyze_understanding_bundle(
                 )
             )
 
+    rule_pred_evals = evaluate_rule_prediction_comparisons(
+        list(_pick(raw_bundle, "rule_prediction_comparisons", "rule_comparisons", default=[]) or [])
+    )
+    first_div_eval = evaluate_first_divergence(
+        _pick(raw_bundle, "first_divergence", "participant_epistemics", default=None)
+    )
+    perturbation_evals = evaluate_perturbation_matrix(
+        list(_pick(raw_bundle, "perturbation_matrix", "perturbation_cases", default=[]) or [])
+    )
+    verdict_clauses, verdict_sentence, verdict_md, verdict_missing = evaluate_verdict_clauses(
+        list(_pick(raw_bundle, "verdict_clauses", default=[]) or [])
+    )
+
     intent_meta = _pick(raw_bundle, "intent", default={}) or {}
     links, headline, last_supported, overall_missing = _synthesize_six_links(
         question=question,
@@ -3728,6 +5364,88 @@ def analyze_understanding_bundle(
         doc_claims=doc_evals,
         corrections=corrections,
     )
+    # Propagate #117 discordance / perturbation regressions into the synthesized six-link chain
+    if first_div_eval is not None and (
+        first_div_eval.caller_attribution_state in ("hop_only", "unverified", "conflicting")
+        or first_div_eval.exists_in_storage == "unverified"
+        or first_div_eval.eligible_for_actor == "unverified"
+        or first_div_eval.present_in_turn == "unverified"
+        or (
+            first_div_eval.eligible_for_actor == "present"
+            and first_div_eval.present_in_turn == "absent"
+        )
+    ):
+        div_state = (
+            "degraded_or_drifted"
+            if (
+                first_div_eval.present_in_turn == "absent"
+                or first_div_eval.caller_attribution_state == "conflicting"
+            )
+            else "unverified"
+        )
+        if links[2].state == "supported" or (
+            links[2].state in ("unverified", "unresolved", "historical_needs_revalidation")
+            and div_state == "degraded_or_drifted"
+        ):
+            links[2] = links[2].model_copy(
+                update={
+                    "state": div_state,
+                    "consequence_summary": (
+                        f"{links[2].consequence_summary} [First Divergence: {first_div_eval.stage_label} — "
+                        f"caller_attribution={first_div_eval.caller_attribution_state}, "
+                        f"present_in_turn={first_div_eval.present_in_turn}]"
+                    ),
+                }
+            )
+    if any(rc.state != "supported" for rc in rule_pred_evals):
+        bad_rc = [rc for rc in rule_pred_evals if rc.state != "supported"]
+        rc_state = (
+            "degraded_or_drifted"
+            if any(rc.state == "degraded_or_drifted" for rc in bad_rc)
+            else "unverified"
+        )
+        if links[4].state == "supported" or (
+            links[4].state in ("unverified", "unresolved", "historical_needs_revalidation")
+            and rc_state == "degraded_or_drifted"
+        ):
+            links[4] = links[4].model_copy(
+                update={
+                    "state": rc_state,
+                    "consequence_summary": (
+                        f"{links[4].consequence_summary} [Rule prediction comparison: {rc_state} on "
+                        f"{', '.join(rc.owner_rule.rule_id for rc in bad_rc[:3])}]"
+                    ),
+                }
+            )
+    if any(not p.passed or p.conclusion_state == "failed_regression" for p in perturbation_evals):
+        pert_state = (
+            "regression_detected"
+            if any(p.conclusion_state == "failed_regression" for p in perturbation_evals)
+            else "unverified"
+        )
+        if links[5].state == "supported" or (
+            links[5].state in ("unverified", "unresolved", "historical_needs_revalidation", "degraded_or_drifted")
+            and pert_state == "regression_detected"
+        ):
+            links[5] = links[5].model_copy(
+                update={
+                    "state": pert_state,
+                    "consequence_summary": (
+                        f"{links[5].consequence_summary} [Perturbation matrix: {pert_state}]"
+                    ),
+                }
+            )
+    # Recompute headline & last_supported unconditionally after #117 link updates
+    headline, last_supported = _compute_headline_and_last_supported(links, out_evals, question)
+    extra_missing = [
+        *(m for rc in rule_pred_evals for m in rc.missing_joins),
+        *(first_div_eval.missing_joins if first_div_eval is not None else []),
+        *verdict_missing,
+    ]
+    for em in extra_missing:
+        if em not in overall_missing:
+            overall_missing.append(em)
+
     cov_statement = (
         f"Evaluated {len(authority_evals)} authority item(s), {len(prov_evals)} provenance record(s), "
         f"{len(out_evals)} outcome lifecycle(s), {len(pres_evals)} preservation contract(s), and "
@@ -3744,6 +5462,12 @@ def analyze_understanding_bundle(
         evaluated_at=eval_ts,
         consequence_headline=headline,
         last_supported_cause=last_supported,
+        verdict_sentence=verdict_sentence,
+        verdict_markdown=verdict_md,
+        verdict_clauses=verdict_clauses,
+        first_divergence=first_div_eval,
+        rule_prediction_comparisons=rule_pred_evals,
+        perturbation_matrix=perturbation_evals,
         overall_missing_joins=overall_missing,
         links=links,
         effective_authority=authority_evals,

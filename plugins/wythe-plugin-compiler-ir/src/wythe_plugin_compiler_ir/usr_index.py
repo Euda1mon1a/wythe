@@ -18,6 +18,8 @@ from typing import Any, Final, Literal
 MAX_ARTIFACT_BYTES: Final[int] = 32 * 1024 * 1024
 MAX_NESTING_DEPTH: Final[int] = 64
 MAX_LINE_CHARS: Final[int] = 8192
+MAX_TOTAL_USR_RELATIONS: Final[int] = 16384
+MAX_TOTAL_USR_ENTRIES: Final[int] = 16384
 
 _OS_ROOT_SYMLINK_PREFIXES: Final[frozenset[tuple[str, str]]] = frozenset(
     {("/", "var"), ("/", "tmp"), ("/", "etc")}
@@ -162,66 +164,66 @@ def validate_safe_path(
     raw_path: str | Path,
     *,
     repo_root: Path | None = None,
-    allow_external: bool = True,
+    allow_external: bool = False,
     allow_dir: bool = False,
 ) -> Path:
     """Validate `raw_path` rejecting symlinks on every path component before `.resolve()`."""
     raw_str = str(raw_path).strip()
     if not raw_str or "\x00" in raw_str:
         raise ValueError("Artifact path must be a non-empty string without NUL bytes.")
-    cand = Path(raw_str).expanduser()
-    if ".." in cand.parts:
-        raise ValueError(f"Path traversal segment '..' is forbidden in '{raw_str}'.")
-    if cand.is_symlink():
-        raise ValueError(f"Refusing symlinked artifact path '{raw_str}'.")
+    try:
+        cand = Path(raw_str).expanduser()
+        if ".." in cand.parts:
+            raise ValueError(f"Path traversal segment '..' is forbidden in '{raw_str}'.")
+        if cand.is_symlink():
+            raise ValueError(f"Refusing symlinked artifact path '{raw_str}'.")
 
-    real_root: Path | None = None
-    if repo_root is not None:
-        root_cand = Path(repo_root).expanduser()
-        if root_cand.is_symlink():
-            raise ValueError(f"Refusing symlinked repository root '{repo_root}'.")
-        if root_cand.is_absolute():
-            _check_abs_parts_no_symlinks(root_cand.parts, str(repo_root))
-        real_root = root_cand.resolve()
+        real_root: Path | None = None
+        if repo_root is not None:
+            root_cand = Path(repo_root).expanduser()
+            if root_cand.is_symlink():
+                raise ValueError(f"Refusing symlinked repository root '{repo_root}'.")
+            if root_cand.is_absolute():
+                _check_abs_parts_no_symlinks(root_cand.parts, str(repo_root))
+            real_root = root_cand.resolve()
 
-    if not cand.is_absolute():
-        base_dir = real_root if real_root is not None else Path.cwd().resolve()
-        walk = base_dir
-        for part in cand.parts:
-            if part in ("", "."):
-                continue
-            walk = walk / part
-            if walk.is_symlink():
-                raise ValueError(f"Refusing symlinked path component in '{raw_str}'.")
-        target = walk
-        if real_root is not None and not allow_external and not target.resolve().is_relative_to(real_root):
-            raise ValueError(f"Artifact path '{raw_str}' escapes repository root '{real_root}'.")
-    else:
-        _check_abs_parts_no_symlinks(cand.parts, raw_str)
-        if real_root is not None:
-            matched_k: int | None = None
-            for k in range(1, len(cand.parts) + 1):
-                pref = Path(*cand.parts[:k])
-                if pref.exists() and pref.resolve() == real_root:
-                    matched_k = k
-                    break
-            if matched_k is not None:
-                walk = real_root
-                for part in cand.parts[matched_k:]:
-                    if part in ("", "."):
-                        continue
-                    walk = walk / part
-                    if walk.is_symlink():
-                        raise ValueError(f"Refusing symlinked path component in '{raw_str}'.")
-                target = walk
-            elif not allow_external:
+        if not cand.is_absolute():
+            base_dir = real_root if real_root is not None else Path.cwd().resolve()
+            walk = base_dir
+            for part in cand.parts:
+                if part in ("", "."):
+                    continue
+                walk = walk / part
+                if walk.is_symlink():
+                    raise ValueError(f"Refusing symlinked path component in '{raw_str}'.")
+            target = walk
+            if real_root is not None and not allow_external and not target.resolve().is_relative_to(real_root):
                 raise ValueError(f"Artifact path '{raw_str}' escapes repository root '{real_root}'.")
+        else:
+            _check_abs_parts_no_symlinks(cand.parts, raw_str)
+            if real_root is not None:
+                matched_k: int | None = None
+                for k in range(1, len(cand.parts) + 1):
+                    pref = Path(*cand.parts[:k])
+                    if pref.exists() and pref.resolve() == real_root:
+                        matched_k = k
+                        break
+                if matched_k is not None:
+                    walk = real_root
+                    for part in cand.parts[matched_k:]:
+                        if part in ("", "."):
+                            continue
+                        walk = walk / part
+                        if walk.is_symlink():
+                            raise ValueError(f"Refusing symlinked path component in '{raw_str}'.")
+                    target = walk
+                elif not allow_external:
+                    raise ValueError(f"Artifact path '{raw_str}' escapes repository root '{real_root}'.")
+                else:
+                    target = cand
             else:
                 target = cand
-        else:
-            target = cand
 
-    try:
         st = target.lstat()
     except OSError as exc:
         raise ValueError(f"Artifact path '{raw_str}' is not accessible: {exc}") from exc
@@ -239,7 +241,7 @@ def read_safe_bytes(
     raw_path: str | Path,
     *,
     repo_root: Path | None = None,
-    allow_external: bool = True,
+    allow_external: bool = False,
     max_bytes: int = MAX_ARTIFACT_BYTES,
 ) -> tuple[Path, bytes]:
     """Read up to `max_bytes` from a verified non-symlink regular file using `O_NOFOLLOW`."""
@@ -249,7 +251,7 @@ def read_safe_bytes(
         allow_external=allow_external,
         allow_dir=False,
     )
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(target, flags)
     except OSError as exc:
@@ -282,7 +284,7 @@ def read_safe_text(
     raw_path: str | Path,
     *,
     repo_root: Path | None = None,
-    allow_external: bool = True,
+    allow_external: bool = False,
     max_bytes: int = MAX_ARTIFACT_BYTES,
 ) -> tuple[Path, str]:
     """Read UTF-8 text from a verified non-symlink regular file within `max_bytes`."""
@@ -309,20 +311,32 @@ def iter_safe_repo_files(
     skip_dirs = _IGNORED_WALK_DIRS | frozenset(exclude_dirs)
     found: list[tuple[Path, str]] = []
 
-    for dirpath, dirnames, filenames in os.walk(validated_root, topdown=True, followlinks=False):
+    for dirpath, dirnames, filenames in os.walk(
+        validated_root,
+        topdown=True,
+        followlinks=False,
+        onerror=lambda _exc: None,
+    ):
         cur_dir = Path(dirpath)
-        dirnames[:] = sorted(
-            d
-            for d in dirnames
-            if d not in skip_dirs and not (cur_dir / d).is_symlink()
-        )
+        kept_dirs: list[str] = []
+        for d in sorted(dirnames):
+            if d in skip_dirs:
+                continue
+            dpath = cur_dir / d
+            try:
+                if dpath.is_symlink():
+                    continue
+            except OSError:
+                continue
+            kept_dirs.append(d)
+        dirnames[:] = kept_dirs
         for fname in sorted(filenames):
             fpath = cur_dir / fname
-            if fpath.is_symlink():
-                continue
             if fpath.suffix.lower() not in wanted:
                 continue
             try:
+                if fpath.is_symlink():
+                    continue
                 resolved_f = fpath.resolve()
                 if not resolved_f.is_relative_to(real_root):
                     continue
@@ -379,6 +393,7 @@ def check_nesting_depth_text(raw_text: str, *, max_depth: int = MAX_NESTING_DEPT
 
 def check_object_depth(root: Any, *, max_depth: int = MAX_NESTING_DEPTH) -> None:
     """Iteratively verify parsed JSON/YAML container depth <= `max_depth`."""
+    visited: set[int] = set()
     stack: list[tuple[Any, int]] = [(root, 0)]
     while stack:
         cur, depth = stack.pop()
@@ -386,14 +401,82 @@ def check_object_depth(root: Any, *, max_depth: int = MAX_NESTING_DEPTH) -> None
             raise ValueError(
                 f"Parsed artifact exceeds maximum nesting depth of {max_depth} levels."
             )
+        oid = id(cur)
+        if oid in visited:
+            continue
+        visited.add(oid)
+        if len(visited) > 65536:
+            raise ValueError("Parsed artifact exceeds unique container budget.")
         if isinstance(cur, dict):
             for val in cur.values():
-                if isinstance(val, (dict, list)):
+                if isinstance(val, (dict, list)) and id(val) not in visited:
                     stack.append((val, depth + 1))
         elif isinstance(cur, list):
             for val in cur:
-                if isinstance(val, (dict, list)):
+                if isinstance(val, (dict, list)) and id(val) not in visited:
                     stack.append((val, depth + 1))
+
+
+def _load_bounded_yaml(yaml_mod: Any, raw_text: str, *, max_depth: int = MAX_NESTING_DEPTH) -> Any:
+    """Parse YAML using a SafeLoader with node, alias, merge, and depth budgets."""
+    max_nodes = 4096
+
+    class _BoundedSafeLoader(yaml_mod.SafeLoader):  # type: ignore[misc, name-defined]
+        def __init__(self, stream: Any) -> None:
+            super().__init__(stream)
+            self._node_count = 0
+            self._alias_count = 0
+            self._merge_steps = 0
+            self._cur_depth = 0
+
+        def compose_node(self, parent: Any, index: Any) -> Any:
+            if self.check_event(yaml_mod.AliasEvent):
+                self._alias_count += 1
+                if self._alias_count > max_nodes or (
+                    self._node_count + self._alias_count
+                ) > max_nodes:
+                    raise yaml_mod.YAMLError(
+                        f"YAML alias expansion exceeds budget ({max_nodes})."
+                    )
+                return super().compose_node(parent, index)
+            self._node_count += 1
+            if (self._node_count + self._alias_count) > max_nodes:
+                raise yaml_mod.YAMLError(f"YAML node count exceeds budget ({max_nodes}).")
+            self._cur_depth += 1
+            if self._cur_depth > max_depth:
+                raise yaml_mod.YAMLError(
+                    f"YAML structure exceeds maximum nesting depth ({max_depth})."
+                )
+            try:
+                return super().compose_node(parent, index)
+            finally:
+                self._cur_depth -= 1
+
+        def flatten_mapping(self, node: Any) -> None:
+            self._merge_steps += 1
+            if self._merge_steps > max_nodes:
+                raise yaml_mod.YAMLError(
+                    f"YAML mapping merge exceeds budget ({max_nodes})."
+                )
+            super().flatten_mapping(node)
+            if len(node.value) > max_nodes:
+                raise yaml_mod.YAMLError(
+                    f"YAML merged mapping exceeds budget ({max_nodes})."
+                )
+
+        def construct_yaml_int(self, node: Any) -> int:
+            raw_val = getattr(node, "value", None)
+            if isinstance(raw_val, str) and len(raw_val) > 4096:
+                raise yaml_mod.YAMLError("YAML integer exceeds maximum bit length")
+            val = super().construct_yaml_int(node)
+            if isinstance(val, int) and not isinstance(val, bool) and val.bit_length() > 4096:
+                raise yaml_mod.YAMLError("YAML integer exceeds maximum bit length")
+            return val
+
+    _BoundedSafeLoader.add_constructor(
+        "tag:yaml.org,2002:int", _BoundedSafeLoader.construct_yaml_int
+    )
+    return yaml_mod.load(raw_text, Loader=_BoundedSafeLoader)
 
 
 def load_bounded_json_or_yaml(
@@ -417,7 +500,7 @@ def load_bounded_json_or_yaml(
     try:
         import yaml  # type: ignore[import-untyped]
 
-        parsed_yaml = yaml.safe_load(stripped)
+        parsed_yaml = _load_bounded_yaml(yaml, stripped, max_depth=max_depth)
     except ImportError:
         parsed_yaml = _parse_minimal_yaml(stripped, max_depth=max_depth)
     except Exception as exc:
@@ -652,6 +735,15 @@ class UsrIndexBundle:
     notes: list[str] = field(default_factory=list)
     dialect: str = "indexstoredb"
     dialects: tuple[str, ...] = ("indexstoredb",)
+    truncated: bool = False
+    _entry_count: int = field(default=0, repr=False, compare=False)
+    _relation_count: int = field(default=0, repr=False, compare=False)
+    _rel_obj_cache: dict[int, tuple[Any, UsrRelation | None, frozenset[str]]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    _rel_list_cache: dict[
+        int, tuple[list[Any], tuple[UsrRelation, ...], str | None, str | None, str | None]
+    ] = field(default_factory=dict, repr=False, compare=False)
 
     def merge(self, other: UsrIndexBundle) -> None:
         for usr, rec in other.symbols_by_usr.items():
@@ -672,9 +764,24 @@ class UsrIndexBundle:
         self.dialects = merged_dials
         if len(merged_dials) == 1:
             self.dialect = merged_dials[0]
+        if other.truncated:
+            self.truncated = True
+        self._entry_count += other._entry_count
+        self._relation_count += other._relation_count
         for note in other.notes:
             if note not in self.notes:
                 self.notes.append(note)
+
+
+def _mark_usr_truncated(bundle: UsrIndexBundle) -> None:
+    if not bundle.truncated:
+        bundle.truncated = True
+        note = (
+            f"usr_index: truncated artifact after reaching entry/relation budget "
+            f"({MAX_TOTAL_USR_RELATIONS})."
+        )
+        if note not in bundle.notes:
+            bundle.notes.append(note)
 
 
 def _safe_int(val: Any, default: int = 1) -> int:
@@ -687,19 +794,33 @@ def _safe_int(val: Any, default: int = 1) -> int:
         return default
 
 
+def _safe_scalar_str(val: Any) -> str:
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if isinstance(val, int) and val.bit_length() > 128:
+            return ""
+        return str(val)
+    return ""
+
+
 def _extract_loc(entry: dict[str, Any], repo_root: Path | None) -> tuple[str, int, int]:
     loc = entry.get("location")
     if isinstance(loc, dict):
         raw_f = loc.get("path") or loc.get("file") or loc.get("uri") or entry.get("file")
-        ln = _safe_int(loc.get("line") or (loc.get("position") or {}).get("line"), 1)
-        col = _safe_int(loc.get("column") or loc.get("col"), 1)
+        pos = loc.get("position")
+        pos_dict = pos if isinstance(pos, dict) else {}
+        ln = _safe_int(loc.get("line") or pos_dict.get("line"), 1)
+        col = _safe_int(
+            loc.get("column") or loc.get("col") or pos_dict.get("column") or pos_dict.get("col"),
+            1,
+        )
     else:
         raw_f = entry.get("source_file") or entry.get("file") or entry.get("path") or entry.get("uri")
         ln = _safe_int(entry.get("line"), 1)
         col = _safe_int(entry.get("column") or entry.get("col"), 1)
-    if isinstance(raw_f, str) and raw_f.startswith("file://"):
-        raw_f = raw_f[7:]
-    return normalize_repo_relpath(str(raw_f or ""), repo_root), ln, col
+    f_str = _safe_scalar_str(raw_f).removeprefix("file://")
+    return normalize_repo_relpath(f_str, repo_root), ln, col
 
 
 def _ingest_entry_dict(
@@ -709,12 +830,18 @@ def _ingest_entry_dict(
     *,
     dialect: Literal["indexstoredb", "clang"] = "indexstoredb",
 ) -> None:
-    usr = str(entry.get("usr") or entry.get("id") or "").strip()
+    if not isinstance(entry, dict):
+        return
+    if bundle.truncated or bundle._entry_count >= MAX_TOTAL_USR_ENTRIES:
+        _mark_usr_truncated(bundle)
+        return
+    bundle._entry_count += 1
+    usr = _safe_scalar_str(entry.get("usr") or entry.get("id")).strip()
     if not usr:
         return
     sf, ln, col = _extract_loc(entry, repo_root)
     raw_roles = entry.get("roles") if "roles" in entry else entry.get("role")
-    has_name = bool(entry.get("name") or entry.get("symbol"))
+    has_name = bool(_safe_scalar_str(entry.get("name") or entry.get("symbol")).strip())
     norm_entry_roles = (
         _normalize_roles(raw_roles, dialect=dialect) if raw_roles is not None else ()
     )
@@ -725,10 +852,12 @@ def _ingest_entry_dict(
         or "declaration" in norm_entry_roles
         or "kind" in entry
     ):
-        sym_name = str(entry.get("name") or entry.get("symbol") or usr).strip()
-        sym_kind = str(entry.get("kind") or "function").strip()
-        sym_lang = classify_usr_language(usr, str(entry.get("language") or entry.get("lang") or ""))
-        recv = str(entry.get("receiver_usr") or "").strip() or None
+        sym_name = _safe_scalar_str(entry.get("name") or entry.get("symbol")).strip() or usr
+        sym_kind = _safe_scalar_str(entry.get("kind")).strip() or "function"
+        sym_lang = classify_usr_language(
+            usr, _safe_scalar_str(entry.get("language") or entry.get("lang"))
+        )
+        recv = _safe_scalar_str(entry.get("receiver_usr")).strip() or None
         prev = bundle.symbols_by_usr.get(usr)
         if prev is None or (not prev.source_file and sf):
             bundle.symbols_by_usr[usr] = UsrSymbolRecord(
@@ -744,9 +873,9 @@ def _ingest_entry_dict(
 
     if raw_roles is not None or entry.get("caller_usr") or entry.get("relations"):
         roles = norm_entry_roles or ("reference",)
-        explicit_caller_usr = str(entry.get("caller_usr") or "").strip() or None
+        explicit_caller_usr = _safe_scalar_str(entry.get("caller_usr")).strip() or None
         caller_usr = explicit_caller_usr
-        caller_name = str(entry.get("caller_name") or "").strip() or None
+        caller_name = _safe_scalar_str(entry.get("caller_name")).strip() or None
         caller_prov: Literal[
             "compiler_called_by",
             "contained_by_callable",
@@ -754,33 +883,89 @@ def _ingest_entry_dict(
             "file_fallback",
             "none",
         ] = "compiler_called_by" if explicit_caller_usr else "none"
-        container_usr = str(entry.get("container_usr") or "").strip() or None
+        container_usr = _safe_scalar_str(entry.get("container_usr")).strip() or None
 
-        parsed_rels: list[UsrRelation] = []
+        parsed_rels_tuple: tuple[UsrRelation, ...] = ()
         relations = entry.get("relations")
         if isinstance(relations, list):
-            for rel in relations:
-                if not isinstance(rel, dict):
-                    continue
-                rel_usr = str(rel.get("usr") or (rel.get("symbol") or {}).get("usr") or "").strip()
-                if not rel_usr:
-                    continue
-                rel_name = (
-                    str(rel.get("name") or (rel.get("symbol") or {}).get("name") or "").strip()
-                    or None
-                )
-                rel_raw_roles = rel.get("roles") if "roles" in rel else rel.get("role")
-                rel_roles = _normalize_roles(
-                    rel_raw_roles, dialect=dialect, default_roles=()
-                )
-                parsed_rels.append(UsrRelation(usr=rel_usr, roles=rel_roles, name=rel_name))
-                rel_low = {r.lower() for r in rel_roles}
-                if "calledby" in rel_low and caller_usr is None:
-                    caller_usr = rel_usr
-                    caller_name = caller_name or rel_name
-                    caller_prov = "compiler_called_by"
-                elif ("containedby" in rel_low or "childof" in rel_low) and container_usr is None:
-                    container_usr = rel_usr
+            rem = MAX_TOTAL_USR_RELATIONS - bundle._relation_count
+            if rem <= 0:
+                _mark_usr_truncated(bundle)
+            else:
+                cached_list = bundle._rel_list_cache.get(id(relations))
+                if cached_list is not None and cached_list[0] is relations and len(relations) <= rem:
+                    bundle._relation_count += len(relations)
+                    parsed_rels_tuple = cached_list[1]
+                    if caller_usr is None and cached_list[2] is not None:
+                        caller_usr = cached_list[2]
+                        caller_name = caller_name or cached_list[3]
+                        caller_prov = "compiler_called_by"
+                    if container_usr is None and cached_list[4] is not None:
+                        container_usr = cached_list[4]
+                else:
+                    parsed_rels: list[UsrRelation] = []
+                    first_cb_usr: str | None = None
+                    first_cb_name: str | None = None
+                    first_cont_usr: str | None = None
+                    complete_list = True
+                    for rel in relations:
+                        if bundle._relation_count >= MAX_TOTAL_USR_RELATIONS:
+                            _mark_usr_truncated(bundle)
+                            complete_list = False
+                            break
+                        bundle._relation_count += 1
+                        if not isinstance(rel, dict):
+                            continue
+                        rid = id(rel)
+                        cached_rel = bundle._rel_obj_cache.get(rid)
+                        if cached_rel is not None and cached_rel[0] is rel:
+                            u_rel, rel_low = cached_rel[1], cached_rel[2]
+                        else:
+                            rel_sym = rel.get("symbol")
+                            rel_sym_dict = rel_sym if isinstance(rel_sym, dict) else {}
+                            rel_usr = _safe_scalar_str(
+                                rel.get("usr") or rel_sym_dict.get("usr")
+                            ).strip()
+                            if not rel_usr:
+                                u_rel, rel_low = None, frozenset()
+                            else:
+                                rel_name = (
+                                    _safe_scalar_str(
+                                        rel.get("name") or rel_sym_dict.get("name")
+                                    ).strip()
+                                    or None
+                                )
+                                rel_raw_roles = rel.get("roles") if "roles" in rel else rel.get("role")
+                                rel_roles = _normalize_roles(
+                                    rel_raw_roles, dialect=dialect, default_roles=()
+                                )
+                                u_rel = UsrRelation(usr=rel_usr, roles=rel_roles, name=rel_name)
+                                rel_low = frozenset(r.lower() for r in rel_roles)
+                            if len(bundle._rel_obj_cache) < 4096:
+                                bundle._rel_obj_cache[rid] = (rel, u_rel, rel_low)
+                        if u_rel is None:
+                            continue
+                        parsed_rels.append(u_rel)
+                        if "calledby" in rel_low and first_cb_usr is None:
+                            first_cb_usr = u_rel.usr
+                            first_cb_name = u_rel.name
+                        elif ("containedby" in rel_low or "childof" in rel_low) and first_cont_usr is None:
+                            first_cont_usr = u_rel.usr
+                    parsed_rels_tuple = tuple(parsed_rels)
+                    if caller_usr is None and first_cb_usr is not None:
+                        caller_usr = first_cb_usr
+                        caller_name = caller_name or first_cb_name
+                        caller_prov = "compiler_called_by"
+                    if container_usr is None and first_cont_usr is not None:
+                        container_usr = first_cont_usr
+                    if complete_list and len(bundle._rel_list_cache) < 1024:
+                        bundle._rel_list_cache[id(relations)] = (
+                            relations,
+                            parsed_rels_tuple,
+                            first_cb_usr,
+                            first_cb_name,
+                            first_cont_usr,
+                        )
 
         bundle.occurrences.append(
             UsrOccurrence(
@@ -793,7 +978,7 @@ def _ingest_entry_dict(
                 caller_name=caller_name,
                 caller_provenance=caller_prov,
                 container_usr=container_usr,
-                relations=tuple(parsed_rels),
+                relations=parsed_rels_tuple,
             )
         )
 
@@ -807,6 +992,8 @@ def _parse_tsv_usr_lines(
 ) -> None:
     header_map: dict[str, int] | None = None
     for idx, raw_line in enumerate(lines):
+        if bundle.truncated:
+            break
         line = raw_line[:MAX_LINE_CHARS].strip()
         if not line or line.startswith("#"):
             continue
@@ -1100,6 +1287,8 @@ def parse_usr_index_text(
         len(lines) > 1 and lines[0].lstrip().startswith("{") and lines[1].lstrip().startswith("{")
     ):
         for raw_ln in lines:
+            if bundle.truncated:
+                break
             ln_clean = raw_ln.strip()
             if not ln_clean:
                 continue
@@ -1133,30 +1322,42 @@ def parse_usr_index_text(
 
     if isinstance(data, list):
         for item in data:
+            if bundle.truncated:
+                break
             if isinstance(item, dict):
                 _ingest_entry_dict(item, bundle, repo_root, dialect=active_dialect)
     elif isinstance(data, dict):
         for key in ("symbols", "occurrences", "records", "refs", "entries"):
+            if bundle.truncated:
+                break
             seq = data.get(key)
             if isinstance(seq, list):
                 for item in seq:
+                    if bundle.truncated:
+                        break
                     if isinstance(item, dict):
                         if key == "occurrences" and "roles" not in item and "role" not in item:
                             item = {**item, "roles": ["reference", "call"]}
                         _ingest_entry_dict(item, bundle, repo_root, dialect=active_dialect)
         units = data.get("units")
-        if isinstance(units, list):
+        if isinstance(units, list) and not bundle.truncated:
             for unit in units:
+                if bundle.truncated:
+                    break
                 if isinstance(unit, dict):
                     for key in ("symbols", "occurrences", "records"):
+                        if bundle.truncated:
+                            break
                         sub = unit.get(key)
                         if isinstance(sub, list):
                             for item in sub:
+                                if bundle.truncated:
+                                    break
                                 if isinstance(item, dict):
                                     _ingest_entry_dict(
                                         item, bundle, repo_root, dialect=active_dialect
                                     )
-        if "usr" in data:
+        if "usr" in data and not bundle.truncated:
             _ingest_entry_dict(data, bundle, repo_root, dialect=active_dialect)
 
     _synthesize_usr_cross_refs(bundle)
@@ -1167,7 +1368,7 @@ def parse_usr_index(
     path: str | Path,
     *,
     repo_root: Path | None = None,
-    allow_external: bool = True,
+    allow_external: bool = False,
     dialect: str | None = None,
 ) -> UsrIndexBundle:
     """Load a read-only `IndexStoreDB` / `clangd` file or directory of index dumps."""
@@ -1196,7 +1397,11 @@ def parse_usr_index(
         )
         return combined
     for fpath, _ in dump_files:
-        _, text = read_safe_text(fpath, repo_root=None, allow_external=True)
+        _, text = read_safe_text(
+            fpath,
+            repo_root=repo_root if not allow_external else None,
+            allow_external=allow_external,
+        )
         combined.merge(
             parse_usr_index_text(
                 text, repo_root=repo_root, format_hint=fpath.name, dialect=dialect

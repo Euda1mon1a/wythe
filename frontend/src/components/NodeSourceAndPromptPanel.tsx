@@ -18,6 +18,16 @@ import {
   type BriefTaskIntent,
 } from '@/lib/wytheBriefBuilder';
 
+function encodeEditorFilePath(absPath: string): string {
+  const normalized = absPath.replace(/\\/g, '/');
+  return normalized
+    .split('/')
+    .map((segment, idx) =>
+      idx === 0 && /^[A-Za-z]:$/.test(segment) ? segment : encodeURIComponent(segment),
+    )
+    .join('/');
+}
+
 interface NodeSourceAndPromptPanelProps {
   activeSlug: string;
   node: AtlasNode;
@@ -109,14 +119,14 @@ export function NodeSourceAndPromptPanel({
           {snippet?.abs_path && (
             <>
               <a
-                href={`vscode://file/${encodeURI(snippet.abs_path)}:${snippet.focus_line}`}
+                href={`vscode://file/${encodeEditorFilePath(snippet.abs_path)}:${snippet.focus_line}`}
                 title={`Open ${absLineRef} in VS Code`}
                 className="flex items-center gap-0.5 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-sky-300 hover:border-sky-400"
               >
                 VS Code <ExternalLink className="h-2.5 w-2.5" />
               </a>
               <a
-                href={`cursor://file/${encodeURI(snippet.abs_path)}:${snippet.focus_line}`}
+                href={`cursor://file/${encodeEditorFilePath(snippet.abs_path)}:${snippet.focus_line}`}
                 title={`Open ${absLineRef} in Cursor`}
                 className="flex items-center gap-0.5 border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-teal-300 hover:border-teal-400"
               >

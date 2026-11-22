@@ -272,16 +272,27 @@ def test_adapters_plugins_endpoint_and_broken_entry_point_isolation(
         assert "tach-boundaries" in by_name
         assert "container-sources" in by_name
         assert by_name["tach-boundaries"].origin == "builtin"
-        assert by_name["tach-boundaries"].version == __version__ == "0.2.7"
+        assert by_name["tach-boundaries"].version == __version__ == "0.2.9"
         assert by_name["tach-boundaries"].trusted is True
         assert by_name["tach-boundaries"].tier == "manipulate"
-        assert by_name["container-sources"].version == __version__ == "0.2.7"
+        assert by_name["container-sources"].version == __version__ == "0.2.9"
         assert "Kubernetes" in by_name["container-sources"].description
+
+        import sysconfig
+
+        _purelib = Path(sysconfig.get_path("purelib"))
 
         class _GoodEP:
             name = "third-party-audit"
             value = "acme_wythe:plugin"
-            dist = type("_Dist", (), {"version": "1.4.2"})()
+
+            class dist:
+                version = "1.4.2"
+                _path = _purelib / "acme_wythe-1.4.2.dist-info"
+
+                @classmethod
+                def locate_file(cls, path: str) -> Path:
+                    return cls._path.parent / path
 
             def load(self) -> WythePluginSpec:
                 return WythePluginSpec(
@@ -374,7 +385,7 @@ def test_openlineage_http_endpoint_and_mcp_tools(
         plug_body = rpc_plugins.json()["result"]
         assert plug_body["isError"] is False
         assert "tach-boundaries" in plug_body["content"][0]["text"]
-        assert "v0.2.7" in plug_body["content"][0]["text"]
+        assert "v0.2.9" in plug_body["content"][0]["text"]
         assert "Kubernetes" in plug_body["content"][0]["text"]
         assert "local_plugins_allowed=false" in plug_body["content"][0]["text"]
 

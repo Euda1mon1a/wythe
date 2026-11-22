@@ -65,9 +65,11 @@ def sync_governance_bundle(
     target = get_target_by_slug(db, target_slug)
     if target is None:
         raise HTTPException(status_code=404, detail=f"Target '{target_slug}' not found")
-    if direction == "export":
-        return export_portable_bundle_to_disk(db, target)
     try:
+        if direction == "export":
+            return export_portable_bundle_to_disk(db, target)
         return sync_portable_bundle_from_disk(db, target)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

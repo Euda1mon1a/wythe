@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import difflib
+import hashlib
 import json
 import re
 import sys
@@ -760,9 +761,20 @@ def _resolve_readonly_target(session: Session, target_or_path: str, profile: str
     candidate = Path(target_or_path).expanduser().resolve()
     if not (looks_like_path or candidate.is_dir()) or not candidate.is_dir():
         raise ValueError(_format_unknown_target_error(session, target_or_path))
+    for reg in list_targets(session):
+        try:
+            if Path(reg.repo_path).expanduser().resolve() == candidate:
+                return reg
+        except OSError:
+            continue
     det = detect_repository_stack(session, str(candidate))
     chosen = det.recommended_profile_slug if profile == "auto" else profile
-    clean_slug = re.sub(r"[^a-z0-9-_]", "-", candidate.name.lower()).strip("-") or "mcp-target"
+    base_slug = re.sub(r"[^a-z0-9-_]", "-", candidate.name.lower()).strip("-") or "mcp-target"
+    path_digest = hashlib.sha256(str(candidate).encode("utf-8")).hexdigest()[:8]
+    clean_slug = f"unregistered-{base_slug[:36].strip('-') or 'target'}-{path_digest}"
+    if get_target_by_slug(session, clean_slug) is not None:
+        suffix = hashlib.sha256(clean_slug.encode("utf-8")).hexdigest()[:6]
+        clean_slug = f"unregistered-{path_digest}-{suffix}"
     return TargetProject(
         id=0,
         slug=clean_slug,
@@ -1042,6 +1054,24 @@ def _execute_camera_choreography_tool(
     eff_only_flagged = (
         args.get("only_flagged") if args.get("only_flagged") is not None else args.get("flagged_only")
     )
+    opt_bool_fields: dict[str, bool | None] = {}
+    for b_key, raw_b in (
+        ("only_flagged", eff_only_flagged),
+        ("isolate_cone", args.get("isolate_cone")),
+        ("connected_only", args.get("connected_only")),
+        ("working_set_only", args.get("working_set_only")),
+        ("compact_visible", args.get("compact_visible")),
+        ("flatten_2d", args.get("flatten_2d")),
+        ("open_drawer", args.get("open_drawer")),
+    ):
+        opt_bool_fields[b_key] = (
+            None
+            if raw_b is None
+            else _parse_strict_bool(raw_b, default=False, field_name=b_key)
+        )
+    reset_filters_val = _parse_strict_bool(
+        args.get("reset_filters"), default=False, field_name="reset_filters"
+    )
     prelim_cmd = ViewportCommand(
         target_slug=prelim_slug_safe[:64],
         session_id=args.get("session_id"),
@@ -1058,20 +1088,20 @@ def _execute_camera_choreography_tool(
         tier_filter=args.get("tier_filter"),
         subkind_filter=args.get("subkind_filter"),
         edge_filter=args.get("edge_filter"),
-        only_flagged=eff_only_flagged,
-        isolate_cone=args.get("isolate_cone"),
-        connected_only=args.get("connected_only"),
+        only_flagged=opt_bool_fields["only_flagged"],
+        isolate_cone=opt_bool_fields["isolate_cone"],
+        connected_only=opt_bool_fields["connected_only"],
         neighborhood_hops=args.get("neighborhood_hops"),
         search_query=args.get("search_query"),
         blast_mode=args.get("blast_mode"),
         diff_base_ref=args.get("diff_base_ref"),
-        working_set_only=args.get("working_set_only"),
-        compact_visible=args.get("compact_visible"),
-        flatten_2d=args.get("flatten_2d"),
+        working_set_only=opt_bool_fields["working_set_only"],
+        compact_visible=opt_bool_fields["compact_visible"],
+        flatten_2d=opt_bool_fields["flatten_2d"],
         group_by=args.get("group_by"),
         active_tab=args.get("active_tab"),
-        open_drawer=args.get("open_drawer"),
-        reset_filters=bool(args.get("reset_filters", False)),
+        open_drawer=opt_bool_fields["open_drawer"],
+        reset_filters=reset_filters_val,
         z_wythe_slice=args.get("z_wythe_slice"),
         zoom_stratum=1 if args.get("zoom_stratum") is None else args.get("zoom_stratum"),
         framing_preset=(
@@ -1085,6 +1115,15 @@ def _execute_camera_choreography_tool(
 
     profile = str(args.get("profile") or "auto")
     target = _resolve_target_for_mcp(session, args.get("target"), profile=profile)
+    for check_sid in dict.fromkeys(
+        sid for sid in (prelim_cmd.session_id, prelim_cmd.refresh_session_id) if sid
+    ):
+        existing_inv = get_investigation_session(check_sid)
+        if existing_inv is not None and existing_inv.target_slug != target.slug:
+            raise ValueError(
+                f"Cross-target mismatch: session `{check_sid}` belongs to "
+                f"`{existing_inv.target_slug}`, not `{target.slug}`."
+            )
     report = get_or_run_cached_scan(session, target, strict_gate=True)
     ev_identity = build_evidence_identity(report)
 
@@ -1527,6 +1566,26 @@ def list_mcp_resources(session: Session) -> list[dict[str, Any]]:
     return resources
 
 
+def _parse_strict_bool(
+    raw_val: object,
+    *,
+    default: bool = False,
+    field_name: str = "flag",
+) -> bool:
+    """Parse boolean arguments strictly without Python `bool('false') == True` coercion."""
+    if raw_val is None:
+        return default
+    if isinstance(raw_val, bool):
+        return raw_val
+    if isinstance(raw_val, str):
+        cleaned = raw_val.strip().lower()
+        if cleaned in ("true", "1", "yes"):
+            return True
+        if cleaned in ("false", "0", "no"):
+            return False
+    raise ValueError(f"Invalid boolean value for `{field_name}`: {raw_val!r}.")
+
+
 def _parse_cone_zoom(raw_zoom: object) -> Literal[1, 2, 3]:
     if raw_zoom is None:
         return 1
@@ -1615,10 +1674,18 @@ def read_mcp_resource(session: Session, uri: str) -> list[dict[str, Any]]:
         )
 
         qs = urllib.parse.parse_qs(query_str, keep_blank_values=False) if query_str else {}
+        und_sid = str((qs.get("session_id") or [""])[-1] or "").strip() or None
+        if und_sid:
+            inv_check = get_investigation_session(und_sid)
+            if inv_check is not None and inv_check.target_slug != target.slug:
+                raise ValueError(
+                    f"Cross-target mismatch: session `{inv_check.session_id}` belongs to "
+                    f"`{inv_check.target_slug}`, not `{target.slug}`."
+                )
         chain = analyze_understanding_bundle(
             UnderstandingAnalyzeRequest(
                 target_slug=target.slug,
-                session_id=(qs.get("session_id") or [None])[-1],
+                session_id=und_sid,
                 subject_id=(qs.get("subject_id") or [None])[-1],
                 question=(qs.get("question") or [None])[-1],
             ),
@@ -1818,6 +1885,26 @@ def dispatch_mcp_request(
     canonical_name = (
         tool_name.replace("atlas_", "wythe_", 1) if tool_name.startswith("atlas_") else tool_name
     )
+    if active_slice == "slm":
+        slm_allowed = {str(t["name"]) for t in MCP_SLM_TOOLS}
+        if canonical_name not in slm_allowed:
+            allowed_str = ", ".join(sorted(slm_allowed))
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Wythe MCP error: Tool `{tool_name}` is not permitted under "
+                                f"`slice=slm`; allowed tools: {allowed_str}."
+                            ),
+                        }
+                    ],
+                    "isError": True,
+                },
+            }
     core_names = {t["name"] for t in [*MCP_TOOLS, *MCP_SLM_TOOLS]} | {
         "wythe_active_view",
         "wythe_understanding",
@@ -1914,11 +2001,25 @@ def _execute_tool_blocks(
         raw_since = args.get("since_revision")
         if raw_since is not None and (isinstance(raw_since, bool) or not isinstance(raw_since, int) or raw_since < 0):
             raise ValueError("`since_revision` must be a non-negative integer.")
-        if target_ovr and get_target_by_slug(session, target_ovr) is None:
-            resolved_proj = _resolve_readonly_target(session, target_ovr)
+        resolved_proj = _resolve_readonly_target(session, target_ovr) if target_ovr else None
+        if req_sid is not None and resolved_proj is not None:
+            existing_inv = get_investigation_session(req_sid)
+            if existing_inv is not None and existing_inv.target_slug != resolved_proj.slug:
+                raise ValueError(
+                    f"Cross-target mismatch: session `{req_sid}` belongs to "
+                    f"`{existing_inv.target_slug}`, not `{resolved_proj.slug}`."
+                )
+        if resolved_proj is not None and (resolved_proj.id is None or resolved_proj.id <= 0):
             explain = explain_ui_focus(session, target_project=resolved_proj, session_id=req_sid)
         else:
             explain = explain_ui_focus(session, target_override=target_ovr, session_id=req_sid)
+        if req_sid is not None:
+            existing_after = get_investigation_session(req_sid)
+            if existing_after is not None and existing_after.target_slug != explain.active_slug:
+                raise ValueError(
+                    f"Cross-target mismatch: session `{req_sid}` belongs to "
+                    f"`{existing_after.target_slug}`, not `{explain.active_slug}`."
+                )
 
         eff_sid = explain.session_id
         delta_items: list[dict[str, Any]] = []
@@ -1995,7 +2096,9 @@ def _execute_tool_blocks(
         )
         blocks: list[dict[str, Any]] = [{"type": "text", "text": enriched_md}]
         if (
-            bool(args.get("include_image"))
+            _parse_strict_bool(
+                args.get("include_image"), default=False, field_name="include_image"
+            )
             and explain.has_snapshot
             and explain.snapshot_path
             and not explain.snapshot_stale
@@ -2191,12 +2294,32 @@ def _execute_investigation_tool(session: Session, args: dict[str, Any]) -> str:
             if not ex_slug:
                 raise ValueError("`get_understanding_example` requires `example_slug`.")
             ex_read = get_understanding_example(ex_slug)
-            return _render_understanding_chain_markdown(ex_read.evaluated_chain)
+            parts = [
+                f"# Wythe Understanding Example :: `{ex_read.summary.slug}`",
+                f"> {ex_read.summary.title} — {ex_read.summary.summary}",
+                "",
+                "## Baseline Report",
+                _render_understanding_chain_markdown(ex_read.baseline_report),
+                "",
+                "## Candidate Report",
+                _render_understanding_chain_markdown(ex_read.candidate_report),
+                "",
+                "## Post-Change Revalidation Report",
+                _render_understanding_chain_markdown(ex_read.post_change_revalidation_report),
+            ]
+            return "\n".join(parts)
 
         eff_target_slug: str | None = None
         if target_arg:
             resolved_t = _resolve_readonly_target(session, target_arg)
             eff_target_slug = resolved_t.slug
+        if eff_target_slug and sid:
+            inv_check = get_investigation_session(sid)
+            if inv_check is not None and inv_check.target_slug != eff_target_slug:
+                raise ValueError(
+                    f"Cross-target mismatch: session `{inv_check.session_id}` belongs to "
+                    f"`{inv_check.target_slug}`, not `{eff_target_slug}`."
+                )
         chain = analyze_understanding_bundle(
             UnderstandingAnalyzeRequest(
                 target_slug=eff_target_slug,
@@ -2230,6 +2353,18 @@ def _execute_investigation_tool(session: Session, args: dict[str, Any]) -> str:
         if not target_arg:
             raise ValueError("`create_session` requires `target`.")
         resolved_t = _resolve_readonly_target(session, target_arg)
+        if resolved_t.id is None or resolved_t.id <= 0:
+            raise ValueError(
+                f"Cannot create investigation session for unregistered path `{resolved_t.repo_path}`; "
+                "register the target first."
+            )
+        if sid:
+            existing_inv = get_investigation_session(sid)
+            if existing_inv is not None and existing_inv.target_slug != resolved_t.slug:
+                raise ValueError(
+                    f"Cross-target mismatch: session `{existing_inv.session_id}` belongs to "
+                    f"`{existing_inv.target_slug}`, not `{resolved_t.slug}`."
+                )
         inv = create_or_reopen_investigation(
             session,
             InvestigationCreateRequest(
@@ -2249,9 +2384,24 @@ def _execute_investigation_tool(session: Session, args: dict[str, Any]) -> str:
         existing_inv = get_investigation_session(sid) if sid else None
         if existing_inv is not None:
             resolved_t = _resolve_target_for_mcp(session, target_arg or existing_inv.target_slug)
+            if resolved_t.id is None or resolved_t.id <= 0:
+                raise ValueError(
+                    f"Cannot record investigation turn on unregistered path `{resolved_t.repo_path}`; "
+                    "register the target first."
+                )
+            if target_arg and resolved_t.slug != existing_inv.target_slug:
+                raise ValueError(
+                    f"Cross-target mismatch: session `{existing_inv.session_id}` belongs to "
+                    f"`{existing_inv.target_slug}`, not `{resolved_t.slug}`."
+                )
             eff_sid = existing_inv.session_id
         else:
             resolved_t = _resolve_target_for_mcp(session, target_arg)
+            if resolved_t.id is None or resolved_t.id <= 0:
+                raise ValueError(
+                    f"Cannot attach investigation session to unregistered path `{resolved_t.repo_path}`; "
+                    "register the target first."
+                )
             cand_sid = sid
             if not cand_sid:
                 active_sids = get_active_session_ids_for_target(resolved_t.slug)
@@ -2317,16 +2467,28 @@ def _execute_investigation_tool(session: Session, args: dict[str, Any]) -> str:
             ),
             report=report,
         )
+        raw_only_flagged = args.get("only_flagged")
+        raw_isolate_cone = args.get("isolate_cone")
         wakeup_cmd = ViewportCommand(
             target_slug=resolved_t.slug,
             session_id=eff_sid,
             refresh_session_id=eff_sid,
-            open_drawer=True if args.get("open_drawer") is None else bool(args.get("open_drawer")),
+            open_drawer=_parse_strict_bool(
+                args.get("open_drawer"), default=True, field_name="open_drawer"
+            ),
             focus_node_ids=resolved_focus,
             selected_node_id=args.get("selected_node_id"),
             lens=args.get("lens"),
-            only_flagged=args.get("only_flagged"),
-            isolate_cone=args.get("isolate_cone"),
+            only_flagged=(
+                None
+                if raw_only_flagged is None
+                else _parse_strict_bool(raw_only_flagged, default=False, field_name="only_flagged")
+            ),
+            isolate_cone=(
+                None
+                if raw_isolate_cone is None
+                else _parse_strict_bool(raw_isolate_cone, default=False, field_name="isolate_cone")
+            ),
         )
         vp_ack = publish_viewport_command(
             wakeup_cmd,
@@ -2355,15 +2517,27 @@ def _execute_investigation_tool(session: Session, args: dict[str, Any]) -> str:
 
     if action == "get_receipts":
         cmd_id = str(args.get("command_id") or "").strip() or None
+        eff_receipt_target = (
+            _resolve_target_for_mcp(session, target_arg).slug if target_arg else None
+        )
+        if sid:
+            inv_check = get_investigation_session(sid)
+            if inv_check is not None:
+                if eff_receipt_target and inv_check.target_slug != eff_receipt_target:
+                    raise ValueError(
+                        f"Cross-target mismatch: session `{inv_check.session_id}` belongs to "
+                        f"`{inv_check.target_slug}`, not `{eff_receipt_target}`."
+                    )
+                eff_receipt_target = eff_receipt_target or inv_check.target_slug
         receipts = list_viewport_receipts(
-            target_slug=target_arg,
+            target_slug=eff_receipt_target,
             session_id=sid,
             command_id=cmd_id,
             limit=40,
         )
         vp_state = (
-            get_viewport_state(target_arg, session_id=sid)
-            if target_arg
+            get_viewport_state(eff_receipt_target, session_id=sid)
+            if eff_receipt_target
             else None
         )
         payload = {
@@ -2377,6 +2551,17 @@ def _execute_investigation_tool(session: Session, args: dict[str, Any]) -> str:
 
     if not sid:
         raise ValueError(f"`{action}` requires `session_id`.")
+
+    if target_arg:
+        inv_check = get_investigation_session(sid)
+        if inv_check is None:
+            raise ValueError(f"Investigation session `{sid}` not found.")
+        resolved_t = _resolve_target_for_mcp(session, target_arg)
+        if inv_check.target_slug != resolved_t.slug:
+            raise ValueError(
+                f"Cross-target mismatch: session `{inv_check.session_id}` belongs to "
+                f"`{inv_check.target_slug}`, not `{resolved_t.slug}`."
+            )
 
     if action == "get_session":
         inv_obj = get_investigation_session(sid)
@@ -2491,8 +2676,27 @@ def _execute_tool(
         return _execute_investigation_tool(session, args)
 
     if canonical == "wythe_understanding":
-        und_action = str(args.get("action") or "explain_understanding")
-        return _execute_investigation_tool(session, {**args, "action": und_action})
+        raw_und_action = args.get("action")
+        if raw_und_action is not None and not isinstance(raw_und_action, str):
+            raise ValueError("Invalid `action` for `wythe_understanding`; expected a string.")
+        und_action = (
+            raw_und_action.strip() if isinstance(raw_und_action, str) else ""
+        ) or "explain_understanding"
+        allowed_und_actions = (
+            "explain_understanding",
+            "analyze_understanding",
+            "list_understanding_examples",
+            "get_understanding_example",
+        )
+        if und_action not in allowed_und_actions:
+            raise ValueError(
+                f"Action `{und_action}` is forbidden on `wythe_understanding`; "
+                f"allowed read-only actions: {list(allowed_und_actions)}."
+            )
+        mapped_action = (
+            "explain_understanding" if und_action == "analyze_understanding" else und_action
+        )
+        return _execute_investigation_tool(session, {**args, "action": mapped_action})
 
     if canonical in ("wythe_focus_camera", "wythe_camera_tour"):
         return _execute_camera_choreography_tool(
@@ -2562,9 +2766,11 @@ def _execute_tool(
         if not query:
             raise ValueError("Missing required parameter `query`.")
         max_nodes = int(args.get("max_nodes") or DEFAULT_CONE_NODES)
-        full = bool(args.get("full", False))
+        full = _parse_strict_bool(args.get("full"), default=False, field_name="full")
         zoom = _parse_cone_zoom(args.get("zoom", 1))
-        unfiltered_ir = bool(args.get("unfiltered_ir", False))
+        unfiltered_ir = _parse_strict_bool(
+            args.get("unfiltered_ir"), default=False, field_name="unfiltered_ir"
+        )
         cone = build_lineage_cone_slice(
             report,
             query,
@@ -2645,6 +2851,65 @@ def _execute_tool(
     raise ValueError(f"Unknown tool `{tool_name}`. Available Wythe MCP tools: {all_known}.")
 
 
+_MAX_MCP_FRAME_BYTES = 4 * 1024 * 1024
+_MAX_MCP_HEADER_LINE_BYTES = 8192
+_MAX_MCP_HEADERS = 32
+_MAX_MCP_JSON_DEPTH = 128
+_MCP_CONTENT_LENGTH_RE = re.compile(rb"^[+-]?\d{1,16}$")
+
+
+def _check_raw_json_nesting(raw_bytes: bytes, *, max_depth: int = _MAX_MCP_JSON_DEPTH) -> None:
+    """Linear O(N) string-aware bracket-nesting pre-check before `json.loads`."""
+    depth = 0
+    in_str = False
+    esc = False
+    start = 3 if raw_bytes.startswith(b"\xef\xbb\xbf") else 0
+    for idx in range(start, len(raw_bytes)):
+        b = raw_bytes[idx]
+        if in_str:
+            if esc:
+                esc = False
+            elif b == 0x5C:
+                esc = True
+            elif b == 0x22:
+                in_str = False
+            continue
+        if b == 0x22:
+            in_str = True
+        elif b in (0x5B, 0x7B):
+            depth += 1
+            if depth > max_depth:
+                raise ValueError(f"JSON nesting depth exceeds maximum ({max_depth}).")
+        elif b in (0x5D, 0x7D) and depth > 0:
+            depth -= 1
+
+
+def _read_exact_bytes(stream: BinaryIO, length: int) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _write_mcp_frame(
+    out_stream: BinaryIO,
+    payload: dict[str, Any],
+    *,
+    use_headers: bool,
+) -> None:
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if use_headers:
+        out_stream.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii") + encoded)
+    else:
+        out_stream.write(encoded + b"\n")
+    out_stream.flush()
+
+
 def run_mcp_stdio_server(
     stdin: BinaryIO | None = None,
     stdout: BinaryIO | None = None,
@@ -2663,7 +2928,7 @@ def run_mcp_stdio_server(
     out_stream = stdout or sys.stdout.buffer
 
     while True:
-        raw_line = in_stream.readline()
+        raw_line = in_stream.readline(_MAX_MCP_FRAME_BYTES + 1)
         if not raw_line:
             break
         stripped = raw_line.strip()
@@ -2673,18 +2938,147 @@ def run_mcp_stdio_server(
         use_headers = False
         if stripped.lower().startswith(b"content-length:"):
             use_headers = True
-            length = int(stripped.split(b":", 1)[1].strip())
+            if len(raw_line) > _MAX_MCP_HEADER_LINE_BYTES or not raw_line.endswith(b"\n"):
+                _write_mcp_frame(
+                    out_stream,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32600, "message": "MCP header line exceeds maximum size."},
+                    },
+                    use_headers=True,
+                )
+                break
+            raw_len = stripped.split(b":", 1)[1].strip()
+            header_count = 0
+            saw_header_eof = False
+            header_overflow = False
             while True:
-                hdr = in_stream.readline()
-                if not hdr or hdr in (b"\r\n", b"\n"):
+                header_count += 1
+                if header_count > _MAX_MCP_HEADERS:
+                    header_overflow = True
                     break
-            payload_bytes = in_stream.read(length)
+                hdr = in_stream.readline(_MAX_MCP_HEADER_LINE_BYTES + 1)
+                if not hdr:
+                    saw_header_eof = True
+                    break
+                if len(hdr) > _MAX_MCP_HEADER_LINE_BYTES or not hdr.endswith(b"\n"):
+                    header_overflow = True
+                    break
+                if hdr in (b"\r\n", b"\n"):
+                    break
+            if saw_header_eof:
+                break
+            if header_overflow:
+                _write_mcp_frame(
+                    out_stream,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32600, "message": "MCP header limit exceeded."},
+                    },
+                    use_headers=True,
+                )
+                break
+            if not _MCP_CONTENT_LENGTH_RE.fullmatch(raw_len):
+                _write_mcp_frame(
+                    out_stream,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32600, "message": "Invalid Content-Length header."},
+                    },
+                    use_headers=True,
+                )
+                continue
+            length = int(raw_len)
+            if length <= 0:
+                _write_mcp_frame(
+                    out_stream,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": "Invalid Content-Length: must be a positive integer.",
+                        },
+                    },
+                    use_headers=True,
+                )
+                continue
+            if length > _MAX_MCP_FRAME_BYTES:
+                _write_mcp_frame(
+                    out_stream,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": (
+                                f"Content-Length {length} exceeds maximum frame size "
+                                f"({_MAX_MCP_FRAME_BYTES} bytes)."
+                            ),
+                        },
+                    },
+                    use_headers=True,
+                )
+                break
+            payload_bytes = _read_exact_bytes(in_stream, length)
+            if payload_bytes is None:
+                break
         else:
+            if len(raw_line) > _MAX_MCP_FRAME_BYTES and not raw_line.endswith(b"\n"):
+                _write_mcp_frame(
+                    out_stream,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": (
+                                f"JSON-RPC frame exceeds maximum size "
+                                f"({_MAX_MCP_FRAME_BYTES} bytes)."
+                            ),
+                        },
+                    },
+                    use_headers=False,
+                )
+                break
+            if len(stripped) > _MAX_MCP_FRAME_BYTES:
+                _write_mcp_frame(
+                    out_stream,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": (
+                                f"JSON-RPC frame exceeds maximum size "
+                                f"({_MAX_MCP_FRAME_BYTES} bytes)."
+                            ),
+                        },
+                    },
+                    use_headers=False,
+                )
+                continue
             payload_bytes = stripped
 
         try:
+            _check_raw_json_nesting(payload_bytes, max_depth=_MAX_MCP_JSON_DEPTH)
             msg = json.loads(payload_bytes.decode("utf-8"))
-        except ValueError:
+        except (ValueError, UnicodeDecodeError):
+            _write_mcp_frame(
+                out_stream,
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32700,
+                        "message": "Parse error: invalid or overly nested JSON payload.",
+                    },
+                },
+                use_headers=use_headers,
+            )
             continue
 
         try:
@@ -2707,10 +3101,5 @@ def run_mcp_stdio_server(
             }
         if resp is None:
             continue
-        encoded = json.dumps(resp, separators=(",", ":")).encode("utf-8")
-        if use_headers:
-            out_stream.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii") + encoded)
-        else:
-            out_stream.write(encoded + b"\n")
-        out_stream.flush()
+        _write_mcp_frame(out_stream, resp, use_headers=use_headers)
     return 0

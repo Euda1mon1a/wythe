@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app import __version__
 from app.cli import main as cli_main
 from app.main import create_app
 
@@ -17,7 +18,7 @@ def test_http_api_surface_end_to_end(isolated_db_url: str) -> None:
     with TestClient(app) as client:
         health = client.get("/healthz")
         assert health.status_code == 200
-        assert health.json() == {"status": "ok"}
+        assert health.json() == {"status": "ok", "version": __version__}
 
         slots = client.get("/api/v1/adapters/slots")
         assert slots.status_code == 200
@@ -121,7 +122,7 @@ def test_http_api_surface_end_to_end(isolated_db_url: str) -> None:
 
         rules = client.get("/api/v1/rules")
         assert rules.status_code == 200
-        assert len(rules.json()) == 19
+        assert len(rules.json()) == 26
 
         patch_rule = client.patch(
             "/api/v1/rules/TRUTH-001",
