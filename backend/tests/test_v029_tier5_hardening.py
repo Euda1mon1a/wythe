@@ -56,8 +56,13 @@ def _init_git(repo: Path) -> None:
 
 def _mkdir_deep_over_1024(base: Path) -> Path:
     base.mkdir(parents=True, exist_ok=True)
+    try:
+        path_max = max(1024, min(int(os.pathconf(base, "PC_PATH_MAX")), 8192))
+    except (AttributeError, OSError, ValueError):
+        path_max = 4096
+    seg_count = (path_max // 180) + 3
     cur_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
-    segs = ["d" * 180 for _ in range(7)]
+    segs = ["d" * 180 for _ in range(seg_count)]
     try:
         for seg in segs:
             try:
@@ -72,7 +77,7 @@ def _mkdir_deep_over_1024(base: Path) -> Path:
     out = base
     for seg in segs:
         out = out / seg
-    assert len(str(out)) > 1024
+    assert len(str(out)) > path_max
     return out
 
 

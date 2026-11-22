@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -402,13 +401,19 @@ def test_container_and_ci_hygiene_contracts() -> None:
     assert parse_dockerfile(REPO_ROOT / "Containerfile", REPO_ROOT) is not None
 
     ci_yml = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-    assert "uv run ruff check backend/app backend/tests plugins" in ci_yml
-    assert re.search(r"^\s+npm run test:scene\s*$", ci_yml, re.MULTILINE)
+    assert "uv run ruff check backend/app backend/tests" in ci_yml
+    assert "uv run pytest -v" in ci_yml
+    assert "wythe gate --strict wythe" in ci_yml
+    assert "wythe gate --strict ." in ci_yml
 
     pub_yml = (REPO_ROOT / ".github/workflows/publish-pypi.yml").read_text(encoding="utf-8")
-    assert "uv run ruff check backend/app backend/tests plugins" in pub_yml
-    assert "app/ui_dist/index.html" in pub_yml
-    assert "wythe gate --strict ." in pub_yml
+    assert "uv run ruff check backend/app backend/tests" in pub_yml
+    assert "uv run pytest -v" in pub_yml
+    assert "wythe gate --strict wythe" in pub_yml
+
+    pyproject_toml = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"plugins/wythe-plugin-agent-harness/src"' in pyproject_toml
+    assert '"plugins/wythe-plugin-wiretap/src"' in pyproject_toml
 
 
 def test_pure_drawer_refresh_ts_behavior_when_tsc_available(tmp_path: Path) -> None:

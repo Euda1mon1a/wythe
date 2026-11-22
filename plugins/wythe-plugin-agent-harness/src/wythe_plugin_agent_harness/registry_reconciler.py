@@ -85,6 +85,26 @@ def _load_bounded_yaml(raw_text: str, *, max_nodes: int = 4096, max_depth: int =
                 raise yaml.YAMLError(
                     f"YAML mapping merge exceeds budget ({max_nodes})."
                 )
+            raw_pairs = getattr(node, "value", ())
+            projected = len(raw_pairs)
+            if projected > max_nodes:
+                raise yaml.YAMLError(
+                    f"YAML merged mapping exceeds budget ({max_nodes})."
+                )
+            for k_node, v_node in raw_pairs:
+                if getattr(k_node, "tag", "") == "tag:yaml.org,2002:merge":
+                    if isinstance(v_node, yaml.MappingNode):
+                        self.flatten_mapping(v_node)
+                        projected += len(v_node.value)
+                    elif isinstance(v_node, yaml.SequenceNode):
+                        for subnode in v_node.value:
+                            if isinstance(subnode, yaml.MappingNode):
+                                self.flatten_mapping(subnode)
+                                projected += len(subnode.value)
+                    if projected > max_nodes:
+                        raise yaml.YAMLError(
+                            f"YAML merged mapping exceeds budget ({max_nodes})."
+                        )
             super().flatten_mapping(node)
             if len(getattr(node, "value", ())) > max_nodes:
                 raise yaml.YAMLError(

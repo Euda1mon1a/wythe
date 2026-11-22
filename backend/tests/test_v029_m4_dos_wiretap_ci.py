@@ -1436,11 +1436,15 @@ def test_r7_wiretap_mixed_case_kv_depth_and_huge_int_guard() -> None:
 
 
 def test_r7_public_parse_entrypoints_and_deep_enametoolong_trees(tmp_path: Path) -> None:
+    try:
+        path_max = max(1024, min(int(os.pathconf(tmp_path, "PC_PATH_MAX")), 8192))
+    except (AttributeError, OSError, ValueError):
+        path_max = 4096
     long300 = "a" * 300
-    deep_segs = ["d" * 200 for _ in range(6)]
+    deep_segs = ["d" * 200 for _ in range((path_max // 200) + 3)]
     deep_rel = Path(*deep_segs)
 
-    # 1. Direct calls to 4 public parse_* entrypoints (plus parse_dockerfile) with >255B, >1024B, and NUL
+    # 1. Direct calls to 4 public parse_* entrypoints (plus parse_dockerfile) with >255B, >PATH_MAX, and NUL
     for bad_rel in (Path(long300), deep_rel / "item", Path("foo\x00bar")):
         comp_parsed, comp_err = parse_compose_file(tmp_path / bad_rel, tmp_path)
         assert comp_parsed is None and comp_err is not None
@@ -1462,7 +1466,7 @@ def test_r7_public_parse_entrypoints_and_deep_enametoolong_trees(tmp_path: Path)
     with pytest.raises(ValueError, match="NUL"):
         extract_declared_ports(tmp_path / "foo\x00bar")
 
-    # 3. Real >1024-byte nested on-disk directory trees do not crash any M4 adapter or plugin
+    # 3. Real >PATH_MAX nested on-disk directory trees do not crash any M4 adapter or plugin
     df_repo = tmp_path / "deep_df"
     _mkdir_deep_chain(df_repo, deep_segs)
     df_res = ManipulatorExtractionResult(nodes=[], edges=[], findings=[], routes=[])
@@ -1482,9 +1486,18 @@ def test_r7_public_parse_entrypoints_and_deep_enametoolong_trees(tmp_path: Path)
     assert cl_res.coverage_complete is False
 
     comp_base = tmp_path / "deep_comp"
-    comp_deep_root = _mkdir_deep_chain(comp_base, ["c" * 180 for _ in range(4)])
-    comp_sub_len = max(120, 1020 - len(str(comp_deep_root)) - 2)
-    comp_sub_seg = "s" * min(200, comp_sub_len)
+    comp_base.mkdir(parents=True, exist_ok=True)
+    comp_base_real = comp_base.resolve()
+    comp_root_segs: list[str] = []
+    cur_len = len(str(comp_base_real))
+    while cur_len + 181 < path_max - 180:
+        comp_root_segs.append("c" * 180)
+        cur_len += 181
+    pad_len = max(1, min(200, (path_max - 160) - cur_len - 1))
+    comp_root_segs.append("c" * pad_len)
+    comp_deep_root = _mkdir_deep_chain(comp_base_real, comp_root_segs)
+    sub_len = max(1, min(200, (path_max - 6) - len(str(comp_deep_root)) - 1))
+    comp_sub_seg = "s" * sub_len
     comp_sub_dir = _mkdir_deep_chain(comp_deep_root, [comp_sub_seg])
     sub_fd = os.open(comp_deep_root, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -1499,7 +1512,8 @@ def test_r7_public_parse_entrypoints_and_deep_enametoolong_trees(tmp_path: Path)
             os.close(s2_fd)
     finally:
         os.close(sub_fd)
-    assert len(str(comp_sub_dir / "compose.yaml")) > 1024
+    assert len(str(comp_sub_dir)) < path_max
+    assert len(str(comp_sub_dir / "compose.yaml")) > path_max
     comp_res = ManipulatorExtractionResult(nodes=[], edges=[], findings=[], routes=[])
     augment_compose_sources(comp_deep_root, ".", comp_res)
     assert comp_res.coverage_complete is False
@@ -1574,9 +1588,13 @@ def test_r8_extract_repo_cpsat_models_hostile_repo_roots(tmp_path: Path) -> None
     symlink_root = tmp_path / "sym_root"
     symlink_root.symlink_to(real_target)
 
-    deep_segs = ["d" * 200 for _ in range(6)]
+    try:
+        path_max = max(1024, min(int(os.pathconf(tmp_path, "PC_PATH_MAX")), 8192))
+    except (AttributeError, OSError, ValueError):
+        path_max = 4096
+    deep_segs = ["d" * 200 for _ in range((path_max // 200) + 3)]
     deep_root = _mkdir_deep_chain(tmp_path / "deep_root_parent", deep_segs)
-    assert len(str(deep_root)) > 1024
+    assert len(str(deep_root)) > path_max
 
     hostile_roots: list[Path | str] = [
         f"{tmp_path}/bad\x00root",

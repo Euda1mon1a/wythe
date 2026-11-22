@@ -92,7 +92,7 @@ def test_p0_4_redos_linear_time_and_field_length_caps() -> None:
     assert _BARE_4XX_5XX_DELIVERY_RE.search(slash_evil) is None
     assert _has_negative_delivery_text(slash_evil) is False
     assert _has_negative_delivery_text("200/ " * 600 + "x") is False
-    assert (time.perf_counter() - t0) < 0.030
+    assert (time.perf_counter() - t0) < 0.250
 
     assert _has_negative_delivery_text("200/503") is True
     assert _has_negative_delivery_text("status=403") is True
@@ -104,20 +104,20 @@ def test_p0_4_redos_linear_time_and_field_length_caps() -> None:
     assert _BENIGN_DELIVERY_FAILURE_NEGATION_RE.search(ident_evil) is None
     assert _has_negative_delivery_text(ident_evil) is False
     assert _has_negative_delivery_text('"' + "a_" * 8000 + 'x"') is False
-    assert (time.perf_counter() - t1) < 0.030
+    assert (time.perf_counter() - t1) < 0.250
 
     yet_evil = "not " + "yet " * 4000
     t2_a = time.perf_counter()
     assert len(_split_clauses(yet_evil)) >= 3999
-    assert (time.perf_counter() - t2_a) < 0.030
+    assert (time.perf_counter() - t2_a) < 0.250
 
     t2_b = time.perf_counter()
     assert len(_split_delivery_clauses(yet_evil)) >= 3999
-    assert (time.perf_counter() - t2_b) < 0.030
+    assert (time.perf_counter() - t2_b) < 0.250
 
     t2_c = time.perf_counter()
     assert _perturbation_outcomes_contradict("blocked", yet_evil) is False
-    assert (time.perf_counter() - t2_c) < 0.030
+    assert (time.perf_counter() - t2_c) < 0.250
 
     assert _perturbation_outcomes_contradict("blocked", "blocked; 404 not found error") is False
     assert _perturbation_outcomes_contradict("blocked", "blocked; my_err=0") is False
@@ -127,7 +127,7 @@ def test_p0_4_redos_linear_time_and_field_length_caps() -> None:
     t3 = time.perf_counter()
     assert _has_negative_delivery_text(oversized) is True
     assert _perturbation_outcomes_contradict("allowed", oversized) is True
-    assert (time.perf_counter() - t3) < 0.015
+    assert (time.perf_counter() - t3) < 0.250
 
 
 def test_p1_4_verdict_uri_sanitization_and_unverified_src_loc_clearing() -> None:

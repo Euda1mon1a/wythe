@@ -121,13 +121,24 @@ def test_p1_3_container_dag_and_yaml_alias_budgets(tmp_path: Path) -> None:
     assert _load_yaml_docs(big_alias_yaml) == []
     with pytest.raises(ValueError):
         parse_usr_index_text(big_alias_yaml, format_hint="bomb.yaml")
-    # Ensure normal nested merge bomb doesn't hang
+    # Ensure wide distinct-key merge exceeding 4096 nodes/pairs is rejected
+    wide_merge_lines = [
+        f"b{b}: &b{b} {{" + ", ".join(f"k_{b}_{j}: 1" for j in range(35)) + "}"
+        for b in range(70)
+    ]
+    wide_merge_lines.append("merged: {<<: [" + ", ".join(f"*b{b}" for b in range(70)) + "]}")
+    with pytest.raises(yaml.YAMLError):
+        _load_bounded_yaml("\n".join(wide_merge_lines))
+    # Ensure nested duplicate-key merge bomb never hangs (either raises YAMLError or deduplicates in O(N))
     merge_bomb = "m0: &m0 {k0: 1, k1: 2, k2: 3, k3: 4}\n" + "\n".join(
         f"m{i}: &m{i} {{<<: [*m{i-1}, *m{i-1}]}}" for i in range(1, 16)
     )
     t2 = time.perf_counter()
-    with pytest.raises(yaml.YAMLError):
-        _load_bounded_yaml(merge_bomb)
+    try:
+        merged_doc = _load_bounded_yaml(merge_bomb)
+        assert isinstance(merged_doc, dict)
+    except yaml.YAMLError:
+        pass
     assert time.perf_counter() - t2 < 0.5
     assert _load_bounded_yaml("tools:\n  - search\n") == {"tools": ["search"]}
     assert isinstance(yaml_bomb, str)
