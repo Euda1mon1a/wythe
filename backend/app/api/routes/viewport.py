@@ -45,11 +45,14 @@ def post_viewport_command_route(
         if target is not None:
             rep = get_or_run_cached_scan(db, target)
             cur_ev_rev = build_evidence_identity(rep).evidence_revision_id
-    return publish_viewport_command(
-        payload,
-        local_only=True,
-        current_evidence_revision=cur_ev_rev,
-    )
+    try:
+        return publish_viewport_command(
+            payload,
+            local_only=True,
+            current_evidence_revision=cur_ev_rev,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/receipts", response_model=ViewportCommandReceiptRead)

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import ast
+import math
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+_MAX_CONST_INT_BITS = 256
+_MAX_CONST_ABS_FLOAT = 1e100
 
 _max_py_file_bytes = 512 * 1024
 _skip_dir_names = frozenset(
@@ -306,6 +311,16 @@ def _extract_string_prefix(node: ast.AST | None) -> str:
     return ""
 
 
+def _bounded_num(val: object) -> int | float | None:
+    if isinstance(val, (bool, complex)):
+        return None
+    if isinstance(val, int):
+        return val if val.bit_length() <= _MAX_CONST_INT_BITS else None
+    if isinstance(val, float):
+        return val if (math.isfinite(val) and abs(val) <= _MAX_CONST_ABS_FLOAT) else None
+    return None
+
+
 def _eval_numeric_expr(
     node: ast.AST,
     const_env: dict[str, int | float],
@@ -314,41 +329,73 @@ def _eval_numeric_expr(
     """Return `(value, truncated_from_float)` for pure constant arithmetic expressions."""
     if depth > 12:
         return None, None
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(
-        node.value, bool
-    ):
-        return node.value, None
+    if isinstance(node, ast.Constant):
+        bval = _bounded_num(node.value)
+        return (bval, None) if bval is not None else (None, None)
     if isinstance(node, ast.Name) and node.id in const_env:
-        return const_env[node.id], None
+        bval = _bounded_num(const_env[node.id])
+        return (bval, None) if bval is not None else (None, None)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
         sub_val, sub_trunc = _eval_numeric_expr(node.operand, const_env, depth + 1)
         if sub_val is None:
             return None, None
-        return (sub_val if isinstance(node.op, ast.UAdd) else -sub_val), sub_trunc
+        raw_res = sub_val if isinstance(node.op, ast.UAdd) else -sub_val
+        bval = _bounded_num(raw_res)
+        return (bval, sub_trunc) if bval is not None else (None, None)
     if isinstance(node, ast.BinOp):
         lv, lt = _eval_numeric_expr(node.left, const_env, depth + 1)
         rv, rt = _eval_numeric_expr(node.right, const_env, depth + 1)
         if lv is None or rv is None:
             return None, None
+        if isinstance(lv, (bool, complex)) or isinstance(rv, (bool, complex)):
+            return None, None
         trunc = lt if lt is not None else rt
-        if isinstance(node.op, ast.Add):
-            return lv + rv, trunc
-        if isinstance(node.op, ast.Sub):
-            return lv - rv, trunc
-        if isinstance(node.op, ast.Mult):
-            return lv * rv, trunc
-        if isinstance(node.op, ast.Div):
-            return (lv / rv, trunc) if rv != 0 else (None, None)
-        if isinstance(node.op, ast.FloorDiv):
-            if rv == 0:
+        try:
+            if isinstance(node.op, ast.Add):
+                res: object = lv + rv
+            elif isinstance(node.op, ast.Sub):
+                res = lv - rv
+            elif isinstance(node.op, ast.Mult):
+                res = lv * rv
+            elif isinstance(node.op, ast.Div):
+                if rv == 0:
+                    return None, None
+                res = lv / rv
+            elif isinstance(node.op, ast.FloorDiv):
+                if rv == 0:
+                    return None, None
+                fval = lv / rv
+                raw_floor = lv // rv
+                bres = _bounded_num(raw_floor)
+                if bres is None:
+                    return None, None
+                if isinstance(fval, float) and math.isfinite(fval) and fval != 0.0 and abs(fval) < 1.0:
+                    try:
+                        if int(bres) == 0:
+                            return 0, float(fval)
+                    except (OverflowError, ValueError):
+                        pass
+                return bres, trunc
+            elif isinstance(node.op, ast.Mod):
+                if rv == 0:
+                    return None, None
+                res = lv % rv
+            elif isinstance(node.op, ast.Pow):
+                if abs(rv) > 16:
+                    return None, None
+                if isinstance(lv, int) and lv.bit_length() > 128:
+                    return None, None
+                if isinstance(lv, float) and (not math.isfinite(lv) or abs(lv) > 1e18):
+                    return None, None
+                if lv == 0 and rv < 0:
+                    return None, None
+                res = lv**rv
+            else:
                 return None, None
-            fval = lv / rv
-            res = lv // rv
-            if isinstance(fval, float) and fval != 0.0 and int(res) == 0 and abs(fval) < 1.0:
-                return int(res), float(fval)
-            return res, trunc
-        if isinstance(node.op, ast.Pow) and abs(rv) <= 16:
-            return lv**rv, trunc
+        except (OverflowError, ValueError, ZeroDivisionError, ArithmeticError):
+            return None, None
+        bres = _bounded_num(res)
+        return (bres, trunc) if bres is not None else (None, None)
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
@@ -359,11 +406,25 @@ def _eval_numeric_expr(
         inner_val, inner_trunc = _eval_numeric_expr(node.args[0], const_env, depth + 1)
         if inner_val is None:
             return None, None
-        cast_val = int(inner_val) if node.func.id == "int" else round(inner_val)
-        if isinstance(inner_val, float) and inner_val != 0.0 and cast_val == 0:
+        try:
+            cast_val = int(inner_val) if node.func.id == "int" else round(inner_val)
+        except (OverflowError, ValueError):
+            return None, None
+        bcast = _bounded_num(cast_val)
+        if bcast is None:
+            return None, None
+        if isinstance(inner_val, float) and math.isfinite(inner_val) and inner_val != 0.0 and bcast == 0:
             return 0, inner_val
-        return cast_val, inner_trunc
+        return bcast, inner_trunc
     return None, None
+
+
+def _safe_unparse(node: ast.AST, max_chars: int | None = None) -> str:
+    try:
+        txt = ast.unparse(node)
+    except (RecursionError, ValueError):
+        txt = f"<{type(node).__name__}>"
+    return txt[:max_chars] if max_chars is not None else txt
 
 
 def _collect_comp_targets(node: ast.AST) -> set[str]:
@@ -381,48 +442,45 @@ def _collect_ident_roots(node: ast.AST | None, extra_skip: set[str] | None = Non
         return []
     skip = _builtin_skip_idents | _collect_comp_targets(node) | (extra_skip or set())
     found: list[str] = []
-
-    def _visit(cur: ast.AST) -> None:
+    stack: list[ast.AST] = [node]
+    while stack:
+        cur = stack.pop()
         if isinstance(cur, ast.Call):
+            children: list[ast.AST] = []
             if isinstance(cur.func, ast.Attribute) and not (
                 isinstance(cur.func.value, ast.Name) and cur.func.value.id in skip
             ):
-                _visit(cur.func.value)
-            for arg in cur.args:
-                _visit(arg)
-            for kw in cur.keywords:
-                _visit(kw.value)
-            return
+                children.append(cur.func.value)
+            children.extend(cur.args)
+            children.extend(kw.value for kw in cur.keywords)
+            stack.extend(reversed(children))
+            continue
         if isinstance(cur, ast.Subscript):
-            _visit(cur.value)
-            return
+            stack.append(cur.value)
+            continue
         if isinstance(cur, ast.Attribute):
             if isinstance(cur.value, ast.Name) and cur.value.id in ("self", "cls", "ctx", "state"):
                 if cur.attr not in skip and not cur.attr.isupper():
                     found.append(cur.attr)
-                return
-            _visit(cur.value)
-            return
+                continue
+            stack.append(cur.value)
+            continue
         if isinstance(cur, ast.Name):
             if cur.id not in skip and not cur.id.isupper():
                 found.append(cur.id)
-            return
-        for child in ast.iter_child_nodes(cur):
-            _visit(child)
-
-    _visit(node)
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(cur))))
     return list(dict.fromkeys(found))
 
 
 def _lhs_symbol(target: ast.AST) -> str | None:
-    if isinstance(target, ast.Name):
-        return target.id
-    if isinstance(target, ast.Subscript):
-        return _lhs_symbol(target.value)
-    if isinstance(target, ast.Attribute):
-        if isinstance(target.value, ast.Name) and target.value.id in ("self", "cls", "ctx", "state"):
-            return target.attr
-        return target.attr
+    cur = target
+    while isinstance(cur, ast.Subscript):
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        return cur.id
+    if isinstance(cur, ast.Attribute):
+        return cur.attr
     return None
 
 
@@ -472,42 +530,59 @@ def _unwrap_cpsat_chain(
     return cur, enforced_args, name_prefix, wrapped_ids
 
 
+MAX_OBJECTIVE_TERMS = 2048
+MAX_FLATTEN_STEPS = 4096
+
+
 def _flatten_objective_exprs(
     expr: ast.AST,
     accumulators: dict[str, list[ast.AST]],
     seen_acc: set[str] | None = None,
 ) -> list[ast.AST]:
-    visited = seen_acc or set()
-    if isinstance(expr, ast.BinOp) and isinstance(expr.op, (ast.Add, ast.Sub)):
-        left_items = _flatten_objective_exprs(expr.left, accumulators, visited)
-        right_items = _flatten_objective_exprs(expr.right, accumulators, visited)
-        if isinstance(expr.op, ast.Sub):
-            right_items = [
-                ast.UnaryOp(op=ast.USub(), operand=r) for r in right_items
-            ]
-        return [*left_items, *right_items]
-    if isinstance(expr, ast.Name) and expr.id in accumulators and expr.id not in visited:
-        nxt = visited | {expr.id}
-        out: list[ast.AST] = []
-        for item in accumulators[expr.id]:
-            out.extend(_flatten_objective_exprs(item, accumulators, nxt))
-        return out or [expr]
-    if isinstance(expr, ast.Call):
-        is_sum = (isinstance(expr.func, ast.Name) and expr.func.id == "sum") or (
-            isinstance(expr.func, ast.Attribute) and expr.func.attr in ("Sum", "sum")
-        )
-        if is_sum and expr.args:
-            arg0 = expr.args[0]
-            if isinstance(arg0, (ast.List, ast.Tuple, ast.Set)):
-                out = []
-                for elt in arg0.elts:
-                    out.extend(_flatten_objective_exprs(elt, accumulators, visited))
-                return out
-            if isinstance(arg0, (ast.GeneratorExp, ast.ListComp)):
-                return [arg0]
-            if isinstance(arg0, ast.Name) and arg0.id in accumulators and arg0.id not in visited:
-                return _flatten_objective_exprs(arg0, accumulators, visited)
-    return [expr]
+    out: list[ast.AST] = []
+    stack: list[tuple[ast.AST, bool, set[str]]] = [(expr, False, seen_acc or set())]
+    steps = 0
+    while stack:
+        if steps >= MAX_FLATTEN_STEPS or len(out) >= MAX_OBJECTIVE_TERMS:
+            break
+        steps += 1
+        cur, neg, visited = stack.pop()
+        if isinstance(cur, ast.BinOp) and isinstance(cur.op, (ast.Add, ast.Sub)):
+            right_neg = (not neg) if isinstance(cur.op, ast.Sub) else neg
+            if len(stack) + 2 <= MAX_FLATTEN_STEPS:
+                stack.append((cur.right, right_neg, visited))
+                stack.append((cur.left, neg, visited))
+            continue
+        if isinstance(cur, ast.Name) and cur.id in accumulators and cur.id not in visited:
+            nxt = visited | {cur.id}
+            items = accumulators[cur.id]
+            if not items:
+                out.append(ast.UnaryOp(op=ast.USub(), operand=cur) if neg else cur)
+            else:
+                cap = max(0, MAX_FLATTEN_STEPS - len(stack))
+                for item in reversed(items[:cap]):
+                    stack.append((item, neg, nxt))
+            continue
+        if isinstance(cur, ast.Call):
+            is_sum = (isinstance(cur.func, ast.Name) and cur.func.id == "sum") or (
+                isinstance(cur.func, ast.Attribute) and cur.func.attr in ("Sum", "sum")
+            )
+            if is_sum and cur.args:
+                arg0 = cur.args[0]
+                if isinstance(arg0, (ast.List, ast.Tuple, ast.Set)):
+                    cap = max(0, MAX_FLATTEN_STEPS - len(stack))
+                    for elt in reversed(arg0.elts[:cap]):
+                        stack.append((elt, neg, visited))
+                    continue
+                if isinstance(arg0, (ast.GeneratorExp, ast.ListComp)):
+                    out.append(ast.UnaryOp(op=ast.USub(), operand=arg0) if neg else arg0)
+                    continue
+                if isinstance(arg0, ast.Name) and arg0.id in accumulators and arg0.id not in visited:
+                    if len(stack) < MAX_FLATTEN_STEPS:
+                        stack.append((arg0, neg, visited))
+                    continue
+        out.append(ast.UnaryOp(op=ast.USub(), operand=cur) if neg else cur)
+    return out
 
 
 def _analyze_objective_term(
@@ -534,7 +609,7 @@ def _analyze_objective_term(
         else:
             for side in (core.left, core.right):
                 if isinstance(side, (ast.Attribute, ast.Subscript)):
-                    txt = ast.unparse(side)
+                    txt = _safe_unparse(side)
                     if any(tok in txt.lower() for tok in ("weight", "penalty", "cost", "coeff", "priority", "points", "fee")):
                         dyn_src = txt
                         break
@@ -555,7 +630,7 @@ def _analyze_objective_term(
 
     refs = tuple(_collect_ident_roots(term_node, comp_skip))
     return CpSatObjectiveTerm(
-        expr_text=ast.unparse(term_node)[:180],
+        expr_text=_safe_unparse(term_node, 180),
         static_weight=static_w,
         truncated_from_float=trunc_f,
         dynamic_source=dyn_src,
@@ -566,10 +641,9 @@ def _analyze_objective_term(
 
 
 def _contains_cpu_count_without_cap(expr: ast.AST) -> bool:
-    has_raw = False
-
-    def _walk(node: ast.AST, capped: bool) -> None:
-        nonlocal has_raw
+    stack: list[tuple[ast.AST, bool]] = [(expr, False)]
+    while stack:
+        node, capped = stack.pop()
         if isinstance(node, ast.Call):
             fn_name = (
                 node.func.id
@@ -577,17 +651,14 @@ def _contains_cpu_count_without_cap(expr: ast.AST) -> bool:
                 else (node.func.attr if isinstance(node.func, ast.Attribute) else "")
             )
             if fn_name in ("min", "clamp"):
-                for arg in node.args:
-                    _walk(arg, True)
-                return
+                for arg in reversed(node.args):
+                    stack.append((arg, True))
+                continue
             if fn_name == "cpu_count" and not capped:
-                has_raw = True
-                return
-        for child in ast.iter_child_nodes(node):
-            _walk(child, capped)
-
-    _walk(expr, False)
-    return has_raw
+                return True
+        for child in reversed(list(ast.iter_child_nodes(node))):
+            stack.append((child, capped))
+    return False
 
 
 def _test_mentions_feasible(test_node: ast.AST) -> bool:
@@ -602,7 +673,7 @@ def _test_mentions_feasible(test_node: ast.AST) -> bool:
 
 
 def _is_db_query_expr(expr: ast.AST) -> tuple[bool, str | None]:
-    txt = ast.unparse(expr)
+    txt = _safe_unparse(expr)
     low = txt.lower()
     if any(tok in low for tok in (".scalars(", ".execute(", ".fetchall(", ".query(", "select(")):
         m_sql = re.search(r"\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)", txt, re.IGNORECASE)
@@ -625,7 +696,7 @@ def _extract_guarded_iterables(func_node: ast.FunctionDef | ast.AsyncFunctionDef
             if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
                 guarded.update(_collect_ident_roots(test.operand))
             elif isinstance(test, ast.Compare):
-                t_str = ast.unparse(test)
+                t_str = _safe_unparse(test)
                 if "len(" in t_str or "[]" in t_str or "None" in t_str:
                     guarded.update(_collect_ident_roots(test))
             elif isinstance(test, ast.BoolOp):
@@ -643,6 +714,8 @@ def _analyze_function(
     qual_name: str,
     module_consts: dict[str, int | float],
     has_cpsat_import: bool,
+    *,
+    obj_term_budget: list[int] | None = None,
 ) -> tuple[
     list[CpSatVariableDecl],
     list[CpSatConstraintDecl],
@@ -666,7 +739,7 @@ def _analyze_function(
     param_names = [a.arg for a in fn_node.args.args if a.arg not in ("self", "cls")]
     model_Receivers: set[str] = {"model", "cp_model", "m"}
     for a in fn_node.args.args:
-        if a.annotation and "CpModel" in ast.unparse(a.annotation):
+        if a.annotation and "CpModel" in _safe_unparse(a.annotation):
             model_Receivers.add(a.arg)
 
     local_consts = dict(module_consts)
@@ -728,13 +801,15 @@ def _analyze_function(
                 nv, _ = _eval_numeric_expr(val_expr, local_consts)
                 if nv is not None:
                     local_consts[lhs] = nv
+                else:
+                    local_consts.pop(lhs, None)
                 is_q, tbl_h = _is_db_query_expr(val_expr)
                 if is_q:
                     queried_vars[lhs] = tbl_h
                 if isinstance(val_expr, (ast.List, ast.Tuple)):
                     accumulators[lhs] = list(val_expr.elts)
                 if isinstance(val_expr, ast.Call):
-                    fn_txt = ast.unparse(val_expr.func)
+                    fn_txt = _safe_unparse(val_expr.func)
                     if fn_txt.endswith("CpModel"):
                         model_Receivers.add(lhs)
                     elif fn_txt.endswith("CpSolver"):
@@ -798,19 +873,22 @@ def _analyze_function(
         unguarded_workers=unguarded_workers,
         unguarded_workers_line=unguarded_workers_line,
         called_syms=called_syms,
+        obj_term_budget=obj_term_budget,
     )
 
 
 def _dfs_nodes(root: ast.AST) -> list[ast.AST]:
     ordered: list[ast.AST] = []
-
-    def _visit(n: ast.AST) -> None:
-        ordered.append(n)
-        for ch in ast.iter_child_nodes(n):
-            _visit(ch)
-
-    _visit(root)
+    stack: list[ast.AST] = [root]
+    while stack:
+        cur = stack.pop()
+        ordered.append(cur)
+        children = list(ast.iter_child_nodes(cur))
+        stack.extend(reversed(children))
     return ordered
+
+
+MAX_MODULE_OBJECTIVE_TERMS = 1024
 
 
 def _finish_function_pass(
@@ -842,6 +920,7 @@ def _finish_function_pass(
     unguarded_workers: bool,
     unguarded_workers_line: int | None,
     called_syms: set[str],
+    obj_term_budget: list[int] | None = None,
 ) -> tuple[
     list[CpSatVariableDecl],
     list[CpSatConstraintDecl],
@@ -853,6 +932,9 @@ def _finish_function_pass(
     CpSatSolverRunDecl | None,
     set[str],
 ]:
+    eff_obj_budget = (
+        obj_term_budget if obj_term_budget is not None else [MAX_MODULE_OBJECTIVE_TERMS]
+    )
     dfs_all = _dfs_nodes(fn_node)
     assign_lhs_by_val_id: dict[int, str] = {}
     for n in dfs_all:
@@ -930,7 +1012,7 @@ def _finish_function_pass(
                     seen_trunc_calls.add(id(n))
                     truncs_out.append(
                         CpSatTruncationHazard(
-                            expr_text=ast.unparse(n)[:160],
+                            expr_text=_safe_unparse(n, 160),
                             evaluated_float=float(trunc_src),
                             truncated_int=0,
                             source_file=rel_path,
@@ -1038,8 +1120,14 @@ def _finish_function_pass(
                 if m_attr.islower() and not (has_cpsat_import and recv_sym in model_receivers):
                     continue
                 seen_calls.update(chain_ids)
+                rem_budget = eff_obj_budget[0]
+                if rem_budget <= 0:
+                    continue
                 sense = _objective_methods[m_attr]
-                flat_terms = _flatten_objective_exprs(inner_call.args[0], accumulators)
+                flat_terms = _flatten_objective_exprs(inner_call.args[0], accumulators)[
+                    :rem_budget
+                ]
+                eff_obj_budget[0] = max(0, eff_obj_budget[0] - len(flat_terms))
                 parsed_terms = [
                     _analyze_objective_term(t_ast, rel_path, inner_call.lineno, local_consts, model_receivers)
                     for t_ast in flat_terms
@@ -1130,7 +1218,7 @@ def _collect_loops_and_solver_runs(
         if direct_q:
             loops_out.append(
                 CpSatUnguardedLoop(
-                    iterable_expr=ast.unparse(n.iter)[:120],
+                    iterable_expr=_safe_unparse(n.iter, 120),
                     table_hint=tbl_hint,
                     source_file=rel_path,
                     line=n.lineno,
@@ -1262,6 +1350,8 @@ def _analyze_module_ast(tree: ast.Module, rel_path: str) -> tuple[CpSatModuleMod
             nv, _ = _eval_numeric_expr(m_val, mod_consts)
             if nv is not None:
                 mod_consts[lhs_name] = nv
+            else:
+                mod_consts.pop(lhs_name, None)
             if not is_init and lhs_name != "__all__" and isinstance(m_val, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
                 for sub in ast.walk(m_val):
                     if isinstance(sub, ast.Name):
@@ -1307,9 +1397,10 @@ def _analyze_module_ast(tree: ast.Module, rel_path: str) -> tuple[CpSatModuleMod
                     scopes.append((f"{node.name}.{item.name}", node.name, item))
 
     fn_feasible_meta: list[tuple[int, int | None, bool]] = []
+    module_obj_budget = [MAX_MODULE_OBJECTIVE_TERMS]
     for qual, cls_owner, fn_node in scopes:
         v_l, c_l, o_l, a_v, a_ln, tr_l, lp_l, run_d, c_syms = _analyze_function(
-            fn_node, rel_path, qual, mod_consts, has_imp
+            fn_node, rel_path, qual, mod_consts, has_imp, obj_term_budget=module_obj_budget
         )
         all_vars.extend(v_l)
         all_cts.extend(c_l)
@@ -1404,50 +1495,114 @@ def extract_repo_cpsat_models(
     backend_subdir: str | None = None,
 ) -> CpSatRepoExtraction:
     """Statically inspect Python modules in `repo_root` for OR-Tools CP-SAT lineage."""
+    if "\x00" in str(repo_root):
+        return CpSatRepoExtraction(
+            repo_root=str(repo_root),
+            modules={},
+            registered_builders=(),
+            unregistered_builders=(),
+            registration_order=(),
+        )
     root_path = Path(repo_root)
-    real_root = root_path.resolve()
+    try:
+        if root_path.is_symlink():
+            return CpSatRepoExtraction(
+                repo_root=str(repo_root),
+                modules={},
+                registered_builders=(),
+                unregistered_builders=(),
+                registration_order=(),
+            )
+        real_root = root_path.resolve()
+    except (OSError, ValueError):
+        return CpSatRepoExtraction(
+            repo_root=str(repo_root),
+            modules={},
+            registered_builders=(),
+            unregistered_builders=(),
+            registration_order=(),
+        )
     scan_base = real_root
-    if backend_subdir and backend_subdir not in ("", "."):
+    if backend_subdir and backend_subdir not in ("", ".") and "\x00" not in backend_subdir:
         cand_sub = root_path / backend_subdir
-        if not cand_sub.is_symlink():
-            resolved_sub = cand_sub.resolve()
-            if resolved_sub.is_relative_to(real_root) and resolved_sub.is_dir():
-                scan_base = resolved_sub
+        if all(
+            len(p.encode("utf-8", errors="surrogateescape")) <= 255
+            for p in cand_sub.parts
+            if p not in (cand_sub.anchor, "", ".")
+        ):
+            try:
+                if not cand_sub.is_symlink():
+                    resolved_sub = cand_sub.resolve()
+                    if resolved_sub.is_relative_to(real_root) and resolved_sub.is_dir():
+                        scan_base = resolved_sub
+            except (OSError, ValueError):
+                pass
 
     py_files: list[tuple[str, Path]] = []
-    if scan_base.is_dir():
-        for dirpath, dirnames, filenames in os.walk(scan_base, followlinks=False):
-            dirnames[:] = sorted(
-                d
-                for d in dirnames
-                if d not in _skip_dir_names and not (Path(dirpath) / d).is_symlink()
-            )
+    try:
+        scan_is_dir = scan_base.is_dir()
+    except (OSError, ValueError):
+        scan_is_dir = False
+    if scan_is_dir:
+        for dirpath, dirnames, filenames in os.walk(
+            scan_base, followlinks=False, onerror=lambda _e: None
+        ):
+            keep_dirs: list[str] = []
+            for d in sorted(dirnames):
+                if d in _skip_dir_names:
+                    continue
+                dpath = Path(dirpath) / d
+                try:
+                    if dpath.is_symlink() or not dpath.resolve().is_relative_to(real_root):
+                        continue
+                except (OSError, ValueError):
+                    continue
+                keep_dirs.append(d)
+            dirnames[:] = keep_dirs
             for fname in sorted(filenames):
                 if not fname.endswith(".py"):
                     continue
                 fpath = Path(dirpath) / fname
-                if fpath.is_symlink():
-                    continue
-                resolved_f = fpath.resolve()
-                if not resolved_f.is_relative_to(real_root):
-                    continue
                 try:
+                    if fpath.is_symlink() or not fpath.is_file():
+                        continue
+                    resolved_f = fpath.resolve()
+                    if not resolved_f.is_relative_to(real_root):
+                        continue
                     if resolved_f.stat().st_size > _max_py_file_bytes:
                         continue
-                except OSError:
+                    rel_posix = resolved_f.relative_to(real_root).as_posix()
+                except (OSError, ValueError):
                     continue
-                rel_posix = resolved_f.relative_to(real_root).as_posix()
                 py_files.append((rel_posix, resolved_f))
 
     raw_models: dict[str, CpSatModuleModel] = {}
     refs_by_file: dict[str, set[str]] = {}
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     for rel_posix, resolved_f in sorted(py_files, key=lambda item: item[0]):
         try:
-            src = resolved_f.read_text(encoding="utf-8", errors="replace")
+            fd = os.open(resolved_f, flags)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > _max_py_file_bytes:
+                    continue
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = os.read(fd, min(65536, _max_py_file_bytes + 1 - total))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > _max_py_file_bytes:
+                        raise ValueError("file exceeds byte cap")
+                src = b"".join(chunks).decode("utf-8", errors="replace")
+            finally:
+                os.close(fd)
             tree = ast.parse(src, filename=rel_posix)
-        except (OSError, SyntaxError):
+            mod_model, ext_refs = _analyze_module_ast(tree, rel_posix)
+        except (OSError, ValueError, SyntaxError, RecursionError):
             continue
-        mod_model, ext_refs = _analyze_module_ast(tree, rel_posix)
         raw_models[rel_posix] = mod_model
         refs_by_file[rel_posix] = ext_refs
 

@@ -47,7 +47,13 @@ from wythe_plugin_solver_chronicle import (
 
 class _FakeDist:
     def __init__(self, version: str = "0.1.0") -> None:
+        import sysconfig
+
         self.version = version
+        self._path = Path(sysconfig.get_path("purelib")) / f"wythe_plugin_solver_chronicle-{version}.dist-info"
+
+    def locate_file(self, path: str) -> Path:
+        return self._path.parent / path
 
 
 class _FakeEntryPoint:

@@ -50,12 +50,23 @@ from app.services.scanner_service import run_target_scan
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+class _FakeDist:
+    def __init__(self, version: str = "0.1.0") -> None:
+        import sysconfig
+
+        self.version = version
+        self._path = Path(sysconfig.get_path("purelib")) / f"fake_spine-{version}.dist-info"
+
+    def locate_file(self, path: str) -> Path:
+        return self._path.parent / path
+
+
 class _FakeEntryPoint:
     def __init__(self, name: str, value: str, loaded: object, version: str = "0.1.0") -> None:
         self.name = name
         self.value = value
         self._loaded = loaded
-        self.dist = type("_FakeDist", (), {"version": version})()
+        self.dist = _FakeDist(version)
 
     def load(self) -> object:
         return self._loaded
@@ -81,14 +92,14 @@ def _init_git(repo_dir: Path) -> None:
 
 
 def test_wave4_core_invariants_and_subkind_taxonomy_parity(db_session) -> None:
-    """Verify MCP tool counts, <2KB SLM budget, 19 seeded RulePolicy rows, seeded StackProfiles, and 15 subkinds."""
+    """Verify MCP tool counts, <2KB SLM budget, 26 seeded RulePolicy rows, seeded StackProfiles, and 15 subkinds."""
     assert len(MCP_TOOLS) == 11
     assert len(MCP_SLM_TOOLS) == 4
     slm_bytes = json.dumps(MCP_SLM_TOOLS, separators=(",", ":")).encode("utf-8")
     assert len(slm_bytes) < 2000
 
     seeded_rules = db_session.scalars(select(RulePolicy).order_by(RulePolicy.rule_code)).all()
-    assert len(seeded_rules) == 19
+    assert len(seeded_rules) == 26
 
     seeded_profiles = db_session.scalars(select(StackProfile).order_by(StackProfile.id)).all()
     assert len(seeded_profiles) == len(INITIAL_STACK_PROFILES)

@@ -14,11 +14,25 @@ interface NormalizedChainLink {
   missingJoins: string[];
 }
 
+interface NormalizedVerdictClause {
+  clauseId: string;
+  text: string;
+  state: string;
+  evidenceRef: string | null;
+  sourceLocation: string | null;
+  missingReceipt: string | null;
+}
+
 interface NormalizedUnderstandingView {
   question: string;
   evidenceRevision: string;
   consequenceHeadline: string;
   lastSupportedCause: string;
+  verdictSentence: string;
+  verdictClauses: NormalizedVerdictClause[];
+  firstDivergence: Record<string, unknown> | null;
+  rulePredictionComparisons: Array<Record<string, unknown>>;
+  perturbationMatrix: Array<Record<string, unknown>>;
   overallMissingJoins: string[];
   links: NormalizedChainLink[];
   effectiveAuthority: Array<Record<string, unknown>>;
@@ -85,11 +99,26 @@ export function normalizeUnderstandingReport(
           missingJoins: [],
         }));
 
+  const rawClauses = asArrayOfRecords(nested.verdict_clauses);
+  const verdictClauses: NormalizedVerdictClause[] = rawClauses.map((cl, idx) => ({
+    clauseId: String(cl.clause_id ?? `clause_${idx + 1}`),
+    text: String(cl.text ?? ''),
+    state: String(cl.state ?? 'unverified'),
+    evidenceRef: typeof cl.evidence_ref === 'string' ? cl.evidence_ref : null,
+    sourceLocation: typeof cl.source_location === 'string' ? cl.source_location : null,
+    missingReceipt: typeof cl.missing_receipt === 'string' ? cl.missing_receipt : null,
+  }));
+
   return {
     question: String(nested.question ?? ''),
     evidenceRevision: String(nested.evidence_revision ?? 'unknown'),
     consequenceHeadline: String(nested.consequence_headline ?? ''),
     lastSupportedCause: String(nested.last_supported_cause ?? ''),
+    verdictSentence: String(nested.verdict_sentence ?? ''),
+    verdictClauses,
+    firstDivergence: asRecord(nested.first_divergence),
+    rulePredictionComparisons: asArrayOfRecords(nested.rule_prediction_comparisons),
+    perturbationMatrix: asArrayOfRecords(nested.perturbation_matrix),
     overallMissingJoins: asStringArray(nested.overall_missing_joins),
     links,
     effectiveAuthority: asArrayOfRecords(nested.effective_authority),
@@ -304,6 +333,194 @@ export function UnderstandingChainPanel({
             </div>
           ) : displayedReport ? (
             <div className="space-y-2 font-mono text-[10px]">
+              {/* Evidence-Linked Single-Sentence Verdict (#117) */}
+              {displayedReport.verdictClauses.length > 0 && (
+                <div
+                  aria-label="Evidence-linked verdict summary"
+                  className="space-y-1.5 border border-emerald-500/40 bg-slate-900/90 p-2.5 text-slate-100"
+                >
+                  <div className="text-[10px] font-semibold uppercase tracking-wider text-emerald-300">
+                    Evidence-Linked Verdict
+                  </div>
+                  <blockquote className="border-l-2 border-teal-400/70 pl-2 font-sans text-xs leading-relaxed text-slate-100">
+                    {displayedReport.verdictClauses.map((cl, idx) => {
+                      const isSupported = cl.state === 'supported';
+                      const refTarget =
+                        cl.sourceLocation ??
+                        cl.evidenceRef ??
+                        (cl.missingReceipt ? `missing:${cl.missingReceipt}` : 'unverified');
+                      return (
+                        <span key={cl.clauseId} className="mr-1.5 inline">
+                          <span
+                            className={
+                              isSupported
+                                ? 'underline decoration-emerald-400/70 underline-offset-2'
+                                : 'text-amber-200 underline decoration-amber-400/80 decoration-dotted underline-offset-2'
+                            }
+                          >
+                            {cl.text}
+                          </span>{' '}
+                          <span
+                            className={`inline-block border px-1 py-0 font-mono text-[9px] ${
+                              isSupported
+                                ? 'border-emerald-500/45 bg-emerald-950/50 text-emerald-200'
+                                : 'border-amber-500/55 bg-amber-950/50 text-amber-200'
+                            }`}
+                          >
+                            [{cl.state}: {refTarget}]
+                          </span>
+                          {idx < displayedReport.verdictClauses.length - 1 ? ' ' : ''}
+                        </span>
+                      );
+                    })}
+                  </blockquote>
+                </div>
+              )}
+
+              {/* First Point of Divergence & Participant Knowledge at Decision Time (#117 AC2 / #105) */}
+              {displayedReport.firstDivergence && (() => {
+                const fd = displayedReport.firstDivergence;
+                const storage = String(fd.exists_in_storage ?? 'unverified');
+                const eligible = String(fd.eligible_for_actor ?? 'unverified');
+                const inTurn = String(fd.present_in_turn ?? 'unverified');
+                const callerState = String(fd.caller_attribution_state ?? 'unverified');
+                const turnEv = asStringArray(fd.evidence_reaching_turn);
+                const candCallers = asStringArray(fd.unattributed_candidate_callers);
+                return (
+                  <div
+                    aria-label="First divergence and participant knowledge at decision time"
+                    className="space-y-1 border border-amber-500/40 bg-amber-950/20 p-2 text-slate-200"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-1 font-semibold text-amber-200">
+                      <span>First Divergence :: {String(fd.stage_label ?? 'Boundary')}</span>
+                      <span>[caller: {callerState}]</span>
+                    </div>
+                    {Boolean(fd.summary) && (
+                      <div className="font-sans text-[11px] text-slate-100">
+                        {String(fd.summary)}
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 gap-1 pt-0.5 sm:grid-cols-3">
+                      <div className="border border-slate-700 bg-slate-950/80 px-1.5 py-1">
+                        <div>1. In Storage: <strong>{storage}</strong></div>
+                        {Boolean(fd.storage_source_ref) && (
+                          <div className="truncate text-[9px] text-slate-400">
+                            {String(fd.storage_source_ref)}
+                          </div>
+                        )}
+                      </div>
+                      <div className="border border-slate-700 bg-slate-950/80 px-1.5 py-1">
+                        <div>2. Eligible: <strong>{eligible}</strong></div>
+                        {Boolean(fd.eligibility_source_ref) && (
+                          <div className="truncate text-[9px] text-slate-400">
+                            {String(fd.eligibility_source_ref)}
+                          </div>
+                        )}
+                      </div>
+                      <div className="border border-slate-700 bg-slate-950/80 px-1.5 py-1">
+                        <div>3. In Turn: <strong>{inTurn}</strong></div>
+                        {Boolean(fd.turn_context_source_ref) && (
+                          <div className="truncate text-[9px] text-slate-400">
+                            {String(fd.turn_context_source_ref)}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="text-slate-300">
+                      Actor: <strong>{String(fd.actor ?? 'unknown')}</strong> · Channel:{' '}
+                      <strong>{String(fd.channel ?? 'unknown')}</strong>
+                      {fd.observed_at ? ` · Observed: ${String(fd.observed_at)}` : ''}
+                      {fd.observed_hop ? ` · Hop: ${String(fd.observed_hop)}` : ''}
+                      {fd.caller_receipt_ref
+                        ? ` (${String(fd.caller_receipt_ref)})`
+                        : candCallers.length > 0
+                          ? ` (unattributed candidates: ${candCallers.join(', ')})`
+                          : ''}
+                    </div>
+                    {turnEv.length > 0 && (
+                      <div className="text-slate-300">
+                        Evidence in turn: {turnEv.join(', ')}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* Rule vs. Implementation Prediction(s) vs. Observed Result (#117 AC1 / #104) */}
+              {displayedReport.rulePredictionComparisons.map((rc, rIdx) => {
+                const rule = asRecord(rc.owner_rule);
+                const preds = asArrayOfRecords(rc.implementation_predictions);
+                const obs = asRecord(rc.observed_result);
+                const openQs = asStringArray(rc.open_questions);
+                return (
+                  <div
+                    key={`rule-pred-${rIdx}`}
+                    className="space-y-1 border border-sky-500/35 bg-sky-950/20 p-2 text-slate-200"
+                  >
+                    <div className="flex flex-wrap justify-between gap-1 font-semibold text-sky-200">
+                      <span>
+                        Rule vs. Prediction vs. Observed:{' '}
+                        {String(rule?.label ?? rc.comparison_id ?? 'rule')}
+                      </span>
+                      <span>[{String(rc.state ?? 'unverified')}]</span>
+                    </div>
+                    {rule && (
+                      <div>
+                        Owner Rule: {String(rule.statement ?? '')}{' '}
+                        <span className="text-sky-300">[{String(rule.source_ref ?? '')}]</span>
+                      </div>
+                    )}
+                    {preds.map((pr, pIdx) => (
+                      <div key={pIdx} className="pl-2 text-slate-300">
+                        • {String(pr.reading_label)}: {String(pr.predicted_at_boundary)} [
+                        {String(pr.match_state)}] ({String(pr.source_ref)})
+                      </div>
+                    ))}
+                    {obs && (
+                      <div className="text-emerald-200">
+                        Observed: {String(obs.summary)} [{String(obs.source_ref)}] · deliveryVerified=
+                        {String(obs.delivery_verified)}
+                      </div>
+                    )}
+                    {Boolean(rc.discriminating_observation) && (
+                      <div className="text-slate-300">
+                        Distinguished by: {String(rc.discriminating_observation)}
+                      </div>
+                    )}
+                    {openQs.map((oq, qIdx) => (
+                      <div key={qIdx} className="text-amber-200">
+                        Open: {oq}
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+
+              {/* Single-Variable Perturbation Checks (#117 AC3) */}
+              {displayedReport.perturbationMatrix.length > 0 && (
+                <div
+                  aria-label="Single-variable perturbation checks"
+                  className="space-y-1 border border-teal-500/35 bg-teal-950/15 p-2 text-slate-200"
+                >
+                  <div className="font-semibold text-teal-200">
+                    Fresh-Case Perturbation Matrix (Vary One Factor at a Time)
+                  </div>
+                  {displayedReport.perturbationMatrix.map((pm, pIdx) => (
+                    <div
+                      key={`pert-${pIdx}`}
+                      className={pm.passed ? 'text-emerald-200' : 'text-rose-300'}
+                    >
+                      [{pm.passed ? 'PASS' : 'FAIL'} · {String(pm.conclusion_state)}]{' '}
+                      <strong>{String(pm.varied_factor)}</strong> — {String(pm.observed_outcome)}
+                      {pm.decisive_receipt_ref ? ` [${String(pm.decisive_receipt_ref)}]` : ''}
+                      {pm.missing_receipt_id
+                        ? ` [missing: ${String(pm.missing_receipt_id)}]`
+                        : ''}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {displayedReport.consequenceHeadline && (
                 <div className="border border-teal-500/35 bg-teal-950/25 p-2 text-slate-100">
                   <div className="font-semibold text-teal-200">

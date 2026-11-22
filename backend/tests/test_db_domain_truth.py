@@ -186,7 +186,16 @@ def test_audit_ruling_separates_cutover_history_from_clean_status(
     db_session: Session, tmp_path: Path
 ) -> None:
     """Completed cutovers stay status='clean' while cutover_history preserves provenance."""
+    import subprocess
+
     repo = _create_policy_violating_repo(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "init"],
+        cwd=repo,
+        check=True,
+    )
     register_target(
         db_session,
         TargetProjectCreate(slug="ruling-sample", name="Ruling Sample", repo_path=str(repo)),
@@ -201,7 +210,7 @@ def test_audit_ruling_separates_cutover_history_from_clean_status(
     record_audit_ruling(
         db_session,
         target.id,
-        audited_commit="abc1234",
+        audited_commit=before.source_commit,
         payload=AuditRulingCreate(
             node_id=svc_node.id,
             disposition="accepted_clean",

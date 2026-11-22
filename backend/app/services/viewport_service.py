@@ -12,14 +12,16 @@ import socket
 import sqlite3
 import tempfile
 import threading
+import time
 import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
+import httpcore
 import httpx
 
 from app.core.clock import utc_now
@@ -36,13 +38,87 @@ from app.schemas.atlas import (
 
 VIEWPORT_RING_MAXLEN: Final[int] = 64
 VIEWPORT_QUEUE_MAXLEN: Final[int] = 64
+VIEWPORT_RECEIPTS_MAXLEN: Final[int] = 256
 DEFAULT_VIEWPORT_ORIGIN: Final[str] = "http://127.0.0.1:8780"
 _SSE_POLL_INTERVAL_SEC: Final[float] = 0.06
 _SSE_KEEPALIVE_SEC: Final[float] = 15.0
 _HTTP_TIMEOUT_SEC: Final[float] = 5.0
-_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+_MAX_VIEWPORT_RESPONSE_BYTES: Final[int] = 1 * 1024 * 1024
+_ALLOWED_LOCAL_V4_NETS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+)
+_ALLOWED_LOCAL_V6_NETS = (
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+)
+_BLOCKED_METADATA_V4_NETS = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("100.100.100.200/32"),
+    ipaddress.ip_network("169.254.169.254/32"),
+)
+_BLOCKED_METADATA_V6_NETS = (
+    ipaddress.ip_network("fd00:ec2::/32"),
+    ipaddress.ip_network("fec0::/10"),
+)
 _INIT_SCHEMA_LOCK = threading.Lock()
 _INITIALIZED_INODES: set[tuple[str, int]] = set()
+
+
+class _PinnedSyncBackend(httpcore.SyncBackend):
+    def __init__(self, pinned_ips: tuple[str, ...]) -> None:
+        super().__init__()
+        self._pinned_ips = pinned_ips
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.NetworkStream:
+        last_exc: Exception | None = None
+        for ip_str in self._pinned_ips:
+            try:
+                return super().connect_tcp(
+                    ip_str,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (OSError, httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_exc = exc
+        if last_exc is not None:
+            raise last_exc
+        raise httpcore.ConnectError(f"No pinned IP available for {host}")
+
+
+def _ensure_json_nesting_bounded(raw_text: str, *, max_depth: int = 128) -> None:
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in raw_text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+            if depth > max_depth:
+                raise ValueError(f"JSON payload exceeds maximum nesting depth ({max_depth}).")
+        elif ch in "}]" and depth > 0:
+            depth -= 1
 
 
 def _resolve_viewport_bus_db_path() -> Path:
@@ -137,6 +213,10 @@ def _open_bus_connection(db_path: Path, *, create: bool) -> sqlite3.Connection |
                     "CREATE INDEX IF NOT EXISTS idx_viewport_receipts_cmd "
                     "ON viewport_receipts (command_id, id)"
                 )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_viewport_receipts_target_id "
+                    "ON viewport_receipts (target_slug, id)"
+                )
                 try:
                     ino = db_path.stat().st_ino
                 except OSError:
@@ -145,52 +225,157 @@ def _open_bus_connection(db_path: Path, *, create: bool) -> sqlite3.Connection |
     return conn
 
 
-def _resolve_host_ips(host: str) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    clean_host = host.split("%", 1)[0]
+def _is_blocked_ip_single(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if (
+        addr.is_link_local
+        or addr.is_multicast
+        or addr.is_unspecified
+        or (addr.is_reserved and not addr.is_loopback)
+    ):
+        return True
+    if isinstance(addr, ipaddress.IPv4Address):
+        return any(addr in net for net in _BLOCKED_METADATA_V4_NETS)
+    return any(addr in net for net in _BLOCKED_METADATA_V6_NETS)
+
+
+def _iter_unwrapped_ips(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    _depth: int = 0,
+) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...]:
+    if _depth > 8 or not isinstance(ip, ipaddress.IPv6Address):
+        return (ip,)
+    out: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [ip]
+    if ip.ipv4_mapped is not None:
+        out.extend(_iter_unwrapped_ips(ip.ipv4_mapped, _depth=_depth + 1))
+    if ip.sixtofour is not None:
+        out.extend(_iter_unwrapped_ips(ip.sixtofour, _depth=_depth + 1))
+    if ip.teredo is not None:
+        srv_v4, cli_v4 = ip.teredo
+        out.extend(_iter_unwrapped_ips(srv_v4, _depth=_depth + 1))
+        out.extend(_iter_unwrapped_ips(cli_v4, _depth=_depth + 1))
+    return tuple(dict.fromkeys(out))
+
+
+def _unwrap_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return _unwrap_ip(ip.ipv4_mapped)
+        if ip.sixtofour is not None:
+            return _unwrap_ip(ip.sixtofour)
+        if ip.teredo is not None:
+            srv_v4, cli_v4 = ip.teredo
+            u_srv = _unwrap_ip(srv_v4)
+            u_cli = _unwrap_ip(cli_v4)
+            if _is_blocked_ip_single(u_srv):
+                return u_srv
+            if _is_blocked_ip_single(u_cli):
+                return u_cli
+            if isinstance(u_srv, ipaddress.IPv4Address) and any(
+                u_srv in net for net in _ALLOWED_LOCAL_V4_NETS
+            ):
+                return u_srv
+            return u_cli
+    return ip
+
+
+def _is_allowed_local_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    unwrapped = _iter_unwrapped_ips(ip)
+    if any(_is_blocked_ip_single(addr) for addr in unwrapped):
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and (
+        ip.sixtofour is not None or ip.teredo is not None
+    ):
+        return False
+    eff = _unwrap_ip(ip)
+    if isinstance(eff, ipaddress.IPv4Address):
+        return any(eff in net for net in _ALLOWED_LOCAL_V4_NETS)
+    return any(eff in net for net in _ALLOWED_LOCAL_V6_NETS)
+
+
+def _resolve_host_ips(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    if "%" in host:
+        return []
     try:
-        return {ipaddress.ip_address(clean_host)}
+        return [ipaddress.ip_address(host)]
     except ValueError:
         pass
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except OSError:
-        return set()
-    resolved: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+        return []
+    resolved: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    seen: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
     for info in infos:
         raw_addr = str(info[4][0]).split("%", 1)[0]
         try:
-            resolved.add(ipaddress.ip_address(raw_addr))
+            ip_obj = ipaddress.ip_address(raw_addr)
         except ValueError:
             continue
+        if ip_obj not in seen:
+            seen.add(ip_obj)
+            resolved.append(ip_obj)
     return resolved
 
 
-def _validate_viewport_server_url(raw_url: str, *, allow_remote: bool) -> str:
+def _validate_and_resolve_viewport_server_url(
+    raw_url: str, *, allow_remote: bool
+) -> tuple[str, tuple[str, ...]]:
     cleaned = raw_url.strip()
+    authority_prefix = cleaned.split("?", 1)[0].split("#", 1)[0]
+    if "\\" in authority_prefix:
+        raise ValueError(
+            f"Invalid viewport server URL '{raw_url}'; backslashes are forbidden in URL authority."
+        )
     parts = urllib.parse.urlsplit(cleaned)
     if parts.scheme not in ("http", "https") or not parts.netloc or not parts.hostname:
         raise ValueError(
             f"Invalid viewport server URL '{raw_url}'; expected http(s)://host[:port]."
         )
-    host = parts.hostname
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid viewport server URL '{raw_url}'; invalid port."
+        ) from exc
+    host = parts.hostname.lower()
+    if "%" in host:
+        raise ValueError(
+            f"Viewport server host '{host}' contains an unsupported IPv6 zone identifier."
+        )
     ips = _resolve_host_ips(host)
+    if not ips:
+        raise ValueError(
+            f"Viewport server host '{host}' could not be resolved to an IP address."
+        )
     for ip in ips:
-        if ip.is_link_local or ip.is_multicast or ip.is_unspecified:
-            raise ValueError(
-                f"Viewport server host '{host}' resolves to a link-local, multicast, or "
-                f"unspecified address ({ip}) and cannot be targeted."
-            )
-    is_local_name = host == "localhost" or host.endswith(".localhost")
-    is_local_ip = bool(ips) and all(
-        (ip.is_loopback or ip.is_private or (isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NET))
-        and not (ip.is_link_local or ip.is_multicast or ip.is_unspecified)
-        for ip in ips
-    )
-    if not (is_local_name or is_local_ip) and not allow_remote:
+        unwrapped = _iter_unwrapped_ips(ip)
+        for addr in unwrapped:
+            if _is_blocked_ip_single(addr):
+                raise ValueError(
+                    f"Viewport server host '{host}' resolves to a cloud metadata, link-local, "
+                    f"multicast, unspecified, or reserved address ({ip}) and cannot be targeted."
+                )
+        if isinstance(ip, ipaddress.IPv6Address) and (
+            ip.sixtofour is not None or ip.teredo is not None
+        ):
+            for addr in unwrapped:
+                if isinstance(addr, ipaddress.IPv4Address) and any(
+                    addr in net for net in _ALLOWED_LOCAL_V4_NETS
+                ):
+                    raise ValueError(
+                        f"Viewport server host '{host}' tunnels a private/loopback IPv4 address "
+                        f"via 6to4/Teredo ({ip}) and cannot be targeted."
+                    )
+    is_local_ip = all(_is_allowed_local_ip(ip) for ip in ips)
+    if not is_local_ip and not allow_remote:
         raise ValueError(
             f"Viewport server host '{host}' is not loopback or private; "
             "pass --allow-remote-viewport to publish to a remote host."
         )
+    netloc = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    if port is not None:
+        netloc = f"{netloc}:{port}"
     base_path = parts.path.rstrip("/")
     if base_path.endswith("/api/v1/viewport/command"):
         endpoint_path = base_path
@@ -200,7 +385,12 @@ def _validate_viewport_server_url(raw_url: str, *, allow_remote: bool) -> str:
         endpoint_path = f"{base_path}/viewport/command"
     else:
         endpoint_path = f"{base_path}/api/v1/viewport/command"
-    return f"{parts.scheme}://{parts.netloc}{endpoint_path}"
+    return f"{parts.scheme.lower()}://{netloc}{endpoint_path}", tuple(str(ip) for ip in ips)
+
+
+def _validate_viewport_server_url(raw_url: str, *, allow_remote: bool) -> str:
+    endpoint_url, _ = _validate_and_resolve_viewport_server_url(raw_url, allow_remote=allow_remote)
+    return endpoint_url
 
 
 def _post_viewport_command_http(
@@ -209,27 +399,81 @@ def _post_viewport_command_http(
     *,
     allow_remote: bool = False,
 ) -> ViewportCommandAck:
-    endpoint_url = _validate_viewport_server_url(server_url, allow_remote=allow_remote)
+    endpoint_url, pinned_ips = _validate_and_resolve_viewport_server_url(
+        server_url, allow_remote=allow_remote
+    )
     body = cmd.model_dump_json().encode("utf-8")
+    transport = httpx.HTTPTransport()
+    pool = getattr(transport, "_pool", None)
+    if isinstance(pool, httpcore.ConnectionPool) and pinned_ips:
+        pool._network_backend = _PinnedSyncBackend(pinned_ips)
+    deadline = time.monotonic() + _HTTP_TIMEOUT_SEC
     try:
-        with httpx.Client(
-            trust_env=False,
-            follow_redirects=False,
-            timeout=_HTTP_TIMEOUT_SEC,
-        ) as client:
-            resp = client.post(
+        with (
+            httpx.Client(
+                transport=transport,
+                trust_env=False,
+                follow_redirects=False,
+                timeout=_HTTP_TIMEOUT_SEC,
+            ) as client,
+            client.stream(
+                "POST",
                 endpoint_url,
                 content=body,
-                headers={"Content-Type": "application/json"},
-            )
-    except httpx.HTTPError as exc:
+                headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+            ) as resp,
+        ):
+            enc = (resp.headers.get("content-encoding") or "").strip().lower()
+            if enc and enc != "identity":
+                raise RuntimeError(
+                    f"Viewport server at {endpoint_url} returned disallowed Content-Encoding `{enc}`."
+                )
+            raw_cl = resp.headers.get("content-length")
+            if raw_cl:
+                try:
+                    if int(raw_cl) > _MAX_VIEWPORT_RESPONSE_BYTES:
+                        raise RuntimeError(
+                            f"Viewport server response declared Content-Length {raw_cl} exceeding "
+                            f"{_MAX_VIEWPORT_RESPONSE_BYTES} byte safety limit."
+                        )
+                except ValueError:
+                    pass
+            buf = bytearray()
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Viewport server response from {endpoint_url} exceeded {_HTTP_TIMEOUT_SEC}s deadline."
+                )
+            for chunk in resp.iter_raw():
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Viewport server response from {endpoint_url} exceeded {_HTTP_TIMEOUT_SEC}s deadline."
+                    )
+                buf.extend(chunk)
+                if len(buf) > _MAX_VIEWPORT_RESPONSE_BYTES:
+                    raise RuntimeError(
+                        f"Viewport server response from {endpoint_url} exceeded "
+                        f"{_MAX_VIEWPORT_RESPONSE_BYTES} byte safety limit."
+                    )
+            status_code = resp.status_code
+            raw_bytes = bytes(buf)
+    except (httpx.HTTPError, TimeoutError) as exc:
         raise RuntimeError(f"Viewport server unreachable at {endpoint_url}: {exc}") from exc
-    if resp.status_code < 200 or resp.status_code >= 300:
-        snippet = resp.text[:240].strip()
+    if status_code < 200 or status_code >= 300:
+        snippet = raw_bytes.decode("utf-8", errors="replace")[:240].strip()
         raise RuntimeError(
-            f"Viewport server at {endpoint_url} rejected command (HTTP {resp.status_code}): {snippet}"
+            f"Viewport server at {endpoint_url} rejected command (HTTP {status_code}): {snippet}"
         )
-    return ViewportCommandAck.model_validate(resp.json())
+    try:
+        decoded_body = raw_bytes.decode("utf-8", errors="replace")
+        _ensure_json_nesting_bounded(decoded_body)
+        parsed = json.loads(decoded_body)
+    except (ValueError, RecursionError) as exc:
+        raise RuntimeError(f"Viewport server at {endpoint_url} returned invalid JSON.") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(  # noqa: TRY004
+            f"Viewport server at {endpoint_url} returned unexpected non-object JSON."
+        )
+    return ViewportCommandAck.model_validate(parsed)
 
 
 def build_viewport_permalink(
@@ -353,7 +597,7 @@ def _effective_delivery_state(
         )
         else "accepted_by_service"
     )
-    if expires_at_raw and state in ("accepted_by_service", "waiting_for_follow"):
+    if expires_at_raw and state in ("accepted_by_service", "waiting_for_follow", "paused_by_human"):
         try:
             exp_dt = (
                 expires_at_raw
@@ -381,27 +625,21 @@ def _max_seq_for_target(db_path: Path, target_slug: str) -> int:
         conn.close()
 
 
-def _query_stored_events(
-    db_path: Path,
+def _query_stored_events_from_conn(
+    conn: sqlite3.Connection,
     target_slug: str,
     session_id: str | None,
     *,
     since_seq: int = 0,
 ) -> list[ViewportCommandEvent]:
-    conn = _open_bus_connection(db_path, create=False)
-    if conn is None:
-        return []
-    try:
-        rows = conn.execute(
-            "SELECT seq, permalink, command_json, created_at, delivery_state, "
-            "applied_clients_json, expires_at "
-            "FROM viewport_events "
-            "WHERE target_slug = ? AND seq > ? "
-            "ORDER BY seq ASC",
-            (target_slug, since_seq),
-        ).fetchall()
-    finally:
-        conn.close()
+    rows = conn.execute(
+        "SELECT seq, permalink, command_json, created_at, delivery_state, "
+        "applied_clients_json, expires_at "
+        "FROM viewport_events "
+        "WHERE target_slug = ? AND seq > ? "
+        "ORDER BY seq ASC",
+        (target_slug, since_seq),
+    ).fetchall()
     now = utc_now()
     events: list[ViewportCommandEvent] = []
     for raw_seq, permalink, command_json, created_at, raw_state, raw_clients, raw_exp in rows:
@@ -423,6 +661,24 @@ def _query_stored_events(
                 )
             )
     return events
+
+
+def _query_stored_events(
+    db_path: Path,
+    target_slug: str,
+    session_id: str | None,
+    *,
+    since_seq: int = 0,
+) -> list[ViewportCommandEvent]:
+    conn = _open_bus_connection(db_path, create=False)
+    if conn is None:
+        return []
+    try:
+        return _query_stored_events_from_conn(
+            conn, target_slug, session_id, since_seq=since_seq
+        )
+    finally:
+        conn.close()
 
 
 @dataclass(eq=False)
@@ -452,13 +708,19 @@ class ViewportBus:
                     conn.execute("BEGIN IMMEDIATE")
                     if target_slug is None:
                         conn.execute("DELETE FROM viewport_events")
+                        conn.execute("DELETE FROM viewport_receipts")
                         conn.execute(
-                            "DELETE FROM sqlite_sequence WHERE name = 'viewport_events'"
+                            "DELETE FROM sqlite_sequence WHERE name IN ('viewport_events', 'viewport_receipts')"
                         )
                     else:
+                        clean_slug = target_slug.strip()
                         conn.execute(
                             "DELETE FROM viewport_events WHERE target_slug = ?",
-                            (target_slug.strip(),),
+                            (clean_slug,),
+                        )
+                        conn.execute(
+                            "DELETE FROM viewport_receipts WHERE target_slug = ?",
+                            (clean_slug,),
                         )
                     conn.execute("COMMIT")
                 finally:
@@ -486,9 +748,20 @@ class ViewportBus:
         from app.services.investigation_service import (
             append_session_delta_event,
             get_active_session_ids_for_target,
+            get_investigation_session,
             get_session_follow_state,
             get_session_raw_focus_state,
         )
+
+        for check_sid in dict.fromkeys(
+            sid for sid in (cmd.session_id, cmd.refresh_session_id) if sid
+        ):
+            existing_inv = get_investigation_session(check_sid)
+            if existing_inv is not None and existing_inv.target_slug != cmd.target_slug:
+                raise ValueError(
+                    f"Session `{check_sid}` belongs to target `{existing_inv.target_slug}`, "
+                    f"not `{cmd.target_slug}`."
+                )
 
         db_path = _resolve_viewport_bus_db_path()
         issued_at = utc_now()
@@ -689,6 +962,18 @@ class ViewportBus:
             subscriber_count=sub_count,
         )
 
+    def _poll_stored_events(
+        self,
+        db_path: Path,
+        target_slug: str,
+        session_id: str | None,
+        since_seq: int,
+    ) -> list[ViewportCommandEvent]:
+        with self._lock:
+            return _query_stored_events(
+                db_path, target_slug, session_id, since_seq=since_seq
+            )
+
     async def stream_events(
         self,
         target_slug: str,
@@ -702,14 +987,17 @@ class ViewportBus:
         norm_slug = target_slug.strip()
         norm_session = (session_id or "").strip() or None
         if once:
-            with self._lock:
-                replay = [
-                    ev
-                    for ev in _query_stored_events(
-                        db_path, norm_slug, norm_session, since_seq=since_seq
-                    )
-                    if ev.delivery_state not in ("stale", "expired")
-                ]
+            def _load_once_replay() -> list[ViewportCommandEvent]:
+                with self._lock:
+                    return [
+                        ev
+                        for ev in _query_stored_events(
+                            db_path, norm_slug, norm_session, since_seq=since_seq
+                        )
+                        if ev.delivery_state not in ("stale", "expired")
+                    ]
+
+            replay = await asyncio.to_thread(_load_once_replay)
             if not replay:
                 yield ": viewport-bus idle\n\n"
                 return
@@ -725,23 +1013,48 @@ class ViewportBus:
             loop=loop,
             wakeup=asyncio.Event(),
         )
-        with self._lock:
-            self._subscribers.add(sub)
-            if since_seq == 0:
-                replay = []
-                last_sent_seq = _max_seq_for_target(db_path, norm_slug)
-            else:
-                replay = [
-                    ev
-                    for ev in _query_stored_events(
-                        db_path, norm_slug, norm_session, since_seq=since_seq
-                    )
-                    if ev.delivery_state in ("accepted_by_service", "waiting_for_follow")
-                ]
-                last_sent_seq = max(since_seq, _max_seq_for_target(db_path, norm_slug))
 
-        last_keepalive = loop.time()
+        def _subscribe_and_load() -> tuple[list[ViewportCommandEvent], int]:
+            with self._lock:
+                self._subscribers.add(sub)
+                conn = _open_bus_connection(db_path, create=False)
+                if conn is None:
+                    return [], since_seq
+                try:
+                    conn.execute("BEGIN")
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(seq), 0) FROM viewport_events WHERE target_slug = ?",
+                        (norm_slug,),
+                    ).fetchone()
+                    max_seq = int(row[0] or 0) if row else 0
+                    if since_seq == 0:
+                        replay_events: list[ViewportCommandEvent] = []
+                        baseline = max_seq
+                    else:
+                        replay_events = [
+                            ev
+                            for ev in _query_stored_events_from_conn(
+                                conn, norm_slug, norm_session, since_seq=since_seq
+                            )
+                            if ev.delivery_state
+                            in ("accepted_by_service", "waiting_for_follow", "paused_by_human")
+                        ]
+                        baseline = max(since_seq, max_seq)
+                    conn.execute("COMMIT")
+                    return replay_events, baseline
+                finally:
+                    with contextlib.suppress(sqlite3.Error):
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                    conn.close()
+
+        def _unsubscribe() -> None:
+            with self._lock:
+                self._subscribers.discard(sub)
+
         try:
+            replay, last_sent_seq = await asyncio.to_thread(_subscribe_and_load)
+            last_keepalive = loop.time()
             yield ": viewport-bus connected\n\n"
             for ev in replay:
                 yield format_sse_viewport_event(ev)
@@ -756,10 +1069,13 @@ class ViewportBus:
                     pass
                 if sub.closed:
                     break
-                with self._lock:
-                    fresh = _query_stored_events(
-                        db_path, norm_slug, norm_session, since_seq=last_sent_seq
-                    )
+                fresh = await asyncio.to_thread(
+                    self._poll_stored_events,
+                    db_path,
+                    norm_slug,
+                    norm_session,
+                    last_sent_seq,
+                )
                 if fresh:
                     emitted_any = False
                     for ev in fresh:
@@ -778,8 +1094,17 @@ class ViewportBus:
                     last_keepalive = now_mono
                     yield ": keepalive\n\n"
         finally:
-            with self._lock:
-                self._subscribers.discard(sub)
+            sub.closed = True
+            unsubscribed = False
+            try:
+                await asyncio.to_thread(_unsubscribe)
+                unsubscribed = True
+            except RuntimeError:
+                _unsubscribe()
+                unsubscribed = True
+            finally:
+                if not unsubscribed:
+                    _unsubscribe()
 
 
 _VIEWPORT_BUS = ViewportBus()
@@ -867,52 +1192,116 @@ def record_viewport_receipt(
     from app.services.investigation_service import (
         append_session_delta_event,
         get_active_session_ids_for_target,
+        get_investigation_session,
     )
 
     db_path = _resolve_viewport_bus_db_path()
     now = utc_now()
     now_iso = now.isoformat()
     receipt_id = f"rcpt_{uuid.uuid4().hex[:12]}"
-    clean_client = payload.client_id.strip()
+    clean_client = (payload.client_id or "").strip()
+    clean_slug = (payload.target_slug or "").strip()
+    clean_cmd_id = (payload.command_id or "").strip()
+    req_sid = (payload.session_id or "").strip() or None
+    if not clean_cmd_id:
+        raise ValueError("Viewport receipt requires a non-empty `command_id`.")
+    if not clean_client:
+        raise ValueError("Viewport receipt requires a non-empty `client_id`.")
+    if not clean_slug:
+        raise ValueError("Viewport receipt requires a non-empty `target_slug`.")
 
     with _VIEWPORT_BUS._lock:
         conn = _open_bus_connection(db_path, create=True)
         assert conn is not None
         try:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT seq, session_id, command_json, delivery_state, applied_clients_json "
-                "FROM viewport_events WHERE command_id = ? AND target_slug = ? "
-                "ORDER BY seq DESC LIMIT 1",
-                (payload.command_id, payload.target_slug),
-            ).fetchone()
-            if row is None and payload.seq is not None:
+            if payload.seq is not None:
                 row = conn.execute(
-                    "SELECT seq, session_id, command_json, delivery_state, applied_clients_json "
-                    "FROM viewport_events WHERE seq = ? AND target_slug = ?",
-                    (payload.seq, payload.target_slug),
+                    "SELECT seq, session_id, command_json, delivery_state, "
+                    "applied_clients_json, expires_at "
+                    "FROM viewport_events WHERE command_id = ? AND target_slug = ? AND seq = ?",
+                    (clean_cmd_id, clean_slug, int(payload.seq)),
                 ).fetchone()
-            if row is None:
-                raise LookupError(
-                    f"Viewport command `{payload.command_id}` not found for target `{payload.target_slug}`."
-                )
+                if row is None:
+                    any_cmd = conn.execute(
+                        "SELECT seq FROM viewport_events WHERE command_id = ? AND target_slug = ? "
+                        "ORDER BY seq DESC LIMIT 1",
+                        (clean_cmd_id, clean_slug),
+                    ).fetchone()
+                    if any_cmd is not None:
+                        raise ValueError(
+                            f"Contradictory viewport receipt identity for `{clean_cmd_id}`: "
+                            f"stored seq={int(any_cmd[0])} does not match supplied seq={payload.seq}."
+                        )
+                    raise LookupError(
+                        f"Viewport command `{clean_cmd_id}` not found for target `{clean_slug}`."
+                    )
+            else:
+                row = conn.execute(
+                    "SELECT seq, session_id, command_json, delivery_state, "
+                    "applied_clients_json, expires_at "
+                    "FROM viewport_events WHERE command_id = ? AND target_slug = ? "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (clean_cmd_id, clean_slug),
+                ).fetchone()
+                if row is None:
+                    raise LookupError(
+                        f"Viewport command `{clean_cmd_id}` not found for target `{clean_slug}`."
+                    )
 
             ev_seq = int(row[0])
-            ev_sid = str(row[1]) if row[1] is not None else None
             cmd_obj = ViewportCommand.model_validate_json(str(row[2]))
-            prev_state = str(row[3] or "accepted_by_service")
+            ev_sid = (str(row[1]).strip() if row[1] is not None else "") or (
+                (cmd_obj.session_id or "").strip() or None
+            )
+            if ev_sid is not None and req_sid != ev_sid:
+                raise ValueError(
+                    f"Viewport command `{clean_cmd_id}` belongs to session `{ev_sid}`, "
+                    f"not `{req_sid or 'unscoped'}`."
+                )
+            if ev_sid is None and req_sid is not None:
+                existing_inv = get_investigation_session(req_sid)
+                if existing_inv is not None and existing_inv.target_slug != clean_slug:
+                    raise ValueError(
+                        f"Session `{req_sid}` belongs to target `{existing_inv.target_slug}`, "
+                        f"not `{clean_slug}`."
+                    )
+
+            prev_state = _effective_delivery_state(
+                str(row[3] or "accepted_by_service"),
+                row[5] or cmd_obj.expires_at,
+                now,
+            )
             clients: list[str] = json.loads(str(row[4] or "[]"))
 
             if payload.outcome == "applied":
+                if prev_state in ("expired", "stale", "rejected"):
+                    raise ValueError(
+                        f"Cannot apply viewport command `{clean_cmd_id}` in `{prev_state}` state."
+                    )
                 new_state: ViewportDeliveryState = "applied_by_browser"
                 if clean_client not in clients:
                     clients.append(clean_client)
             elif payload.outcome == "paused_by_human":
-                new_state = "applied_by_browser" if prev_state == "applied_by_browser" else "paused_by_human"
+                if prev_state in ("expired", "stale", "rejected"):
+                    raise ValueError(
+                        f"Cannot pause viewport command `{clean_cmd_id}` in `{prev_state}` state."
+                    )
+                new_state = (
+                    "applied_by_browser" if prev_state == "applied_by_browser" else "paused_by_human"
+                )
             elif payload.outcome == "stale_revision":
-                new_state = "stale"
+                new_state = (
+                    prev_state
+                    if prev_state in ("expired", "rejected", "applied_by_browser")
+                    else "stale"
+                )
             else:
-                new_state = "rejected"
+                new_state = (
+                    prev_state
+                    if prev_state in ("expired", "stale", "applied_by_browser")
+                    else "rejected"
+                )
 
             updated_cmd = cmd_obj.model_copy(
                 update={
@@ -923,15 +1312,22 @@ def record_viewport_receipt(
             conn.execute(
                 "UPDATE viewport_events "
                 "SET delivery_state = ?, applied_clients_json = ?, command_json = ? "
-                "WHERE seq = ?",
+                "WHERE seq = ? AND target_slug = ?",
                 (
                     new_state,
                     json.dumps(clients[:32]),
                     updated_cmd.model_dump_json(),
                     ev_seq,
+                    clean_slug,
                 ),
             )
-            eff_sid = (payload.session_id or "").strip() or ev_sid
+            eff_sid = ev_sid or req_sid
+            conn.execute(
+                "DELETE FROM viewport_receipts "
+                "WHERE target_slug = ? AND COALESCE(session_id, '') = COALESCE(?, '') "
+                "AND command_id = ? AND COALESCE(seq, -1) = COALESCE(?, -1) AND client_id = ?",
+                (clean_slug, eff_sid, updated_cmd.command_id, ev_seq, clean_client),
+            )
             conn.execute(
                 "INSERT INTO viewport_receipts ("
                 "receipt_id, command_id, seq, target_slug, session_id, client_id, "
@@ -941,7 +1337,7 @@ def record_viewport_receipt(
                     receipt_id,
                     updated_cmd.command_id,
                     ev_seq,
-                    payload.target_slug,
+                    clean_slug,
                     eff_sid,
                     clean_client,
                     payload.outcome,
@@ -951,13 +1347,23 @@ def record_viewport_receipt(
                     now_iso,
                 ),
             )
+            conn.execute(
+                "DELETE FROM viewport_receipts "
+                "WHERE target_slug = ? AND id <= COALESCE(("
+                "SELECT id FROM viewport_receipts WHERE target_slug = ? "
+                "ORDER BY id DESC LIMIT 1 OFFSET ?"
+                "), 0)",
+                (clean_slug, clean_slug, VIEWPORT_RECEIPTS_MAXLEN),
+            )
             conn.execute("COMMIT")
         finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             conn.close()
 
     delta_sid = eff_sid
     if not delta_sid:
-        sids = get_active_session_ids_for_target(payload.target_slug)
+        sids = get_active_session_ids_for_target(clean_slug)
         if len(sids) == 1:
             delta_sid = sids[0]
     if delta_sid:
@@ -986,7 +1392,7 @@ def record_viewport_receipt(
         receipt_id=receipt_id,
         command_id=updated_cmd.command_id,
         seq=ev_seq,
-        target_slug=payload.target_slug,
+        target_slug=clean_slug,
         session_id=eff_sid,
         client_id=clean_client,
         outcome=payload.outcome,
@@ -1003,8 +1409,23 @@ def list_viewport_receipts(
     target_slug: str | None = None,
     session_id: str | None = None,
     command_id: str | None = None,
+    seq: int | None = None,
     limit: int = 50,
 ) -> list[ViewportCommandReceiptRead]:
+    clean_slug = target_slug.strip() if (target_slug and target_slug.strip()) else None
+    clean_sid = session_id.strip() if (session_id and session_id.strip()) else None
+    if clean_sid is not None:
+        from app.services.investigation_service import get_investigation_session
+
+        inv_sess = get_investigation_session(clean_sid)
+        if inv_sess is not None:
+            if clean_slug is not None and inv_sess.target_slug != clean_slug:
+                return []
+            clean_slug = clean_slug or inv_sess.target_slug
+        elif clean_slug is None:
+            # Browser-only or evicted session without an explicit target_slug must not bleed across targets.
+            return []
+
     db_path = _resolve_viewport_bus_db_path()
     conn = _open_bus_connection(db_path, create=False)
     if conn is None:
@@ -1012,15 +1433,18 @@ def list_viewport_receipts(
     try:
         clauses: list[str] = []
         params: list[object] = []
-        if target_slug and target_slug.strip():
+        if clean_slug:
             clauses.append("r.target_slug = ?")
-            params.append(target_slug.strip())
-        if session_id and session_id.strip():
-            clauses.append("(r.session_id IS NULL OR r.session_id = ?)")
-            params.append(session_id.strip())
+            params.append(clean_slug)
+        if clean_sid:
+            clauses.append("r.session_id = ?")
+            params.append(clean_sid)
         if command_id and command_id.strip():
             clauses.append("r.command_id = ?")
             params.append(command_id.strip())
+        if seq is not None:
+            clauses.append("r.seq = ?")
+            params.append(int(seq))
         where_sql = f"WHERE {' AND '.join(clauses)} " if clauses else ""
         params.append(max(1, min(200, limit)))
         rows = conn.execute(
@@ -1028,7 +1452,11 @@ def list_viewport_receipts(
             "r.client_id, r.outcome, r.delivery_state, r.applied_focus_revision, r.note, r.recorded_at, "
             "COALESCE(e.applied_clients_json, '[]') "
             "FROM viewport_receipts r "
-            "LEFT JOIN viewport_events e ON e.command_id = r.command_id "
+            "LEFT JOIN viewport_events e "
+            "  ON e.target_slug = r.target_slug "
+            " AND e.command_id = r.command_id "
+            " AND (r.seq IS NULL OR e.seq = r.seq) "
+            " AND (e.session_id IS NULL OR r.session_id IS NULL OR e.session_id = r.session_id) "
             f"{where_sql}"
             "ORDER BY r.id DESC LIMIT ?",
             tuple(params),

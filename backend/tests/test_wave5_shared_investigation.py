@@ -988,7 +988,7 @@ def test_stage2a_wiretap_cli_runtime_provenance_and_understanding_integration(
             assert any(s.producer == "wiretap:otel_traces" for s in rt_sources)
             assert any("static dark matter" in s.sampling_note for s in rt_sources)
             v_refs = validate_references_against_report(
-                ["z3:m:route:main:port:1:8780"],
+                ["z3:m:compose:compose.yaml:api:port:1:8780"],
                 rep,
                 evidence_revision_id=ev.evidence_revision_id,
             )

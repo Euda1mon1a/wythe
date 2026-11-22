@@ -195,16 +195,23 @@ def load_cpp_usr_index(
                     max_files=512,
                 )
                 return [
-                    read_safe_artifact_text(abs_f, repo_root=None, max_bytes=max_bytes)
+                    read_safe_artifact_text(
+                        abs_f, repo_root=None, allow_external=True, max_bytes=max_bytes
+                    )
                     for _, abs_f in dir_files
                 ]
-        return [read_safe_artifact_text(raw_item, repo_root=repo_root, max_bytes=max_bytes)]
+        return [
+            read_safe_artifact_text(
+                raw_item, repo_root=repo_root, allow_external=True, max_bytes=max_bytes
+            )
+        ]
 
     for raw_p in index_paths:
         for resolved, text in _expand_index_sources(raw_p):
             sources.append(str(resolved))
             stripped = text.lstrip()
-            if stripped.startswith(("{", "[")):
+            is_jsonl = resolved.suffix.lower() in (".jsonl", ".ndjson")
+            if not is_jsonl and stripped.startswith(("{", "[")):
                 try:
                     loaded = json.loads(text)
                 except (json.JSONDecodeError, RecursionError) as exc:
@@ -222,23 +229,49 @@ def load_cpp_usr_index(
                                 if isinstance(item, dict):
                                     _add_rec(item)
             else:
-                for raw_ln in text.splitlines()[:50000]:
-                    line = raw_ln.strip()
-                    if not line or line.startswith("#"):
+                decoder = json.JSONDecoder()
+                idx = 0
+                txt_len = len(text)
+                parsed_entries = 0
+                while idx < txt_len and parsed_entries < 50000:
+                    while idx < txt_len and text[idx].isspace():
+                        idx += 1
+                    if idx >= txt_len:
+                        break
+                    if text[idx] == "#":
+                        nl = text.find("\n", idx)
+                        idx = txt_len if nl == -1 else nl + 1
                         continue
-                    if line.startswith("{"):
+                    if text[idx] == "{":
                         try:
-                            obj = json.loads(line)
+                            obj, end_idx = decoder.raw_decode(text, idx)
                         except (json.JSONDecodeError, RecursionError):
+                            nl = text.find("\n", idx)
+                            idx = txt_len if nl == -1 else nl + 1
                             continue
+                        idx = end_idx
+                        parsed_entries += 1
                         if isinstance(obj, dict):
                             check_json_depth(obj, max_depth=MAX_NESTING_DEPTH)
                             _add_rec(obj)
-                    elif "\t" in line:
-                        cols = line.split("\t")
-                        if len(cols) >= 4:
-                            ln_no = int(cols[4]) if len(cols) >= 5 and cols[4].isdigit() else 1
-                            _add_rec({"usr": cols[0], "name": cols[1], "kind": cols[2], "file": cols[3], "line": ln_no})
+                    else:
+                        nl = text.find("\n", idx)
+                        line = (text[idx:] if nl == -1 else text[idx:nl]).strip()
+                        idx = txt_len if nl == -1 else nl + 1
+                        parsed_entries += 1
+                        if "\t" in line:
+                            cols = line.split("\t")
+                            if len(cols) >= 4:
+                                ln_no = int(cols[4]) if len(cols) >= 5 and cols[4].isdigit() else 1
+                                _add_rec(
+                                    {
+                                        "usr": cols[0],
+                                        "name": cols[1],
+                                        "kind": cols[2],
+                                        "file": cols[3],
+                                        "line": ln_no,
+                                    }
+                                )
 
     return CppUsrIndex(
         symbols_by_usr=by_usr,
@@ -487,7 +520,9 @@ def build_constraint_stage_matrix(
     stage_sources: dict[str, list[tuple[str, str, list[str]]]] = {s: [] for s in PIPELINE_STAGES}
 
     for rel_posix, abs_p in iter_safe_repo_files(repo_root, suffixes=_CPP_SUFFIXES):
-        _, raw_txt = read_safe_artifact_text(abs_p, repo_root=repo_root, max_bytes=max_bytes)
+        _, raw_txt = read_safe_artifact_text(
+            abs_p, repo_root=repo_root, max_bytes=max_bytes, errors="replace"
+        )
         cleaned = strip_c_comments_and_strings(raw_txt, blank_strings=True)
         stages = classify_cpp_solver_stages(rel_posix, cleaned)
         if not stages:

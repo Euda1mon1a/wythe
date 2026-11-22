@@ -234,9 +234,12 @@ def upgrade_edges_with_compiler_ir(
 
     calls_by_caller: dict[str, list[Any]] = {}
     for c in ir_bundle.calls:
-        calls_by_caller.setdefault(c.caller_symbol, []).append(c)
+        if not c.is_dynamic and c.kind != "indirect_call":
+            calls_by_caller.setdefault(c.caller_symbol, []).append(c)
 
     for c in ir_bundle.calls:
+        if c.is_dynamic or c.kind == "indirect_call":
+            continue
         src_fn = ir_bundle.functions.get(c.caller_symbol)
         dst_fn = ir_bundle.functions.get(c.callee_symbol)
         src_f = (src_fn.source_file if src_fn else "") or c.source_file
@@ -246,6 +249,8 @@ def upgrade_edges_with_compiler_ir(
             cross_pairs.append((src_f, dst_fn.source_file, c.caller_label, dst_fn.label, c.caller_usr, dst_fn.usr))
         if dst_fn.is_thunk_or_arc:
             for hop2 in calls_by_caller.get(dst_fn.symbol, ()):
+                if hop2.is_dynamic or hop2.kind == "indirect_call":
+                    continue
                 end_fn = ir_bundle.functions.get(hop2.callee_symbol)
                 if end_fn is not None and end_fn.source_file:
                     cross_pairs.append((src_f, end_fn.source_file, c.caller_label, end_fn.label, c.caller_usr, end_fn.usr))
@@ -707,21 +712,24 @@ class CompilerIrPlugin:
             llvm_ir=llvm_ir,
             metallib=metallib,
         )
-        ir_bundle = (
-            load_combined_ir_bundle(
-                repo_root,
-                index_store=arts["index_store"],
-                sil=arts["sil"],
-                llvm_ir=arts["llvm_ir"],
+        try:
+            ir_bundle = (
+                load_combined_ir_bundle(
+                    repo_root,
+                    index_store=arts["index_store"],
+                    sil=arts["sil"],
+                    llvm_ir=arts["llvm_ir"],
+                )
+                if (arts["index_store"] or arts["sil"] or arts["llvm_ir"])
+                else CompilerIrBundle()
             )
-            if (arts["index_store"] or arts["sil"] or arts["llvm_ir"])
-            else CompilerIrBundle()
-        )
-        seam = verify_metal_compute_seams(
-            repo_root,
-            metallib_paths=arts["metallib"],
-            extra_metal_files=self._extra_metal_files,
-        )
+            seam = verify_metal_compute_seams(
+                repo_root,
+                metallib_paths=arts["metallib"],
+                extra_metal_files=self._extra_metal_files,
+            )
+        except (OSError, ValueError):
+            return {}
         if not (ir_bundle.functions or ir_bundle.usr_index.symbols_by_usr or seam.has_metal_surface):
             return {}
 

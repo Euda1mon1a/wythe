@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -12,9 +13,12 @@ from app.adapters.base import ManipulatorExtractionResult, RawCandidateFinding
 from app.adapters.registry_sources import extract_registry_truth_nodes
 from app.schemas.atlas import AtlasEdge, AtlasNode, PolicyFieldConsumption
 from wythe_plugin_agent_harness.python_inspector import (
+    EXCLUDED_DIR_NAMES,
+    MAX_FILE_BYTES,
     HarnessConfig,
     HarnessInspectionBundle,
     RegistryLoadRecord,
+    _read_bounded_regular_text,
     is_safe_regular_file,
 )
 
@@ -41,6 +45,65 @@ class DeclarativeToolRegistry:
     cataloged_tools: tuple[str, ...]
     columns: tuple[str, ...]
     policy_columns: tuple[str, ...]
+
+
+def _load_bounded_yaml(raw_text: str, *, max_nodes: int = 4096, max_depth: int = 64) -> object:
+    """Parse YAML safely while capping node count, alias expansions, merge size, and depth."""
+
+    class _BoundedSafeLoader(yaml.SafeLoader):
+        def __init__(self, stream: object) -> None:
+            super().__init__(stream)
+            self._node_count = 0
+            self._alias_count = 0
+            self._merge_steps = 0
+            self._cur_depth = 0
+
+        def compose_node(self, parent: object, index: object) -> object:
+            if self.check_event(yaml.AliasEvent):
+                self._alias_count += 1
+                if (self._node_count + self._alias_count) > max_nodes:
+                    raise yaml.YAMLError(
+                        f"YAML alias expansion exceeds budget ({max_nodes})."
+                    )
+                return super().compose_node(parent, index)
+            self._node_count += 1
+            if (self._node_count + self._alias_count) > max_nodes:
+                raise yaml.YAMLError(f"YAML node count exceeds budget ({max_nodes}).")
+            self._cur_depth += 1
+            if self._cur_depth > max_depth:
+                raise yaml.YAMLError(
+                    f"YAML structure exceeds maximum nesting depth ({max_depth})."
+                )
+            try:
+                return super().compose_node(parent, index)
+            finally:
+                self._cur_depth -= 1
+
+        def flatten_mapping(self, node: object) -> None:
+            self._merge_steps += 1
+            if self._merge_steps > max_nodes:
+                raise yaml.YAMLError(
+                    f"YAML mapping merge exceeds budget ({max_nodes})."
+                )
+            super().flatten_mapping(node)
+            if len(getattr(node, "value", ())) > max_nodes:
+                raise yaml.YAMLError(
+                    f"YAML merged mapping exceeds budget ({max_nodes})."
+                )
+
+        def construct_yaml_int(self, node: object) -> int:
+            raw_val = getattr(node, "value", None)
+            if isinstance(raw_val, str) and len(raw_val) > 4096:
+                raise yaml.YAMLError("YAML integer exceeds maximum bit length")
+            val = super().construct_yaml_int(node)
+            if isinstance(val, int) and not isinstance(val, bool) and val.bit_length() > 4096:
+                raise yaml.YAMLError("YAML integer exceeds maximum bit length")
+            return val
+
+    _BoundedSafeLoader.add_constructor(
+        "tag:yaml.org,2002:int", _BoundedSafeLoader.construct_yaml_int
+    )
+    return yaml.load(raw_text, Loader=_BoundedSafeLoader)
 
 
 def _extract_catalog_entries(section: object) -> tuple[list[str], list[str]]:
@@ -75,64 +138,115 @@ def discover_tool_registries(
     repo_root: Path,
 ) -> tuple[list[DeclarativeToolRegistry], list[str]]:
     """Discover `config/*.{json,yaml,yml}` & `configs/*.{json,yaml,yml}` tool/capability catalogs."""
-    if repo_root.is_symlink() or not repo_root.exists():
-        return [], []
     try:
+        if repo_root.is_symlink():
+            return [], [f"{repo_root}: symlinked repository root"]
+        if not repo_root.exists():
+            return [], []
         real_root = repo_root.resolve()
-    except OSError:
-        return [], []
+    except OSError as exc:
+        return [], [f"{repo_root}: {type(exc).__name__}"]
 
     registries: list[DeclarativeToolRegistry] = []
     errors: list[str] = []
 
+    def _rel_label(path: Path, fallback: str) -> str:
+        try:
+            return path.relative_to(repo_root).as_posix()
+        except ValueError:
+            try:
+                return path.resolve().relative_to(real_root).as_posix()
+            except (OSError, ValueError):
+                return fallback
+
     for dirname in ("config", "configs"):
         cfg_dir = repo_root / dirname
-        if cfg_dir.is_symlink() or not cfg_dir.is_dir():
-            continue
         try:
-            if not cfg_dir.resolve().is_relative_to(real_root):
+            if cfg_dir.is_symlink():
+                errors.append(f"{dirname}: symlink directory skipped")
                 continue
-            entries = sorted(cfg_dir.rglob("*"))
-        except OSError:
+            if not cfg_dir.is_dir():
+                continue
+            if not cfg_dir.resolve().is_relative_to(real_root):
+                errors.append(f"{dirname}: escapes repository root")
+                continue
+        except (OSError, ValueError) as exc:
+            errors.append(f"{dirname}: {type(exc).__name__}")
             continue
 
-        for cand in entries:
-            if cand.suffix.lower() not in {".json", ".yaml", ".yml"}:
-                continue
-            if not is_safe_regular_file(cand, real_root):
-                continue
-            rel = cand.resolve().relative_to(real_root).as_posix()
+        candidate_files: list[Path] = []
+
+        def _on_walk_err(exc: OSError, *, _dir: str = dirname) -> None:
+            err_name = Path(exc.filename).name if exc.filename else _dir
+            err_rel = _rel_label(Path(exc.filename), err_name) if exc.filename else _dir
+            errors.append(f"{err_rel}: {type(exc).__name__}")
+
+        for parent, dirs, names in os.walk(cfg_dir, followlinks=False, onerror=_on_walk_err):
+            parent_path = Path(parent)
+            kept_dirs: list[str] = []
+            for dname in sorted(dirs):
+                if dname in EXCLUDED_DIR_NAMES or dname.startswith("."):
+                    continue
+                dpath = parent_path / dname
+                try:
+                    if dpath.is_symlink() or not dpath.resolve().is_relative_to(real_root):
+                        errors.append(f"{_rel_label(dpath, dname)}: unsafe or symlink directory skipped")
+                        continue
+                except (OSError, ValueError) as exc:
+                    errors.append(f"{_rel_label(dpath, dname)}: {type(exc).__name__}")
+                    continue
+                kept_dirs.append(dname)
+            dirs[:] = kept_dirs
+
+            for fname in sorted(names):
+                cand = parent_path / fname
+                if cand.suffix.lower() not in {".json", ".yaml", ".yml"}:
+                    continue
+                if not is_safe_regular_file(cand, real_root):
+                    errors.append(
+                        f"{_rel_label(cand, fname)}: unsafe, symlink, or oversized registry file skipped"
+                    )
+                    continue
+                candidate_files.append(cand)
+
+        for cand in sorted(candidate_files):
+            rel = _rel_label(cand, cand.name)
             try:
-                raw_text = cand.read_text(encoding="utf-8")
+                rel = cand.resolve().relative_to(real_root).as_posix()
+                raw_text = _read_bounded_regular_text(
+                    cand,
+                    max_bytes=MAX_FILE_BYTES,
+                    real_root=real_root,
+                    encoding="utf-8",
+                )
                 data = (
                     json.loads(raw_text)
                     if cand.suffix.lower() == ".json"
-                    else yaml.safe_load(raw_text)
+                    else _load_bounded_yaml(raw_text)
                 )
-            except (OSError, UnicodeError, ValueError, yaml.YAMLError, RecursionError) as exc:
+                if not isinstance(data, dict):
+                    continue
+                if not (set(data.keys()) & {"tools", "capabilities"}):
+                    continue
+
+                cat_names: list[str] = []
+                cols: list[str] = [str(k) for k in data]
+                for sec_key in ("tools", "capabilities"):
+                    if sec_key in data:
+                        sec_names, sec_keys = _extract_catalog_entries(data[sec_key])
+                        for n in sec_names:
+                            if n not in cat_names:
+                                cat_names.append(n)
+                        for k in sec_keys:
+                            if k not in cols:
+                                cols.append(k)
+
+                pol_cols = [c for c in cols if c.lower() in _GATING_POLICY_KEYS]
+                if not pol_cols:
+                    pol_cols = [c for c in cols if c in ("tools", "capabilities")]
+            except (OSError, UnicodeError, ValueError, TypeError, yaml.YAMLError, RecursionError) as exc:
                 errors.append(f"{rel}: {type(exc).__name__}")
                 continue
-
-            if not isinstance(data, dict):
-                continue
-            if not (set(data.keys()) & {"tools", "capabilities"}):
-                continue
-
-            cat_names: list[str] = []
-            cols: list[str] = [str(k) for k in data]
-            for sec_key in ("tools", "capabilities"):
-                if sec_key in data:
-                    sec_names, sec_keys = _extract_catalog_entries(data[sec_key])
-                    for n in sec_names:
-                        if n not in cat_names:
-                            cat_names.append(n)
-                    for k in sec_keys:
-                        if k not in cols:
-                            cols.append(k)
-
-            pol_cols = [c for c in cols if c.lower() in _GATING_POLICY_KEYS]
-            if not pol_cols:
-                pol_cols = [c for c in cols if c in ("tools", "capabilities")]
 
             registries.append(
                 DeclarativeToolRegistry(
@@ -260,10 +374,19 @@ def reconcile_manifests_and_registries(
 ) -> tuple[list[DeclarativeToolRegistry], int]:
     """Evaluate `AGENT-002` budgets, shadow tools, `reads_truth` edges & `PolicyFieldConsumption`."""
     registries, reg_errors = discover_tool_registries(repo_root)
-    bundle.parse_errors.extend(reg_errors)
+    if reg_errors:
+        bundle.parse_errors.extend(reg_errors)
+        object.__setattr__(result, "coverage_complete", False)
 
     already_ran_reg_sources = any(
-        n.startswith("JSON command source coverage:") for n in result.notes
+        n.startswith(
+            (
+                "JSON command source coverage:",
+                "YAML command source coverage:",
+                "JSON/YAML ",
+            )
+        )
+        for n in result.notes
     )
     preexisting_truth_ids: set[str] = set()
     if already_ran_reg_sources:

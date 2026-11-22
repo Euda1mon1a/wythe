@@ -645,6 +645,26 @@ def test_mcp_record_turn_and_wythe_reply_cli_stdin_pipe(
                 "PYTHONPATH": str(REPO_ROOT / "backend"),
                 "WYTHE_STATE_DIR": str(state_dir),
             }
+            amb_proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "app.cli",
+                    "reply",
+                    "--server",
+                    server_url,
+                    "--question",
+                    "Terminal Frontier Pipe",
+                ],
+                input="Frontier analysis of `t:batch_quota_policies` at `backend/app/models.py:5`.",
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            assert amb_proc.returncode == 2
+            assert "multiple active sessions" in amb_proc.stderr
+
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -653,6 +673,8 @@ def test_mcp_record_turn_and_wythe_reply_cli_stdin_pipe(
                     "reply",
                     "--server",
                     server_url,
+                    "--session",
+                    "inv_cli_pipe",
                     "--question",
                     "Terminal Frontier Pipe",
                 ],
@@ -1027,8 +1049,30 @@ def test_multi_session_target_switch_updates_active_slug_for_wythe_reply(
                 "PYTHONPATH": str(REPO_ROOT / "backend"),
                 "WYTHE_STATE_DIR": str(state_dir),
             }
-            proc = subprocess.run(
+            amb_proc = subprocess.run(
                 [sys.executable, "-m", "app.cli", "reply", "--server", server_url, "--question", "Switch Back Pipe"],
+                input="Piped back into `t:batch_quota_policies`.",
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            assert amb_proc.returncode == 2
+            assert "inv_lab_a" in amb_proc.stderr and "inv_lab_b" in amb_proc.stderr
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "app.cli",
+                    "reply",
+                    "--server",
+                    server_url,
+                    "--session",
+                    "inv_lab_b",
+                    "--question",
+                    "Switch Back Pipe",
+                ],
                 input="Piped back into `t:batch_quota_policies`.",
                 text=True,
                 capture_output=True,

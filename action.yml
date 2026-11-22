@@ -18,7 +18,7 @@ inputs:
     required: false
     default: "gate"
   base-ref:
-    description: "Git base ref when mode is 'diff'"
+    description: "Git base ref when mode is 'diff' or trusted config base"
     required: false
     default: "origin/main"
   strict:
@@ -26,7 +26,7 @@ inputs:
     required: false
     default: "false"
   sync-config:
-    description: "Hydrate governance rules/ratchets from .wythe/governance.json ('true' or 'false')"
+    description: "Hydrate governance rules/ratchets from trusted .wythe/governance.json ('true' or 'false')"
     required: false
     default: "true"
   sarif-file:
@@ -52,21 +52,90 @@ runs:
         TA_STRICT: ${{ inputs.strict }}
         TA_SYNC: ${{ inputs.sync-config }}
         TA_SARIF: ${{ inputs.sarif-file }}
+        TA_ACTION_PATH: ${{ github.action_path }}
+        TA_EVENT_NAME: ${{ github.event_name }}
+        TA_GITHUB_BASE_REF: ${{ github.base_ref }}
+        TA_PR_EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        TA_MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        TA_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        TA_REF: ${{ github.ref }}
       run: |
         set -euo pipefail
+        case "$TA_TARGET" in
+          -*)
+            echo "::error::Invalid inputs.target '$TA_TARGET': leading '-' is forbidden." >&2
+            exit 2
+            ;;
+        esac
         ARGS=()
         if [ "$TA_MODE" = "diff" ]; then
-          ARGS+=("diff" "$TA_TARGET" "--profile" "$TA_PROFILE" "--base" "$TA_BASE")
+          if [ -z "$TA_BASE" ]; then
+            echo "::error::inputs.base-ref is required in diff mode." >&2
+            exit 2
+          fi
+          case "$TA_BASE" in
+            -*)
+              echo "::error::Invalid inputs.base-ref '$TA_BASE': leading '-' is forbidden." >&2
+              exit 2
+              ;;
+          esac
+          ARGS+=("diff" "--profile" "$TA_PROFILE" "--base" "$TA_BASE")
+          if [ -n "$TA_SARIF" ]; then
+            ARGS+=("--sarif" "$TA_SARIF")
+          fi
+          ARGS+=("--" "$TA_TARGET")
         else
-          ARGS+=("gate" "$TA_TARGET" "--profile" "$TA_PROFILE")
+          ARGS+=("gate" "--profile" "$TA_PROFILE")
           if [ "$TA_STRICT" = "true" ]; then
             ARGS+=("--strict")
           fi
           if [ "$TA_SYNC" = "true" ]; then
             ARGS+=("--sync-config")
+            TRUST_WORKING_TREE=false
+            if [ "${TA_EVENT_NAME:-}" = "push" ] && [ -n "${TA_DEFAULT_BRANCH:-}" ] && [ "${TA_REF:-}" = "refs/heads/${TA_DEFAULT_BRANCH}" ]; then
+              TRUST_WORKING_TREE=true
+            fi
+            if [ "$TRUST_WORKING_TREE" != "true" ]; then
+              RESOLVED_BASE=""
+              if [ -n "${TA_BASE:-}" ] && [ "${TA_BASE}" != "origin/main" ]; then
+                RESOLVED_BASE="$TA_BASE"
+              elif [ "${TA_EVENT_NAME:-}" = "merge_group" ]; then
+                if [ -n "${TA_MERGE_GROUP_BASE_SHA:-}" ]; then
+                  RESOLVED_BASE="$TA_MERGE_GROUP_BASE_SHA"
+                else
+                  RESOLVED_BASE="${TA_BASE:-}"
+                fi
+              elif [ "${TA_EVENT_NAME:-}" = "pull_request" ] || [ "${TA_EVENT_NAME:-}" = "pull_request_target" ] || [ "${TA_EVENT_NAME:-}" = "pull_request_review" ] || [ "${TA_EVENT_NAME:-}" = "pull_request_review_comment" ] || [ "${TA_EVENT_NAME:-}" = "pull_request_review_thread" ]; then
+                if [ -n "${TA_GITHUB_BASE_REF:-}" ]; then
+                  RESOLVED_BASE="origin/${TA_GITHUB_BASE_REF}"
+                elif [ -n "${TA_PR_EVENT_BASE_REF:-}" ]; then
+                  RESOLVED_BASE="origin/${TA_PR_EVENT_BASE_REF}"
+                elif [ -n "${TA_DEFAULT_BRANCH:-}" ] && [ "${TA_BASE:-}" = "origin/main" ]; then
+                  RESOLVED_BASE="origin/${TA_DEFAULT_BRANCH}"
+                else
+                  RESOLVED_BASE="${TA_BASE:-}"
+                fi
+              elif [ -n "${TA_BASE:-}" ] && [ "${TA_BASE}" = "origin/main" ] && [ -n "${TA_DEFAULT_BRANCH:-}" ]; then
+                RESOLVED_BASE="origin/${TA_DEFAULT_BRANCH}"
+              else
+                RESOLVED_BASE="${TA_BASE:-}"
+              fi
+              if [ -z "$RESOLVED_BASE" ]; then
+                echo "::error::Trusted config base ref is required for event '${TA_EVENT_NAME:-}'." >&2
+                exit 2
+              fi
+              case "$RESOLVED_BASE" in
+                -*)
+                  echo "::error::Invalid trusted config base ref '$RESOLVED_BASE': leading '-' is forbidden." >&2
+                  exit 2
+                  ;;
+              esac
+              ARGS+=("--trusted-config-ref" "$RESOLVED_BASE")
+            fi
           fi
+          if [ -n "$TA_SARIF" ]; then
+            ARGS+=("--sarif" "$TA_SARIF")
+          fi
+          ARGS+=("--" "$TA_TARGET")
         fi
-        if [ -n "$TA_SARIF" ]; then
-          ARGS+=("--sarif" "$TA_SARIF")
-        fi
-        uvx --from "${{ github.action_path }}[treesitter]" wythe "${ARGS[@]}"
+        uvx --from "${TA_ACTION_PATH}[treesitter]" wythe "${ARGS[@]}"

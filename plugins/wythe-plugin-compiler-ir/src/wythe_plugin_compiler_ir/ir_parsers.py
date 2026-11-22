@@ -476,7 +476,7 @@ def parse_sil_file(
     path: str | Path,
     *,
     repo_root: Path | None = None,
-    allow_external: bool = True,
+    allow_external: bool = False,
 ) -> CompilerIrBundle:
     """Load a `.sil` file or directory of `.sil` files safely without executing `swiftc`."""
     validated = validate_safe_path(
@@ -491,7 +491,11 @@ def parse_sil_file(
 
     out = CompilerIrBundle()
     for fpath, _ in iter_safe_repo_files(validated, suffixes=(".sil",), max_files=256):
-        _, text = read_safe_text(fpath, repo_root=None, allow_external=True)
+        _, text = read_safe_text(
+            fpath,
+            repo_root=repo_root if not allow_external else None,
+            allow_external=allow_external,
+        )
         out.merge(parse_sil_text(text, repo_root=repo_root))
     return out
 
@@ -702,7 +706,7 @@ def parse_llvm_ir_file(
     path: str | Path,
     *,
     repo_root: Path | None = None,
-    allow_external: bool = True,
+    allow_external: bool = False,
 ) -> CompilerIrBundle:
     """Load a read-only `.ll` file or directory of `.ll` files without invoking `clang`/`llvm-dis`."""
     validated = validate_safe_path(
@@ -717,6 +721,10 @@ def parse_llvm_ir_file(
 
     out = CompilerIrBundle()
     for fpath, _ in iter_safe_repo_files(validated, suffixes=(".ll",), max_files=256):
-        _, text = read_safe_text(fpath, repo_root=None, allow_external=True)
+        _, text = read_safe_text(
+            fpath,
+            repo_root=repo_root if not allow_external else None,
+            allow_external=allow_external,
+        )
         out.merge(parse_llvm_ir_text(text, repo_root=repo_root))
     return out

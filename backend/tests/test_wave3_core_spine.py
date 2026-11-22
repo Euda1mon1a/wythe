@@ -67,12 +67,23 @@ def _clean_viewport_bus() -> Any:
     reset_viewport_bus()
 
 
+class _FakeDist:
+    def __init__(self, version: str) -> None:
+        import sysconfig
+
+        self.version = version
+        self._path = Path(sysconfig.get_path("purelib")) / f"fake_plugin-{version}.dist-info"
+
+    def locate_file(self, path: str) -> Path:
+        return self._path.parent / path
+
+
 class _FakeEntryPoint:
     def __init__(self, name: str, value: str, loaded: object, version: str = "0.1.0") -> None:
         self.name = name
         self.value = value
         self._loaded = loaded
-        self.dist = type("_FakeDist", (), {"version": version})()
+        self.dist = _FakeDist(version)
 
     def load(self) -> object:
         return self._loaded
@@ -132,9 +143,9 @@ def _make_mini_repo(repo_dir: Path) -> Path:
 
 
 def test_core_domain_agnostic_baseline_and_pyproject_plugin_paths(db_session) -> None:
-    """Verify core wythe stays 100% domain-agnostic with 19 DB rules, 10 MCP tools, and 4 SLM tools <2KB."""
+    """Verify core wythe stays 100% domain-agnostic with 26 DB rules, 11 MCP tools, and 4 SLM tools <2KB."""
     seeded_rules = db_session.scalars(select(RulePolicy).order_by(RulePolicy.rule_code)).all()
-    assert len(seeded_rules) == 19
+    assert len(seeded_rules) == 26
     assert not any(r.rule_code.startswith("AGENT-") for r in seeded_rules)
 
     assert len(MCP_TOOLS) == 11
@@ -318,8 +329,8 @@ def test_multi_protocol_plugin_coercion_and_metadata(
         any(b.key == "synth_vars" and b.count == 7 for b in n.stratum_badges)
         for n in report.nodes
     )
-    # Confirm DB RulePolicy table remained strictly 19 rows
-    assert len(db_session.scalars(select(RulePolicy)).all()) == 19
+    # Confirm DB RulePolicy table remained strictly 26 rows
+    assert len(db_session.scalars(select(RulePolicy)).all()) == 26
 
 
 def test_cli_local_plugin_optin_across_scan_gate_context_and_db_rule_precedence(

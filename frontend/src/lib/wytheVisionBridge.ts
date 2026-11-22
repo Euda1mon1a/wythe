@@ -16,6 +16,25 @@ import {
 } from './wytheSceneLenses';
 import type { WythePaletteColors } from '@/lib/wytheTheme';
 
+const BOUNDARY_TAG_RE = /<\s*\/?\s*untrusted_repo_metadata\b[^>]*>?/gi;
+
+export function sanitizeRepoMetadataText(
+  value: string | null | undefined,
+  maxLen = 280,
+): string {
+  if (!value) return '';
+  return value
+    .replace(BOUNDARY_TAG_RE, '[redacted-boundary-tag]')
+    .replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+}
+
+export function fenceUntrustedRepoMetadata(raw: string): string {
+  const neutralized = raw.replace(BOUNDARY_TAG_RE, '[redacted-boundary-tag]');
+  return `<untrusted_repo_metadata>\n${neutralized}\n</untrusted_repo_metadata>`;
+}
+
 export interface VisualFocusFiducial {
   district: string | null;
   focusedNodeId: string | null;
@@ -394,10 +413,14 @@ export function buildLiveViewportDigest(params: {
   const hovNode = hoveredNodeId ? nodesById.get(hoveredNodeId) ?? null : null;
   const legend = getLensLegendItems(lens, Boolean(diffOverlay));
 
+  const safeSlug = sanitizeRepoMetadataText(activeSlug, 80);
+  const safeCommit = sanitizeRepoMetadataText(sourceCommit, 40).slice(0, 10);
+  const safeSearch = sanitizeRepoMetadataText(searchQuery, 120);
+  const safeDiffLabel = diffOverlay ? sanitizeRepoMetadataText(diffOverlay.label, 120) : '';
   const lines: string[] = [
-    `### Live 3D Camera Frustum & Exact Screen Colors (${activeSlug} @ ${sourceCommit.slice(0, 10)})`,
+    `### Live 3D Camera Frustum & Exact Screen Colors (${safeSlug} @ ${safeCommit})`,
     `- **Camera Frustum**: **${frustumEntries.length}** nodes within camera bounds (out of ${visibleNodes.length} represented nodes; ${overviewNodeIds?.size ?? 0} overview dots).`,
-    `- **Active Controls**: Lens=\`${lens}\` (${SCENE_LENS_LABELS[lens]}) | Layout=\`${layoutMode}\` | Tier=\`${tierFilter}\` | Subkind=\`${subkindFilter}\` | EdgeFilter=\`${edgeFilter}\` | FlaggedOnly=\`${onlyFlagged}\` | IsolateCone=\`${isolateCone}\` | ConnectedOnly=\`${connectedOnly}\` | NeighborhoodHops=\`${neighborhoodHops}\` | WorkingSet=\`${workingSetOnly}\` | Compact=\`${compactVisible}\` | Flat2D=\`${flatten2D}\` | GroupBy=\`${groupBy}\` | ZSlice=\`${zWytheSlice}\` | ZoomStratum=\`${zoomStratum}\`${searchQuery ? ` | Search=\`${searchQuery}\`` : ''}${diffOverlay ? ` | 3D Blast=\`${diffOverlay.label}\`` : ' | 3D Blast=`off`'}`,
+    `- **Active Controls**: Lens=\`${lens}\` (${SCENE_LENS_LABELS[lens]}) | Layout=\`${layoutMode}\` | Tier=\`${tierFilter}\` | Subkind=\`${sanitizeRepoMetadataText(subkindFilter, 64)}\` | EdgeFilter=\`${sanitizeRepoMetadataText(edgeFilter, 64)}\` | FlaggedOnly=\`${onlyFlagged}\` | IsolateCone=\`${isolateCone}\` | ConnectedOnly=\`${connectedOnly}\` | NeighborhoodHops=\`${neighborhoodHops}\` | WorkingSet=\`${workingSetOnly}\` | Compact=\`${compactVisible}\` | Flat2D=\`${flatten2D}\` | GroupBy=\`${groupBy}\` | ZSlice=\`${zWytheSlice}\` | ZoomStratum=\`${zoomStratum}\`${safeSearch ? ` | Search=\`${safeSearch}\`` : ''}${diffOverlay ? ` | 3D Blast=\`${safeDiffLabel}\`` : ' | 3D Blast=`off`'}`,
     `- **Active Color Legend**: ${legend.map((it) => `${it.label} (${it.color})`).join(' · ')}`,
   ];
 
@@ -405,50 +428,58 @@ export function buildLiveViewportDigest(params: {
     const sf = findingsByNode.get(selNode.id) ?? [];
     const inb = edges.filter((e) => e.target_id === selNode.id).slice(0, 6);
     const outb = edges.filter((e) => e.source_id === selNode.id).slice(0, 6);
+    const sId = sanitizeRepoMetadataText(selNode.id, 160);
+    const sLabel = sanitizeRepoMetadataText(selNode.label, 160);
+    const sCluster = sanitizeRepoMetadataText(deriveDomainCluster(selNode), 80);
+    const sFile = sanitizeRepoMetadataText(selNode.source_file, 200);
     lines.push(
-      `- **SELECTED / HIGHLIGHTED NODE (Pinned by User)**: \`${selNode.id}\` (${selNode.tier} \`${selNode.subkind}\`, label=\`${selNode.label}\`, status=\`${selNode.status}\`, district=\`${deriveDomainCluster(selNode)}\`, discovery_pointer=\`${selNode.source_file}:${selNode.line}\`)`,
+      `- **SELECTED / HIGHLIGHTED NODE (Pinned by User)**: \`${sId}\` (${selNode.tier} \`${selNode.subkind}\`, label=\`${sLabel}\`, status=\`${selNode.status}\`, district=\`${sCluster}\`, discovery_pointer=\`${sFile}:${selNode.line}\`)`,
     );
     if (selNode.store_purpose) {
       const sp = selNode.store_purpose;
       const details = [
-        `intended_use=${sp.intended_use}`,
-        sp.authoritative_source ? `authoritative_source=${sp.authoritative_source}` : null,
-        sp.copy_reason ? `copy_reason=${sp.copy_reason}` : null,
-        sp.refresh_policy ? `refresh_policy=${sp.refresh_policy}` : null,
-        sp.recovery_expectation ? `recovery_expectation=${sp.recovery_expectation}` : null,
-        sp.keyspace_scope ? `keyspace_scope=${sp.keyspace_scope}` : null,
+        `intended_use=${sanitizeRepoMetadataText(sp.intended_use, 80)}`,
+        sp.authoritative_source ? `authoritative_source=${sanitizeRepoMetadataText(sp.authoritative_source, 160)}` : null,
+        sp.copy_reason ? `copy_reason=${sanitizeRepoMetadataText(sp.copy_reason, 180)}` : null,
+        sp.refresh_policy ? `refresh_policy=${sanitizeRepoMetadataText(sp.refresh_policy, 120)}` : null,
+        sp.recovery_expectation ? `recovery_expectation=${sanitizeRepoMetadataText(sp.recovery_expectation, 120)}` : null,
+        sp.keyspace_scope ? `keyspace_scope=${sanitizeRepoMetadataText(sp.keyspace_scope, 120)}` : null,
       ]
         .filter(Boolean)
         .join(', ');
       lines.push(`  - Declared Store Purpose (intent, NOT proof of verification): ${details}`);
       if (sp.verification_summary) {
-        lines.push(`  - Purpose Verification: ${sp.verification_summary}`);
+        lines.push(`  - Purpose Verification: ${sanitizeRepoMetadataText(sp.verification_summary, 240)}`);
       }
     } else if (selNode.verification_note) {
-      lines.push(`  - Static Verification Note: ${selNode.verification_note}`);
+      lines.push(`  - Static Verification Note: ${sanitizeRepoMetadataText(selNode.verification_note, 240)}`);
     }
     if (sf.length > 0) {
       lines.push(
         `  - Selected Node Findings: ${sf
           .slice(0, 4)
           .map((f) => {
+            const fNode = sanitizeRepoMetadataText(f.node_id, 160);
+            const fFile = sanitizeRepoMetadataText(f.source_file, 200);
+            const fTitle = sanitizeRepoMetadataText(f.title, 200);
+            const fRule = sanitizeRepoMetadataText(f.rule_code, 48);
             const loc =
               f.target_node_id === selNode.id && f.node_id !== selNode.id
-                ? `causal writer \`${f.node_id}\` @ \`${f.source_file}:${f.line}\``
-                : `\`${f.source_file}:${f.line}\``;
-            return `\`${f.rule_code}\` [${f.severity} | ${f.confidence} | ${f.evidence_strength}] ${f.title} (${loc})`;
+                ? `causal writer \`${fNode}\` @ \`${fFile}:${f.line}\``
+                : `\`${fFile}:${f.line}\``;
+            return `\`${fRule}\` [${f.severity} | ${f.confidence} | ${f.evidence_strength}] ${fTitle} (${loc})`;
           })
           .join('; ')}`,
       );
     }
     if (inb.length > 0) {
       lines.push(
-        `  - Inbound Callers/Readers: ${inb.map((e) => `\`${e.source_id}\` --[${e.kind} | ${e.verification}]-->`).join(', ')}`,
+        `  - Inbound Callers/Readers: ${inb.map((e) => `\`${sanitizeRepoMetadataText(e.source_id, 160)}\` --[${e.kind} | ${e.verification}]-->`).join(', ')}`,
       );
     }
     if (outb.length > 0) {
       lines.push(
-        `  - Outbound Targets/Tables: ${outb.map((e) => `--[${e.kind} | ${e.verification}]--> \`${e.target_id}\``).join(', ')}`,
+        `  - Outbound Targets/Tables: ${outb.map((e) => `--[${e.kind} | ${e.verification}]--> \`${sanitizeRepoMetadataText(e.target_id, 160)}\``).join(', ')}`,
       );
     }
   } else {
@@ -457,7 +488,7 @@ export function buildLiveViewportDigest(params: {
 
   if (hovNode && hovNode.id !== selNode?.id) {
     lines.push(
-      `- **Cursor Currently Hovering**: \`${hovNode.id}\` (\`${hovNode.label}\`, ${hovNode.subkind}, \`${hovNode.source_file}:${hovNode.line}\`, status=\`${hovNode.status}\`)`,
+      `- **Cursor Currently Hovering**: \`${sanitizeRepoMetadataText(hovNode.id, 160)}\` (\`${sanitizeRepoMetadataText(hovNode.label, 160)}\`, ${hovNode.subkind}, \`${sanitizeRepoMetadataText(hovNode.source_file, 200)}:${hovNode.line}\`, status=\`${hovNode.status}\`)`,
     );
   }
 
@@ -465,7 +496,7 @@ export function buildLiveViewportDigest(params: {
   for (const [bucket, bucketNodes] of colorBuckets.entries()) {
     const sample = bucketNodes
       .slice(0, 6)
-      .map((n) => `\`${n.label}\` (${n.subkind}, status=${n.status})`)
+      .map((n) => `\`${sanitizeRepoMetadataText(n.label, 120)}\` (${n.subkind}, status=${n.status})`)
       .join(', ');
     lines.push(`- **${bucket}**: **${bucketNodes.length}** nodes on screen — e.g. ${sample}`);
   }
@@ -478,8 +509,11 @@ export function buildLiveViewportDigest(params: {
     for (const entry of centerTop) {
       const n = entry.node;
       const nf = findingsByNode.get(n.id)?.[0];
+      const nfText = nf
+        ? `, finding=\`${sanitizeRepoMetadataText(nf.rule_code, 48)}\`: ${sanitizeRepoMetadataText(nf.title, 180)}`
+        : '';
       lines.push(
-        `- \`${n.id}\` (\`${n.label}\`, ${n.tier}/${n.subkind}, color=**${entry.colorBucket}**, \`${n.source_file}:${n.line}\`${nf ? `, finding=\`${nf.rule_code}\`: ${nf.title}` : ''})`,
+        `- \`${sanitizeRepoMetadataText(n.id, 160)}\` (\`${sanitizeRepoMetadataText(n.label, 120)}\`, ${n.tier}/${n.subkind}, color=**${entry.colorBucket}**, \`${sanitizeRepoMetadataText(n.source_file, 200)}:${n.line}\`${nfText})`,
       );
     }
   }
@@ -492,12 +526,12 @@ export function buildLiveViewportDigest(params: {
   }
 
   const focusTag = selNode
-    ? `Selected: ${selNode.label}`
+    ? `Selected: ${sanitizeRepoMetadataText(selNode.label, 80)}`
     : hovNode
-      ? `Hover: ${hovNode.label}`
+      ? `Hover: ${sanitizeRepoMetadataText(hovNode.label, 80)}`
       : centerTop[0]
-        ? `Center: ${centerTop[0].node.label}`
-        : activeSlug;
+        ? `Center: ${sanitizeRepoMetadataText(centerTop[0].node.label, 80)}`
+        : safeSlug;
 
   return {
     observedAtIso: new Date().toISOString(),
@@ -511,7 +545,7 @@ export function buildLiveViewportDigest(params: {
     hoveredNodeId,
     summaryPill: `${frustumEntries.length}/${visibleNodes.length} in camera · ${focusTag}`,
     referencedNodeIds: refIds,
-    markdownBrief: lines.join('\n'),
+    markdownBrief: fenceUntrustedRepoMetadata(lines.join('\n')),
   };
 }
 

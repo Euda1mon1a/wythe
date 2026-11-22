@@ -113,6 +113,15 @@ def _build_redis_semantics_repo(tmp_path: Path) -> Path:
         "app.include_router(router, prefix='/api/v1')\n",
     )
     _w(repo, "frontend/src/app/page.tsx", "export default function Home() { return <main>Ok</main>; }\n")
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "init"],
+        cwd=repo,
+        check=True,
+    )
     return repo
 
 

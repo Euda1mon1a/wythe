@@ -214,7 +214,9 @@ def trace_sat_parameter_lineage(
         # only when solver C++ code explicitly references SatParameters.
         has_cpp_sat_params = False
         for _, abs_p in iter_safe_repo_files(repo_root, suffixes=_CPP_SUFFIXES):
-            _, raw_t = read_safe_artifact_text(abs_p, repo_root=repo_root, max_bytes=max_bytes)
+            _, raw_t = read_safe_artifact_text(
+                abs_p, repo_root=repo_root, max_bytes=max_bytes, errors="replace"
+            )
             if "SatParameters" in raw_t:
                 has_cpp_sat_params = True
                 break
@@ -230,7 +232,9 @@ def trace_sat_parameter_lineage(
     all_thresholds: list[HardcodedHeuristicThreshold] = []
 
     for rel_posix, abs_p in iter_safe_repo_files(repo_root, suffixes=_CPP_SUFFIXES):
-        _, raw_txt = read_safe_artifact_text(abs_p, repo_root=repo_root, max_bytes=max_bytes)
+        _, raw_txt = read_safe_artifact_text(
+            abs_p, repo_root=repo_root, max_bytes=max_bytes, errors="replace"
+        )
         cleaned = strip_c_comments_and_strings(raw_txt, blank_strings=True)
         if not _is_solver_cpp_file(rel_posix, cleaned):
             continue

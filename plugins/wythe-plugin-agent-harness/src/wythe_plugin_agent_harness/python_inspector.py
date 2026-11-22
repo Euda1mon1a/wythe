@@ -12,6 +12,7 @@ import ast
 import json
 import os
 import re
+import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -202,6 +203,13 @@ class HarnessInspectionBundle:
 
 def is_safe_regular_file(path: Path, real_root: Path, max_bytes: int = MAX_FILE_BYTES) -> bool:
     """Verify `path` is a non-symlink regular file inside `real_root` within `max_bytes`."""
+    if "\x00" in str(path):
+        return False
+    for part in path.parts:
+        if part in (path.anchor, "", "."):
+            continue
+        if len(part.encode("utf-8", errors="surrogateescape")) > 255:
+            return False
     try:
         if path.is_symlink() or not path.is_file():
             return False
@@ -209,7 +217,7 @@ def is_safe_regular_file(path: Path, real_root: Path, max_bytes: int = MAX_FILE_
         if not resolved.is_relative_to(real_root):
             return False
         return path.stat().st_size <= max_bytes
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
@@ -218,28 +226,35 @@ def iter_safe_repo_files(
     suffixes: set[str],
 ) -> tuple[list[tuple[Path, str]], int]:
     """Walk `repo_root` safely without following symlinks or reading >512 KiB files."""
-    if repo_root.is_symlink() or not repo_root.exists():
+    if "\x00" in str(repo_root):
         return [], 1
     try:
+        if repo_root.is_symlink() or not repo_root.exists():
+            return [], 1
         real_root = repo_root.resolve()
-    except OSError:
+    except (OSError, ValueError):
         return [], 1
 
     collected: list[tuple[Path, str]] = []
     skipped = 0
-    for parent, dirs, names in os.walk(real_root, followlinks=False):
+
+    def _on_walk_error(_exc: OSError) -> None:
+        nonlocal skipped
+        skipped += 1
+
+    for parent, dirs, names in os.walk(real_root, followlinks=False, onerror=_on_walk_error):
         parent_path = Path(parent)
         kept_dirs: list[str] = []
         for dname in sorted(dirs):
             dpath = parent_path / dname
-            if dname in EXCLUDED_DIR_NAMES or dname.startswith(".") or dpath.is_symlink():
+            if dname in EXCLUDED_DIR_NAMES or dname.startswith("."):
                 skipped += 1
                 continue
             try:
-                if not dpath.resolve().is_relative_to(real_root):
+                if dpath.is_symlink() or not dpath.resolve().is_relative_to(real_root):
                     skipped += 1
                     continue
-            except OSError:
+            except (OSError, ValueError):
                 skipped += 1
                 continue
             kept_dirs.append(dname)
@@ -256,22 +271,64 @@ def iter_safe_repo_files(
             if not is_safe_regular_file(fpath, real_root):
                 skipped += 1
                 continue
-            rel = fpath.resolve().relative_to(real_root).as_posix()
+            try:
+                rel = fpath.resolve().relative_to(real_root).as_posix()
+            except (OSError, ValueError):
+                skipped += 1
+                continue
             collected.append((fpath, rel))
     return collected, skipped
 
 
+def _read_bounded_regular_text(
+    path: Path,
+    *,
+    max_bytes: int = MAX_FILE_BYTES,
+    real_root: Path | None = None,
+    encoding: str = "utf-8",
+) -> str:
+    if real_root is not None and (path.is_symlink() or not path.resolve().is_relative_to(real_root)):
+        raise OSError("Path outside repository root or symlink")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("Not a regular file")
+        if st.st_size > max_bytes:
+            raise ValueError(f"File exceeds {max_bytes}-byte limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"File exceeds {max_bytes}-byte limit")
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode(encoding)
+
+
 def load_harness_config(repo_root: Path) -> HarnessConfig:
     """Read optional `[tool.wythe.agent_harness]` settings from target `pyproject.toml`."""
-    if repo_root.is_symlink() or not repo_root.exists():
+    if "\x00" in str(repo_root):
         return HarnessConfig()
     try:
+        if repo_root.is_symlink() or not repo_root.exists():
+            return HarnessConfig()
         real_root = repo_root.resolve()
         pyproject = repo_root / "pyproject.toml"
         if not is_safe_regular_file(pyproject, real_root):
             return HarnessConfig()
-        raw = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValueError):
+        raw = tomllib.loads(
+            _read_bounded_regular_text(
+                pyproject, max_bytes=MAX_FILE_BYTES, real_root=real_root, encoding="utf-8"
+            )
+        )
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValueError, RecursionError):
         return HarnessConfig()
 
     tool_tbl = raw.get("tool")
@@ -295,85 +352,260 @@ def load_harness_config(repo_root: Path) -> HarnessConfig:
     )
 
 
+def _sanitize_schema_obj(obj: object, depth: int = 0) -> object:
+    if depth > 24:
+        return None
+    if isinstance(obj, int) and not isinstance(obj, bool):
+        return obj if obj.bit_length() <= 4096 else 0
+    if isinstance(obj, list):
+        return [_sanitize_schema_obj(item, depth + 1) for item in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_schema_obj(item, depth + 1) for item in obj]
+    if isinstance(obj, dict):
+        out: dict[str, object] = {}
+        for k, v in obj.items():
+            try:
+                ks = k if isinstance(k, str) else str(_sanitize_schema_obj(k, depth + 1))
+            except ValueError:
+                ks = "<int>"
+            out[ks] = _sanitize_schema_obj(v, depth + 1)
+        return out
+    return obj
+
+
+MAX_SCHEMA_JSON_BYTES = 262_144  # 256 KiB serialized schema budget ceiling
+
+
+def _estimate_json_ascii_bytes_bounded(
+    raw_obj: object,
+    *,
+    limit: int = MAX_SCHEMA_JSON_BYTES,
+    max_steps: int = 8192,
+) -> tuple[int, bool]:
+    """Estimate `json.dumps(..., ensure_ascii=True)` byte size in bounded time & memory."""
+    est = 0
+    steps = 0
+    str_len_cache: dict[int, int] = {}
+    stack: list[object] = [raw_obj]
+    while stack:
+        steps += 1
+        if steps > max_steps or est > limit:
+            return max(est, limit + 1), True
+        cur = stack.pop()
+        if cur is None or isinstance(cur, bool):
+            est += 5
+        elif isinstance(cur, str):
+            sid = id(cur)
+            cached = str_len_cache.get(sid)
+            if cached is None:
+                if len(cur) > limit:
+                    return limit + 1, True
+                cached = len(json.dumps(cur, ensure_ascii=True))
+                str_len_cache[sid] = cached
+            est += cached
+        elif isinstance(cur, int):
+            est += max(1, int(cur.bit_length() * 0.30103) + 2) if cur.bit_length() <= 4096 else 1
+        elif isinstance(cur, float):
+            est += 16
+        elif isinstance(cur, (list, tuple)):
+            est += 2 + max(0, len(cur) - 1)
+            if est > limit:
+                return max(est, limit + 1), True
+            rem = max(0, max_steps - steps - len(stack) + 1)
+            stack.extend(cur[: rem + 1])
+        elif isinstance(cur, dict):
+            est += 2 + 2 * len(cur)
+            if est > limit:
+                return max(est, limit + 1), True
+            rem = max(0, max_steps - steps - len(stack) + 1)
+            for k, v in list(cur.items())[: rem + 1]:
+                stack.append(v)
+                stack.append(k)
+        else:
+            est += 18
+    if est > limit:
+        return est, True
+    return est, False
+
+
 def estimate_schema_budget(raw_obj: object) -> tuple[int, int]:
     """Return `(byte_len, approx_tokens)` using `max(1, (byte_len + 3) // 4)`."""
-    encoded = json.dumps(
-        raw_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("utf-8")
+    est_bytes, exceeded = _estimate_json_ascii_bytes_bounded(raw_obj, limit=MAX_SCHEMA_JSON_BYTES)
+    if exceeded:
+        capped = min(est_bytes, MAX_SCHEMA_JSON_BYTES * 4)
+        return capped, max(1, (capped + 3) // 4)
+    try:
+        dumped = json.dumps(
+            raw_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+    except ValueError:
+        dumped = json.dumps(
+            _sanitize_schema_obj(raw_obj),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=lambda _x: "<unserializable>",
+        )
+    encoded = dumped.encode("utf-8")
     byte_len = len(encoded)
     return byte_len, max(1, (byte_len + 3) // 4)
 
 
 def _dotted_name(node: ast.AST | None) -> str:
-    if node is None:
+    attrs: list[str] = []
+    cur = node
+    steps = 0
+    while cur is not None and steps < 256:
+        steps += 1
+        if isinstance(cur, ast.Name):
+            attrs.append(cur.id)
+            return ".".join(reversed(attrs))
+        if isinstance(cur, ast.Attribute):
+            attrs.append(cur.attr)
+            cur = cur.value
+            continue
+        if isinstance(cur, ast.Call):
+            if attrs:
+                break
+            cur = cur.func
+            continue
         return ""
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        head = _dotted_name(node.value)
-        return f"{head}.{node.attr}" if head else node.attr
-    if isinstance(node, ast.Call):
-        return _dotted_name(node.func)
+    if attrs:
+        return ".".join(reversed(attrs))
     return ""
+
+
+_MAX_STATIC_AST_EVAL_STEPS = 4096
+_MAX_PY_PATH_STR_DEPTH = 16
+_MAX_PY_PATH_STR_LEN = 4096
+_MAX_STR_ENV_ENTRIES = 2048
 
 
 def _eval_static_ast_value(
     node: ast.AST | None,
     env: dict[str, object] | None = None,
     depth: int = 0,
+    _budget: list[int] | None = None,
 ) -> object:
     """Safely materialize JSON-like AST literals and bounded `range(N)` comprehensions."""
     if node is None or depth > 14:
         return None
+    budget = _budget if _budget is not None else [_MAX_STATIC_AST_EVAL_STEPS]
+    if budget[0] <= 0:
+        return None
+    budget[0] -= 1
     local_env = env or {}
     if isinstance(node, ast.Constant):
-        if isinstance(node.value, (str, int, float, bool)) or node.value is None:
+        if isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value if node.value.bit_length() <= 4096 else None
+        if isinstance(node.value, (str, float, bool)) or node.value is None:
             return node.value
-        return str(node.value)
+        try:
+            return str(node.value)
+        except ValueError:
+            return None
     if isinstance(node, ast.Name):
-        return local_env.get(node.id, f"<ref:{node.id}>")
+        val = local_env.get(node.id, f"<ref:{node.id}>")
+        if isinstance(val, int) and not isinstance(val, bool) and val.bit_length() > 4096:
+            return None
+        return val
     if isinstance(node, ast.JoinedStr):
         parts: list[str] = []
-        for part in node.values:
+        total_len = 0
+        for part in node.values[:250]:
+            if budget[0] <= 0:
+                return None
             if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                total_len += len(part.value)
+                if total_len > _MAX_PY_PATH_STR_LEN:
+                    return None
                 parts.append(part.value)
             elif isinstance(part, ast.FormattedValue):
-                val = _eval_static_ast_value(part.value, local_env, depth + 1)
-                parts.append(str(val) if val is not None else "{expr}")
+                val = _eval_static_ast_value(part.value, local_env, depth + 1, budget)
+                if budget[0] <= 0:
+                    return None
+                try:
+                    chunk = str(val) if val is not None else "{expr}"
+                except ValueError:
+                    chunk = "{expr}"
+                total_len += len(chunk)
+                if total_len > _MAX_PY_PATH_STR_LEN:
+                    return None
+                parts.append(chunk)
         return "".join(parts)
-    if isinstance(node, (ast.List, ast.Tuple)):
-        return [_eval_static_ast_value(elt, local_env, depth + 1) for elt in node.elts[:250]]
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        seq_out: list[object] = []
+        for elt in node.elts[:250]:
+            if budget[0] <= 0:
+                return None
+            seq_out.append(_eval_static_ast_value(elt, local_env, depth + 1, budget))
+            if budget[0] <= 0:
+                return None
+        return seq_out
     if isinstance(node, ast.Dict):
         out: dict[str, object] = {}
-        for k_node, v_node in zip(node.keys, node.values, strict=False):
+        for k_node, v_node in zip(node.keys[:250], node.values[:250], strict=False):
+            if budget[0] <= 0:
+                return None
             if k_node is None:
-                spread = _eval_static_ast_value(v_node, local_env, depth + 1)
+                spread = _eval_static_ast_value(v_node, local_env, depth + 1, budget)
+                if budget[0] <= 0:
+                    return None
                 if isinstance(spread, dict):
                     out.update(spread)
                 continue
-            k_val = _eval_static_ast_value(k_node, local_env, depth + 1)
+            k_val = _eval_static_ast_value(k_node, local_env, depth + 1, budget)
+            v_val = _eval_static_ast_value(v_node, local_env, depth + 1, budget)
+            if budget[0] <= 0:
+                return None
             if isinstance(k_val, str):
-                out[k_val] = _eval_static_ast_value(v_node, local_env, depth + 1)
+                out[k_val] = v_val
         return out
-    if isinstance(node, ast.ListComp) and len(node.generators) == 1:
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)) and len(node.generators) == 1:
         gen = node.generators[0]
         if (
             isinstance(gen.target, ast.Name)
             and isinstance(gen.iter, ast.Call)
             and _dotted_name(gen.iter.func) == "range"
-            and gen.iter.args
+            and 1 <= len(gen.iter.args) <= 2
         ):
-            bound = _eval_static_ast_value(gen.iter.args[-1], local_env, depth + 1)
+            bound = _eval_static_ast_value(gen.iter.args[-1], local_env, depth + 1, budget)
             start = (
-                _eval_static_ast_value(gen.iter.args[0], local_env, depth + 1)
-                if len(gen.iter.args) >= 2
+                _eval_static_ast_value(gen.iter.args[0], local_env, depth + 1, budget)
+                if len(gen.iter.args) == 2
                 else 0
             )
-            if isinstance(bound, int) and isinstance(start, int) and 0 <= bound - start <= 250:
+            if (
+                isinstance(bound, int)
+                and not isinstance(bound, bool)
+                and isinstance(start, int)
+                and not isinstance(start, bool)
+                and 0 <= bound - start <= 250
+            ):
+                if isinstance(node, ast.DictComp):
+                    dict_out: dict[str, object] = {}
+                    for idx in range(start, bound):
+                        if budget[0] <= 0:
+                            return None
+                        sub_env = {**local_env, gen.target.id: idx}
+                        k_val = _eval_static_ast_value(node.key, sub_env, depth + 1, budget)
+                        v_val = _eval_static_ast_value(node.value, sub_env, depth + 1, budget)
+                        if budget[0] <= 0:
+                            return None
+                        if isinstance(k_val, (str, int, float, bool)):
+                            try:
+                                dict_out[str(k_val)] = v_val
+                            except ValueError:
+                                continue
+                    return dict_out
                 items: list[object] = []
                 for idx in range(start, bound):
+                    if budget[0] <= 0:
+                        return None
                     sub_env = {**local_env, gen.target.id: idx}
-                    items.append(_eval_static_ast_value(node.elt, sub_env, depth + 1))
+                    items.append(_eval_static_ast_value(node.elt, sub_env, depth + 1, budget))
+                    if budget[0] <= 0:
+                        return None
                 return items
     return None
 
@@ -451,19 +683,54 @@ _VOLATILE_VAR_TOKENS = frozenset(
 )
 
 
+_MAX_VOLATILE_SCAN_DEPTH = 80
+_MAX_VOLATILE_SCAN_STEPS = 4096
+
+
 def _volatile_reasons_in_py_expr(
     expr: ast.AST | None,
     sym_exprs: dict[str, ast.AST],
     static_consts: set[str],
     seen: set[str] | None = None,
+    _memo: dict[str, tuple[str, ...]] | None = None,
 ) -> list[str]:
     """Return volatile clock/UUID/random/RAG expressions interpolated in a system prefix."""
     if expr is None:
         return []
-    visited = set(seen or ())
-    reasons: list[str] = []
+    memo: dict[str, tuple[str, ...]] = _memo if _memo is not None else {}
+    trunc_at_depth: dict[str, tuple[int, tuple[str, ...]]] = {}
+    active_stack: set[str] = set(seen or ())
+    steps = [0]
 
-    def _scan(sub: ast.AST, in_interp: bool = False) -> None:
+    def _eval_symbol(sym: str, next_depth: int) -> tuple[tuple[str, ...], bool]:
+        if sym in memo:
+            return memo[sym], False
+        if sym in active_stack:
+            return (), True
+        prev_trunc = trunc_at_depth.get(sym)
+        if prev_trunc is not None and next_depth >= prev_trunc[0]:
+            return prev_trunc[1], True
+        active_stack.add(sym)
+        sym_reasons: list[str] = []
+        sym_truncated = _scan(sym_exprs[sym], sym_reasons, in_interp=False, depth=next_depth)
+        active_stack.discard(sym)
+        res_tuple = tuple(sym_reasons)
+        if not sym_truncated:
+            memo[sym] = res_tuple
+        else:
+            trunc_at_depth[sym] = (next_depth, res_tuple)
+        return res_tuple, sym_truncated
+
+    def _scan(
+        sub: ast.AST,
+        out_reasons: list[str],
+        in_interp: bool = False,
+        depth: int = 0,
+    ) -> bool:
+        if depth > _MAX_VOLATILE_SCAN_DEPTH or steps[0] >= _MAX_VOLATILE_SCAN_STEPS:
+            return True
+        steps[0] += 1
+        truncated = False
         if isinstance(sub, ast.Call):
             dotted = _dotted_name(sub.func)
             leaf = dotted.rsplit(".", 1)[-1]
@@ -474,29 +741,26 @@ def _volatile_reasons_in_py_expr(
                 or leaf.startswith(("retrieve_", "search_memory", "fetch_memor", "get_rag"))
             ):
                 label = dotted or leaf
-                if label not in reasons:
-                    reasons.append(label)
-            elif dotted in sym_exprs and dotted not in visited:
-                visited.add(dotted)
-                for r in _volatile_reasons_in_py_expr(
-                    sym_exprs[dotted], sym_exprs, static_consts, visited
-                ):
-                    if r not in reasons:
-                        reasons.append(r)
+                if label not in out_reasons:
+                    out_reasons.append(label)
+            elif dotted in sym_exprs:
+                sub_r, sub_t = _eval_symbol(dotted, depth + 1)
+                truncated = truncated or sub_t
+                for r in sub_r:
+                    if r not in out_reasons:
+                        out_reasons.append(r)
         elif isinstance(sub, ast.Name):
             nm = sub.id
             if nm in static_consts or nm.isupper():
-                return
-            if nm in sym_exprs and nm not in visited:
-                visited.add(nm)
-                sub_reasons = _volatile_reasons_in_py_expr(
-                    sym_exprs[nm], sym_exprs, static_consts, visited
-                )
-                for r in sub_reasons:
-                    if r not in reasons:
-                        reasons.append(r)
-                if sub_reasons:
-                    return
+                return False
+            if nm in sym_exprs:
+                sub_r, sub_t = _eval_symbol(nm, depth + 1)
+                truncated = truncated or sub_t
+                for r in sub_r:
+                    if r not in out_reasons:
+                        out_reasons.append(r)
+                if sub_r:
+                    return truncated
             if (
                 in_interp
                 and (
@@ -522,23 +786,31 @@ def _volatile_reasons_in_py_expr(
                         )
                     )
                 )
-                and nm not in reasons
+                and nm not in out_reasons
             ):
-                reasons.append(nm)
+                out_reasons.append(nm)
+            return truncated
         elif isinstance(sub, ast.JoinedStr):
             for part in sub.values:
-                if isinstance(part, ast.FormattedValue):
-                    _scan(part.value, in_interp=True)
-            return
+                if isinstance(part, ast.FormattedValue) and _scan(
+                    part.value, out_reasons, in_interp=True, depth=depth + 1
+                ):
+                    truncated = True
+            return truncated
         elif isinstance(sub, ast.BinOp) and isinstance(sub.op, (ast.Add, ast.Mod)):
-            _scan(sub.left, in_interp=True)
-            _scan(sub.right, in_interp=True)
-            return
+            if _scan(sub.left, out_reasons, in_interp=True, depth=depth + 1):
+                truncated = True
+            if _scan(sub.right, out_reasons, in_interp=True, depth=depth + 1):
+                truncated = True
+            return truncated
 
         for child in ast.iter_child_nodes(sub):
-            _scan(child, in_interp=in_interp)
+            if _scan(child, out_reasons, in_interp=in_interp, depth=depth + 1):
+                truncated = True
+        return truncated
 
-    _scan(expr, in_interp=False)
+    reasons: list[str] = []
+    _scan(expr, reasons, in_interp=False, depth=0)
     return reasons
 
 
@@ -546,14 +818,22 @@ def _expr_has_tail_turn_context(
     expr: ast.AST | None,
     sym_exprs: dict[str, ast.AST],
     static_consts: set[str],
+    _memo: dict[str, tuple[str, ...]] | None = None,
 ) -> bool:
     if expr is None:
         return False
+    checked_syms: set[str] = set()
     for sub in ast.walk(expr):
         if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
             if "[TURN CONTEXT]" in sub.value or "TURN_CONTEXT" in sub.value:
                 return True
-        elif isinstance(sub, ast.Name) and sub.id in sym_exprs:
+        elif (
+            isinstance(sub, ast.Name)
+            and sub.id in sym_exprs
+            and sub.id not in checked_syms
+            and len(checked_syms) < 128
+        ):
+            checked_syms.add(sub.id)
             for inner in ast.walk(sym_exprs[sub.id]):
                 if (
                     isinstance(inner, ast.Constant)
@@ -561,7 +841,7 @@ def _expr_has_tail_turn_context(
                     and "[TURN CONTEXT]" in inner.value
                 ):
                     return True
-    return bool(_volatile_reasons_in_py_expr(expr, sym_exprs, static_consts))
+    return bool(_volatile_reasons_in_py_expr(expr, sym_exprs, static_consts, _memo=_memo))
 
 
 def _dict_role_and_content(node: ast.Dict) -> tuple[str | None, ast.AST | None]:
@@ -576,22 +856,46 @@ def _dict_role_and_content(node: ast.Dict) -> tuple[str | None, ast.AST | None]:
     return role_val, content_expr
 
 
-def _resolve_py_path_str(node: ast.AST | None, str_env: dict[str, str]) -> str | None:
-    if node is None:
+def _resolve_py_path_str(
+    node: ast.AST | None, str_env: dict[str, str], depth: int = 0
+) -> str | None:
+    if node is None or depth > _MAX_PY_PATH_STR_DEPTH:
         return None
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
+        return node.value if len(node.value) <= _MAX_PY_PATH_STR_LEN else None
     if isinstance(node, ast.Name) and node.id in str_env:
-        return str_env[node.id]
+        val = str_env[node.id]
+        return val if len(val) <= _MAX_PY_PATH_STR_LEN else None
     if isinstance(node, ast.Call) and _dotted_name(node.func).endswith("Path") and node.args:
-        return _resolve_py_path_str(node.args[0], str_env)
+        return _resolve_py_path_str(node.args[0], str_env, depth + 1)
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        total_len = 0
+        for part in node.values[:250]:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                chunk = part.value
+            elif isinstance(part, ast.FormattedValue):
+                resolved = _resolve_py_path_str(part.value, str_env, depth + 1)
+                if resolved is None:
+                    return None
+                chunk = resolved
+            else:
+                return None
+            total_len += len(chunk)
+            if total_len > _MAX_PY_PATH_STR_LEN:
+                return None
+            parts.append(chunk)
+        return "".join(parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
-        left = _resolve_py_path_str(node.left, str_env)
-        right = _resolve_py_path_str(node.right, str_env)
+        left = _resolve_py_path_str(node.left, str_env, depth + 1)
+        right = _resolve_py_path_str(node.right, str_env, depth + 1)
         if left and right:
             sep = "/" if isinstance(node.op, ast.Div) else ""
-            return f"{left.rstrip('/')}{sep}{right.lstrip('/')}" if sep else left + right
-        if right and (right.endswith((".json", ".yaml", ".yml")) or "config" in right):
+            joined = f"{left.rstrip('/')}{sep}{right.lstrip('/')}" if sep else left + right
+            return joined if len(joined) <= _MAX_PY_PATH_STR_LEN else None
+        if right and len(right) <= _MAX_PY_PATH_STR_LEN and (
+            right.endswith((".json", ".yaml", ".yml")) or "config" in right
+        ):
             return right
     return None
 
@@ -909,14 +1213,26 @@ def inspect_python_module_ast(rel_path: str, source_text: str) -> HarnessInspect
                 mod_sym_exprs[tname] = val_node
                 if isinstance(val_node, ast.Constant):
                     if isinstance(val_node.value, str):
-                        mod_str_env[tname] = val_node.value
+                        if len(val_node.value) <= _MAX_PY_PATH_STR_LEN and (
+                            tname in mod_str_env or len(mod_str_env) < _MAX_STR_ENV_ENTRIES
+                        ):
+                            mod_str_env[tname] = val_node.value
+                        else:
+                            mod_str_env.pop(tname, None)
                         if tname.isupper():
                             mod_static_consts.add(tname)
-                    elif isinstance(val_node.value, int) and not isinstance(val_node.value, bool):
+                    elif (
+                        isinstance(val_node.value, int)
+                        and not isinstance(val_node.value, bool)
+                        and val_node.value.bit_length() <= 4096
+                    ):
                         mod_int_env[tname] = val_node.value
                 s_path = _resolve_py_path_str(val_node, mod_str_env)
-                if s_path:
-                    mod_str_env[tname] = s_path
+                if s_path and len(s_path) <= _MAX_PY_PATH_STR_LEN:
+                    if tname in mod_str_env or len(mod_str_env) < _MAX_STR_ENV_ENTRIES:
+                        mod_str_env[tname] = s_path
+                elif not isinstance(val_node, ast.Constant):
+                    mod_str_env.pop(tname, None)
                 eval_val = _eval_static_ast_value(val_node, mod_int_env)
                 tool_items = _extract_tool_schema_items(eval_val)
                 if tool_items:
@@ -1034,9 +1350,17 @@ def inspect_python_module_ast(rel_path: str, source_text: str) -> HarnessInspect
                 vname = s.targets[0].id
                 loc_exprs[vname] = s.value
                 sp = _resolve_py_path_str(s.value, loc_strs)
-                if sp:
-                    loc_strs[vname] = sp
-                if isinstance(s.value, ast.Constant) and isinstance(s.value.value, int) and not isinstance(s.value.value, bool):
+                if sp and len(sp) <= _MAX_PY_PATH_STR_LEN:
+                    if vname in loc_strs or len(loc_strs) < _MAX_STR_ENV_ENTRIES:
+                        loc_strs[vname] = sp
+                else:
+                    loc_strs.pop(vname, None)
+                if (
+                    isinstance(s.value, ast.Constant)
+                    and isinstance(s.value.value, int)
+                    and not isinstance(s.value.value, bool)
+                    and s.value.value.bit_length() <= 4096
+                ):
                     loc_ints[vname] = s.value.value
 
         # Walk statements in this scope without descending into nested defs
@@ -1058,6 +1382,7 @@ def inspect_python_module_ast(rel_path: str, source_text: str) -> HarnessInspect
 
         seen_prompt_lines: set[int] = set()
         seen_dict_ids: set[int] = set()
+        scope_vol_memo: dict[str, tuple[str, ...]] = {}
         reg_hint: str | None = None
         reg_line = sc_ln
         accessed_keys: set[str] = set()
@@ -1084,11 +1409,18 @@ def inspect_python_module_ast(rel_path: str, source_text: str) -> HarnessInspect
                     ):
                         seen_dict_ids.add(id(first))
                         seen_prompt_lines.add(first.lineno)
-                        reasons = _volatile_reasons_in_py_expr(content0, loc_exprs, mod_static_consts)
+                        reasons = _volatile_reasons_in_py_expr(
+                            content0, loc_exprs, mod_static_consts, _memo=scope_vol_memo
+                        )
                         tail_ctx = any(
                             isinstance(elt, ast.Dict)
                             and _dict_role_and_content(elt)[0] == "user"
-                            and _expr_has_tail_turn_context(_dict_role_and_content(elt)[1], loc_exprs, mod_static_consts)
+                            and _expr_has_tail_turn_context(
+                                _dict_role_and_content(elt)[1],
+                                loc_exprs,
+                                mod_static_consts,
+                                _memo=scope_vol_memo,
+                            )
                             for elt in node.elts[1:]
                         )
                         bundle.prompts.append(
@@ -1109,7 +1441,9 @@ def inspect_python_module_ast(rel_path: str, source_text: str) -> HarnessInspect
                     if scope_has_llm_ctx and role_d in ("system", "developer") and content_d is not None:
                         seen_dict_ids.add(id(node))
                         seen_prompt_lines.add(node.lineno)
-                        reasons = _volatile_reasons_in_py_expr(content_d, loc_exprs, mod_static_consts)
+                        reasons = _volatile_reasons_in_py_expr(
+                            content_d, loc_exprs, mod_static_consts, _memo=scope_vol_memo
+                        )
                         bundle.prompts.append(
                             PromptSurface(
                                 rel_path=rel_path,
@@ -1125,7 +1459,9 @@ def inspect_python_module_ast(rel_path: str, source_text: str) -> HarnessInspect
                     for k_n, v_n in zip(node.keys, node.values, strict=False):
                         if isinstance(k_n, ast.Constant) and k_n.value == "systemPrompt" and v_n is not None:
                             seen_prompt_lines.add(node.lineno)
-                            reasons = _volatile_reasons_in_py_expr(v_n, loc_exprs, mod_static_consts)
+                            reasons = _volatile_reasons_in_py_expr(
+                                v_n, loc_exprs, mod_static_consts, _memo=scope_vol_memo
+                            )
                             bundle.prompts.append(
                                 PromptSurface(
                                     rel_path=rel_path,
@@ -1155,7 +1491,9 @@ def inspect_python_module_ast(rel_path: str, source_text: str) -> HarnessInspect
                         ):
                             continue
                         seen_prompt_lines.add(node.lineno)
-                        reasons = _volatile_reasons_in_py_expr(kw.value, loc_exprs, mod_static_consts)
+                        reasons = _volatile_reasons_in_py_expr(
+                            kw.value, loc_exprs, mod_static_consts, _memo=scope_vol_memo
+                        )
                         mech = "mcp_sampling" if kw.arg == "systemPrompt" else "anthropic_system"
                         bundle.prompts.append(
                             PromptSurface(

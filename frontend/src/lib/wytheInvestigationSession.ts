@@ -351,7 +351,7 @@ export function evaluateIncomingViewportCommand(params: {
       expires_at?: string | null;
     };
   };
-  source: 'sse' | 'initial_state';
+  source: 'sse' | 'initial_state' | 'resume';
   activeTargetSlug: string;
   activeSessionId: string | null;
   clientId: string;
@@ -368,7 +368,7 @@ export function evaluateIncomingViewportCommand(params: {
     activeSessionId,
     clientId,
     followState,
-    currentEvidenceRevisionId = null,
+    currentEvidenceRevisionId,
     ackedCommandIds = [],
     pausedNotifiedCommandIds,
     nowMs = Date.now(),
@@ -389,11 +389,8 @@ export function evaluateIncomingViewportCommand(params: {
       reason: 'wrong_target',
     };
   }
-  if (
-    event.command.session_id &&
-    activeSessionId &&
-    event.command.session_id !== activeSessionId
-  ) {
+  const eventSessionId = event.command.session_id?.trim() || null;
+  if (eventSessionId && eventSessionId !== activeSessionId) {
     return {
       action: 'ignore',
       shouldMoveCamera: false,
@@ -420,12 +417,27 @@ export function evaluateIncomingViewportCommand(params: {
   }
 
   const deliveryState = event.delivery_state ?? 'accepted_by_service';
-  const expMs = event.command.expires_at ? Date.parse(event.command.expires_at) : NaN;
-  if (deliveryState === 'expired' || (Number.isFinite(expMs) && expMs <= nowMs)) {
+  const rawExp = event.command.expires_at?.trim() || null;
+  const expMs = rawExp ? Date.parse(rawExp) : NaN;
+  if (
+    deliveryState === 'expired' ||
+    (rawExp !== null && (!Number.isFinite(expMs) || expMs <= nowMs))
+  ) {
+    if (source === 'initial_state') {
+      return {
+        action: 'ignore',
+        shouldMoveCamera: false,
+        receiptOutcome: null,
+        markAcked: true,
+        markPausedNotified: false,
+        commandKey,
+        reason: 'expired',
+      };
+    }
     return {
-      action: 'ignore',
+      action: 'reject',
       shouldMoveCamera: false,
-      receiptOutcome: null,
+      receiptOutcome: 'rejected',
       markAcked: true,
       markPausedNotified: false,
       commandKey,
@@ -461,9 +473,15 @@ export function evaluateIncomingViewportCommand(params: {
   }
 
   const expectedRev = event.command.expected_evidence_revision?.trim() || null;
+  const normalizedCurrentRev =
+    currentEvidenceRevisionId !== undefined
+      ? currentEvidenceRevisionId?.trim() || null
+      : undefined;
   if (
     deliveryState === 'stale' ||
-    (expectedRev && currentEvidenceRevisionId && expectedRev !== currentEvidenceRevisionId)
+    (expectedRev &&
+      normalizedCurrentRev !== undefined &&
+      expectedRev !== normalizedCurrentRev)
   ) {
     return {
       action: 'reject_stale',

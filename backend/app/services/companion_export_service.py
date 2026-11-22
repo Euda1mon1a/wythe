@@ -12,6 +12,10 @@ All functions in this module are deterministic, read-only, and non-executing:
 from __future__ import annotations
 
 import json
+import os
+import re
+import stat
+import urllib.parse
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -36,10 +40,13 @@ NON_CERTIFICATION_NOTICE = (
 )
 
 
-def _file_uri(repo_path: str, rel_file: str, line: int) -> str:
-    clean_repo = repo_path.rstrip("/")
-    clean_rel = rel_file.lstrip("/")
-    return f"file://{clean_repo}/{clean_rel}#L{max(line, 1)}"
+def _file_uri(repo_path: str, rel_file: str, line: int, *, target_slug: str = "") -> str:
+    clean_repo = repo_path.strip().rstrip("/")
+    clean_rel = urllib.parse.quote(rel_file.lstrip("/"), safe="/")
+    if clean_repo.startswith(("https://", "http://", "git://", "ssh://")):
+        return f"{clean_repo}/{clean_rel}#L{max(line, 1)}"
+    slug = urllib.parse.quote((target_slug or Path(clean_repo).name or "repo").strip("/") or "repo", safe="")
+    return f"file://{slug}/{clean_rel}#L{max(line, 1)}"
 
 
 def _parse_column_field(raw_col: str) -> dict[str, str]:
@@ -49,7 +56,7 @@ def _parse_column_field(raw_col: str) -> dict[str, str]:
         return {"name": col_name.strip(), "type": col_type.strip() or "unknown"}
     parts = text.split(None, 1)
     if len(parts) == 2:
-        return {"name": parts[0].strip(), "type": parts[1].strip()}
+        return {"name": parts[0].strip(), "type": col_type.strip() if (col_type := parts[1]) else "unknown"}
     return {"name": text, "type": "unknown"}
 
 
@@ -58,12 +65,15 @@ def _source_location_facet(
     source_file: str,
     line: int,
     commit: str,
+    *,
+    for_job: bool = True,
+    target_slug: str = "",
 ) -> dict[str, object]:
     return {
         "_producer": OPENLINEAGE_PRODUCER,
-        "_schemaURL": SOURCE_LOCATION_FACET_URL,
+        "_schemaURL": SOURCE_LOCATION_FACET_URL if for_job else OPENLINEAGE_SPEC_URL,
         "type": "git",
-        "url": _file_uri(repo_path, source_file, line),
+        "url": _file_uri(repo_path, source_file, line, target_slug=target_slug),
         "path": source_file,
         "line": line,
         "version": commit,
@@ -116,7 +126,12 @@ def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, objec
                         "fields": [_parse_column_field(c) for c in dn.columns],
                     },
                     "sourceCodeLocation": _source_location_facet(
-                        report.repo_path, dn.source_file, dn.line, report.source_commit
+                        report.repo_path,
+                        dn.source_file,
+                        dn.line,
+                        report.source_commit,
+                        for_job=False,
+                        target_slug=report.target_slug,
                     ),
                     "documentation": {
                         "_producer": OPENLINEAGE_PRODUCER,
@@ -292,7 +307,12 @@ def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, objec
                         "jobType": mn.subkind.upper(),
                     },
                     "sourceCodeLocation": _source_location_facet(
-                        report.repo_path, mn.source_file, mn.line, report.source_commit
+                        report.repo_path,
+                        mn.source_file,
+                        mn.line,
+                        report.source_commit,
+                        for_job=True,
+                        target_slug=report.target_slug,
                     ),
                     "documentation": {
                         "_producer": OPENLINEAGE_PRODUCER,
@@ -369,7 +389,12 @@ def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, objec
                         "jobType": "E2E_CHAIN",
                     },
                     "sourceCodeLocation": _source_location_facet(
-                        report.repo_path, src_file, src_line, report.source_commit
+                        report.repo_path,
+                        src_file,
+                        src_line,
+                        report.source_commit,
+                        for_job=True,
+                        target_slug=report.target_slug,
                     ),
                     "documentation": {
                         "_producer": OPENLINEAGE_PRODUCER,
@@ -416,17 +441,134 @@ def build_openlineage_static_bundle(report: TruthAtlasReport) -> dict[str, objec
     }
 
 
-def _read_bounded_json(path_arg: Path | str) -> tuple[str, Any]:
-    target = Path(path_arg)
-    if target.is_symlink() or not target.is_file():
-        raise ValueError(f"Companion artifact '{target}' must be an existing regular file.")
-    size = target.stat().st_size
-    if size > MAX_COMPANION_BYTES:
-        raise ValueError(
-            f"Companion artifact '{target}' ({size} bytes) exceeds bounded read limit."
-        )
-    payload = json.loads(target.read_text(encoding="utf-8-sig"))
-    return str(target), payload
+MAX_COMPANION_JSON_DEPTH = 128
+_OS_ROOT_SYMLINK_DIRS = frozenset({"tmp", "var", "etc"})
+
+
+def _is_os_root_alias(path: Path) -> bool:
+    return path.parent == Path(path.anchor) and path.name in _OS_ROOT_SYMLINK_DIRS
+
+
+def _check_raw_json_nesting(raw_bytes: bytes, *, max_depth: int = MAX_COMPANION_JSON_DEPTH) -> None:
+    """Linear O(N) string-aware bracket-nesting pre-check before `json.loads`."""
+    depth = 0
+    in_str = False
+    esc = False
+    start = 3 if raw_bytes.startswith(b"\xef\xbb\xbf") else 0
+    for idx in range(start, len(raw_bytes)):
+        b = raw_bytes[idx]
+        if in_str:
+            if esc:
+                esc = False
+            elif b == 0x5C:
+                esc = True
+            elif b == 0x22:
+                in_str = False
+            continue
+        if b == 0x22:
+            in_str = True
+        elif b in (0x5B, 0x7B):
+            depth += 1
+            if depth > max_depth:
+                raise ValueError(f"Companion JSON nesting depth exceeds maximum ({max_depth}).")
+        elif b in (0x5D, 0x7D) and depth > 0:
+            depth -= 1
+
+
+def _validate_companion_path(path_arg: Path | str, *, repo_root: Path | None = None) -> Path:
+    raw_str = str(path_arg)
+    if not raw_str.strip() or "\x00" in raw_str:
+        raise ValueError("Companion artifact path must be a non-empty regular file path.")
+    cand = Path(path_arg)
+    resolved_root: Path | None = None
+    if repo_root is not None:
+        if repo_root.is_symlink() and not _is_os_root_alias(repo_root):
+            raise ValueError(f"Refusing symlinked repository root: {repo_root}")
+        for anc in (repo_root, *repo_root.parents):
+            if anc.is_symlink() and not _is_os_root_alias(anc):
+                raise ValueError(f"Refusing symlinked ancestor in companion artifact path: {anc}")
+        resolved_root = repo_root.resolve()
+
+    if cand.is_symlink() and not _is_os_root_alias(cand):
+        raise ValueError(f"Companion artifact '{cand}' must be an existing regular file.")
+
+    if cand.is_absolute():
+        cur = Path(cand.anchor)
+        parts = cand.parts[1:]
+    else:
+        raw_base_dir = repo_root if repo_root is not None else Path.cwd()
+        for anc in (raw_base_dir, *raw_base_dir.parents):
+            if anc.is_symlink() and not _is_os_root_alias(anc):
+                raise ValueError(f"Refusing symlinked ancestor in companion artifact path: {anc}")
+        cur = resolved_root if resolved_root is not None else raw_base_dir.resolve()
+        parts = cand.parts
+
+    entered_root = resolved_root is not None and cur == resolved_root
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            nxt = cur.parent
+            if entered_root and resolved_root is not None and not nxt.is_relative_to(resolved_root):
+                raise ValueError(f"Companion artifact '{cand}' escapes repository root.")
+            cur = nxt
+            continue
+        cur = cur / part
+        if cur.is_symlink():
+            if _is_os_root_alias(cur):
+                cur = cur.resolve()
+            else:
+                raise ValueError(f"Refusing symlink component in companion artifact path: {cur}")
+        if resolved_root is not None and cur == resolved_root:
+            entered_root = True
+
+    try:
+        resolved = cur.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"Companion artifact '{cand}' must be an existing regular file.") from exc
+    if entered_root and resolved_root is not None and not resolved.is_relative_to(resolved_root):
+        raise ValueError(f"Companion artifact '{cand}' escapes repository root.")
+    return resolved
+
+
+def _read_bounded_json(path_arg: Path | str, *, repo_root: Path | None = None) -> tuple[str, Any]:
+    resolved = _validate_companion_path(path_arg, repo_root=repo_root)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(resolved, flags)
+    except OSError as exc:
+        raise ValueError(f"Companion artifact '{path_arg}' must be an existing regular file.") from exc
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Companion artifact '{path_arg}' must be an existing regular file.")
+        if st.st_size > MAX_COMPANION_BYTES:
+            raise ValueError(
+                f"Companion artifact '{path_arg}' ({st.st_size} bytes) exceeds bounded read limit."
+            )
+        while True:
+            blk = os.read(fd, 65536)
+            if not blk:
+                break
+            total += len(blk)
+            if total > MAX_COMPANION_BYTES:
+                raise ValueError(
+                    f"Companion artifact '{path_arg}' exceeds bounded read limit."
+                )
+            chunks.append(blk)
+    except OSError as exc:
+        raise ValueError(f"Failed reading companion artifact '{path_arg}': {exc}") from exc
+    finally:
+        os.close(fd)
+    raw_bytes = b"".join(chunks)
+    _check_raw_json_nesting(raw_bytes, max_depth=MAX_COMPANION_JSON_DEPTH)
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8-sig"))
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Companion artifact '{path_arg}' is not valid UTF-8 JSON.") from exc
+    return str(resolved), payload
 
 
 def _ecosystem_from_purl(purl: str | None) -> str:
@@ -437,8 +579,8 @@ def _ecosystem_from_purl(purl: str | None) -> str:
     return eco.strip().lower() or "unknown"
 
 
-def _parse_syft_sbom(path_arg: Path | str) -> dict[str, object]:
-    resolved_str, data = _read_bounded_json(path_arg)
+def _parse_syft_sbom(path_arg: Path | str, *, repo_root: Path | None = None) -> dict[str, object]:
+    resolved_str, data = _read_bounded_json(path_arg, repo_root=repo_root)
     if not isinstance(data, dict):
         raise TypeError("Syft SBOM JSON root must be an object.")
 
@@ -574,8 +716,219 @@ def _sarif_severity(result_obj: dict[str, Any], rule_obj: dict[str, Any]) -> str
     return "UNKNOWN"
 
 
-def _parse_trivy_report(path_arg: Path | str) -> dict[str, object]:
-    resolved_str, data = _read_bounded_json(path_arg)
+_SARIF_SECRET_RULE_IDS = frozenset(
+    {
+        "aws-access-key-id",
+        "aws-secret-access-key",
+        "github-pat",
+        "github-oauth",
+        "gitlab-pat",
+        "slack-access-token",
+        "slack-web-hook",
+        "discord-web-hook",
+        "sentry-dsn",
+        "postgres-dsn",
+        "jwt-token",
+        "gcp-api-key",
+        "stripe-access-token",
+        "private-key",
+        "gcp-service-account",
+        "generic-api-key",
+        "azure-storage-key",
+        "pypi-api-token",
+        "npm-access-token",
+        "heroku-api-key",
+        "twilio-api-key",
+        "jwt",
+    }
+)
+_SARIF_SECRET_RULE_TOKENS = (
+    "secret",
+    "private-key",
+    "private_key",
+    "privatekey",
+    "access-key",
+    "access_key",
+    "api-key",
+    "api_key",
+    "apikey",
+    "-pat",
+    "_pat",
+    "oauth",
+    "credential",
+    "password",
+    "-token",
+    "_token",
+    "webhook",
+    "web-hook",
+    "web_hook",
+    "-dsn",
+    "_dsn",
+    "auth",
+    "bearer",
+    "jwt",
+    "signing-key",
+    "signing_key",
+)
+_SARIF_SECRET_TAG_TOKENS = (
+    "secret",
+    "credential",
+    "token",
+    "password",
+    "api-key",
+    "api_key",
+    "apikey",
+    "access-key",
+    "access_key",
+    "accesskey",
+    "signing-key",
+    "signing_key",
+    "signingkey",
+    "ssh-key",
+    "ssh_key",
+    "sshkey",
+    "encryption-key",
+    "encryption_key",
+    "master-key",
+    "master_key",
+    "deploy-key",
+    "deploy_key",
+    "hmac-key",
+    "hmac_key",
+    "bearer",
+    "oauth",
+    "jwt",
+    "private-key",
+    "private_key",
+    "privatekey",
+    "webhook",
+    "web-hook",
+    "web_hook",
+    "-dsn",
+    "_dsn",
+)
+_SARIF_SECRET_TAG_PAT_RE = re.compile(r"(?<![a-z0-9])pat(?![a-z0-9])")
+_SARIF_SECRET_TAG_KEY_RE = re.compile(r"(?<![a-z0-9])([a-z0-9]+)[_-]keys?(?![a-z0-9])")
+_NON_SECRET_KEY_TAG_PREFIXES = frozenset(
+    {
+        "primary",
+        "foreign",
+        "composite",
+        "candidate",
+        "partition",
+        "sort",
+        "hash",
+        "range",
+        "shard",
+        "cache",
+        "routing",
+        "lookup",
+        "public",
+        "surrogate",
+        "natural",
+        "alternate",
+        "unique",
+        "index",
+        "hotkey",
+    }
+)
+
+
+def _is_secret_sarif_tag(tag: str) -> bool:
+    if tag in ("pat", "key", "keys"):
+        return True
+    if any(tok in tag for tok in _SARIF_SECRET_TAG_TOKENS):
+        return True
+    if _SARIF_SECRET_TAG_PAT_RE.search(tag):
+        return True
+    return any(
+        match.group(1) not in _NON_SECRET_KEY_TAG_PREFIXES
+        for match in _SARIF_SECRET_TAG_KEY_RE.finditer(tag)
+    )
+
+
+def _is_secret_sarif_rule(rule_low: str) -> bool:
+    if rule_low in _SARIF_SECRET_RULE_IDS:
+        return True
+    if any(tok in rule_low for tok in _SARIF_SECRET_RULE_TOKENS):
+        return True
+    return any(
+        match.group(1) not in _NON_SECRET_KEY_TAG_PREFIXES
+        for match in _SARIF_SECRET_TAG_KEY_RE.finditer(rule_low)
+    )
+
+
+_MAX_SARIF_TITLE_SCRUB_CHARS = 4096
+_SARIF_MATCH_TAIL_RE = re.compile(r"(?is)\bMatch[ \t]*:.*$")
+_SARIF_SECRET_VALUE_RE = re.compile(
+    r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"
+    r"|https?://hooks\.slack\.com/services/\S+"
+    r"|https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\S+"
+    r"|https?://[^/\s@]+@[^\s/]*sentry\.io/\S*"
+    r"|AIza[0-9A-Za-z_-]{20,}"
+    r"|npm_[A-Za-z0-9]{20,}"
+    r"|pypi-[A-Za-z0-9_-]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{12,}"
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16}"
+    r"|gh[pousr]_[A-Za-z0-9_]{8,}"
+    r"|glpat-[A-Za-z0-9_-]{8,}"
+    r"|\bhf_[A-Za-z0-9]{16,}"
+    r"|\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
+    r"|\bhvs\.[A-Za-z0-9_-]{16,}"
+    r"|\bxapp-[0-9A-Za-z-]{16,}"
+    r"|[sr]k_(?:live|test)_[A-Za-z0-9_]+"
+    r"|\bsk[-_][A-Za-z0-9_-]{8,}\b"
+    r"|xox[baprs]-[A-Za-z0-9-]{8,}"
+    r"|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*"
+    r"|\bAuthorization[ \t]*:[ \t]*(?>Bearer|Token|Basic)(?>[ \t]+)\S+"
+    r"|\b(?:Bearer|Basic)(?>[ \t]+)\S+"
+    r"|\bToken(?>[ \t]+)[A-Za-z0-9._~+/=-]{8,}"
+    r"|\bENV(?>[ \t]+)[A-Za-z0-9_]{0,64}?(?:PASS|SECRET|TOKEN|KEY)[A-Za-z0-9_]{0,64}(?![A-Za-z0-9_])(?:[ \t]*=(?>[ \t]*)|(?>[ \t]+))\S+"
+    r"|(?<![A-Za-z0-9_-])(?:\x22|\x27)?[A-Za-z0-9_-]{0,48}?(?:pass(?:word|wd)?|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|auth[-_]?key|client[-_]?secret|dsn)[A-Za-z0-9_-]{0,48}(?![A-Za-z0-9_-])(?:\x22|\x27)?[ \t]*[:=](?>[ \t]*)(?:\x22(?:\\.|[^\x22\\\r\n]){1,256}\x22|\x27(?:\\.|[^\x27\\\r\n]){1,256}\x27|[^\s,;}\]\x22\x27]+)"
+    r"|(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@\S*"
+    r"|://[^/\s:@]+:[^/\s@]+@",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _scrub_trivy_title(raw: object, *, secret_mode: bool = False, fallback: str = "Detected secret rule match") -> str:
+    if secret_mode:
+        return fallback[:140]
+    raw_str = str(raw or "").strip()[:_MAX_SARIF_TITLE_SCRUB_CHARS]
+    fb_str = str(fallback or "")[:_MAX_SARIF_TITLE_SCRUB_CHARS]
+    fallback_clean = _SARIF_SECRET_VALUE_RE.sub(
+        "[REDACTED]", _SARIF_MATCH_TAIL_RE.sub("Match: [REDACTED]", fb_str)
+    ).strip() or "Detected finding"
+    if not raw_str:
+        return fallback_clean[:140]
+    scrubbed = _SARIF_MATCH_TAIL_RE.sub("Match: [REDACTED]", raw_str)
+    scrubbed = _SARIF_SECRET_VALUE_RE.sub("[REDACTED]", scrubbed).strip()
+    return (scrubbed or fallback_clean)[:140]
+
+
+def _sanitize_sarif_title(
+    res: dict[str, Any],
+    rule_meta: dict[str, Any],
+    *,
+    kind: str,
+    rule_id: str,
+    is_secret: bool = False,
+) -> str:
+    if kind == "secret" or is_secret:
+        return "Detected secret rule match"
+    safe_rule_id = _scrub_trivy_title(rule_id, fallback="unknown")
+    msg_obj = res.get("message")
+    raw_msg = str(msg_obj.get("text") or "") if isinstance(msg_obj, dict) else ""
+    if raw_msg.strip():
+        return _scrub_trivy_title(raw_msg, fallback=safe_rule_id)
+    sd_obj = rule_meta.get("shortDescription")
+    if isinstance(sd_obj, dict) and sd_obj.get("text"):
+        return _scrub_trivy_title(sd_obj["text"], fallback=safe_rule_id)
+    return safe_rule_id[:140]
+
+
+def _parse_trivy_report(path_arg: Path | str, *, repo_root: Path | None = None) -> dict[str, object]:
+    resolved_str, data = _read_bounded_json(path_arg, repo_root=repo_root)
     if not isinstance(data, dict):
         raise TypeError("Trivy report JSON root must be an object.")
 
@@ -590,7 +943,9 @@ def _parse_trivy_report(path_arg: Path | str) -> dict[str, object]:
         for run in data["runs"]:
             if not isinstance(run, dict):
                 continue
-            rules_list = run.get("tool", {}).get("driver", {}).get("rules", [])
+            tool_obj = run.get("tool") if isinstance(run.get("tool"), dict) else {}
+            driver_obj = tool_obj.get("driver") if isinstance(tool_obj.get("driver"), dict) else {}
+            rules_list = driver_obj.get("rules", [])
             rule_map = {
                 str(r.get("id")): r
                 for r in (rules_list if isinstance(rules_list, list) else [])
@@ -603,28 +958,44 @@ def _parse_trivy_report(path_arg: Path | str) -> dict[str, object]:
                 if not isinstance(res, dict):
                     continue
                 rule_id = str(res.get("ruleId") or "unknown")
+                rule_low = rule_id.lower()
                 rule_meta = rule_map.get(rule_id, {})
-                tags_raw = rule_meta.get("properties", {}).get("tags", [])
-                tags = {str(t).lower() for t in tags_raw} if isinstance(tags_raw, list) else set()
+                tags: set[str] = set()
+                for prop_holder in (res.get("properties"), rule_meta.get("properties")):
+                    if isinstance(prop_holder, dict):
+                        t_raw = prop_holder.get("tags")
+                        if isinstance(t_raw, list):
+                            tags.update(str(t).lower() for t in t_raw)
                 sev = _sarif_severity(res, rule_meta)
                 sev_counts[sev] += 1
+                is_secret = (
+                    any(_is_secret_sarif_tag(tag) for tag in tags)
+                    or _is_secret_sarif_rule(rule_low)
+                )
                 if rule_id.upper().startswith(_SARIF_VULN_HEADS) or "vulnerability" in tags:
                     kind = "vulnerability"
                     vuln_count += 1
-                elif "secret" in tags or "secret" in rule_id.lower():
+                elif is_secret:
                     kind = "secret"
                     secret_count += 1
                 else:
                     kind = "misconfiguration"
                     misconfig_count += 1
                 if len(samples) < 12:
-                    msg = str(res.get("message", {}).get("text") or rule_id)[:140]
+                    safe_rule_id = _scrub_trivy_title(rule_id, fallback="unknown")
+                    msg = _sanitize_sarif_title(
+                        res,
+                        rule_meta,
+                        kind=kind,
+                        rule_id=safe_rule_id,
+                        is_secret=is_secret,
+                    )
                     samples.append(
-                        {"id": rule_id, "category": kind, "severity": sev, "title": msg}
+                        {"id": safe_rule_id, "category": kind, "severity": sev, "title": msg}
                     )
     elif isinstance(data.get("Results"), list) or "SchemaVersion" in data:
         report_format = "trivy-json"
-        for block in data.get("Results", []):
+        for block in data.get("Results") or []:
             if not isinstance(block, dict):
                 continue
             for v in block.get("Vulnerabilities") or []:
@@ -634,14 +1005,14 @@ def _parse_trivy_report(path_arg: Path | str) -> dict[str, object]:
                 sev = _norm_severity(v.get("Severity"))
                 sev_counts[sev] += 1
                 if len(samples) < 12:
-                    vid = str(v.get("VulnerabilityID") or "CVE-UNKNOWN")
-                    pkg = str(v.get("PkgName") or "pkg")
+                    vid = _scrub_trivy_title(v.get("VulnerabilityID"), fallback="CVE-UNKNOWN")
+                    pkg = _scrub_trivy_title(v.get("PkgName"), fallback="pkg")
                     samples.append(
                         {
                             "id": vid,
                             "category": "vulnerability",
                             "severity": sev,
-                            "title": f"{pkg}: {str(v.get('Title') or vid)[:110]}",
+                            "title": f"{pkg}: {_scrub_trivy_title(v.get('Title'), fallback=vid)[:110]}",
                         }
                     )
             for m in block.get("Misconfigurations") or []:
@@ -653,13 +1024,13 @@ def _parse_trivy_report(path_arg: Path | str) -> dict[str, object]:
                 sev = _norm_severity(m.get("Severity"))
                 sev_counts[sev] += 1
                 if len(samples) < 12:
-                    mid = str(m.get("ID") or "MISCONFIG")
+                    mid = _scrub_trivy_title(m.get("ID"), fallback="MISCONFIG")
                     samples.append(
                         {
                             "id": mid,
                             "category": "misconfiguration",
                             "severity": sev,
-                            "title": str(m.get("Title") or mid)[:140],
+                            "title": _scrub_trivy_title(m.get("Title"), fallback=mid),
                         }
                     )
             for s in block.get("Secrets") or []:
@@ -669,14 +1040,18 @@ def _parse_trivy_report(path_arg: Path | str) -> dict[str, object]:
                 sev = _norm_severity(s.get("Severity"))
                 sev_counts[sev] += 1
                 if len(samples) < 12:
-                    sid = str(s.get("RuleID") or "SECRET")
-                    # Never include `Match` secret material in correlated output.
+                    sid = _scrub_trivy_title(s.get("RuleID"), fallback="SECRET")
+                    # Never include `Match` or custom Title secret material in correlated output.
                     samples.append(
                         {
                             "id": sid,
                             "category": "secret",
                             "severity": sev,
-                            "title": str(s.get("Title") or "Detected secret rule match")[:140],
+                            "title": _scrub_trivy_title(
+                                s.get("Title"),
+                                secret_mode=True,
+                                fallback="Detected secret rule match",
+                            ),
                         }
                     )
     else:
@@ -724,8 +1099,14 @@ def summarize_companion_security_artifacts(
         for f in (*by_rule.get("MANIP-004", ()), *by_rule.get("MANIP-005", ()))
     ]
 
+    cand_repo_root: Path | None = None
+    if report.repo_path and not report.repo_path.startswith(("https://", "http://", "git://", "ssh://")):
+        rp = Path(report.repo_path)
+        if rp.exists() and not rp.is_symlink():
+            cand_repo_root = rp
+
     syft_summary: dict[str, object] = (
-        _parse_syft_sbom(syft_path)
+        _parse_syft_sbom(syft_path, repo_root=cand_repo_root)
         if syft_path is not None
         else {
             "present": False,
@@ -737,7 +1118,7 @@ def summarize_companion_security_artifacts(
         }
     )
     trivy_summary: dict[str, object] = (
-        _parse_trivy_report(trivy_path)
+        _parse_trivy_report(trivy_path, repo_root=cand_repo_root)
         if trivy_path is not None
         else {
             "present": False,

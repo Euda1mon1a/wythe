@@ -152,3 +152,51 @@ def test_binary_diff_attributes_cannot_hide_changed_code(repo: Path) -> None:
     _commit(repo)
     (repo / "frontend/src/widgets/unused.tsx").write_text("export const WORKLOAD_CAP = 80;\n")
     assert collect_git_changes(repo, "HEAD").after["frontend/src/widgets/unused.tsx"] == [(1, 1_000_000)]
+
+
+def test_issue_99_intra_repo_relative_file_symlinks_succeed_while_escaping_fail_closed(
+    repo: Path,
+    tmp_path: Path,
+) -> None:
+    """Issue #99: intra-repo relative file symlinks (`120000`) materialize safely; escaping/dangling fail closed."""
+    target_script = repo / "scripts" / "sys" / "cli_entry.swift"
+    target_script.parent.mkdir(parents=True, exist_ok=True)
+    target_script.write_text("struct AppCLIMain {}\n", encoding="utf-8")
+
+    xcode_link = repo / "xcode" / "AppCLI" / "Sources" / "main.swift"
+    xcode_link.parent.mkdir(parents=True, exist_ok=True)
+    xcode_link.symlink_to("../../../scripts/sys/cli_entry.swift")
+
+    chained_link = repo / "xcode" / "AppCLI" / "alias.swift"
+    chained_link.symlink_to("Sources/main.swift")
+    sha = _commit(repo)
+
+    snap = tmp_path / "snap_ok"
+    snap.mkdir()
+    materialize_base_tree(repo, sha, snap)
+    mat_file = snap / "xcode" / "AppCLI" / "Sources" / "main.swift"
+    assert mat_file.is_file() and not mat_file.is_symlink()
+    assert mat_file.read_text(encoding="utf-8") == "struct AppCLIMain {}\n"
+    assert (snap / "xcode" / "AppCLI" / "alias.swift").read_text(encoding="utf-8") == (
+        "struct AppCLIMain {}\n"
+    )
+
+    (repo / "frontend/src/widgets/unused.tsx").unlink()
+    proc, result = _cli(repo, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert result["base_graph_status"] == "available"
+    assert result["diff_verdict"] == "PASS"
+
+    for bad_name, bad_target in (
+        ("escape_bounce.swift", "../../outside/../app/scripts/sys/cli_entry.swift"),
+        ("abs_link.swift", "/etc/hosts"),
+        ("dangling.swift", "scripts/sys/does_not_exist.swift"),
+    ):
+        sub_repo = tmp_path / f"bad_{bad_name}"
+        subprocess.run(["cp", "-R", str(repo), str(sub_repo)], check=True)
+        (sub_repo / bad_name).symlink_to(bad_target)
+        bad_sha = _commit(sub_repo)
+        bad_dest = tmp_path / f"dest_{bad_name}"
+        bad_dest.mkdir()
+        with pytest.raises(ValueError, match="unresolved symlink or submodule"):
+            materialize_base_tree(sub_repo, bad_sha, bad_dest)

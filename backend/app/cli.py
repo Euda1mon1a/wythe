@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import re
+import stat
 import sys
 import urllib.parse
-import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -49,6 +50,7 @@ from app.services.llm_context_service import (
 )
 from app.services.mcp_service import run_mcp_stdio_server
 from app.services.portable_config_service import (
+    _read_bundle_from_trusted_git_ref,
     export_portable_bundle_to_disk,
     resolve_existing_bundle_path,
     sync_portable_bundle_from_disk,
@@ -100,11 +102,17 @@ def _run_reply_cli(args: argparse.Namespace) -> int:
             if cleaned_tok and cleaned_tok not in focus_ids:
                 focus_ids.append(cleaned_tok)
 
+    explicit_sid = bool((args.session or "").strip())
     resolved_slug = (args.target or "").strip() or None
     resolved_sid = (args.session or "").strip() or None
     question_text = (args.question or "External frontier CLI analysis").strip()
 
-    with httpx.Client(trust_env=False, follow_redirects=False, timeout=10.0) as client:
+    with httpx.Client(
+        trust_env=False,
+        follow_redirects=False,
+        timeout=10.0,
+        headers={"X-Wythe-Client": "1"},
+    ) as client:
         if not resolved_slug or not resolved_sid:
             q_parts: list[str] = []
             if resolved_slug:
@@ -115,6 +123,14 @@ def _run_reply_cli(args: argparse.Namespace) -> int:
             focus_resp = client.get(f"{api_base}/ui-focus{qs}")
             if 200 <= focus_resp.status_code < 300:
                 focus_json = focus_resp.json()
+                if not explicit_sid and focus_json.get("ambiguous_session_ids"):
+                    amb_list = ", ".join(str(x) for x in focus_json["ambiguous_session_ids"])
+                    print(
+                        f"wythe reply error: multiple active sessions ({amb_list}); "
+                        "pass --session <session_id> explicitly.",
+                        file=sys.stderr,
+                    )
+                    return 2
                 if not resolved_slug and isinstance(focus_json.get("active_slug"), str):
                     resolved_slug = focus_json["active_slug"].strip() or None
                 if not resolved_sid and isinstance(focus_json.get("session_id"), str):
@@ -136,7 +152,15 @@ def _run_reply_cli(args: argparse.Namespace) -> int:
             )
             if 200 <= inv_list_resp.status_code < 300:
                 sessions = inv_list_resp.json().get("sessions") or []
-                if sessions:
+                if len(sessions) > 1:
+                    amb_sids = ", ".join(str(s.get("session_id")) for s in sessions[:8])
+                    print(
+                        f"wythe reply error: {len(sessions)} active sessions on '{resolved_slug}' "
+                        f"({amb_sids}); pass --session <session_id> explicitly.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if len(sessions) == 1:
                     resolved_sid = str(sessions[0].get("session_id") or "").strip() or None
             if not resolved_sid:
                 create_resp = client.post(
@@ -240,6 +264,39 @@ def _run_reply_cli(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_bounded_regular_text(path: Path, *, max_bytes: int = 2_000_000) -> str:
+    if path.is_symlink():
+        raise ValueError(f"Refusing symlink file: {path}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Refusing non-regular file: {path}")
+        if st.st_size > max_bytes:
+            raise ValueError(f"File exceeds {max_bytes} byte limit: {path}")
+        raw = fh.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"File exceeds {max_bytes} byte limit: {path}")
+    return raw.decode("utf-8")
+
+
+def _sanitize_cli_slug(raw: str, *, default: str = "cli-target") -> str:
+    cleaned = re.sub(r"[^a-z0-9-_]", "-", raw.strip().lower()).lstrip("-_").rstrip("-")
+    if not cleaned:
+        cleaned = default
+    if len(cleaned) < 2:
+        cleaned = f"{cleaned}-repo"
+    cleaned = cleaned[:64].rstrip("-")
+    if len(cleaned) < 2 or not re.match(r"^[a-z0-9][a-z0-9-_]*$", cleaned):
+        return default
+    return cleaned
+
+
 def _resolve_cli_target(
     session,
     target_or_path: str,
@@ -248,6 +305,7 @@ def _resolve_cli_target(
     ensure_persisted: bool = False,
     allow_local_plugins: bool = False,
     local_plugin_modules: list[str] | None = None,
+    trusted_config_ref: str | None = None,
 ) -> tuple[TargetProject, bool]:
     looks_like_path = (
         target_or_path in (".", "..")
@@ -275,17 +333,41 @@ def _resolve_cli_target(
     chosen_profile = detected.recommended_profile_slug if profile == "auto" else profile
     legacy_snap = "backend/app/data/truth_atlas_snapshot.json"
     has_legacy = (candidate / legacy_snap).is_file()
-    clean_slug = re.sub(r"[^a-z0-9-_]", "-", candidate.name.lower()).strip("-") or "cli-target"
-    bundle_candidate = resolve_existing_bundle_path(candidate)
-    if bundle_candidate.is_file():
-        try:
-            raw_b = json.loads(bundle_candidate.read_text(encoding="utf-8"))
-            if isinstance(raw_b.get("target_slug"), str) and raw_b["target_slug"].strip():
-                clean_slug = raw_b["target_slug"].strip()
-        except (OSError, ValueError):
-            pass
-    if len(clean_slug) < 2:
-        clean_slug = f"{clean_slug}-repo"
+    clean_slug = _sanitize_cli_slug(candidate.name)
+    if trusted_config_ref is not None:
+        loaded_trusted = _read_bundle_from_trusted_git_ref(candidate, trusted_config_ref)
+        if loaded_trusted is not None:
+            trusted_bundle, _ = loaded_trusted
+            if isinstance(trusted_bundle.target_slug, str) and trusted_bundle.target_slug.strip():
+                clean_slug = _sanitize_cli_slug(
+                    trusted_bundle.target_slug, default=clean_slug
+                )
+    else:
+        bundle_candidate = resolve_existing_bundle_path(candidate)
+        if (
+            not bundle_candidate.is_symlink()
+            and not bundle_candidate.parent.is_symlink()
+            and bundle_candidate.is_file()
+        ):
+            try:
+                raw_b = json.loads(_read_bounded_regular_text(bundle_candidate))
+                if (
+                    isinstance(raw_b, dict)
+                    and isinstance(raw_b.get("target_slug"), str)
+                    and raw_b["target_slug"].strip()
+                ):
+                    clean_slug = _sanitize_cli_slug(
+                        raw_b["target_slug"], default=clean_slug
+                    )
+            except (OSError, ValueError):
+                pass
+
+    by_slug = get_target_by_slug(session, clean_slug)
+    if by_slug is not None and Path(by_slug.repo_path).resolve() != candidate:
+        import hashlib
+
+        path_suffix = hashlib.sha256(str(candidate).encode("utf-8")).hexdigest()[:6]
+        clean_slug = f"{clean_slug[:54]}-{path_suffix}"
 
     if ensure_persisted:
         by_slug = get_target_by_slug(session, clean_slug)
@@ -771,14 +853,45 @@ def _build_combined_companion_summary(
 
 
 def _write_json_file(dest: str, payload_str: str) -> Path:
-    out_p = Path(dest).expanduser().resolve()
-    out_p.parent.mkdir(parents=True, exist_ok=True)
-    out_p.write_text(payload_str + "\n", encoding="utf-8")
+    import stat
+
+    expanded = Path(dest).expanduser()
+    if "\x00" in str(expanded) or ".." in expanded.parts:
+        raise ValueError(f"Unsafe output file path: {dest}")
+    if expanded.is_symlink() or expanded.parent.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlink output path: {dest}")
+    parent_res = expanded.parent.resolve()
+    parent_res.mkdir(parents=True, exist_ok=True)
+    out_p = parent_res / expanded.name
+    if out_p.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlink output path: {out_p}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(out_p, flags, 0o644)
+    with os.fdopen(fd, "wb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Output destination must be a regular file: {out_p}")
+        fh.write((payload_str + "\n").encode("utf-8"))
     return out_p
+
+
+def _get_cli_version() -> str:
+    from app import __version__
+
+    try:
+        return importlib.metadata.version("wythe")
+    except importlib.metadata.PackageNotFoundError:
+        return __version__
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wythe", description="Wythe — 3-Tier Architecture & Lineage Verifier")
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {_get_cli_version()}",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
     add_security_parser(sub)
 
@@ -849,6 +962,11 @@ def main(argv: list[str] | None = None) -> int:
     p_gate.add_argument("--redis-dsn", default=None, help="Optional read-only Redis DSN")
     p_gate.add_argument("--strict", action="store_true", help="Require zero blocking violations (ignore ratchet)")
     p_gate.add_argument("--sync-config", action="store_true", help="Hydrate DB from .wythe/governance.json first")
+    p_gate.add_argument(
+        "--trusted-config-ref",
+        default=None,
+        help="Optional trusted Git commit/ref from which to read .wythe/governance.json",
+    )
     p_gate.add_argument("--sarif", dest="sarif_out", default=None, help="Write SARIF 2.1.0 report to file")
     _add_probe_args(p_gate)
     _add_plugin_optin_args(p_gate)
@@ -875,6 +993,11 @@ def main(argv: list[str] | None = None) -> int:
     p_sync.add_argument("target", help="Registered target slug or filesystem path")
     p_sync.add_argument("--profile", default="auto")
     p_sync.add_argument("--in", dest="in_file", default=None, help="Custom input bundle path")
+    p_sync.add_argument(
+        "--trusted-config-ref",
+        default=None,
+        help="Optional trusted Git commit/ref from which to read .wythe/governance.json",
+    )
 
     p_openapi = sub.add_parser("export-openapi", help="Export deterministic OpenAPI JSON schema")
     p_openapi.add_argument("--out", required=True, help="Output file path")
@@ -1070,6 +1193,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_serve.add_argument("--host", default=None)
     p_serve.add_argument("--port", type=int, default=None)
+    p_serve.add_argument(
+        "--allowed-hosts",
+        default=None,
+        help="Comma-separated allowed Host header patterns (e.g. '*.ts.net,100.64.0.0/10' or 'tailnet')",
+    )
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if raw_argv and raw_argv[0] == "watch-solver":
@@ -1138,17 +1266,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "export-openapi":
-        application = create_app()
-        out_p = _write_json_file(args.out, json.dumps(application.openapi(), indent=2))
-        print(f"Wrote OpenAPI schema to {out_p}")
-        return 0
+        try:
+            application = create_app()
+            out_p = _write_json_file(args.out, json.dumps(application.openapi(), indent=2))
+            print(f"Wrote OpenAPI schema to {out_p}")
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"wythe export-openapi error: {exc}", file=sys.stderr)
+            return 2
 
     if args.cmd == "mcp":
-        return run_mcp_stdio_server(
-            slice_mode=args.slice_mode,
-            server_url=args.server_url,
-            allow_remote_viewport=bool(args.allow_remote_viewport),
-        )
+        try:
+            return run_mcp_stdio_server(
+                slice_mode=args.slice_mode,
+                server_url=args.server_url,
+                allow_remote_viewport=bool(args.allow_remote_viewport),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"wythe mcp error: {exc}", file=sys.stderr)
+            return 2
 
     if args.cmd == "reply":
         try:
@@ -1158,38 +1294,51 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     if args.cmd == "focus":
-        if args.remote:
-            base = args.remote.strip().rstrip("/")
-            if not base.endswith("/api/v1"):
-                base = f"{base}/api/v1"
-            q_parts: list[str] = []
-            if args.target:
-                q_parts.append(f"target={urllib.parse.quote(args.target)}")
-            if args.session_id:
-                q_parts.append(f"session_id={urllib.parse.quote(args.session_id)}")
-            qs = f"?{'&'.join(q_parts)}" if q_parts else ""
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(f"{base}/ui-focus{qs}", timeout=10.0) as resp:
-                raw_json = resp.read().decode("utf-8", errors="replace")
-            parsed = json.loads(raw_json)
-            if args.as_json:
-                print(json.dumps(parsed, indent=2))
-            else:
-                print(str(parsed.get("markdown_brief") or ""))
+        try:
+            if args.remote:
+                vp_url = _validate_viewport_server_url(args.remote, allow_remote=False)
+                api_base = vp_url.removesuffix("/viewport/command")
+                q_parts: list[str] = []
+                if args.target:
+                    q_parts.append(f"target={urllib.parse.quote(args.target)}")
+                if args.session_id:
+                    q_parts.append(f"session_id={urllib.parse.quote(args.session_id)}")
+                qs = f"?{'&'.join(q_parts)}" if q_parts else ""
+                with httpx.Client(
+                    trust_env=False,
+                    follow_redirects=False,
+                    timeout=10.0,
+                    headers={"X-Wythe-Client": "1"},
+                ) as client:
+                    resp = client.get(f"{api_base}/ui-focus{qs}")
+                    if resp.status_code < 200 or resp.status_code >= 300:
+                        raise ValueError(
+                            f"Remote ui-focus returned HTTP {resp.status_code}."
+                        )
+                    if len(resp.content) > 4_000_000:
+                        raise ValueError("Remote ui-focus response exceeds 4 MB limit.")
+                    parsed = resp.json()
+                if args.as_json:
+                    print(json.dumps(parsed, indent=2))
+                else:
+                    print(str(parsed.get("markdown_brief") or ""))
+                return 0
+            initialize_database()
+            factory = get_session_factory()
+            with factory() as session:
+                explain = explain_ui_focus(
+                    session,
+                    target_override=args.target,
+                    session_id=args.session_id,
+                )
+                if args.as_json:
+                    print(explain.model_dump_json(indent=2))
+                else:
+                    print(explain.markdown_brief)
             return 0
-        initialize_database()
-        factory = get_session_factory()
-        with factory() as session:
-            explain = explain_ui_focus(
-                session,
-                target_override=args.target,
-                session_id=args.session_id,
-            )
-            if args.as_json:
-                print(explain.model_dump_json(indent=2))
-            else:
-                print(explain.markdown_brief)
-        return 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"wythe focus error: {exc}", file=sys.stderr)
+            return 2
 
     if args.cmd == "understand":
         from app.services.understanding_service import (
@@ -1240,7 +1389,9 @@ def main(argv: list[str] | None = None) -> int:
                     prior_explanation_revision=args.prior_revision,
                     bundle_path=b_path,
                 )
-                chain = analyze_understanding_bundle(req, db=session)
+                chain = analyze_understanding_bundle(
+                    req, db=session, allow_unrooted_cli_bundle=True
+                )
                 json_text = chain.model_dump_json(indent=2)
                 if args.json_out:
                     _write_json_file(args.json_out, json_text)
@@ -1249,6 +1400,15 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"# Wythe Understanding Chain :: {chain.example_slug or chain.target_slug or 'bundle'}")
                     print(f"> Question: {chain.question}")
+                    if chain.verdict_sentence:
+                        print(f"> Verdict: {chain.verdict_sentence}")
+                    if chain.first_divergence is not None:
+                        fd = chain.first_divergence
+                        print(
+                            f"> First Divergence [{fd.stage_label}]: actor={fd.actor}, channel={fd.channel}, "
+                            f"storage={fd.exists_in_storage}, eligible={fd.eligible_for_actor}, "
+                            f"in_turn={fd.present_in_turn}, caller_attribution={fd.caller_attribution_state}"
+                        )
                     print(f"> Headline: {chain.consequence_headline}")
                     print(f"> Last Supported Cause: {chain.last_supported_cause}")
                     for lk in chain.links:
@@ -1262,32 +1422,47 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     if args.cmd == "serve":
-        settings = load_settings()
-        initialize_database()
-        serve_target = args.target or ("." if (Path.cwd() / ".git").exists() else None)
-        if serve_target:
-            factory = get_session_factory()
-            with factory() as session:
-                resolved_target, _ = _resolve_cli_target(
-                    session, serve_target, args.profile, ensure_persisted=True
-                )
-                cfg_file = resolve_existing_bundle_path(Path(resolved_target.repo_path).resolve())
-                if cfg_file.is_file():
-                    sync_portable_bundle_from_disk(session, resolved_target, in_path=cfg_file)
+        try:
+            if args.allowed_hosts:
+                os.environ["WYTHE_ALLOWED_HOSTS"] = str(args.allowed_hosts)
+            settings = load_settings()
+            bind_host = args.host or settings.api_host
+            bind_port = settings.api_port if args.port is None else int(args.port)
+            if bind_port <= 0 or bind_port > 65535:
                 print(
-                    f"Registered target '{resolved_target.slug}' "
-                    f"({resolved_target.stack_profile_slug}) -> {resolved_target.repo_path}"
+                    f"wythe serve error: --port must be between 1 and 65535 (got {bind_port}).",
+                    file=sys.stderr,
                 )
-        bind_host = args.host or settings.api_host
-        bind_port = args.port or settings.api_port
-        print(f"Wythe serving on http://{bind_host}:{bind_port}")
-        uvicorn.run(
-            "app.main:app",
-            host=bind_host,
-            port=bind_port,
-            reload=False,
-        )
-        return 0
+                return 2
+            if bind_host not in ("127.0.0.1", "localhost", "::1"):
+                print(
+                    f"WARNING: wythe serve is binding non-loopback address '{bind_host}:{bind_port}'. "
+                    "Ensure Tailscale/firewall controls and --allowed-hosts are configured.",
+                    file=sys.stderr,
+                )
+            initialize_database()
+            serve_target = args.target or ("." if (Path.cwd() / ".git").exists() else None)
+            if serve_target:
+                factory = get_session_factory()
+                with factory() as session:
+                    resolved_target, _ = _resolve_cli_target(
+                        session, serve_target, args.profile, ensure_persisted=True
+                    )
+                    print(
+                        f"Registered target '{resolved_target.slug}' "
+                        f"({resolved_target.stack_profile_slug}) -> {resolved_target.repo_path}"
+                    )
+            print(f"Wythe serving on http://{bind_host}:{bind_port}")
+            uvicorn.run(
+                "app.main:app",
+                host=bind_host,
+                port=bind_port,
+                reload=False,
+            )
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"wythe serve error: {exc}", file=sys.stderr)
+            return 2
 
     try:
         initialize_database()
@@ -1299,7 +1474,21 @@ def main(argv: list[str] | None = None) -> int:
                 allow_local_plugins=allow_local,
                 local_plugin_modules=local_mods,
             )
-            need_persist = args.cmd == "sync-config" or getattr(args, "sync_config", False)
+            raw_trusted_ref = getattr(args, "trusted_config_ref", None)
+            cleaned_trusted_ref: str | None = None
+            if raw_trusted_ref is not None:
+                cleaned_trusted_ref = str(raw_trusted_ref).strip()
+                if not cleaned_trusted_ref or cleaned_trusted_ref.startswith("-"):
+                    print(
+                        "wythe error: --trusted-config-ref must be a non-empty Git ref not starting with '-'.",
+                        file=sys.stderr,
+                    )
+                    return 2
+            should_sync_cfg = bool(
+                getattr(args, "sync_config", False)
+                or (args.cmd == "gate" and cleaned_trusted_ref is not None)
+            )
+            need_persist = args.cmd == "sync-config" or should_sync_cfg
             target, is_persisted = _resolve_cli_target(
                 session,
                 args.target,
@@ -1307,6 +1496,7 @@ def main(argv: list[str] | None = None) -> int:
                 ensure_persisted=need_persist,
                 allow_local_plugins=allow_local,
                 local_plugin_modules=local_mods,
+                trusted_config_ref=cleaned_trusted_ref,
             )
 
             if args.cmd == "export-config":
@@ -1321,7 +1511,12 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.cmd == "sync-config":
                 in_custom = Path(args.in_file).expanduser() if args.in_file else None
-                receipt = sync_portable_bundle_from_disk(session, target, in_path=in_custom)
+                receipt = sync_portable_bundle_from_disk(
+                    session,
+                    target,
+                    in_path=in_custom,
+                    trusted_git_ref=cleaned_trusted_ref,
+                )
                 print(
                     f"Synced governance bundle <- {receipt.bundle_path} "
                     f"(rules={receipt.rules_synced}, vocabs={receipt.vocabularies_synced}, "
@@ -1429,10 +1624,15 @@ def main(argv: list[str] | None = None) -> int:
                     print(cone.markdown)
                 return 0 if cone.matched_seed_ids else 1
 
-            if getattr(args, "sync_config", False):
-                cfg_file = resolve_existing_bundle_path(Path(target.repo_path).resolve())
-                if cfg_file.is_file():
-                    sync_portable_bundle_from_disk(session, target, in_path=cfg_file)
+            if should_sync_cfg:
+                if cleaned_trusted_ref is not None:
+                    sync_portable_bundle_from_disk(
+                        session, target, trusted_git_ref=cleaned_trusted_ref
+                    )
+                else:
+                    cfg_file = resolve_existing_bundle_path(Path(target.repo_path).resolve())
+                    if cfg_file.is_file():
+                        sync_portable_bundle_from_disk(session, target, in_path=cfg_file)
 
             if args.cmd == "diff":
                 report = run_target_scan(
@@ -1447,7 +1647,16 @@ def main(argv: list[str] | None = None) -> int:
                     allow_local_plugins=allow_local,
                     local_plugin_modules=local_mods,
                 )
-                diff_rep = run_target_diff(session, target, report, args.base)
+                diff_rep = run_target_diff(
+                    session,
+                    target,
+                    report,
+                    args.base,
+                    pg_dsn=args.dsn,
+                    redis_dsn=args.redis_dsn,
+                    allow_local_plugins=allow_local,
+                    local_plugin_modules=local_mods,
+                )
                 print(
                     f"Wythe Diff :: {diff_rep.target_slug} (base={diff_rep.base_ref} -> {_commit_label(report)})"
                 )

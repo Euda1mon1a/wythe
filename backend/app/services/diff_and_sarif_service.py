@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
-from collections import deque
+import urllib.parse
+from collections import Counter, deque
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import __version__
+from app.core.safe_git import SafeGitError, run_safe_git
 from app.models import ScanSnapshot, TargetProject
 from app.schemas.atlas import (
     BoundaryFinding,
@@ -35,6 +38,52 @@ def _directional_slice(start_ids: set[str], adj: dict[str, set[str]]) -> set[str
     return visited
 
 
+def _finding_delta_key(f: BoundaryFinding) -> tuple[str, str | None, str | None, str, str]:
+    return (
+        f.rule_code,
+        f.node_id,
+        f.target_node_id,
+        f.source_file,
+        f.title,
+    )
+
+
+def _compute_new_findings(
+    head_findings: list[BoundaryFinding],
+    base_findings: list[BoundaryFinding] | None,
+    changed_ranges: dict[str, list[tuple[int, int]]],
+) -> list[BoundaryFinding]:
+    """Compute genuine `(head - base)` multiset finding delta (falling back to hunk overlap if base missing)."""
+    def _in_hunk(f: BoundaryFinding) -> bool:
+        ranges = changed_ranges.get(f.source_file)
+        return bool(ranges and any(lo <= f.line <= hi for lo, hi in ranges))
+
+    if base_findings is None:
+        return [f for f in head_findings if _in_hunk(f)]
+
+    base_counts = Counter(_finding_delta_key(bf) for bf in base_findings)
+    grouped_head: dict[tuple[str, str | None, str | None, str, str], list[BoundaryFinding]] = {}
+    for hf in head_findings:
+        grouped_head.setdefault(_finding_delta_key(hf), []).append(hf)
+
+    selected_ids: set[int] = set()
+    for key, instances in grouped_head.items():
+        excess = len(instances) - base_counts.get(key, 0)
+        if excess <= 0:
+            continue
+        # Prefer instances landing inside changed hunks first when a file already had an older duplicate
+        ranked = sorted(instances, key=lambda item: (0 if _in_hunk(item) else 1, item.line))
+        for chosen in ranked[:excess]:
+            selected_ids.add(id(chosen))
+
+    return [hf for hf in head_findings if id(hf) in selected_ids]
+
+
+def _encode_sarif_uri(source_file: str) -> str:
+    clean = source_file.replace("\\", "/").lstrip("/")
+    return urllib.parse.quote(clean, safe="/:@!$&'()*+,;=-._~")
+
+
 def compute_diff_and_blast_radius(
     repo_root: Path,
     report: TruthAtlasReport,
@@ -44,14 +93,17 @@ def compute_diff_and_blast_radius(
     changes: GitChanges | None = None,
     analysis_notes: list[str] | None = None,
 ) -> DiffBlastRadiusReport:
-    """Compute changed-line boundary findings + upstream/downstream 3-tier blast radius."""
+    """Compute new cross-tier boundary findings + upstream/downstream 3-tier blast radius."""
     changes = changes or collect_git_changes(repo_root, base_ref)
     if base_report is not None and base_report.source_commit != changes.base_commit:
         raise ValueError("Base graph does not match the requested Git commit")
     changed_ranges = changes.after
     changed_files = sorted(changes.before.keys() | changes.after.keys())
     notes = list(analysis_notes or [])
-    base_missing = bool(changes.before) and base_report is None
+    base_recovery_failed = any(
+        n.startswith("Base graph could not be recovered:") for n in notes
+    )
+    base_missing = (bool(changes.before) or base_recovery_failed) and base_report is None
     head_incomplete = not report.coverage_complete
     base_incomplete = base_report is not None and not base_report.coverage_complete
     incomplete = base_missing or head_incomplete or base_incomplete
@@ -79,8 +131,6 @@ def compute_diff_and_blast_radius(
     base_impacted: set[str] = set()
     nodes_by_id = {}
     chains_by_id = {}
-    # Traverse each graph separately: joining old and new edges can invent paths
-    # that never existed in either source tree.
     for graph, paths in ((base_report, changes.before), (report, changes.after)):
         if graph is None:
             continue
@@ -112,30 +162,32 @@ def compute_diff_and_blast_radius(
         nid for nid in impacted_all if nid in nodes_by_id and nodes_by_id[nid].tier == "display"
     )
 
-    new_findings: list[BoundaryFinding] = []
-    for f in report.findings:
-        ranges = changed_ranges.get(f.source_file)
-        if not ranges:
-            continue
-        if any(lo <= f.line <= hi for lo, hi in ranges):
-            new_findings.append(f)
-
+    effective_base_findings: list[BoundaryFinding] | None = (
+        base_report.findings if base_report is not None else None
+    )
+    new_findings = _compute_new_findings(report.findings, effective_base_findings, changed_ranges)
     blocking_new = sum(1 for f in new_findings if f.blocks_gate)
+
     commits_in_range: list[str] = []
     if base_ref.upper() != "WORKING":
         try:
-            log_proc = subprocess.run(
-                ["git", "log", "--oneline", "--first-parent", "-n", "25", f"{changes.base_commit}..HEAD", "--"],
-                cwd=repo_root,
-                check=True,
-                capture_output=True,
+            log_proc = run_safe_git(
+                repo_root,
+                "log",
+                "--oneline",
+                "--first-parent",
+                "-n",
+                "25",
+                f"{changes.base_commit}..HEAD",
+                "--",
                 text=True,
-                timeout=4,
+                check=True,
+                timeout=4.0,
             )
             commits_in_range = [
-                ln.strip() for ln in log_proc.stdout.splitlines() if ln.strip()
+                ln.strip() for ln in str(log_proc.stdout).splitlines() if ln.strip()
             ]
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, SafeGitError):
             commits_in_range = []
 
     head_ids = {node.id for node in report.nodes}
@@ -159,9 +211,7 @@ def compute_diff_and_blast_radius(
         new_findings=new_findings,
         blocking_new_findings=blocking_new,
         diff_verdict=(
-            "INCOMPLETE"
-            if base_missing
-            else "FAIL"
+            "FAIL"
             if blocking_new > 0
             else "INCOMPLETE"
             if incomplete
@@ -171,26 +221,43 @@ def compute_diff_and_blast_radius(
 
 
 def run_target_diff(
-    session: Session, target: TargetProject, report: TruthAtlasReport, base_ref: str,
+    session: Session,
+    target: TargetProject,
+    report: TruthAtlasReport,
+    base_ref: str,
+    *,
+    pg_dsn: str | None = None,
+    redis_dsn: str | None = None,
+    allow_local_plugins: bool = False,
+    local_plugin_modules: Sequence[str] | None = None,
+    strict_gate: bool = True,
 ) -> DiffBlastRadiusReport:
     """Scan the requested base in isolation; never modify or execute the target tree."""
     root = Path(target.repo_path).resolve()
     changes = collect_git_changes(root, base_ref)
     base_report = None
     notes: list[str] = []
-    if changes.before:
+    if changes.before or changes.after:
         try:
             with tempfile.TemporaryDirectory(prefix="wythe-base-") as directory:
                 base_root = Path(directory)
                 materialize_base_tree(root, changes.base_commit, base_root)
                 base_target = TargetProject(
-                    id=0, slug=target.slug, name=target.name, repo_path=directory,
+                    id=target.id, slug=target.slug, name=target.name, repo_path=directory,
                     stack_profile_slug=target.stack_profile_slug,
                     backend_subdir=target.backend_subdir, frontend_subdir=target.frontend_subdir,
                     legacy_snapshot_relpath=target.legacy_snapshot_relpath,
                 )
                 base_report = run_target_scan(
-                    session, base_target, strict_gate=True, persist_snapshot=False,
+                    session,
+                    base_target,
+                    pg_dsn=pg_dsn,
+                    redis_dsn=redis_dsn,
+                    strict_gate=strict_gate,
+                    persist_snapshot=False,
+                    allow_local_plugins=allow_local_plugins,
+                    local_plugin_modules=local_plugin_modules,
+                    source_commit_override=changes.base_commit,
                 ).model_copy(update={"source_commit": changes.base_commit})
         except Exception as exc:  # noqa: BLE001 - incomplete evidence must never become PASS
             notes.append(f"Base graph could not be recovered: {exc}")
@@ -206,7 +273,7 @@ def compare_recorded_snapshots(
     base_snapshot_id: int,
     head_snapshot_id: int,
 ) -> SnapshotComparisonReport | None:
-    """Compare two persisted `ScanSnapshot` rows and return exact structural/finding deltas."""
+    """Compare two persisted `ScanSnapshot` rows and return exact multiset structural/finding deltas."""
     base_row = session.scalar(
         select(ScanSnapshot).where(
             ScanSnapshot.target_id == target_id,
@@ -230,13 +297,27 @@ def compare_recorded_snapshots(
     added_nodes = [head_nodes[nid] for nid in sorted(head_nodes.keys() - base_nodes.keys())]
     removed_nodes = [base_nodes[nid] for nid in sorted(base_nodes.keys() - head_nodes.keys())]
 
-    def _f_key(f: BoundaryFinding) -> tuple[str, str | None, str, str]:
-        return (f.rule_code, f.node_id, f.source_file, f.title)
+    def _snap_key(f: BoundaryFinding) -> tuple[str, str | None, str, int, str]:
+        return (f.rule_code, f.node_id, f.source_file, f.line, f.title)
 
-    base_f = {_f_key(f): f for f in base_rep.findings}
-    head_f = {_f_key(f): f for f in head_rep.findings}
-    new_findings = [head_f[k] for k in sorted(head_f.keys() - base_f.keys(), key=str)]
-    resolved_findings = [base_f[k] for k in sorted(base_f.keys() - head_f.keys(), key=str)]
+    base_counts = Counter(_snap_key(f) for f in base_rep.findings)
+    head_counts = Counter(_snap_key(f) for f in head_rep.findings)
+
+    new_findings: list[BoundaryFinding] = []
+    seen_new: Counter[tuple[str, str | None, str, int, str]] = Counter()
+    for hf in head_rep.findings:
+        k = _snap_key(hf)
+        if seen_new[k] < max(0, head_counts[k] - base_counts[k]):
+            seen_new[k] += 1
+            new_findings.append(hf)
+
+    resolved_findings: list[BoundaryFinding] = []
+    seen_res: Counter[tuple[str, str | None, str, int, str]] = Counter()
+    for bf in base_rep.findings:
+        k = _snap_key(bf)
+        if seen_res[k] < max(0, base_counts[k] - head_counts[k]):
+            seen_res[k] += 1
+            resolved_findings.append(bf)
 
     return SnapshotComparisonReport(
         target_slug=target_slug,
@@ -288,7 +369,7 @@ def build_sarif_log(
                 {
                     "physicalLocation": {
                         "artifactLocation": {
-                            "uri": f.source_file,
+                            "uri": _encode_sarif_uri(f.source_file),
                             "uriBaseId": "%SRCROOT%",
                         },
                         "region": {"startLine": max(1, f.line)},
@@ -311,11 +392,13 @@ def build_sarif_log(
                         "rules": rules_payload,
                     }
                 },
+                "originalUriBaseIds": {
+                    "%SRCROOT%": {"uri": ""},
+                },
                 "automationDetails": {
                     "id": f"wythe/{report.target_slug}/{report.stack_profile}"
                 },
                 "results": results_payload,
-                # The scan reads files from disk: record whether that matched the commit.
                 "properties": {
                     "sourceCommit": report.source_commit,
                     "worktreeDirty": report.worktree_dirty,

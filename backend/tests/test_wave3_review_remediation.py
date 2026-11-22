@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -18,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from app.db.session import get_session_factory
-from app.services.mcp_service import _resolve_target_for_mcp
+from app.services.mcp_service import _resolve_readonly_target, _resolve_target_for_mcp
 from app.services.scanner_service import run_target_scan
 from app.services.viewport_service import get_viewport_state
 from wythe_plugin_cpsat.proto_companion import (
@@ -272,6 +274,10 @@ def test_findings_1_and_5_live_follow_cadence_zero_runpy_warning_and_sse_stream(
     (repo / "backend" / "app" / "main.py").write_text("def solve():\n    return 1\n", encoding="utf-8")
     solve_log = repo / "solve.log"
     solve_log.write_text("Starting CP-SAT solver v9.15\nStarting search at 0.00s\n", encoding="utf-8")
+    resolved_repo = repo.resolve()
+    base_slug = re.sub(r"[^a-z0-9-_]", "-", resolved_repo.name.lower()).strip("-") or "mcp-target"
+    path_digest = hashlib.sha256(str(resolved_repo).encode("utf-8")).hexdigest()[:8]
+    expected_slug = f"unregistered-{base_slug[:36].strip('-') or 'target'}-{path_digest}"
 
     # 1. Live --follow keeps alive across active writes > follow_timeout and publishes intermediate updates
     from wythe_plugin_solver_chronicle.log_parser import IncrementalSolverLogParser
@@ -318,7 +324,7 @@ def test_findings_1_and_5_live_follow_cadence_zero_runpy_warning_and_sse_stream(
             fh.write(f"# {step + 1} 0.{step + 1}0s best:{100 - step} next:[50,99] rins_lns\n")
         time.sleep(0.2)
         assert follow_thread.is_alive(), f"Watcher exited prematurely at step {step}"
-        vp = get_viewport_state("follow-target")
+        vp = get_viewport_state(expected_slug)
         assert vp.latest is not None
         seen_seqs.append(vp.latest.seq)
         if vp.latest.command.chronicle_timeline is not None:
@@ -386,8 +392,9 @@ def test_findings_1_and_5_live_follow_cadence_zero_runpy_warning_and_sse_stream(
         assert watch_proc.returncode == 0, watch_proc.stderr
         assert watch_proc.stderr == ""
         watch_json = json.loads(watch_proc.stdout)
+        assert watch_json["target_slug"] == expected_slug
         with no_proxy.open(
-            f"{base_url}/api/v1/viewport/state?target_slug=follow-target", timeout=5.0
+            f"{base_url}/api/v1/viewport/state?target_slug={expected_slug}", timeout=5.0
         ) as resp:
             srv_state = json.loads(resp.read().decode("utf-8"))
         assert srv_state["latest"]["seq"] == watch_json["viewport_seq"]
@@ -450,6 +457,10 @@ def test_round2_verifier_edge_cases_mcp_scope_prefix_partial_line_and_pb_parity(
     assert isolated_db_url.startswith("sqlite:")
 
     # --- Item 1: Plugin MCP `wythe_solver_chronicle` honors `--server-url` & `local_viewport_only` ---
+    import sysconfig
+
+    purelib = Path(sysconfig.get_path("purelib"))
+
     class _ChronEP:
         name = "solver-chronicle"
         value = "wythe_plugin_solver_chronicle:register_wythe_plugin"
@@ -457,6 +468,11 @@ def test_round2_verifier_edge_cases_mcp_scope_prefix_partial_line_and_pb_parity(
 
         class dist:
             version = "0.1.0"
+            _path = purelib / "wythe_plugin_solver_chronicle-0.1.0.dist-info"
+
+            @classmethod
+            def locate_file(cls, path: str) -> Path:
+                return cls._path.parent / path
 
         def load(self):
             return register_wythe_plugin
@@ -505,11 +521,14 @@ def test_round2_verifier_edge_cases_mcp_scope_prefix_partial_line_and_pb_parity(
             },
         },
     }
+    expected_slug = _resolve_readonly_target(
+        db_session, str(repo), profile="python-services"
+    ).slug
     res_closed = dispatch_mcp_request(db_session, mcp_call, server_url=closed_url)
     assert res_closed is not None
     assert res_closed["result"]["isError"] is True
     assert "unreachable" in res_closed["result"]["content"][0]["text"].lower()
-    assert get_viewport_state("r2-repo").latest is None
+    assert get_viewport_state(expected_slug).latest is None
 
     # HTTP `/api/v1/mcp` sets `local_viewport_only=True`, ignoring broken `WYTHE_SERVER_URL` in env
     monkeypatch.setenv("WYTHE_SERVER_URL", closed_url)
@@ -518,7 +537,7 @@ def test_round2_verifier_edge_cases_mcp_scope_prefix_partial_line_and_pb_parity(
         assert http_mcp.status_code == 200
         assert http_mcp.json()["result"]["isError"] is False
     monkeypatch.delenv("WYTHE_SERVER_URL", raising=False)
-    assert get_viewport_state("r2-repo").latest is not None
+    assert get_viewport_state(expected_slug).latest is not None
 
     # --- Item 2: Prefix/substring & container-function false attribution ---
     target = _resolve_target_for_mcp(db_session, str(repo), profile="python-services")

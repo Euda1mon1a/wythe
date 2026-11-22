@@ -39,6 +39,7 @@ _PLIST_TAG_TOKEN_RE: Final[re.Pattern[bytes]] = re.compile(
 
 
 def _check_python_container_depth(obj: Any, *, max_depth: int = MAX_NESTING_DEPTH) -> None:
+    visited: set[int] = set()
     stack: list[tuple[Any, int]] = [(obj, 1)]
     while stack:
         cur, depth = stack.pop()
@@ -46,13 +47,19 @@ def _check_python_container_depth(obj: Any, *, max_depth: int = MAX_NESTING_DEPT
             raise ValueError(
                 f"Plist structure exceeds maximum nesting depth ({max_depth})."
             )
+        oid = id(cur)
+        if oid in visited:
+            continue
+        visited.add(oid)
+        if len(visited) > 65536:
+            raise ValueError("Plist structure exceeds maximum unique container budget.")
         if isinstance(cur, dict):
             for val in cur.values():
-                if isinstance(val, (dict, list, tuple)):
+                if isinstance(val, (dict, list, tuple)) and id(val) not in visited:
                     stack.append((val, depth + 1))
         elif isinstance(cur, (list, tuple)):
             for item in cur:
-                if isinstance(item, (dict, list, tuple)):
+                if isinstance(item, (dict, list, tuple)) and id(item) not in visited:
                     stack.append((item, depth + 1))
 
 

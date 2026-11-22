@@ -37,7 +37,13 @@ from wythe_plugin_agent_harness import (
 
 class _FakeDist:
     def __init__(self, version: str = "0.1.0") -> None:
+        import sysconfig
+
         self.version = version
+        self._path = Path(sysconfig.get_path("purelib")) / f"wythe_plugin_agent_harness-{version}.dist-info"
+
+    def locate_file(self, path: str) -> Path:
+        return self._path.parent / path
 
 
 class _FakeEntryPoint:
@@ -810,4 +816,4 @@ def test_end_to_end_scan_and_entry_point_materialize_agent_001_002_003_into_gate
     for code in ("AGENT-001", "AGENT-002", "AGENT-003"):
         assert ep_gate_by_code[code].observed_count >= 1
     assert ep_report.gate.verdict == "PASS"
-    assert len(db_session.scalars(select(RulePolicy)).all()) == 19
+    assert len(db_session.scalars(select(RulePolicy)).all()) == 26

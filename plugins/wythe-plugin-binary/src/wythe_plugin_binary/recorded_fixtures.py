@@ -80,6 +80,7 @@ class RecordedBinaryCapture:
     linux_capabilities: tuple[str, ...]
     slice_entitlements: dict[str, dict[str, Any]] = field(default_factory=dict)
     slice_has_entitlements_blob: dict[str, bool] = field(default_factory=dict)
+    slice_der_only_entitlements: dict[str, bool] = field(default_factory=dict)
 
 
 MachoBinaryCapabilities = RecordedBinaryCapture
@@ -536,18 +537,23 @@ def parse_readelf_dynamic_output(
 
 
 def _check_json_depth(root: Any, max_depth: int = _MAX_JSON_DEPTH) -> None:
+    visited: set[int] = set()
     stack: list[tuple[Any, int]] = [(root, 0)]
     while stack:
         cur, d = stack.pop()
         if d > max_depth:
             raise ValueError(f"Recorded JSON fixture exceeds max nesting depth ({max_depth}).")
+        oid = id(cur)
+        if oid in visited:
+            continue
+        visited.add(oid)
         if isinstance(cur, dict):
             for v in cur.values():
-                if isinstance(v, (dict, list)):
+                if isinstance(v, (dict, list)) and id(v) not in visited:
                     stack.append((v, d + 1))
         elif isinstance(cur, list):
             for v in cur:
-                if isinstance(v, (dict, list)):
+                if isinstance(v, (dict, list)) and id(v) not in visited:
                     stack.append((v, d + 1))
 
 

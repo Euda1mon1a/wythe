@@ -25,7 +25,7 @@ from app.adapters.base import (
 from app.adapters.ts_workspace import WorkspaceResolver, resolve_string_expr
 from app.schemas.atlas import AtlasEdge, AtlasNode
 
-_SKIP_PARTS = ("adapters", "tests", "__pycache__", "node_modules", "target", ".git", "migrations", "alembic")
+_SKIP_PARTS = ("tests", "__pycache__", "node_modules", "target", ".git", "migrations", "alembic")
 _CODE_SUFFIXES = (".py", ".ts", ".js", ".go", ".rs")
 
 _REDIS_SDK_RE = re.compile(
@@ -912,7 +912,7 @@ def augment_redis_ephemeral_lineage(
                     ttl_stores.add(sid)
                 else:
                     record_unbounded_write(mnode, rel_repo, sid, prefix, raw_key, op, lineno)
-                if mnode.subkind == "route" and has_service_layer:
+                if (mnode.subkind == "route" or mnode.http_paths) and has_service_layer:
                     manip.findings.append(
                         RawCandidateFinding(
                             rule_code="TRUTH-003",

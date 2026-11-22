@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import struct
 from pathlib import Path
 from typing import Any, Literal
@@ -42,6 +43,8 @@ LC_REEXPORT_DYLIB = 0x8000001F
 
 CSMAGIC_EMBEDDED_SIGNATURE = 0xFADE0CC0
 CSMAGIC_EMBEDDED_ENTITLEMENTS = 0xFADE7171
+CSMAGIC_EMBEDDED_DER_ENTITLEMENTS = 0xFADE7172
+CSSLOT_DER_ENTITLEMENTS = 7
 
 MAX_LOAD_COMMANDS = 4096
 MAX_SECTIONS_PER_SEG = 512
@@ -88,9 +91,27 @@ def _read_cstring_at(buf: bytes, start: int, limit: int = 1024) -> str:
     return "".join(ch for ch in decoded if ord(ch) >= 0x20 and ord(ch) != 0x7F).strip()
 
 
+_NON_NUL_BYTE_RE = re.compile(b"[" + bytes([94, 0]) + b"]")
+
+
 def _extract_printable_cstrings(sec_bytes: bytes, *, max_items: int = MAX_CSTRINGS) -> list[str]:
     out: list[str] = []
-    for chunk in sec_bytes.split(b"\x00"):
+    pos = 0
+    total_len = len(sec_bytes)
+    scanned_steps = 0
+    max_scan_steps = max_items * 64 + 65536
+    while pos < total_len and len(out) < max_items:
+        m = _NON_NUL_BYTE_RE.search(sec_bytes, pos)
+        if m is None:
+            break
+        pos = m.start()
+        scanned_steps += 1
+        if scanned_steps > max_scan_steps:
+            break
+        nul = sec_bytes.find(b"\x00", pos)
+        end = total_len if nul == -1 else nul
+        chunk = sec_bytes[pos:end]
+        pos = total_len if nul == -1 else end + 1
         if len(chunk) < 2 or len(chunk) > 512:
             continue
         try:
@@ -99,8 +120,6 @@ def _extract_printable_cstrings(sec_bytes: bytes, *, max_items: int = MAX_CSTRIN
             continue
         if all(0x20 <= ord(ch) <= 0x7E or ch == "\t" for ch in s):
             out.append(s)
-            if len(out) >= max_items:
-                break
     return out
 
 
@@ -117,34 +136,55 @@ def _vm_to_file_offset(
     return None
 
 
-def _parse_code_signature_entitlements_with_presence(
+def _parse_code_signature_entitlements_detail(
     sig_bytes: bytes,
-) -> tuple[dict[str, Any], bool]:
+) -> tuple[dict[str, Any], bool, bool]:
     if len(sig_bytes) < 8:
         raise ValueError("Truncated Mach-O LC_CODE_SIGNATURE payload (< 8 bytes).")
     magic, total_len = struct.unpack_from(">II", sig_bytes, 0)
     if magic == CSMAGIC_EMBEDDED_ENTITLEMENTS:
         if total_len < 8 or total_len > len(sig_bytes):
             raise ValueError("Out-of-bounds CSMAGIC_EMBEDDED_ENTITLEMENTS blob length.")
-        return parse_safe_entitlements_xml(sig_bytes[8:total_len]), True
+        return parse_safe_entitlements_xml(sig_bytes[8:total_len]), True, False
+    if magic == CSMAGIC_EMBEDDED_DER_ENTITLEMENTS:
+        if total_len < 8 or total_len > len(sig_bytes):
+            raise ValueError("Out-of-bounds CSMAGIC_EMBEDDED_DER_ENTITLEMENTS blob length.")
+        return {}, True, True
     if magic != CSMAGIC_EMBEDDED_SIGNATURE:
-        return {}, False
+        return {}, False, False
     if len(sig_bytes) < 12 or total_len < 12 or total_len > len(sig_bytes):
         raise ValueError("Corrupt or truncated CSMAGIC_EMBEDDED_SIGNATURE superblob.")
     count = struct.unpack_from(">I", sig_bytes, 8)[0]
     if count > MAX_SUPERBLOB_BLOBS or 12 + count * 8 > total_len:
         raise ValueError("Out-of-bounds CS_SuperBlob index count.")
 
+    xml_ents: dict[str, Any] = {}
+    has_xml = False
+    has_der = False
     for idx in range(count):
-        _btype, boff = struct.unpack_from(">II", sig_bytes, 12 + idx * 8)
+        btype, boff = struct.unpack_from(">II", sig_bytes, 12 + idx * 8)
         if boff < 12 or boff + 8 > total_len:
             raise ValueError("Out-of-bounds CS_BlobIndex offset in LC_CODE_SIGNATURE.")
         sub_magic, sub_len = struct.unpack_from(">II", sig_bytes, boff)
         if sub_len < 8 or boff + sub_len > total_len:
             raise ValueError("Out-of-bounds sub-blob length in LC_CODE_SIGNATURE.")
         if sub_magic == CSMAGIC_EMBEDDED_ENTITLEMENTS:
-            return parse_safe_entitlements_xml(sig_bytes[boff + 8 : boff + sub_len]), True
-    return {}, False
+            xml_ents = parse_safe_entitlements_xml(sig_bytes[boff + 8 : boff + sub_len])
+            has_xml = True
+        elif btype == CSSLOT_DER_ENTITLEMENTS or sub_magic == CSMAGIC_EMBEDDED_DER_ENTITLEMENTS:
+            has_der = True
+    if has_xml:
+        return xml_ents, True, False
+    if has_der:
+        return {}, True, True
+    return {}, False, False
+
+
+def _parse_code_signature_entitlements_with_presence(
+    sig_bytes: bytes,
+) -> tuple[dict[str, Any], bool]:
+    ents, has_blob, _der_only = _parse_code_signature_entitlements_detail(sig_bytes)
+    return ents, has_blob
 
 
 def _parse_code_signature_entitlements(sig_bytes: bytes) -> dict[str, Any]:
@@ -484,9 +524,10 @@ def _parse_macho_64_slice(
 
     entitlements: dict[str, Any] = {}
     has_ent_blob = False
+    der_only = False
     if codesig_range is not None and codesig_range[1] > 0:
         cs_off, cs_sz = codesig_range
-        entitlements, has_ent_blob = _parse_code_signature_entitlements_with_presence(
+        entitlements, has_ent_blob, der_only = _parse_code_signature_entitlements_detail(
             slice_buf[cs_off : cs_off + cs_sz]
         )
 
@@ -508,6 +549,7 @@ def _parse_macho_64_slice(
         linux_capabilities=(),
         slice_entitlements={arch_name: dict(entitlements)},
         slice_has_entitlements_blob={arch_name: has_ent_blob},
+        slice_der_only_entitlements={arch_name: der_only},
     )
 
 
@@ -537,6 +579,8 @@ def parse_macho_bytes(
             raise ValueError("Truncated Universal Mach-O fat_arch header table.")
 
         slices: list[RecordedBinaryCapture] = []
+        total_slice_bytes = 0
+        seen_ranges: list[tuple[int, int]] = []
         for idx in range(nfat_arch):
             ent_pos = 8 + idx * arch_entry_sz
             if is_fat64:
@@ -549,7 +593,17 @@ def parse_macho_bytes(
                 )
             if s_sz < 32 or s_off < 8 or s_off + s_sz > len(buf):
                 raise ValueError(f"Out-of-bounds Universal Mach-O slice #{idx}.")
-            sub_buf = buf[s_off : s_off + s_sz]
+            total_slice_bytes += s_sz
+            if total_slice_bytes > MAX_BINARY_BYTES:
+                raise ValueError(
+                    f"Universal Mach-O cumulative slice bytes ({total_slice_bytes}) exceed {MAX_BINARY_BYTES}-byte limit."
+                )
+            s_end = s_off + s_sz
+            for prev_start, prev_end in seen_ranges:
+                if s_off < prev_end and prev_start < s_end:
+                    raise ValueError(f"Overlapping Universal Mach-O slice #{idx} is forbidden.")
+            seen_ranges.append((s_off, s_end))
+            sub_buf = buf[s_off:s_end]
             if sub_buf[:4] in (FAT_MAGIC_BE, FAT_MAGIC_LE, FAT_MAGIC_64_BE, FAT_MAGIC_64_LE):
                 raise ValueError("Nested Universal Mach-O headers are forbidden.")
             slices.append(
@@ -563,7 +617,7 @@ def parse_macho_bytes(
         imp_syms: dict[str, DemangledSymbol] = {}
         refl: dict[tuple[str, str], ReflectionDescriptor] = {}
         wit: dict[tuple[str, str], Any] = {}
-        per_arch_slices: dict[str, list[tuple[dict[str, Any], bool]]] = {}
+        per_arch_slices: dict[str, list[tuple[dict[str, Any], bool, bool]]] = {}
 
         for sl in slices:
             for a in sl.architectures:
@@ -571,7 +625,8 @@ def parse_macho_bytes(
                     arches.append(a)
                 s_ent = dict(sl.slice_entitlements.get(a, sl.entitlements))
                 s_blob = bool(sl.slice_has_entitlements_blob.get(a, bool(sl.entitlements)))
-                per_arch_slices.setdefault(a, []).append((s_ent, s_blob))
+                s_der = bool(sl.slice_der_only_entitlements.get(a, False))
+                per_arch_slices.setdefault(a, []).append((s_ent, s_blob, s_der))
             for lb in sl.linked_libraries:
                 libs_by_p.setdefault(lb.raw_path, lb)
             for rp in sl.rpaths:
@@ -588,20 +643,23 @@ def parse_macho_bytes(
 
         sorted_slice_ents: dict[str, dict[str, Any]] = {}
         sorted_slice_blobs: dict[str, bool] = {}
+        sorted_slice_der_only: dict[str, bool] = {}
         for arch_k in sorted(per_arch_slices):
             entries_for_arch = per_arch_slices[arch_k]
             if len(entries_for_arch) == 1:
                 sorted_slice_ents[arch_k] = entries_for_arch[0][0]
                 sorted_slice_blobs[arch_k] = entries_for_arch[0][1]
+                sorted_slice_der_only[arch_k] = entries_for_arch[0][2]
             else:
                 ordered_dups = sorted(
                     entries_for_arch,
-                    key=lambda pair: (pair[1], repr(sorted(pair[0].items()))),
+                    key=lambda triple: (triple[1], triple[2], repr(sorted(triple[0].items()))),
                 )
-                for dup_i, (d_ent, d_blob) in enumerate(ordered_dups, start=1):
+                for dup_i, (d_ent, d_blob, d_der) in enumerate(ordered_dups, start=1):
                     dup_key = f"{arch_k}#{dup_i}"
                     sorted_slice_ents[dup_key] = d_ent
                     sorted_slice_blobs[dup_key] = d_blob
+                    sorted_slice_der_only[dup_key] = d_der
 
         merged_ent = aggregate_slice_entitlements_conservatively(sorted_slice_ents)
 
@@ -623,6 +681,7 @@ def parse_macho_bytes(
             linux_capabilities=(),
             slice_entitlements=sorted_slice_ents,
             slice_has_entitlements_blob=sorted_slice_blobs,
+            slice_der_only_entitlements=sorted_slice_der_only,
         )
 
     raise ValueError(f"Unsupported Mach-O header magic {magic4.hex()} in '{source_name}'.")
@@ -632,10 +691,13 @@ def parse_macho_file(
     path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = MAX_BINARY_BYTES,
 ) -> RecordedBinaryCapture:
     """Safely read a non-symlink Mach-O file and parse its headers, symbols, & entitlements."""
-    resolved, raw = read_bounded_regular_bytes(path, repo_root=repo_root, max_bytes=max_bytes)
+    resolved, raw = read_bounded_regular_bytes(
+        path, repo_root=repo_root, allow_external=allow_external, max_bytes=max_bytes
+    )
     return parse_macho_bytes(raw, source_name=resolved.name)
 
 

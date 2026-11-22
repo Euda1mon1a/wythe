@@ -9,6 +9,7 @@ Strictly passive, pure-Python, and non-executing.
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
 from collections.abc import Iterable
@@ -112,6 +113,31 @@ def resolve_safe_companion_path(
     return target
 
 
+def open_safe_regular_fd(
+    safe_path: Path,
+    *,
+    raw_label: str | Path | None = None,
+    max_bytes: int = MAX_SOLVER_COMPANION_BYTES,
+) -> int:
+    """Atomically open a validated regular file using O_NOFOLLOW + fstat size check."""
+    label = raw_label if raw_label is not None else safe_path
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(safe_path, flags)
+    except OSError as exc:
+        raise ValueError(f"Cannot safely open companion path '{label}': {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Companion path '{label}' must be a regular file.")
+        if st.st_size > max_bytes:
+            raise ValueError(f"Companion path '{label}' exceeds {max_bytes}-byte limit.")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def read_safe_companion_bytes(
     raw_path: str | Path,
     *,
@@ -126,7 +152,17 @@ def read_safe_companion_bytes(
         allow_external=allow_external,
         max_bytes=max_bytes,
     )
-    data = safe_path.read_bytes()
+    fd = open_safe_regular_fd(safe_path, raw_label=raw_path, max_bytes=max_bytes)
+    chunks: list[bytes] = []
+    remaining = max_bytes + 1
+    with os.fdopen(fd, "rb") as fh:
+        while remaining > 0:
+            chunk = fh.read(min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    data = b"".join(chunks)
     if len(data) > max_bytes:
         raise ValueError(f"Companion path '{raw_path}' exceeds {max_bytes}-byte limit.")
     return safe_path, data
@@ -1145,18 +1181,23 @@ def _opt_protojson_float(mapping: dict[str, Any], *keys: str) -> float | None:
 
 
 def _check_json_depth(root: Any, max_depth: int = 64) -> None:
+    visited: set[int] = set()
     stack: list[tuple[Any, int]] = [(root, 0)]
     while stack:
         cur, d = stack.pop()
         if d > max_depth:
             raise ValueError(f"Corrupt or excessively nested JSON companion artifact (> {max_depth} levels).")
+        oid = id(cur)
+        if oid in visited:
+            continue
+        visited.add(oid)
         if isinstance(cur, dict):
             for v in cur.values():
-                if isinstance(v, (dict, list)):
+                if isinstance(v, (dict, list)) and id(v) not in visited:
                     stack.append((v, d + 1))
         elif isinstance(cur, list):
             for v in cur:
-                if isinstance(v, (dict, list)):
+                if isinstance(v, (dict, list)) and id(v) not in visited:
                     stack.append((v, d + 1))
 
 

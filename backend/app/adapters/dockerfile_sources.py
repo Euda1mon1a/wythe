@@ -7,19 +7,26 @@ or following symlinks outside the repository root.
 from __future__ import annotations
 
 import ast
+import functools
 import json
 import os
 import re
 import shlex
+import stat
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 import yaml
 
 from app.adapters.base import ManipulatorExtractionResult, RawCandidateFinding
 from app.adapters.service_sources import EXCLUDED_PARTS
 from app.schemas.atlas import AtlasEdge, AtlasNode
+
+MAX_ENV_VALUE_LEN = 8192
+MAX_ENV_BINDINGS = 2048
+MAX_DOCKERIGNORE_RULES = 2048
 
 _DOCKERFILE_EXACT = frozenset({"Dockerfile", "Containerfile"})
 _DOCKERFILE_PREFIXES = ("Dockerfile.", "Containerfile.")
@@ -47,11 +54,267 @@ def is_compose_filename(name: str) -> bool:
     return bool(_COMPOSE_VARIANT_RE.match(name))
 
 
+def _has_safe_path_segments(path_or_str: Path | str, *, max_segment_bytes: int = 255) -> bool:
+    if isinstance(path_or_str, str):
+        if not path_or_str or "\x00" in path_or_str:
+            return False
+        path_obj = Path(path_or_str)
+    else:
+        raw_s = str(path_or_str)
+        if not raw_s or "\x00" in raw_s:
+            return False
+        path_obj = path_or_str
+    anchor = path_obj.anchor
+    for part in path_obj.parts:
+        if part == anchor or part in ("", "."):
+            continue
+        if "\x00" in part or len(part.encode("utf-8", errors="surrogateescape")) > max_segment_bytes:
+            return False
+    return True
+
+
 def _is_within_root(candidate: Path, real_root: Path) -> bool:
+    if not _has_safe_path_segments(candidate):
+        return False
     try:
         return candidate.resolve().is_relative_to(real_root)
-    except OSError:
+    except (OSError, ValueError):
         return False
+
+
+def _safe_is_symlink(path: Path) -> bool:
+    if not _has_safe_path_segments(path):
+        return False
+    try:
+        return path.is_symlink()
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_is_file(path: Path) -> bool:
+    if not _has_safe_path_segments(path):
+        return False
+    try:
+        return path.is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_is_dir(path: Path) -> bool:
+    if not _has_safe_path_segments(path):
+        return False
+    try:
+        return path.is_dir()
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_exists(path: Path) -> bool:
+    if not _has_safe_path_segments(path):
+        return False
+    try:
+        return path.exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_resolve(path: Path) -> Path | None:
+    if not _has_safe_path_segments(path):
+        return None
+    try:
+        return path.resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def _safe_contained_file(path: Path, real_root: Path) -> str | None:
+    if not _has_safe_path_segments(path):
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        resolved = path.resolve()
+        if not resolved.is_relative_to(real_root):
+            return None
+        return resolved.relative_to(real_root).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
+def _safe_contained_dir(path: Path, real_root: Path) -> Path | None:
+    if not _has_safe_path_segments(path):
+        return None
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return None
+        resolved = path.resolve()
+        if not resolved.is_relative_to(real_root):
+            return None
+        return resolved
+    except (OSError, ValueError):
+        return None
+
+
+def _safe_contained_entry(path: Path, real_root: Path) -> tuple[str, bool, bool] | None:
+    if not _has_safe_path_segments(path):
+        return None
+    try:
+        if path.is_symlink() or not path.exists():
+            return None
+        resolved = path.resolve()
+        if not resolved.is_relative_to(real_root):
+            return None
+        rel = "." if resolved == real_root else resolved.relative_to(real_root).as_posix()
+        return rel, path.is_file(), path.is_dir()
+    except (OSError, ValueError):
+        return None
+
+
+MAX_DOCKER_STAGES = 128
+MAX_STAGE_MAPPINGS = 2048
+MAX_GLOB_MATCHES = 4096
+
+
+def _safe_glob(root: Path, pattern: str) -> list[Path]:
+    if not pattern or "\x00" in pattern or not _has_safe_path_segments(root):
+        return []
+    raw_segs = [s for s in pattern.replace("\\", "/").split("/") if s and s != "."]
+    if not raw_segs or len(raw_segs) > 32:
+        return []
+    dedup_segs: list[str] = []
+    wildcard_segs = 0
+    for seg in raw_segs:
+        if seg == "**" and dedup_segs and dedup_segs[-1] == "**":
+            continue
+        if any(ch in seg for ch in "*?["):
+            wildcard_segs += 1
+            if wildcard_segs > 12:
+                return []
+        elif len(seg.encode("utf-8", errors="surrogateescape")) > 255:
+            return []
+        dedup_segs.append(seg)
+    norm_pattern = "/".join(dedup_segs)
+    try:
+        matched: list[Path] = []
+        for p in root.glob(norm_pattern):
+            matched.append(p)
+            if len(matched) >= MAX_GLOB_MATCHES:
+                break
+        return sorted(matched)
+    except (OSError, ValueError):
+        return []
+
+
+def _read_bounded_regular_text(
+    path: Path,
+    *,
+    max_bytes: int = 1_048_576,
+    real_root: Path | None = None,
+    encoding: str = "utf-8",
+) -> str:
+    if not _has_safe_path_segments(path):
+        raise OSError("Unsafe path segments")
+    if real_root is not None and (_safe_is_symlink(path) or not _is_within_root(path, real_root)):
+        raise OSError("Path outside repository root or symlink")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("Not a regular file")
+        if st.st_size > max_bytes:
+            raise ValueError(f"File exceeds {max_bytes}-byte limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"File exceeds {max_bytes}-byte limit")
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode(encoding)
+
+
+def _make_bounded_yaml_loader(max_nodes: int = 4096, max_depth: int = 64) -> type[yaml.SafeLoader]:
+    class _BoundedSafeLoader(yaml.SafeLoader):
+        def __init__(self, stream: Any) -> None:
+            super().__init__(stream)
+            self._node_count = 0
+            self._alias_count = 0
+            self._merge_steps = 0
+            self._cur_depth = 0
+
+        def compose_node(self, parent: Any, index: Any) -> Any:
+            if self.check_event(yaml.AliasEvent):
+                self._alias_count += 1
+                if (self._node_count + self._alias_count) > max_nodes:
+                    raise yaml.YAMLError(f"YAML alias expansion exceeds budget ({max_nodes}).")
+                return super().compose_node(parent, index)
+            self._node_count += 1
+            if (self._node_count + self._alias_count) > max_nodes:
+                raise yaml.YAMLError(f"YAML node count exceeds budget ({max_nodes}).")
+            self._cur_depth += 1
+            if self._cur_depth > max_depth:
+                raise yaml.YAMLError(
+                    f"YAML structure exceeds maximum nesting depth ({max_depth})."
+                )
+            try:
+                return super().compose_node(parent, index)
+            finally:
+                self._cur_depth -= 1
+
+        def flatten_mapping(self, node: Any) -> None:
+            self._merge_steps += 1
+            if self._merge_steps > max_nodes:
+                raise yaml.YAMLError(f"YAML mapping merge exceeds budget ({max_nodes}).")
+            raw_pairs = getattr(node, "value", ())
+            projected = len(raw_pairs)
+            if projected > max_nodes:
+                raise yaml.YAMLError(f"YAML merged mapping exceeds budget ({max_nodes}).")
+            for k_node, v_node in raw_pairs:
+                if getattr(k_node, "tag", "") == "tag:yaml.org,2002:merge":
+                    if isinstance(v_node, yaml.MappingNode):
+                        self.flatten_mapping(v_node)
+                        projected += len(v_node.value)
+                    elif isinstance(v_node, yaml.SequenceNode):
+                        for subnode in v_node.value:
+                            if isinstance(subnode, yaml.MappingNode):
+                                self.flatten_mapping(subnode)
+                                projected += len(subnode.value)
+                    if projected > max_nodes:
+                        raise yaml.YAMLError(f"YAML merged mapping exceeds budget ({max_nodes}).")
+            super().flatten_mapping(node)
+            if len(getattr(node, "value", ())) > max_nodes:
+                raise yaml.YAMLError(f"YAML merged mapping exceeds budget ({max_nodes}).")
+
+        def construct_yaml_int(self, node: Any) -> int:
+            if isinstance(node.value, str) and len(node.value) > 4096:
+                raise yaml.YAMLError("YAML integer exceeds maximum bit length")
+            val = super().construct_yaml_int(node)
+            if isinstance(val, int) and not isinstance(val, bool) and val.bit_length() > 4096:
+                raise yaml.YAMLError("YAML integer exceeds maximum bit length")
+            return val
+
+    _BoundedSafeLoader.add_constructor(
+        "tag:yaml.org,2002:int", _BoundedSafeLoader.construct_yaml_int
+    )
+    return _BoundedSafeLoader
+
+
+def _load_bounded_yaml(
+    raw_text: str, *, max_nodes: int = 4096, max_depth: int = 64
+) -> object:
+    return yaml.load(raw_text, Loader=_make_bounded_yaml_loader(max_nodes, max_depth))
+
+
+def _load_bounded_yaml_all(
+    raw_text: str, *, max_nodes: int = 4096, max_depth: int = 64
+) -> list[object]:
+    return list(yaml.load_all(raw_text, Loader=_make_bounded_yaml_loader(max_nodes, max_depth)))
 
 
 def _normalize_posix_rel(raw: str) -> str | None:
@@ -74,48 +337,195 @@ def _normalize_posix_rel(raw: str) -> str | None:
     return "/".join(parts) if parts else "."
 
 
-def _compile_dockerignore_glob(pattern: str) -> re.Pattern[str] | None:
+@functools.lru_cache(maxsize=8192)
+def _compile_segment_tokens(seg: str) -> tuple[tuple[Any, ...], ...] | None:
+    if not any(ch in seg for ch in "*?["):
+        return (("exact", seg),)
+    if "?" not in seg and "[" not in seg:
+        collapsed = re.sub(r"\*+", "*", seg)
+        if collapsed == "*":
+            return (("star",),)
+        if collapsed.count("*") == 1:
+            if collapsed.startswith("*"):
+                return (("suffix", collapsed[1:]),)
+            if collapsed.endswith("*"):
+                return (("prefix", collapsed[:-1]),)
+    tokens: list[tuple[Any, ...]] = []
+    i = 0
+    n = len(seg)
+    while i < n:
+        ch = seg[i]
+        if ch == "*":
+            while i + 1 < n and seg[i + 1] == "*":
+                i += 1
+            if not tokens or tokens[-1] != ("star",):
+                tokens.append(("star",))
+            i += 1
+        elif ch == "?":
+            tokens.append(("any",))
+            i += 1
+        elif ch == "[":
+            end = seg.find("]", i + 1)
+            if end == -1:
+                tokens.append(("lit", "["))
+                i += 1
+            else:
+                body = seg[i + 1 : end]
+                negated = False
+                if body.startswith(("!", "^")):
+                    negated = True
+                    body = body[1:]
+                if not body:
+                    return None
+                chars: set[str] = set()
+                ranges: list[tuple[str, str]] = []
+                j = 0
+                m = len(body)
+                while j < m:
+                    if j + 2 < m and body[j + 1] == "-":
+                        lo, hi = body[j], body[j + 2]
+                        if ord(lo) > ord(hi):
+                            return None
+                        ranges.append((lo, hi))
+                        j += 3
+                    else:
+                        chars.add(body[j])
+                        j += 1
+                tokens.append(("cls", negated, frozenset(chars), tuple(ranges)))
+                i = end + 1
+        else:
+            tokens.append(("lit", ch))
+            i += 1
+    return tuple(tokens)
+
+
+def _token_matches_char(tok: tuple[Any, ...], ch: str) -> bool:
+    kind = tok[0]
+    if kind == "any":
+        return True
+    if kind == "lit":
+        return ch == tok[1]
+    _, negated, chars, ranges = tok
+    hit = ch in chars or any(lo <= ch <= hi for lo, hi in ranges)
+    return not hit if negated else hit
+
+
+@functools.lru_cache(maxsize=16384)
+def _match_segment(tokens: tuple[tuple[Any, ...], ...], text: str) -> bool:
+    if len(tokens) == 1:
+        t0 = tokens[0]
+        k0 = t0[0]
+        if k0 == "exact":
+            return text == t0[1]
+        if k0 == "star":
+            return True
+        if k0 == "suffix":
+            return text.endswith(t0[1])
+        if k0 == "prefix":
+            return text.startswith(t0[1])
+    ti = 0
+    si = 0
+    tn = len(tokens)
+    sn = len(text)
+    star_ti = -1
+    star_si = 0
+    while si < sn:
+        if ti < tn and tokens[ti][0] == "star":
+            star_ti = ti
+            star_si = si
+            ti += 1
+        elif ti < tn and _token_matches_char(tokens[ti], text[si]):
+            ti += 1
+            si += 1
+        elif star_ti != -1:
+            ti = star_ti + 1
+            star_si += 1
+            si = star_si
+        else:
+            return False
+    while ti < tn and tokens[ti][0] == "star":
+        ti += 1
+    return ti == tn
+
+
+@dataclass(frozen=True)
+class _DockerIgnoreMatcher:
+    segments: tuple[tuple[tuple[Any, ...], ...] | None, ...]
+
+    def matches(self, rel_path: str) -> bool:
+        if not rel_path or rel_path == ".":
+            return False
+        path_segs = [s for s in rel_path.split("/") if s]
+        n = len(path_segs)
+        if n == 0:
+            return False
+        dp = [True] + [False] * n
+        for pseg in self.segments:
+            if pseg is None:
+                for j in range(1, n + 1):
+                    dp[j] = dp[j] or dp[j - 1]
+            else:
+                new_dp = [False] * (n + 1)
+                any_hit = False
+                for j in range(1, n + 1):
+                    if dp[j - 1] and _match_segment(pseg, path_segs[j - 1]):
+                        new_dp[j] = True
+                        any_hit = True
+                if not any_hit:
+                    return False
+                dp = new_dp
+        return dp[n]
+
+    def matches_any_prefix(self, path_segs: tuple[str, ...]) -> bool:
+        n = len(path_segs)
+        if n == 0:
+            return False
+        dp = [True] + [False] * n
+        for pseg in self.segments:
+            if pseg is None:
+                for j in range(1, n + 1):
+                    if dp[j - 1]:
+                        for k in range(j, n + 1):
+                            dp[k] = True
+                        break
+            else:
+                new_dp = [False] * (n + 1)
+                any_hit = False
+                for j in range(1, n + 1):
+                    if dp[j - 1] and _match_segment(pseg, path_segs[j - 1]):
+                        new_dp[j] = True
+                        any_hit = True
+                if not any_hit:
+                    return False
+                dp = new_dp
+        return any(dp[1:])
+
+    def match(self, rel_path: str) -> bool:
+        return self.matches(rel_path)
+
+
+@functools.lru_cache(maxsize=4096)
+def _compile_dockerignore_glob(pattern: str) -> _DockerIgnoreMatcher | None:
+    if len(pattern) > 4096:
+        return None
     norm = pattern.strip().replace("\\", "/")
     while norm.startswith("./"):
         norm = norm[2:]
     norm = norm.strip("/")
     if not norm or norm == ".":
-        return re.compile(r"^.*$") if pattern.strip() in {"*", "**"} else None
-    out: list[str] = ["^"]
-    i = 0
-    n = len(norm)
-    while i < n:
-        if norm[i : i + 3] == "**/":
-            out.append("(?:.+/)?")
-            i += 3
-        elif norm[i : i + 3] == "/**":
-            out.append("(?:/.*)?")
-            i += 3
-        elif norm[i : i + 2] == "**":
-            out.append(".*")
-            i += 2
-        elif norm[i] == "*":
-            out.append("[^/]*")
-            i += 1
-        elif norm[i] == "?":
-            out.append("[^/]")
-            i += 1
-        elif norm[i] == "[":
-            end = norm.find("]", i + 1)
-            if end != -1:
-                cls_body = norm[i + 1 : end]
-                if cls_body.startswith("!"):
-                    cls_body = "^" + cls_body[1:]
-                out.append(f"[{cls_body}]")
-                i = end + 1
-            else:
-                out.append(re.escape("["))
-                i += 1
+        return None
+    raw_segs = [s for s in norm.split("/") if s]
+    seg_matchers: list[tuple[tuple[Any, ...], ...] | None] = []
+    for seg in raw_segs:
+        if seg == "**":
+            if not seg_matchers or seg_matchers[-1] is not None:
+                seg_matchers.append(None)
         else:
-            out.append(re.escape(norm[i]))
-            i += 1
-    out.append("$")
-    return re.compile("".join(out))
+            compiled_seg = _compile_segment_tokens(seg)
+            if compiled_seg is None:
+                return None
+            seg_matchers.append(compiled_seg)
+    return _DockerIgnoreMatcher(segments=tuple(seg_matchers))
 
 
 @dataclass(frozen=True)
@@ -123,7 +533,10 @@ class DockerIgnoreSpec:
     """Compiled `.dockerignore` rule list evaluated in declaration order."""
 
     source_rel: str | None = None
-    rules: tuple[tuple[re.Pattern[str], bool], ...] = ()
+    rules: tuple[tuple[_DockerIgnoreMatcher, bool], ...] = ()
+    _cache: dict[str, bool] = field(
+        default_factory=dict, init=False, repr=False, compare=False, hash=False
+    )
 
     def is_excluded(self, rel_ctx: str) -> bool:
         if not self.rules:
@@ -131,32 +544,42 @@ class DockerIgnoreSpec:
         norm = _normalize_posix_rel(rel_ctx)
         if norm is None or norm == ".":
             return False
-        parts = norm.split("/")
-        ancestors = ["/".join(parts[:idx]) for idx in range(1, len(parts) + 1)]
+        cached = self._cache.get(norm)
+        if cached is not None:
+            return cached
+        parts = tuple(norm.split("/"))
+        active_rules = (
+            self.rules[-MAX_DOCKERIGNORE_RULES:]
+            if len(self.rules) > MAX_DOCKERIGNORE_RULES
+            else self.rules
+        )
         excluded = False
-        for regex, negated in self.rules:
-            if any(regex.match(anc) for anc in ancestors):
+        for matcher, negated in reversed(active_rules):
+            if matcher.matches_any_prefix(parts):
                 excluded = not negated
+                break
+        if len(self._cache) < 4096:
+            self._cache[norm] = excluded
         return excluded
 
     def is_dir_completely_excluded(self, dir_fs: Path, rel_ctx: str, real_root: Path) -> bool:
         if not self.rules:
             return False
         has_any_file = False
-        for parent, dirs, names in os.walk(dir_fs, followlinks=False):
+        for parent, dirs, names in os.walk(dir_fs, followlinks=False, onerror=lambda _e: None):
             dirs[:] = [
                 d for d in sorted(dirs)
-                if not (Path(parent) / d).is_symlink()
-                and _is_within_root(Path(parent) / d, real_root)
+                if _safe_contained_dir(Path(parent) / d, real_root) is not None
             ]
             for name in sorted(names):
                 fpath = Path(parent) / name
-                if fpath.is_symlink() or not fpath.is_file():
-                    continue
-                if not _is_within_root(fpath, real_root):
+                if _safe_contained_file(fpath, real_root) is None:
                     continue
                 has_any_file = True
-                sub_rel = fpath.relative_to(dir_fs).as_posix()
+                try:
+                    sub_rel = fpath.relative_to(dir_fs).as_posix()
+                except ValueError:
+                    continue
                 full_ctx = sub_rel if rel_ctx in ("", ".") else f"{rel_ctx}/{sub_rel}"
                 if not self.is_excluded(full_ctx):
                     return False
@@ -167,32 +590,56 @@ def parse_dockerignore(
     context_root: Path,
     dockerfile_path: Path | None,
     repo_root: Path,
+    *,
+    notes_out: list[str] | None = None,
 ) -> DockerIgnoreSpec:
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        return DockerIgnoreSpec()
     candidates: list[Path] = []
     if dockerfile_path is not None:
         candidates.append(dockerfile_path.with_name(dockerfile_path.name + ".dockerignore"))
     candidates.append(context_root / ".dockerignore")
     for cand in candidates:
-        if cand.is_symlink() or not cand.is_file() or not _is_within_root(cand, real_root):
+        if not _has_safe_path_segments(cand):
+            continue
+        if _safe_is_symlink(cand) or (_safe_exists(cand) and not _safe_is_file(cand)) or (
+            _safe_exists(cand) and not _is_within_root(cand, real_root)
+        ):
+            if notes_out is not None:
+                notes_out.append(
+                    f"Skipped symlink or non-regular .dockerignore {cand.name}; ignore rules absent."
+                )
+            continue
+        if not _safe_exists(cand):
             continue
         try:
-            text = cand.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+            text = _read_bounded_regular_text(cand, max_bytes=262_144, real_root=real_root)
+        except (OSError, UnicodeError, ValueError):
+            if notes_out is not None:
+                notes_out.append(
+                    f"Could not read .dockerignore {cand.name}; ignore rules absent."
+                )
             continue
-        compiled: list[tuple[re.Pattern[str], bool]] = []
+        compiled: list[tuple[_DockerIgnoreMatcher, bool]] = []
         for raw_line in text.splitlines():
             stripped = raw_line.strip()
-            if not stripped or raw_line.lstrip().startswith("#"):
+            if not stripped or raw_line.lstrip().startswith("#") or len(stripped) > 4096:
                 continue
             negated = stripped.startswith("!")
             pat_str = stripped[1:].strip() if negated else stripped
             if not pat_str:
                 continue
-            rx = _compile_dockerignore_glob(pat_str)
-            if rx is not None:
-                compiled.append((rx, negated))
-        rel = cand.resolve().relative_to(real_root).as_posix()
+            matcher = _compile_dockerignore_glob(pat_str)
+            if matcher is not None:
+                entry = (matcher, negated)
+                if not compiled or compiled[-1] != entry:
+                    compiled.append(entry)
+                if len(compiled) >= MAX_DOCKERIGNORE_RULES:
+                    break
+        rel = _safe_contained_file(cand, real_root)
+        if rel is None:
+            continue
         return DockerIgnoreSpec(source_rel=rel, rules=tuple(compiled))
     return DockerIgnoreSpec()
 
@@ -207,24 +654,46 @@ def _is_dockerfile_name(name: str) -> bool:
     return name.endswith(_DOCKERFILE_SUFFIXES)
 
 
-def discover_dockerfiles(repo_root: Path) -> tuple[list[Path], int]:
+def discover_dockerfiles(
+    repo_root: Path,
+    *,
+    skipped_notes: list[str] | None = None,
+) -> tuple[list[Path], int]:
     """Discover repository Dockerfiles/Containerfiles without following symlinks."""
-    if repo_root.is_symlink():
+    if not _has_safe_path_segments(repo_root) or _safe_is_symlink(repo_root):
+        if skipped_notes is not None:
+            skipped_notes.append(
+                "Skipped symlink or unsafe repository root; Dockerfile declarations absent."
+            )
         return [], 1
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        if skipped_notes is not None:
+            skipped_notes.append(
+                "Skipped unreadable repository root; Dockerfile declarations absent."
+            )
+        return [], 1
     found: list[Path] = []
     excluded = 0
-    for parent, dirs, names in os.walk(repo_root, followlinks=False):
+    walk_errors: list[OSError] = []
+    for parent, dirs, names in os.walk(repo_root, followlinks=False, onerror=walk_errors.append):
         keep: list[str] = []
         for dname in sorted(dirs):
             dpath = Path(parent) / dname
-            if (
-                dname in EXCLUDED_PARTS
-                or (dname.startswith(".") and dname not in ALLOWED_CONTAINER_DOT_DIRS)
-                or dpath.is_symlink()
-                or not _is_within_root(dpath, real_root)
+            if dname in EXCLUDED_PARTS or (
+                dname.startswith(".") and dname not in ALLOWED_CONTAINER_DOT_DIRS
             ):
                 excluded += 1
+            elif _safe_contained_dir(dpath, real_root) is None:
+                excluded += 1
+                if skipped_notes is not None:
+                    try:
+                        rel_d = dpath.relative_to(repo_root).as_posix()
+                    except ValueError:
+                        rel_d = dname
+                    skipped_notes.append(
+                        f"Skipped symlink or out-of-root directory {rel_d}; Dockerfile declarations absent."
+                    )
             else:
                 keep.append(dname)
         dirs[:] = keep
@@ -232,26 +701,40 @@ def discover_dockerfiles(repo_root: Path) -> tuple[list[Path], int]:
             if not _is_dockerfile_name(fname):
                 continue
             fpath = Path(parent) / fname
-            if fpath.is_symlink() or not _is_within_root(fpath, real_root):
+            if _safe_contained_file(fpath, real_root) is None:
                 excluded += 1
-            elif fpath.is_file():
+                if skipped_notes is not None:
+                    try:
+                        rel_f = fpath.relative_to(repo_root).as_posix()
+                    except ValueError:
+                        rel_f = fname
+                    skipped_notes.append(
+                        f"Skipped symlink or non-regular Dockerfile {rel_f}; build declarations absent."
+                    )
+            else:
                 found.append(fpath)
+    if walk_errors:
+        excluded += len(walk_errors)
+        if skipped_notes is not None:
+            skipped_notes.append(
+                "Skipped unreadable directory during Dockerfile discovery; build declarations absent."
+            )
     return sorted(found), excluded
 
 
 def _compose_context_hints(repo_root: Path) -> dict[str, Path]:
     """Map repo-relative Dockerfile paths to explicit compose `build.context` roots."""
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        return {}
     hints: dict[str, Path] = {}
     search_dirs = [repo_root]
     try:
         for child in sorted(repo_root.iterdir()):
             if (
-                not child.is_symlink()
-                and child.is_dir()
+                _safe_contained_dir(child, real_root) is not None
                 and (not child.name.startswith(".") or child.name in ALLOWED_CONTAINER_DOT_DIRS)
                 and child.name not in EXCLUDED_PARTS
-                and _is_within_root(child, real_root)
             ):
                 search_dirs.append(child)
     except OSError:
@@ -265,11 +748,14 @@ def _compose_context_hints(repo_root: Path) -> dict[str, Path]:
         for cpath in entries:
             if not is_compose_filename(cpath.name):
                 continue
-            if cpath.is_symlink() or not cpath.is_file() or not _is_within_root(cpath, real_root):
+            if _safe_contained_file(cpath, real_root) is None:
                 continue
             try:
-                data = yaml.safe_load(cpath.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, yaml.YAMLError):
+                raw_compose = _read_bounded_regular_text(
+                    cpath, max_bytes=1_048_576, real_root=real_root
+                )
+                data = _load_bounded_yaml(raw_compose, max_nodes=4096, max_depth=64)
+            except (OSError, UnicodeError, ValueError, RecursionError, yaml.YAMLError):
                 continue
             if not isinstance(data, dict) or not isinstance(data.get("services"), dict):
                 continue
@@ -280,18 +766,25 @@ def _compose_context_hints(repo_root: Path) -> dict[str, Path]:
                 if isinstance(build, str):
                     ctx_raw, df_raw = build, "Dockerfile"
                 elif isinstance(build, dict):
-                    ctx_raw = str(build.get("context") or ".")
-                    df_raw = str(build.get("dockerfile") or "Dockerfile")
+                    raw_ctx_val = build.get("context")
+                    raw_df_val = build.get("dockerfile")
+                    ctx_raw = raw_ctx_val if isinstance(raw_ctx_val, str) and raw_ctx_val else "."
+                    df_raw = (
+                        raw_df_val if isinstance(raw_df_val, str) and raw_df_val else "Dockerfile"
+                    )
                 else:
                     continue
-                ctx_dir = (cpath.parent / ctx_raw).resolve()
-                if not _is_within_root(ctx_dir, real_root) or not ctx_dir.is_dir():
+                ctx_dir = _safe_contained_dir(cpath.parent / ctx_raw, real_root)
+                if ctx_dir is None:
+                    continue
+                if not _has_safe_path_segments(df_raw):
                     continue
                 df_cand = ctx_dir / df_raw
-                if not df_cand.is_file():
+                df_rel = _safe_contained_file(df_cand, real_root)
+                if df_rel is None:
                     df_cand = cpath.parent / df_raw
-                if not df_cand.is_symlink() and df_cand.is_file() and _is_within_root(df_cand, real_root):
-                    df_rel = df_cand.resolve().relative_to(real_root).as_posix()
+                    df_rel = _safe_contained_file(df_cand, real_root)
+                if df_rel is not None:
                     hints.setdefault(df_rel, ctx_dir)
     return hints
 
@@ -372,8 +865,7 @@ class DockerStage:
                 ctx_rel = _repo_rel_to_ctx_rel(mapping.repo_rel, mapping.context_rel_root)
                 if ctx_rel is not None and mapping.ignore_spec.is_excluded(ctx_rel):
                     continue
-                fs = real_root / mapping.repo_rel
-                if not fs.is_symlink() and fs.is_file() and _is_within_root(fs, real_root):
+                if _safe_contained_file(real_root / mapping.repo_rel, real_root) is not None:
                     return mapping.repo_rel
             else:
                 mp = mapping.container_path.rstrip("/") or "/"
@@ -389,8 +881,7 @@ class DockerStage:
                 ctx_rel = _repo_rel_to_ctx_rel(cand_rel, mapping.context_rel_root)
                 if ctx_rel is not None and mapping.ignore_spec.is_excluded(ctx_rel):
                     continue
-                fs = real_root / cand_rel
-                if not fs.is_symlink() and fs.is_file() and _is_within_root(fs, real_root):
+                if _safe_contained_file(real_root / cand_rel, real_root) is not None:
                     return cand_rel
         return None
 
@@ -504,35 +995,67 @@ _BUILD_VAR_EXPAND_RE = re.compile(
 )
 
 
-def _expand_build_vars(value: str, bindings: dict[str, str]) -> tuple[str, bool]:
+def _expand_build_vars(
+    value: str,
+    bindings: dict[str, str],
+    *,
+    max_len: int = MAX_ENV_VALUE_LEN,
+) -> tuple[str, bool]:
+    if "$" not in value:
+        return (value[:max_len] if len(value) > max_len else value), False
     unresolved = False
-
-    def _repl(match: re.Match[str]) -> str:
-        nonlocal unresolved
+    parts: list[str] = []
+    cur_len = 0
+    last_end = 0
+    for match in _BUILD_VAR_EXPAND_RE.finditer(value):
+        lit = value[last_end : match.start()]
+        if lit:
+            rem = max_len - cur_len
+            if rem <= 0:
+                break
+            if len(lit) >= rem:
+                parts.append(lit[:rem])
+                cur_len = max_len
+                break
+            parts.append(lit)
+            cur_len += len(lit)
+        last_end = match.end()
         if match.group("plain"):
             key = match.group("plain")
             if key in bindings:
-                return bindings[key]
-            unresolved = True
-            return match.group(0)
-        key = match.group("bname")
-        op = match.group("bop")
-        default = match.group("bdef") or ""
-        cur = bindings.get(key)
-        if op in (":-", "-"):
-            if cur is not None and (cur != "" or op == "-"):
-                return cur
-            return default
-        if op in (":+", "+"):
-            if cur:
-                return default
-            return ""
-        if cur is not None:
-            return cur
-        unresolved = True
-        return match.group(0)
-
-    return _BUILD_VAR_EXPAND_RE.sub(_repl, value), unresolved
+                chunk = bindings[key]
+            else:
+                unresolved = True
+                chunk = match.group(0)
+        else:
+            key = match.group("bname")
+            op = match.group("bop")
+            default = match.group("bdef") or ""
+            cur = bindings.get(key)
+            if op in (":-", "-"):
+                chunk = cur if (cur is not None and (cur != "" or op == "-")) else default
+            elif op in (":+", "+"):
+                chunk = default if cur else ""
+            elif cur is not None:
+                chunk = cur
+            else:
+                unresolved = True
+                chunk = match.group(0)
+        if chunk:
+            rem = max_len - cur_len
+            if rem <= 0:
+                break
+            if len(chunk) >= rem:
+                parts.append(chunk[:rem])
+                cur_len = max_len
+                break
+            parts.append(chunk)
+            cur_len += len(chunk)
+    else:
+        tail = value[last_end:]
+        if tail and cur_len < max_len:
+            parts.append(tail[: max_len - cur_len])
+    return "".join(parts), unresolved
 
 
 def _shlex_tokens(raw: str) -> list[str]:
@@ -542,15 +1065,21 @@ def _shlex_tokens(raw: str) -> list[str]:
         return raw.split()
 
 
+def _store_bounded_binding(target: dict[str, str], key: str, value: str) -> None:
+    if not key:
+        return
+    if key in target or len(target) < MAX_ENV_BINDINGS:
+        target[key] = value[:MAX_ENV_VALUE_LEN]
+
+
 def _parse_arg_bindings(raw_args: str, current: dict[str, str], global_args: dict[str, str]) -> None:
     for tok in _shlex_tokens(raw_args):
         if "=" in tok:
             k, v = tok.split("=", 1)
-            expanded, _ = _expand_build_vars(v, current)
-            if k:
-                current[k] = expanded
+            expanded, _ = _expand_build_vars(v, current, max_len=MAX_ENV_VALUE_LEN)
+            _store_bounded_binding(current, k, expanded)
         elif tok in global_args and tok not in current:
-            current[tok] = global_args[tok]
+            _store_bounded_binding(current, tok, global_args[tok])
 
 
 def _parse_env_bindings(raw_args: str, current: dict[str, str]) -> None:
@@ -565,16 +1094,24 @@ def _parse_env_bindings(raw_args: str, current: dict[str, str]) -> None:
         rest = stripped[len(tokens[0]) :].strip()
         if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in ("'", '"'):
             rest = rest[1:-1]
-        expanded, _ = _expand_build_vars(rest, current)
-        current[key] = expanded
+        expanded, _ = _expand_build_vars(rest, current, max_len=MAX_ENV_VALUE_LEN)
+        _store_bounded_binding(current, key, expanded)
         return
     for tok in tokens:
         if "=" not in tok:
             continue
         k, v = tok.split("=", 1)
         if k:
-            expanded, _ = _expand_build_vars(v, current)
-            current[k] = expanded
+            expanded, _ = _expand_build_vars(v, current, max_len=MAX_ENV_VALUE_LEN)
+            _store_bounded_binding(current, k, expanded)
+
+
+def _parse_bounded_json_int(raw_digits: str) -> int:
+    s = raw_digits.strip()
+    digits = s.removeprefix("-")
+    if not digits or not digits.isascii() or not digits.isdigit() or len(digits) > 64:
+        return 0
+    return int(s)
 
 
 def _parse_copy_args(raw_args: str) -> tuple[str | None, list[str], str | None]:
@@ -588,10 +1125,10 @@ def _parse_copy_args(raw_args: str) -> tuple[str | None, list[str], str | None]:
             from_ref = flag.split("=", 1)[1].strip().strip("'\"")
     if rest.startswith("[") and rest.endswith("]"):
         try:
-            arr = json.loads(rest)
+            arr = json.loads(rest, parse_int=_parse_bounded_json_int)
             if isinstance(arr, list) and len(arr) >= 2 and all(isinstance(x, str) for x in arr):
                 return from_ref, arr[:-1], arr[-1]
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             pass
     tokens = _shlex_tokens(rest)
     if len(tokens) < 2:
@@ -615,11 +1152,16 @@ def _propagate_from_stage_mappings(
         or len(sources) > 1
         or dest_abs in dst_stage.known_dirs
     )
+    src_snapshot = tuple(src_stage.mappings)
     for src_raw in sources:
+        if len(dst_stage.mappings) >= MAX_STAGE_MAPPINGS:
+            return
         src_exp, _ = _expand_build_vars(src_raw, dst_stage.env)
         sp = _norm_container_path(src_exp, src_stage.workdir)
         sp_prefix = sp.rstrip("/")
-        for m in src_stage.mappings:
+        for m in src_snapshot:
+            if len(dst_stage.mappings) >= MAX_STAGE_MAPPINGS:
+                return
             if not m.is_dir:
                 if m.container_path == sp:
                     c_dest = (
@@ -646,14 +1188,16 @@ def _propagate_from_stage_mappings(
                         else (m.repo_rel if not sub else f"{m.repo_rel}/{sub}")
                     )
                     fs = real_root if cand_repo == "." else real_root / cand_repo
-                    if fs.is_symlink() or not _is_within_root(fs, real_root):
+                    entry_info = _safe_contained_entry(fs, real_root)
+                    if entry_info is None:
                         continue
-                    if fs.is_dir():
+                    _, fs_is_file, fs_is_dir = entry_info
+                    if fs_is_dir:
                         dst_stage.mappings.append(
                             StageCopyMapping(dest_abs, cand_repo, True, m.context_rel_root, m.ignore_spec)
                         )
                         dst_stage.known_dirs.add(dest_abs)
-                    elif fs.is_file():
+                    elif fs_is_file:
                         c_dest = (
                             _norm_container_path(f"{dest_abs.rstrip('/')}/{PurePosixPath(sp).name}")
                             if dest_is_dir
@@ -712,8 +1256,8 @@ def _parse_command_declaration(
 
     if stripped.startswith("[") and stripped.endswith("]"):
         try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError:
+            parsed = json.loads(stripped, parse_int=_parse_bounded_json_int)
+        except (json.JSONDecodeError, ValueError):
             findings.append(
                 RawCandidateFinding(
                     rule_code="MANIP-004",
@@ -813,13 +1357,15 @@ def _infer_context_root(
     repo_root: Path,
     context_override: Path | None,
 ) -> Path:
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root) or repo_root
     if context_override is not None and _is_within_root(context_override, real_root):
-        return context_override.resolve()
-    df_dir = df_path.parent.resolve()
+        resolved_ovr = _safe_resolve(context_override)
+        if resolved_ovr is not None:
+            return resolved_ovr
+    df_dir = _safe_resolve(df_path.parent) or real_root
     if df_dir == real_root:
         return real_root
-    if (df_dir / ".dockerignore").is_file() and not (df_dir / ".dockerignore").is_symlink():
+    if _safe_is_file(df_dir / ".dockerignore") and not _safe_is_symlink(df_dir / ".dockerignore"):
         return df_dir
 
     dir_hits = root_hits = 0
@@ -835,9 +1381,9 @@ def _infer_context_root(
             norm = _normalize_posix_rel(src)
             if norm is None or norm == ".":
                 continue
-            if (df_dir / norm).exists():
+            if _safe_exists(df_dir / norm):
                 dir_hits += 1
-            if (real_root / norm).exists():
+            if _safe_exists(real_root / norm):
                 root_hits += 1
     return real_root if root_hits > dir_hits else df_dir
 
@@ -859,23 +1405,33 @@ def parse_dockerfile(
     df_path: Path,
     repo_root: Path,
     context_override: Path | None = None,
+    *,
+    notes_out: list[str] | None = None,
 ) -> ParsedDockerfile | None:
-    real_root = repo_root.resolve()
-    if df_path.is_symlink() or not df_path.is_file() or not _is_within_root(df_path, real_root):
+    real_root = _safe_resolve(repo_root)
+    rel_path = _safe_contained_file(df_path, real_root) if real_root is not None else None
+    if rel_path is None:
+        if notes_out is not None:
+            notes_out.append(
+                f"Skipped symlink or non-regular Dockerfile {df_path.name}; build declarations absent."
+            )
         return None
     try:
-        text = df_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+        text = _read_bounded_regular_text(df_path, max_bytes=1_048_576, real_root=real_root)
+    except (OSError, UnicodeError, ValueError):
+        if notes_out is not None:
+            notes_out.append(
+                f"Could not read Dockerfile {df_path.name}; build declarations absent."
+            )
         return None
 
-    rel_path = df_path.resolve().relative_to(real_root).as_posix()
     nid = f"m:dockerfile:{rel_path}"
     instructions = _split_dockerfile_instructions(text)
     context_root = _infer_context_root(df_path, instructions, repo_root, context_override)
     ctx_rel_root = (
         "." if context_root == real_root else context_root.relative_to(real_root).as_posix()
     )
-    ignore_spec = parse_dockerignore(context_root, df_path, repo_root)
+    ignore_spec = parse_dockerignore(context_root, df_path, repo_root, notes_out=notes_out)
 
     global_args: dict[str, str] = {}
     stages: list[DockerStage] = []
@@ -889,6 +1445,8 @@ def parse_dockerfile(
             _parse_arg_bindings(instr.raw_args, global_args, global_args)
             continue
         if kw == "FROM":
+            if len(stages) >= MAX_DOCKER_STAGES:
+                break
             base_image, stage_name = _parse_from_args(instr.raw_args, global_args)
             parent = stages_by_name.get(base_image.lower())
             if parent is not None:
@@ -900,7 +1458,7 @@ def parse_dockerfile(
                     workdir=parent.workdir,
                     env=dict(parent.env),
                     known_dirs=set(parent.known_dirs),
-                    mappings=list(parent.mappings),
+                    mappings=list(parent.mappings[:MAX_STAGE_MAPPINGS]),
                     entrypoint=parent.entrypoint,
                     cmd=parent.cmd,
                     installs_local_package=parent.installs_local_package,
@@ -996,7 +1554,9 @@ def _handle_copy_or_add(
     if from_ref is not None:
         ref_exp, _ = _expand_build_vars(from_ref, current_stage.env)
         src_stage = stages_by_name.get(ref_exp.lower())
-        if src_stage is None and ref_exp.isdigit():
+        if src_stage is not None and src_stage.index >= current_stage.index:
+            src_stage = None
+        if src_stage is None and ref_exp.isascii() and ref_exp.isdigit() and len(ref_exp) <= 6:
             idx = int(ref_exp)
             if 0 <= idx < current_stage.index:
                 src_stage = stages[idx]
@@ -1042,8 +1602,8 @@ def _handle_copy_or_add(
         if any(ch in norm for ch in "*?["):
             matched = [
                 p
-                for p in sorted(context_root.glob(norm))
-                if not p.is_symlink() and _is_within_root(p, real_root)
+                for p in _safe_glob(context_root, norm)
+                if not _safe_is_symlink(p) and _is_within_root(p, real_root)
             ]
             if not matched:
                 findings.append(
@@ -1060,9 +1620,18 @@ def _handle_copy_or_add(
                 continue
             kept = 0
             for mp in matched:
-                m_ctx_rel = mp.resolve().relative_to(context_root).as_posix()
-                m_repo_rel = mp.resolve().relative_to(real_root).as_posix()
-                if mp.is_file() and not ignore_spec.is_excluded(m_ctx_rel):
+                mp_info = _safe_contained_entry(mp, real_root)
+                if mp_info is None:
+                    continue
+                m_repo_rel, mp_is_file, mp_is_dir = mp_info
+                mp_res = _safe_resolve(mp)
+                if mp_res is None:
+                    continue
+                try:
+                    m_ctx_rel = mp_res.relative_to(context_root).as_posix()
+                except ValueError:
+                    continue
+                if mp_is_file and not ignore_spec.is_excluded(m_ctx_rel):
                     kept += 1
                     c_dest = (
                         _norm_container_path(f"{dest_abs.rstrip('/')}/{mp.name}")
@@ -1072,7 +1641,7 @@ def _handle_copy_or_add(
                     current_stage.mappings.append(
                         StageCopyMapping(c_dest, m_repo_rel, False, ctx_rel_root, ignore_spec)
                     )
-                elif mp.is_dir() and not ignore_spec.is_dir_completely_excluded(mp, m_ctx_rel, real_root):
+                elif mp_is_dir and not ignore_spec.is_dir_completely_excluded(mp, m_ctx_rel, real_root):
                     kept += 1
                     current_stage.mappings.append(
                         StageCopyMapping(dest_abs, m_repo_rel, True, ctx_rel_root, ignore_spec)
@@ -1096,7 +1665,8 @@ def _handle_copy_or_add(
             continue
 
         src_fs = context_root if norm == "." else context_root / norm
-        if src_fs.is_symlink() or not _is_within_root(src_fs, real_root) or not src_fs.exists():
+        entry_info = _safe_contained_entry(src_fs, real_root)
+        if entry_info is None:
             findings.append(
                 RawCandidateFinding(
                     rule_code="MANIP-005",
@@ -1113,12 +1683,8 @@ def _handle_copy_or_add(
             )
             continue
 
-        repo_rel = (
-            "."
-            if src_fs.resolve() == real_root
-            else src_fs.resolve().relative_to(real_root).as_posix()
-        )
-        if src_fs.is_file():
+        repo_rel, src_is_file, src_is_dir = entry_info
+        if src_is_file:
             if ignore_spec.is_excluded(norm):
                 findings.append(
                     RawCandidateFinding(
@@ -1143,7 +1709,7 @@ def _handle_copy_or_add(
             current_stage.mappings.append(
                 StageCopyMapping(c_dest, repo_rel, False, ctx_rel_root, ignore_spec)
             )
-        elif src_fs.is_dir():
+        elif src_is_dir:
             if norm != "." and ignore_spec.is_dir_completely_excluded(src_fs, norm, real_root):
                 findings.append(
                     RawCandidateFinding(
@@ -1602,19 +2168,22 @@ def _collect_top_level_callables(
     stmts: list[ast.stmt],
 ) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef]:
     found: dict[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = {}
-    for stmt in stmts:
+    try_types = (ast.Try, *((ast.TryStar,) if hasattr(ast, "TryStar") else ()))
+    stack: list[ast.stmt] = list(reversed(stmts))
+    while stack:
+        stmt = stack.pop()
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             found[stmt.name] = stmt
         elif isinstance(stmt, ast.If):
+            stack.extend(reversed(stmt.orelse))
             if not _is_type_checking_guard(stmt.test):
-                found.update(_collect_top_level_callables(stmt.body))
-            found.update(_collect_top_level_callables(stmt.orelse))
-        elif isinstance(stmt, ast.Try):
-            found.update(_collect_top_level_callables(stmt.body))
-            for handler in stmt.handlers:
-                found.update(_collect_top_level_callables(handler.body))
-            found.update(_collect_top_level_callables(stmt.orelse))
-            found.update(_collect_top_level_callables(stmt.finalbody))
+                stack.extend(reversed(stmt.body))
+        elif isinstance(stmt, try_types):
+            stack.extend(reversed(stmt.finalbody))
+            stack.extend(reversed(stmt.orelse))
+            for handler in reversed(stmt.handlers):
+                stack.extend(reversed(handler.body))
+            stack.extend(reversed(stmt.body))
     return found
 
 
@@ -1628,15 +2197,11 @@ def _filter_callable_entrypoint_symbols(
         return ()
     py_path = real_root / repo_rel
     try:
-        if (
-            py_path.is_symlink()
-            or not py_path.is_file()
-            or not _is_within_root(py_path, real_root)
-            or py_path.stat().st_size > 262144
-        ):
-            return ()
-        tree = ast.parse(py_path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, SyntaxError, ValueError):
+        raw_py = _read_bounded_regular_text(
+            py_path, max_bytes=262_144, real_root=real_root, encoding="utf-8-sig"
+        )
+        tree = ast.parse(raw_py)
+    except (OSError, UnicodeError, SyntaxError, ValueError, RecursionError):
         return ()
 
     callable_defs = _collect_top_level_callables(tree.body)
@@ -1742,9 +2307,9 @@ def resolve_command_targets_with_symbols(
                     rel_cands.append(norm_val)
                 for rc in rel_cands:
                     for froot in fallback_roots:
-                        cand_fs = froot / rc
-                        if not cand_fs.is_symlink() and cand_fs.is_file() and _is_within_root(cand_fs, real_root):
-                            _record(cand_fs.resolve().relative_to(real_root).as_posix(), False, tgt.symbol)
+                        rel_hit = _safe_contained_file(froot / rc, real_root)
+                        if rel_hit is not None:
+                            _record(rel_hit, False, tgt.symbol)
                             hit_copy = True
                             break
                     if hit_copy:
@@ -1754,12 +2319,10 @@ def resolve_command_targets_with_symbols(
                     stem = str(PurePosixPath(stripped).with_suffix(""))
                     ts_cands = [f"src/{stem}.ts", f"{stem}.ts", f"src/{stem}.js", f"{stem}.js"]
                     matches = [
-                        (froot / tc).resolve().relative_to(real_root).as_posix()
+                        rel_hit
                         for froot in fallback_roots
                         for tc in ts_cands
-                        if not (froot / tc).is_symlink()
-                        and (froot / tc).is_file()
-                        and _is_within_root(froot / tc, real_root)
+                        if (rel_hit := _safe_contained_file(froot / tc, real_root)) is not None
                     ]
                     uniq = sorted(set(matches))
                     if len(uniq) == 1:
@@ -1785,10 +2348,10 @@ def resolve_command_targets_with_symbols(
             if not hit_copy:
                 for froot in fallback_roots:
                     for mc_idx, mc in enumerate(mod_cands):
-                        cand_fs = froot / mc
-                        if not cand_fs.is_symlink() and cand_fs.is_file() and _is_within_root(cand_fs, real_root):
+                        rel_hit = _safe_contained_file(froot / mc, real_root)
+                        if rel_hit is not None:
                             eff_sym = tgt.symbol or (tail_sym if mc_idx >= 4 else None)
-                            _record(cand_fs.resolve().relative_to(real_root).as_posix(), False, eff_sym)
+                            _record(rel_hit, False, eff_sym)
                             hit_copy = True
                             break
                     if hit_copy:
@@ -1849,8 +2412,7 @@ def ensure_repo_target_nodes(
     if existing:
         target_nodes = existing
     else:
-        fs = real_root / repo_rel
-        if fs.is_symlink() or not fs.is_file() or not _is_within_root(fs, real_root):
+        if _safe_contained_file(real_root / repo_rel, real_root) is None:
             return []
         script_node = AtlasNode(
             id=f"m:script:{repo_rel}",
@@ -1867,10 +2429,10 @@ def ensure_repo_target_nodes(
 
     if repo_rel.endswith(".sh"):
         sh_fs = real_root / repo_rel
-        if not sh_fs.is_symlink() and sh_fs.is_file() and sh_fs.stat().st_size <= 65536:
+        if _safe_contained_file(sh_fs, real_root) is not None:
             try:
-                sh_text = sh_fs.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
+                sh_text = _read_bounded_regular_text(sh_fs, max_bytes=65_536, real_root=real_root)
+            except (OSError, UnicodeError, ValueError):
                 sh_text = ""
             sh_targets: list[CommandTarget] = []
             for raw_line in sh_text.splitlines():
@@ -1918,21 +2480,24 @@ def _is_type_checking_guard(test: ast.expr) -> bool:
 
 def _iter_runtime_import_stmts(stmts: list[ast.stmt]) -> list[ast.Import | ast.ImportFrom]:
     found: list[ast.Import | ast.ImportFrom] = []
-    for stmt in stmts:
+    try_types = (ast.Try, *((ast.TryStar,) if hasattr(ast, "TryStar") else ()))
+    stack: list[ast.stmt] = list(reversed(stmts))
+    while stack:
+        stmt = stack.pop()
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             found.append(stmt)
         elif isinstance(stmt, ast.If):
+            stack.extend(reversed(stmt.orelse))
             if not _is_type_checking_guard(stmt.test):
-                found.extend(_iter_runtime_import_stmts(stmt.body))
-            found.extend(_iter_runtime_import_stmts(stmt.orelse))
-        elif isinstance(stmt, ast.Try):
-            found.extend(_iter_runtime_import_stmts(stmt.body))
-            for handler in stmt.handlers:
-                found.extend(_iter_runtime_import_stmts(handler.body))
-            found.extend(_iter_runtime_import_stmts(stmt.orelse))
-            found.extend(_iter_runtime_import_stmts(stmt.finalbody))
+                stack.extend(reversed(stmt.body))
+        elif isinstance(stmt, try_types):
+            stack.extend(reversed(stmt.finalbody))
+            stack.extend(reversed(stmt.orelse))
+            for handler in reversed(stmt.handlers):
+                stack.extend(reversed(handler.body))
+            stack.extend(reversed(stmt.body))
         elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            found.extend(_iter_runtime_import_stmts(stmt.body))
+            stack.extend(reversed(stmt.body))
     return found
 
 
@@ -1940,12 +2505,15 @@ def _resolve_dotted_to_repo(dotted: str, base_dir: Path, real_root: Path) -> lis
     parts = [p for p in dotted.split(".") if p]
     if not parts:
         return []
+    if any(not _has_safe_path_segments(p) for p in parts[:-1]):
+        return []
     out: list[str] = []
     py_cand = base_dir.joinpath(*parts[:-1], f"{parts[-1]}.py")
     init_cand = base_dir.joinpath(*parts, "__init__.py")
     for cand in (py_cand, init_cand):
-        if not cand.is_symlink() and cand.is_file() and _is_within_root(cand, real_root):
-            out.append(cand.resolve().relative_to(real_root).as_posix())
+        rel_hit = _safe_contained_file(cand, real_root)
+        if rel_hit is not None:
+            out.append(rel_hit)
     return out
 
 
@@ -1953,10 +2521,9 @@ def _extract_py_import_files(
     py_fs: Path, real_root: Path, import_roots: list[Path]
 ) -> list[str]:
     try:
-        if py_fs.stat().st_size > 262144:
-            return []
-        tree = ast.parse(py_fs.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, SyntaxError):
+        raw_py = _read_bounded_regular_text(py_fs, max_bytes=262_144, real_root=real_root)
+        tree = ast.parse(raw_py)
+    except (OSError, UnicodeError, SyntaxError, ValueError, RecursionError):
         return []
     resolved: list[str] = []
     for stmt in _iter_runtime_import_stmts(tree.body):
@@ -2025,7 +2592,7 @@ def _check_unpacked_runtime_dependencies(
         cur_rel = queue.popleft()
         cur_trail = trails[cur_rel]
         cur_fs = real_root / cur_rel
-        valid_fs = not cur_fs.is_symlink() and cur_fs.is_file() and _is_within_root(cur_fs, real_root)
+        valid_fs = _safe_contained_file(cur_fs, real_root) is not None
         if valid_fs:
             covered, reason = final_stage.covers_repo_file(cur_rel)
             if not covered and cur_rel not in flagged_files:
@@ -2092,12 +2659,28 @@ def augment_dockerfile_sources(
     """Discover Dockerfiles, add `m:dockerfile:*` nodes/edges, and check build/runtime drift."""
     from app.adapters.container_launchers import augment_container_launchers
 
-    df_paths, _ = discover_dockerfiles(repo_root)
+    skipped_notes: list[str] = []
+    df_paths, _ = discover_dockerfiles(repo_root, skipped_notes=skipped_notes)
+    if skipped_notes:
+        object.__setattr__(result, "coverage_complete", False)
+        for sn in skipped_notes:
+            if sn not in result.notes:
+                result.notes.append(sn)
     if not df_paths:
+        di_notes: list[str] = []
+        parse_dockerignore(repo_root, None, repo_root, notes_out=di_notes)
+        if di_notes:
+            object.__setattr__(result, "coverage_complete", False)
+            for dn in di_notes:
+                if dn not in result.notes:
+                    result.notes.append(dn)
         augment_container_launchers(repo_root, backend_subdir, result, dockerfiles={})
         return {}
 
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        object.__setattr__(result, "coverage_complete", False)
+        return {}
     compose_hints = _compose_context_hints(repo_root)
     by_src = index_nodes_by_source(result)
     seen_node_ids = {n.id for n in result.nodes}
@@ -2108,9 +2691,21 @@ def augment_dockerfile_sources(
     unresolved_count = 0
 
     for df_path in df_paths:
-        rel_guess = df_path.resolve().relative_to(real_root).as_posix()
-        parsed = parse_dockerfile(df_path, repo_root, context_override=compose_hints.get(rel_guess))
+        rel_guess = _safe_contained_file(df_path, real_root)
+        if rel_guess is None:
+            object.__setattr__(result, "coverage_complete", False)
+            continue
+        df_notes: list[str] = []
+        parsed = parse_dockerfile(
+            df_path, repo_root, context_override=compose_hints.get(rel_guess), notes_out=df_notes
+        )
+        if df_notes:
+            object.__setattr__(result, "coverage_complete", False)
+            for dn in df_notes:
+                if dn not in result.notes:
+                    result.notes.append(dn)
         if parsed is None:
+            object.__setattr__(result, "coverage_complete", False)
             continue
         parsed_map[parsed.rel_path] = parsed
         nid = f"m:dockerfile:{parsed.rel_path}"
@@ -2146,8 +2741,12 @@ def augment_dockerfile_sources(
 
         cmd_targets, cmd_line = extract_stage_command_targets(final_stage)
         fallback_roots = [parsed.context_root]
-        bdir = (repo_root / backend_subdir).resolve() if backend_subdir else real_root
-        if _is_within_root(bdir, real_root) and bdir.is_dir() and bdir not in fallback_roots:
+        bdir = (
+            _safe_contained_dir(repo_root / backend_subdir, real_root)
+            if backend_subdir
+            else real_root
+        )
+        if bdir is not None and bdir not in fallback_roots:
             fallback_roots.append(bdir)
 
         resolved_triples = resolve_command_targets_with_symbols(

@@ -3,12 +3,154 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from app.adapters.treesitter_engine import _get_parser, has_treesitter
+
+MAX_FRONTEND_FILE_BYTES = 4 * 1024 * 1024
+
+
+def _canonicalize_macos_system_prefix(path: Path) -> Path:
+    """Canonicalize macOS `/tmp`, `/var`, `/etc` -> `/private/...` without following user symlinks."""
+    if not path.is_absolute():
+        return path
+    parts = path.parts
+    if len(parts) >= 2 and parts[1] in ("tmp", "var", "etc"):
+        sys_link = Path("/") / parts[1]
+        priv_dir = Path("/private") / parts[1]
+        try:
+            if sys_link.is_symlink() and os.readlink(sys_link) == f"private/{parts[1]}" and priv_dir.is_dir():
+                return priv_dir.joinpath(*parts[2:])
+        except OSError:
+            pass
+    return path
+
+
+def safe_resolve_contained_path(candidate: Path, repo_root: Path) -> Path | None:
+    """Resolve `candidate` strictly within `repo_root`, rejecting traversal and symlinks."""
+    cand_raw = str(candidate)
+    root_raw = str(repo_root)
+    if "\x00" in cand_raw or "\x00" in root_raw:
+        return None
+    try:
+        if repo_root.is_symlink():
+            return None
+        repo_res = repo_root.resolve()
+    except OSError:
+        return None
+
+    cand_norm = _canonicalize_macos_system_prefix(candidate)
+    if not cand_norm.is_absolute():
+        cand_abs = repo_res / cand_norm
+    elif cand_norm.is_relative_to(repo_res):
+        cand_abs = cand_norm
+    elif candidate.is_relative_to(repo_root):
+        cand_abs = repo_res / candidate.relative_to(repo_root)
+    else:
+        return None
+
+    try:
+        rel_parts = cand_abs.relative_to(repo_res).parts
+    except ValueError:
+        return None
+
+    dir_stack: list[str] = []
+    for part in rel_parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not dir_stack:
+                return None
+            dir_stack.pop()
+            continue
+        cur = repo_res.joinpath(*dir_stack, part)
+        try:
+            if cur.is_symlink():
+                return None
+        except OSError:
+            return None
+        dir_stack.append(part)
+
+    try:
+        final = repo_res.joinpath(*dir_stack).resolve()
+    except OSError:
+        return None
+    return final if final.is_relative_to(repo_res) else None
+
+
+def safe_read_repo_bytes(
+    path: Path,
+    repo_root: Path,
+    *,
+    max_bytes: int = MAX_FRONTEND_FILE_BYTES,
+) -> bytes:
+    """Read regular file bytes strictly contained in `repo_root` with O_NOFOLLOW|O_NONBLOCK and size cap."""
+    safe_path = safe_resolve_contained_path(path, repo_root)
+    if safe_path is None:
+        raise OSError(f"Refusing out-of-repo or symlink path: {path}")
+    try:
+        repo_res = repo_root.resolve()
+        rel_parts = [p for p in safe_path.relative_to(repo_res).parts if p not in ("", ".")]
+    except (OSError, ValueError) as exc:
+        raise OSError(f"Invalid contained path: {path}") from exc
+    if not rel_parts:
+        raise IsADirectoryError(f"Path resolves to repository root directory: {path}")
+
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    leaf_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    cur_fd = os.open(repo_res, dir_flags)
+    leaf_fd = -1
+    try:
+        for part in rel_parts[:-1]:
+            next_fd = os.open(part, dir_flags, dir_fd=cur_fd)
+            os.close(cur_fd)
+            cur_fd = next_fd
+        leaf_fd = os.open(rel_parts[-1], leaf_flags, dir_fd=cur_fd)
+        os.close(cur_fd)
+        cur_fd = -1
+
+        st = os.fstat(leaf_fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"Refusing non-regular file: {safe_path}")
+        if st.st_size > max_bytes:
+            raise OSError(f"File exceeds {max_bytes} byte cap: {safe_path}")
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            rem = max_bytes + 1 - total
+            if rem <= 0:
+                break
+            chunk = os.read(leaf_fd, min(65536, rem))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise OSError(f"File exceeds {max_bytes} byte cap: {safe_path}")
+        return b"".join(chunks)
+    finally:
+        if cur_fd >= 0:
+            os.close(cur_fd)
+        if leaf_fd >= 0:
+            os.close(leaf_fd)
+
+
+def safe_read_repo_text(
+    path: Path,
+    repo_root: Path,
+    *,
+    max_bytes: int = MAX_FRONTEND_FILE_BYTES,
+    encoding: str = "utf-8",
+    errors: str = "strict",
+) -> str:
+    """Read UTF-8 text from a contained regular file within `repo_root`."""
+    return safe_read_repo_bytes(path, repo_root, max_bytes=max_bytes).decode(encoding, errors=errors)
 
 TS_SOURCE_EXTS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
 _SUFFIX_SWAPS: dict[str, tuple[str, ...]] = {
@@ -139,31 +281,101 @@ class TsDynamicImportSite:
     is_direct_invoked: bool = False
 
 
-def _load_jsonc_file(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
+_MAX_CST_DEPTH = 4096
+_MAX_CST_NODES = 250_000
+
+
+def _load_jsonc_file(path: Path, *, repo_root: Path | None = None) -> dict[str, Any]:
     try:
-        data = json.loads(strip_jsonc(path.read_text(encoding="utf-8", errors="replace")))
+        if repo_root is not None:
+            raw_txt = safe_read_repo_text(path, repo_root, errors="replace")
+        else:
+            if path.is_symlink() or not path.is_file():
+                return {}
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            fd = os.open(path, flags)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FRONTEND_FILE_BYTES:
+                    return {}
+                chunks: list[bytes] = []
+                total = 0
+                while total <= MAX_FRONTEND_FILE_BYTES:
+                    chunk = os.read(fd, min(65536, MAX_FRONTEND_FILE_BYTES + 1 - total))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                if total > MAX_FRONTEND_FILE_BYTES:
+                    return {}
+                raw_txt = b"".join(chunks).decode("utf-8", errors="replace")
+            finally:
+                os.close(fd)
+        data = json.loads(strip_jsonc(raw_txt))
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def load_tsconfig_paths(config_path: Path, *, seen: frozenset[Path] = frozenset()) -> TsConfigPaths:
-    resolved = config_path.resolve()
-    cfg_dir = resolved.parent
-    if resolved in seen or not resolved.is_file():
-        return TsConfigPaths(config_dir=cfg_dir, base_url=cfg_dir)
+def _safe_is_file(path: Path | None) -> bool:
+    if path is None:
+        return False
+    try:
+        return path.is_file()
+    except OSError:
+        return False
 
-    data = _load_jsonc_file(resolved)
+
+def _safe_is_dir(path: Path | None) -> bool:
+    if path is None:
+        return False
+    try:
+        return path.is_dir() and os.access(path, os.R_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def load_tsconfig_paths(
+    config_path: Path,
+    *,
+    seen: frozenset[Path] = frozenset(),
+    repo_root: Path | None = None,
+) -> TsConfigPaths:
+    if len(seen) >= 16:
+        cfg_dir = config_path.parent
+        return TsConfigPaths(config_dir=cfg_dir, base_url=cfg_dir)
+    if repo_root is not None:
+        resolved = safe_resolve_contained_path(config_path, repo_root)
+        if resolved is None or resolved in seen or not _safe_is_file(resolved):
+            try:
+                cfg_dir = repo_root.resolve()
+            except OSError:
+                cfg_dir = repo_root
+            return TsConfigPaths(config_dir=cfg_dir, base_url=cfg_dir)
+    else:
+        try:
+            if config_path.is_symlink() or config_path.parent.is_symlink():
+                return TsConfigPaths(config_dir=config_path.parent, base_url=config_path.parent)
+            canonical_parent = _canonicalize_macos_system_prefix(Path(os.path.abspath(config_path.parent)))
+            resolved = config_path.resolve()
+        except OSError:
+            return TsConfigPaths(config_dir=config_path.parent, base_url=config_path.parent)
+        if resolved.parent != canonical_parent or resolved in seen or not _safe_is_file(resolved):
+            cfg_dir = config_path.parent if resolved.parent != canonical_parent else resolved.parent
+            return TsConfigPaths(config_dir=cfg_dir, base_url=cfg_dir)
+
+    cfg_dir = resolved.parent
+    data = _load_jsonc_file(resolved, repo_root=repo_root)
     base_cfg: TsConfigPaths | None = None
     ext_val = data.get("extends")
     if isinstance(ext_val, str) and ext_val.startswith("."):
-        ext_cand = (cfg_dir / ext_val).resolve()
-        if not ext_cand.is_file() and not ext_cand.name.endswith(".json"):
-            ext_cand = Path(f"{ext_cand}.json")
-        if ext_cand.is_file():
-            base_cfg = load_tsconfig_paths(ext_cand, seen=seen | {resolved})
+        ext_cand = cfg_dir / ext_val
+        bound_root = repo_root if repo_root is not None else cfg_dir
+        ext_safe = safe_resolve_contained_path(ext_cand, bound_root)
+        if (ext_safe is None or not _safe_is_file(ext_safe)) and not ext_cand.name.endswith(".json"):
+            ext_safe = safe_resolve_contained_path(Path(f"{ext_cand}.json"), bound_root)
+        if ext_safe is not None and _safe_is_file(ext_safe):
+            base_cfg = load_tsconfig_paths(ext_safe, seen=seen | {resolved}, repo_root=repo_root)
 
     comp = data.get("compilerOptions")
     if not isinstance(comp, dict):
@@ -171,7 +383,11 @@ def load_tsconfig_paths(config_path: Path, *, seen: frozenset[Path] = frozenset(
 
     raw_base_url = comp.get("baseUrl")
     if isinstance(raw_base_url, str):
-        base_url = (cfg_dir / raw_base_url).resolve()
+        cand_bu = cfg_dir / raw_base_url
+        if repo_root is not None:
+            base_url = safe_resolve_contained_path(cand_bu, repo_root) or cfg_dir
+        else:
+            base_url = safe_resolve_contained_path(cand_bu, cfg_dir) or cfg_dir
     elif base_cfg is not None:
         base_url = base_cfg.base_url
     else:
@@ -189,9 +405,17 @@ def load_tsconfig_paths(config_path: Path, *, seen: frozenset[Path] = frozenset(
                     continue
                 if "*" in t:
                     pre, suf = t.split("*", 1)
-                    resolved_targets.append(((base_url / (pre.removeprefix("./") or ".")).resolve(), suf))
+                    cand_t = base_url / (pre.removeprefix("./") or ".")
+                    bound_t = repo_root if repo_root is not None else cfg_dir
+                    safe_t = safe_resolve_contained_path(cand_t, bound_t)
+                    if safe_t is not None:
+                        resolved_targets.append((safe_t, suf))
                 else:
-                    resolved_targets.append(((base_url / t).resolve(), ""))
+                    cand_t = base_url / t
+                    bound_t = repo_root if repo_root is not None else cfg_dir
+                    safe_t = safe_resolve_contained_path(cand_t, bound_t)
+                    if safe_t is not None:
+                        resolved_targets.append((safe_t, ""))
             if resolved_targets:
                 merged_paths[pat] = resolved_targets
 
@@ -199,11 +423,7 @@ def load_tsconfig_paths(config_path: Path, *, seen: frozenset[Path] = frozenset(
 
 
 def _is_within(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
+    return safe_resolve_contained_path(path, root) is not None
 
 
 def probe_ts_candidate(
@@ -212,41 +432,38 @@ def probe_ts_candidate(
     *,
     exts: tuple[str, ...] = TS_SOURCE_EXTS,
 ) -> Path | None:
-    """Resolve a module path candidate to an existing source file inside `repo_root`."""
-    try:
-        resolved = cand.resolve()
-    except OSError:
-        return None
-    if not _is_within(resolved, repo_root):
-        return None
-    if resolved.is_file():
-        if resolved.suffix in exts:
-            return resolved
+    """Resolve a module path candidate to an existing regular source file inside `repo_root`."""
+    safe_direct = safe_resolve_contained_path(cand, repo_root)
+    if _safe_is_file(safe_direct):
+        if safe_direct is not None and safe_direct.suffix in exts:
+            return safe_direct
         return None
     suf = cand.suffix.lower()
     if suf in _SUFFIX_SWAPS:
         stem_path = cand.with_suffix("")
         for swap_ext in _SUFFIX_SWAPS[suf]:
-            p = Path(f"{stem_path}{swap_ext}").resolve()
-            if _is_within(p, repo_root) and p.is_file():
+            p = safe_resolve_contained_path(Path(f"{stem_path}{swap_ext}"), repo_root)
+            if _safe_is_file(p):
                 return p
     for ext in exts:
-        p = Path(f"{cand}{ext}").resolve()
-        if _is_within(p, repo_root) and p.is_file():
+        p = safe_resolve_contained_path(Path(f"{cand}{ext}"), repo_root)
+        if _safe_is_file(p):
             return p
     for ext in exts:
-        p = (cand / f"index{ext}").resolve()
-        if _is_within(p, repo_root) and p.is_file():
+        p = safe_resolve_contained_path(cand / f"index{ext}", repo_root)
+        if _safe_is_file(p):
             return p
     return None
 
 
-def _extract_pkg_source_entry(pkg_dir: Path, entry_val: Any) -> Path | None:
+def _extract_pkg_source_entry(pkg_dir: Path, entry_val: Any, *, depth: int = 0) -> Path | None:
+    if depth > 16:
+        return None
     if isinstance(entry_val, str):
-        return (pkg_dir / entry_val).resolve()
+        return pkg_dir / entry_val
     if isinstance(entry_val, dict):
         for key in (".", "source", "import", "default", "module", "require", "types"):
-            sub = _extract_pkg_source_entry(pkg_dir, entry_val.get(key))
+            sub = _extract_pkg_source_entry(pkg_dir, entry_val.get(key), depth=depth + 1)
             if sub is not None:
                 return sub
     return None
@@ -266,33 +483,52 @@ class WorkspaceResolver:
 
     @classmethod
     def build(cls, repo_root: Path, extra_roots: tuple[Path, ...] = ()) -> WorkspaceResolver:
-        root = repo_root.resolve()
+        try:
+            if repo_root.is_symlink():
+                return cls(repo_root=repo_root)
+            root = repo_root.resolve()
+            if not _safe_is_dir(root):
+                return cls(repo_root=root)
+            with os.scandir(root):
+                pass
+        except OSError:
+            return cls(repo_root=repo_root)
         res = cls(repo_root=root)
-        roots_to_scan = [root, *extra_roots]
+        roots_to_scan: list[Path] = [root]
+        for er in extra_roots:
+            safe_er = safe_resolve_contained_path(er, root)
+            if _safe_is_dir(safe_er) and safe_er is not None:
+                roots_to_scan.append(safe_er)
         for sub_name in ("backend", "server", "frontend", "web", "client"):
-            sub_dir = root / sub_name
-            if sub_dir.is_dir():
-                roots_to_scan.append(sub_dir.resolve())
+            safe_sub = safe_resolve_contained_path(Path(sub_name), root)
+            if _safe_is_dir(safe_sub) and safe_sub is not None:
+                roots_to_scan.append(safe_sub)
         for pat in ("packages/*", "apps/*"):
-            for d in sorted(root.glob(pat)):
-                if d.is_dir() and "node_modules" not in d.parts:
-                    roots_to_scan.append(d.resolve())
+            try:
+                glob_hits = sorted(root.glob(pat))
+            except OSError:
+                continue
+            for d in glob_hits:
+                if "node_modules" in d.parts:
+                    continue
+                safe_d = safe_resolve_contained_path(d, root)
+                if _safe_is_dir(safe_d) and safe_d is not None:
+                    roots_to_scan.append(safe_d)
 
         seen_dirs: set[Path] = set()
-        for d in roots_to_scan:
-            rd = d.resolve()
-            if rd in seen_dirs:
+        for rd in roots_to_scan:
+            if rd in seen_dirs or not _safe_is_dir(rd):
                 continue
             seen_dirs.add(rd)
             for cfg_name in ("tsconfig.json", "tsconfig.server.json", "tsconfig.base.json"):
-                cfg_file = rd / cfg_name
-                if cfg_file.is_file():
-                    res.tsconfigs[rd] = load_tsconfig_paths(cfg_file)
+                cfg_file = safe_resolve_contained_path(rd / cfg_name, root)
+                if _safe_is_file(cfg_file) and cfg_file is not None:
+                    res.tsconfigs[rd] = load_tsconfig_paths(cfg_file, repo_root=root)
                     break
-            pkg_json = rd / "package.json"
-            if pkg_json.is_file():
+            safe_pkg = safe_resolve_contained_path(rd / "package.json", root)
+            if _safe_is_file(safe_pkg) and safe_pkg is not None:
                 try:
-                    data = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
+                    data = json.loads(safe_read_repo_text(safe_pkg, root, errors="replace"))
                 except (OSError, ValueError):
                     data = {}
                 if isinstance(data, dict) and isinstance(data.get("name"), str):
@@ -308,21 +544,25 @@ class WorkspaceResolver:
                             for field_name in ("source", "module", "main"):
                                 raw_e = data.get(field_name)
                                 if isinstance(raw_e, str):
-                                    entry = (rd / raw_e).resolve()
+                                    entry = rd / raw_e
                                     break
                         if entry is not None:
                             res.pkg_entries[pkg_name] = entry
         return res
 
     def _nearest_tsconfig(self, from_file: Path) -> TsConfigPaths | None:
-        cur = from_file.resolve().parent
-        while _is_within(cur, self.repo_root):
+        safe_from = safe_resolve_contained_path(from_file, self.repo_root)
+        if safe_from is None:
+            return None
+        repo_res = self.repo_root.resolve()
+        cur = safe_from.parent
+        while cur.is_relative_to(repo_res):
             if cur in self.tsconfigs:
                 return self.tsconfigs[cur]
-            if cur == self.repo_root:
+            if cur == repo_res:
                 break
             cur = cur.parent
-        return self.tsconfigs.get(self.repo_root)
+        return self.tsconfigs.get(repo_res)
 
     def resolve_import(
         self,
@@ -334,13 +574,16 @@ class WorkspaceResolver:
         spec = spec.strip()
         if not spec:
             return None
+        safe_from = safe_resolve_contained_path(from_file, self.repo_root)
+        if safe_from is None:
+            return None
 
         # 1. Relative import
         if spec.startswith("."):
-            return probe_ts_candidate((from_file.parent / spec).resolve(), self.repo_root, exts=exts)
+            return probe_ts_candidate(safe_from.parent / spec, self.repo_root, exts=exts)
 
         # 2. Nearest tsconfig `paths` and `baseUrl`
-        cfg = self._nearest_tsconfig(from_file)
+        cfg = self._nearest_tsconfig(safe_from)
         if cfg is not None:
             # Match longest wildcard prefix first for specificity
             matches: list[tuple[int, str, list[tuple[Path, str]]]] = []
@@ -356,25 +599,25 @@ class WorkspaceResolver:
             for _score, star_val, targets in matches:
                 for tgt_pre, tgt_suf in targets:
                     sub = f"{star_val}{tgt_suf}".lstrip("/") if star_val or tgt_suf else ""
-                    cand = (tgt_pre / sub).resolve() if sub else tgt_pre
+                    cand = tgt_pre / sub if sub else tgt_pre
                     hit = probe_ts_candidate(cand, self.repo_root, exts=exts)
                     if hit is not None:
                         return hit
 
             # Fallback shortcuts relative to tsconfig baseUrl/src/lib
             if spec.startswith("@/"):
-                src_dir = cfg.config_dir / "src" if (cfg.config_dir / "src").is_dir() else cfg.base_url
-                hit = probe_ts_candidate((src_dir / spec[2:]).resolve(), self.repo_root, exts=exts)
+                src_dir = cfg.config_dir / "src" if _safe_is_dir(cfg.config_dir / "src") else cfg.base_url
+                hit = probe_ts_candidate(src_dir / spec[2:], self.repo_root, exts=exts)
                 if hit is not None:
                     return hit
             elif spec.startswith(("$lib/", "#lib/")):
-                src_dir = cfg.config_dir / "src" if (cfg.config_dir / "src").is_dir() else cfg.base_url
-                lib_dir = src_dir / "lib" if (src_dir / "lib").is_dir() else src_dir
-                hit = probe_ts_candidate((lib_dir / spec[5:]).resolve(), self.repo_root, exts=exts)
+                src_dir = cfg.config_dir / "src" if _safe_is_dir(cfg.config_dir / "src") else cfg.base_url
+                lib_dir = src_dir / "lib" if _safe_is_dir(src_dir / "lib") else src_dir
+                hit = probe_ts_candidate(lib_dir / spec[5:], self.repo_root, exts=exts)
                 if hit is not None:
                     return hit
             elif not spec.startswith("#"):
-                hit = probe_ts_candidate((cfg.base_url / spec).resolve(), self.repo_root, exts=exts)
+                hit = probe_ts_candidate(cfg.base_url / spec, self.repo_root, exts=exts)
                 if hit is not None:
                     return hit
 
@@ -561,13 +804,17 @@ def extract_module_string_bindings(
     _visiting: frozenset[Path] = frozenset(),
 ) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
     """Collect constant strings and enum maps visible in `path` via local defs, imports, and barrels."""
-    rp = path.resolve()
+    if len(_visiting) >= 32:
+        return {}, {}
+    rp = safe_resolve_contained_path(path, resolver.repo_root)
+    if rp is None:
+        return {}, {}
     if rp in resolver._const_cache:
         return resolver._const_cache[rp]
-    if rp in _visiting or not rp.is_file():
+    if rp in _visiting or not _safe_is_file(rp):
         return {}, {}
     try:
-        text = rp.read_text(encoding="utf-8", errors="replace")
+        text = safe_read_repo_text(rp, resolver.repo_root, errors="replace")
     except (OSError, UnicodeError):
         return {}, {}
 
@@ -640,11 +887,13 @@ def resolve_reexport_targets(
     _visiting: frozenset[Path] = frozenset(),
 ) -> list[Path]:
     """Resolve `export { ... } from '...'` and `export * from '...'` targets inside a barrel file."""
-    rp = barrel_path.resolve()
-    if rp in _visiting or not rp.is_file():
+    if len(_visiting) >= 32:
+        return []
+    rp = safe_resolve_contained_path(barrel_path, resolver.repo_root)
+    if rp is None or rp in _visiting or not _safe_is_file(rp):
         return []
     try:
-        text = rp.read_text(encoding="utf-8", errors="replace")
+        text = safe_read_repo_text(rp, resolver.repo_root, errors="replace")
     except (OSError, UnicodeError):
         return []
 
@@ -724,20 +973,24 @@ def executable_ts_text(source: str, *, is_tsx: bool = False) -> tuple[str, dict[
                 "implements_clause",
             })
 
-            def mask(node: Any) -> None:
+            stack: list[tuple[Any, int]] = [(tree.root_node, 0)]
+            steps = 0
+            while stack and steps < _MAX_CST_NODES:
+                node, depth = stack.pop()
+                steps += 1
                 if node.type in skip_types:
                     _blank_span(buf, node.start_byte, node.end_byte)
-                    return
+                    continue
                 if node.type == "export_statement" and node.child_by_field_name("source") is not None:
                     _blank_span(buf, node.start_byte, node.end_byte)
-                    return
+                    continue
                 if node.type in ("as_expression", "satisfies_expression") and len(node.named_children) >= 2:
                     t_node = node.child_by_field_name("type") or node.named_children[-1]
                     _blank_span(buf, node.named_children[0].end_byte, t_node.end_byte)
-                for ch in node.children:
-                    mask(ch)
+                if depth < _MAX_CST_DEPTH:
+                    for ch in reversed(node.children):
+                        stack.append((ch, depth + 1))
 
-            mask(tree.root_node)
             return buf.decode("utf-8", errors="replace"), di_map
 
     # Regex fallback: strip import/re-export lines, type/interface decls, `typeof import(...)`, and `: Type` annotations.
@@ -845,7 +1098,11 @@ def extract_ts_dynamic_imports(exec_text: str, *, is_tsx: bool = False) -> list[
             def _char_idx(byte_pos: int) -> int:
                 return len(raw[:byte_pos].decode("utf-8", errors="replace"))
 
-            def walk(node: Any) -> None:
+            stack: list[tuple[Any, int]] = [(tree.root_node, 0)]
+            steps = 0
+            while stack and steps < _MAX_CST_NODES:
+                node, depth = stack.pop()
+                steps += 1
                 if node.type == "call_expression":
                     fn = node.child_by_field_name("function")
                     if fn is not None and fn.type == "import":
@@ -902,10 +1159,10 @@ def extract_ts_dynamic_imports(exec_text: str, *, is_tsx: bool = False) -> list[
                                 is_direct_invoked=direct,
                             )
                         )
-                for ch in node.children:
-                    walk(ch)
+                if depth < _MAX_CST_DEPTH:
+                    for ch in reversed(node.children):
+                        stack.append((ch, depth + 1))
 
-            walk(tree.root_node)
             return sites
 
     sites_fb: list[TsDynamicImportSite] = []

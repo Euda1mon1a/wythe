@@ -141,6 +141,7 @@ def _read_companion_bytes(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = _default_max_companion_bytes,
 ) -> tuple[Path, bytes]:
     raw_str = str(raw_path).strip()
@@ -174,6 +175,8 @@ def _read_companion_bytes(
                 raise ValueError(f"Refusing symlinked path component in '{raw_path}'.")
         if repo_root is not None:
             real_root = repo_root.resolve()
+            if not allow_external and not cand.resolve().is_relative_to(real_root):
+                raise ValueError(f"Companion path '{raw_path}' escapes repository root.")
             for k in range(1, len(cand.parts) + 1):
                 pref = Path(*cand.parts[:k])
                 if pref.exists() and pref.resolve() == real_root:
@@ -492,7 +495,7 @@ def _unescape_pbtxt_string(raw_inner: str) -> str:
             except ValueError:
                 out.append(nxt)
                 i += 2
-        elif nxt.isdigit():
+        elif nxt in "01234567":
             oct_digits = nxt
             j = i + 2
             while j < n and len(oct_digits) < 3 and raw_inner[j] in "01234567":
@@ -814,18 +817,23 @@ def _dict_to_cp_solver_response(
 
 
 def _check_json_depth(root: Any, max_depth: int = _MAX_PBTXT_DEPTH) -> None:
+    visited: set[int] = set()
     stack: list[tuple[Any, int]] = [(root, 0)]
     while stack:
         cur, d = stack.pop()
         if d > max_depth:
             raise ValueError(f"Corrupt or excessively nested JSON companion artifact (> {max_depth} levels).")
+        oid = id(cur)
+        if oid in visited:
+            continue
+        visited.add(oid)
         if isinstance(cur, dict):
             for v in cur.values():
-                if isinstance(v, (dict, list)):
+                if isinstance(v, (dict, list)) and id(v) not in visited:
                     stack.append((v, d + 1))
         elif isinstance(cur, list):
             for v in cur:
-                if isinstance(v, (dict, list)):
+                if isinstance(v, (dict, list)) and id(v) not in visited:
                     stack.append((v, d + 1))
 
 
@@ -833,10 +841,13 @@ def parse_cp_model_proto(
     path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = _default_max_companion_bytes,
 ) -> CpModelProtoSummary:
     """Read a JSON, `.pbtxt`, or binary `.pb` `CpModelProto` without `ortools`/`protobuf`."""
-    resolved, raw = _read_companion_bytes(path, repo_root=repo_root, max_bytes=max_bytes)
+    resolved, raw = _read_companion_bytes(
+        path, repo_root=repo_root, allow_external=allow_external, max_bytes=max_bytes
+    )
     fmt = _detect_proto_format(resolved, raw)
     if fmt == "binary":
         return _parse_binary_cp_model_proto(str(resolved), raw)
@@ -859,10 +870,13 @@ def parse_cp_solver_response(
     path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = _default_max_companion_bytes,
 ) -> CpSolverResponseSummary:
     """Read a JSON, `.pbtxt`, or binary `.pb` `CpSolverResponse` without `ortools`/`protobuf`."""
-    resolved, raw = _read_companion_bytes(path, repo_root=repo_root, max_bytes=max_bytes)
+    resolved, raw = _read_companion_bytes(
+        path, repo_root=repo_root, allow_external=allow_external, max_bytes=max_bytes
+    )
     fmt = _detect_proto_format(resolved, raw)
     if fmt == "binary":
         return _parse_binary_cp_solver_response(str(resolved), raw)
@@ -961,12 +975,16 @@ def correlate_cpsat_companions(
     ct_anchors.sort(key=lambda item: (-len(item[0]), item[0]))
 
     proto_sum = (
-        parse_cp_model_proto(proto_arg, repo_root=root_p, max_bytes=max_bytes)  # type: ignore[arg-type]
+        parse_cp_model_proto(
+            proto_arg, repo_root=root_p, allow_external=True, max_bytes=max_bytes  # type: ignore[arg-type]
+        )
         if proto_arg is not None
         else None
     )
     resp_sum = (
-        parse_cp_solver_response(resp_arg, repo_root=root_p, max_bytes=max_bytes)  # type: ignore[arg-type]
+        parse_cp_solver_response(
+            resp_arg, repo_root=root_p, allow_external=True, max_bytes=max_bytes  # type: ignore[arg-type]
+        )
         if resp_arg is not None
         else None
     )

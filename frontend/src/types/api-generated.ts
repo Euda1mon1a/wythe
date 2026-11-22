@@ -954,7 +954,7 @@ export interface components {
              * Used Vision Snapshot
              * @default false
              */
-            used_vision_snapshot: boolean;
+            used_vision_snapshot: boolean | null;
             /**
              * Image Supplied
              * @default false
@@ -962,6 +962,16 @@ export interface components {
             image_supplied: boolean;
             /** Fallback Reason */
             fallback_reason?: string | null;
+            /** Execution Origin */
+            execution_origin?: ("browser_client" | "wythe_server") | null;
+            /** Endpoint Origin */
+            endpoint_origin?: string | null;
+            /** Requested Model Id */
+            requested_model_id?: string | null;
+            /** Resolved Model Id */
+            resolved_model_id?: string | null;
+            /** Fallback From */
+            fallback_from?: string | null;
             /** Context Headline */
             context_headline: string;
             /** Answer Markdown */
@@ -1767,6 +1777,72 @@ export interface components {
              */
             sampling_note: string;
         };
+        /**
+         * FirstDivergencePoint
+         * @description AC 2: First point where observed behavior differed from intent + actor knowledge.
+         */
+        FirstDivergencePoint: {
+            /** Divergence Id */
+            divergence_id: string;
+            /** Stage Label */
+            stage_label: string;
+            /** Summary */
+            summary: string;
+            /** Expected By Owner */
+            expected_by_owner: string;
+            /** Actual Observed */
+            actual_observed: string;
+            /** Actor */
+            actor: string;
+            /** Channel */
+            channel: string;
+            /** Observed At */
+            observed_at?: string | null;
+            /**
+             * Exists In Storage
+             * @default unverified
+             * @enum {string}
+             */
+            exists_in_storage: "present" | "absent" | "unverified";
+            /** Storage Source Ref */
+            storage_source_ref?: string | null;
+            /**
+             * Eligible For Actor
+             * @default unverified
+             * @enum {string}
+             */
+            eligible_for_actor: "present" | "absent" | "unverified";
+            /** Eligibility Source Ref */
+            eligibility_source_ref?: string | null;
+            /**
+             * Present In Turn
+             * @default unverified
+             * @enum {string}
+             */
+            present_in_turn: "present" | "absent" | "unverified";
+            /** Turn Context Source Ref */
+            turn_context_source_ref?: string | null;
+            /** Evidence Reaching Turn */
+            evidence_reaching_turn?: string[];
+            /** Observed Hop */
+            observed_hop?: string | null;
+            /** Hop Evidence Ref */
+            hop_evidence_ref?: string | null;
+            /**
+             * Caller Attribution State
+             * @default unverified
+             * @enum {string}
+             */
+            caller_attribution_state: "caller_verified" | "hop_only" | "unverified" | "conflicting";
+            /** Attributed Caller */
+            attributed_caller?: string | null;
+            /** Caller Receipt Ref */
+            caller_receipt_ref?: string | null;
+            /** Unattributed Candidate Callers */
+            unattributed_candidate_callers?: string[];
+            /** Missing Joins */
+            missing_joins?: string[];
+        };
         /** GateEvaluation */
         GateEvaluation: {
             /**
@@ -1825,6 +1901,31 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /**
+         * ImplementationPrediction
+         * @description What one reading or branch of the implementation predicts before and at a boundary.
+         */
+        ImplementationPrediction: {
+            /** Prediction Id */
+            prediction_id: string;
+            /** Reading Label */
+            reading_label: string;
+            /**
+             * Predicted Before Boundary
+             * @default
+             */
+            predicted_before_boundary: string;
+            /** Predicted At Boundary */
+            predicted_at_boundary: string;
+            /** Source Ref */
+            source_ref: string;
+            /**
+             * Match State
+             * @default undistinguished
+             * @enum {string}
+             */
+            match_state: "consistent_with_observation" | "refuted_by_observation" | "undistinguished" | "unverified";
         };
         /**
          * ImportClosureSummary
@@ -2438,6 +2539,24 @@ export interface components {
             approx_tokens: number;
             /** Markdown */
             markdown: string;
+            /** Observed At */
+            observed_at?: string | null;
+            /** Source Observed At */
+            source_observed_at?: string | null;
+            /** Valid Until */
+            valid_until?: string | null;
+            /**
+             * Observation Source
+             * @default
+             */
+            observation_source: string | null;
+            /**
+             * Coverage Complete
+             * @default true
+             */
+            coverage_complete: boolean | null;
+            /** Unobserved Tiers */
+            unobserved_tiers?: string[];
         };
         /** LlmContextConeReport */
         LlmContextConeReport: {
@@ -2493,6 +2612,24 @@ export interface components {
              * @default
              */
             markdown: string;
+            /** Observed At */
+            observed_at?: string | null;
+            /** Source Observed At */
+            source_observed_at?: string | null;
+            /** Valid Until */
+            valid_until?: string | null;
+            /**
+             * Observation Source
+             * @default
+             */
+            observation_source: string | null;
+            /**
+             * Coverage Complete
+             * @default true
+             */
+            coverage_complete: boolean | null;
+            /** Unobserved Tiers */
+            unobserved_tiers?: string[];
         };
         /** LlmNodePointer */
         LlmNodePointer: {
@@ -2521,6 +2658,32 @@ export interface components {
             columns?: string[];
             /** Http Paths */
             http_paths?: string[];
+            /**
+             * Omitted Http Path Count
+             * @default 0
+             */
+            omitted_http_path_count: number;
+        };
+        /**
+         * ObservedBoundaryResult
+         * @description Empirical or captured observation distinguishing implementation predictions.
+         */
+        ObservedBoundaryResult: {
+            /** Observation Id */
+            observation_id: string;
+            /** Summary */
+            summary: string;
+            /** Observed At */
+            observed_at?: string | null;
+            /** Source Ref */
+            source_ref: string;
+            /**
+             * Delivery Verified
+             * @default false
+             */
+            delivery_verified: boolean;
+            /** Delivery Receipt Ref */
+            delivery_receipt_ref?: string | null;
         };
         /** OnDeviceEngineStatus */
         OnDeviceEngineStatus: {
@@ -2628,6 +2791,10 @@ export interface components {
             subject_id: string;
             /** Producer Claimed Stage */
             producer_claimed_stage?: string | null;
+            /** Producer Claimed Delivery Status */
+            producer_claimed_delivery_status?: string | null;
+            /** Producer Claimed Terminal State */
+            producer_claimed_terminal_state?: string | null;
             /**
              * Last Proven Stage
              * @enum {string}
@@ -2656,6 +2823,16 @@ export interface components {
              * @enum {string}
              */
             delivery_status: "delivered" | "queued_not_rendered" | "not_recorded" | "failed" | "unknown";
+            /**
+             * Positive Commit Established
+             * @default false
+             */
+            positive_commit_established: boolean;
+            /**
+             * Positive Delivery Established
+             * @default false
+             */
+            positive_delivery_established: boolean;
             /**
              * Blind Retry Prohibited
              * @default false
@@ -2718,6 +2895,53 @@ export interface components {
              * @default
              */
             detail: string;
+        };
+        /**
+         * OwnerRuleSpec
+         * @description Owner-declared domain or operational rule linked to its canonical source.
+         */
+        OwnerRuleSpec: {
+            /** Rule Id */
+            rule_id: string;
+            /** Label */
+            label: string;
+            /** Statement */
+            statement: string;
+            /** Source Ref */
+            source_ref: string;
+            /** Authority Ref */
+            authority_ref?: string | null;
+        };
+        /**
+         * PerturbationCaseResult
+         * @description AC 3: Single-variable fresh-case perturbation check and missing-receipt detector.
+         */
+        PerturbationCaseResult: {
+            /** Case Id */
+            case_id: string;
+            /** Label */
+            label: string;
+            /** Varied Factor */
+            varied_factor: string;
+            /** Held Fixed */
+            held_fixed?: string[];
+            /** Expected Outcome */
+            expected_outcome: string;
+            /** Observed Outcome */
+            observed_outcome: string;
+            /**
+             * Conclusion State
+             * @enum {string}
+             */
+            conclusion_state: "supported" | "unverified" | "failed_regression";
+            /** Passed */
+            passed: boolean;
+            /** Decisive Receipt Ref */
+            decisive_receipt_ref?: string | null;
+            /** Missing Receipt Id */
+            missing_receipt_id?: string | null;
+            /** Unverified Conclusion */
+            unverified_conclusion?: string | null;
         };
         /** PluginListResponse */
         PluginListResponse: {
@@ -2925,6 +3149,8 @@ export interface components {
             audit_rulings?: components["schemas"]["PortableRulingItem"][];
             /** Reference Exemplars */
             reference_exemplars?: components["schemas"]["PortableReferenceExemplar"][];
+            /** Fabricated Fallback Allowlist */
+            fabricated_fallback_allowlist?: string[];
         };
         /** PortableRatchetItem */
         PortableRatchetItem: {
@@ -2987,6 +3213,8 @@ export interface components {
             evidence_scope?: string[];
             /** Audited Commit */
             audited_commit: string;
+            /** Effective Until */
+            effective_until?: string | null;
             /** Recorded By */
             recorded_by: string;
         };
@@ -3216,6 +3444,36 @@ export interface components {
             blocks_gate?: boolean | null;
             /** Updated By */
             updated_by: string;
+        };
+        /**
+         * RulePredictionComparison
+         * @description AC 1: Owner rule, implementation predictions, and observed result in one record.
+         */
+        RulePredictionComparison: {
+            /** Comparison Id */
+            comparison_id: string;
+            /** Subject Id */
+            subject_id: string;
+            owner_rule: components["schemas"]["OwnerRuleSpec"];
+            /** Implementation Predictions */
+            implementation_predictions?: components["schemas"]["ImplementationPrediction"][];
+            observed_result?: components["schemas"]["ObservedBoundaryResult"] | null;
+            /** Discriminating Observation */
+            discriminating_observation?: string | null;
+            /** Matched Prediction Ids */
+            matched_prediction_ids?: string[];
+            /** Refuted Prediction Ids */
+            refuted_prediction_ids?: string[];
+            /** Open Questions */
+            open_questions?: string[];
+            /**
+             * State
+             * @default unverified
+             * @enum {string}
+             */
+            state: "supported" | "degraded_or_drifted" | "unverified" | "unresolved";
+            /** Missing Joins */
+            missing_joins?: string[];
         };
         /**
          * RuntimeProvenanceEvaluation
@@ -4317,6 +4575,23 @@ export interface components {
             consequence_headline: string;
             /** Last Supported Cause */
             last_supported_cause: string;
+            /**
+             * Verdict Sentence
+             * @default
+             */
+            verdict_sentence: string;
+            /**
+             * Verdict Markdown
+             * @default
+             */
+            verdict_markdown: string;
+            /** Verdict Clauses */
+            verdict_clauses?: components["schemas"]["VerdictClause"][];
+            first_divergence?: components["schemas"]["FirstDivergencePoint"] | null;
+            /** Rule Prediction Comparisons */
+            rule_prediction_comparisons?: components["schemas"]["RulePredictionComparison"][];
+            /** Perturbation Matrix */
+            perturbation_matrix?: components["schemas"]["PerturbationCaseResult"][];
             /** Overall Missing Joins */
             overall_missing_joins?: string[];
             /** Links */
@@ -4515,6 +4790,27 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /**
+         * VerdictClause
+         * @description Single clause in the top-level verdict sentence linked to its exact evidence.
+         */
+        VerdictClause: {
+            /** Clause Id */
+            clause_id: string;
+            /** Text */
+            text: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "supported" | "unverified" | "degraded_or_drifted" | "indeterminate";
+            /** Evidence Ref */
+            evidence_ref?: string | null;
+            /** Source Location */
+            source_location?: string | null;
+            /** Missing Receipt */
+            missing_receipt?: string | null;
         };
         /** ViewportCommand */
         ViewportCommand: {

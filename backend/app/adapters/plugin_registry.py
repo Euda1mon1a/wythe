@@ -11,11 +11,18 @@ Security boundary:
 
 from __future__ import annotations
 
+import ast
 import importlib
+import importlib.machinery
 import importlib.metadata
 import importlib.util
 import inspect
+import json
 import sys
+import sysconfig
+import threading
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -66,6 +73,8 @@ _VALID_SEVERITIES = ("blocking", "warning")
 _VALID_CONFIDENCES = ("confirmed", "candidate")
 _VALID_STRENGTHS = ("ast_exact", "structural_match", "heuristic")
 _VALID_MATURITIES = ("implemented", "experimental")
+_PLUGIN_IMPORT_LOCK = threading.RLock()
+_OS_ROOT_SYMLINK_DIRS: frozenset[str] = frozenset({"tmp", "var", "etc"})
 
 _ACTIVE_STRATUM_ARTIFACTS: ContextVar[tuple[tuple[str, tuple[str, ...]], ...]] = ContextVar(
     "wythe_active_stratum_artifacts",
@@ -755,6 +764,503 @@ def _coerce_plugin_specs(
     return specs
 
 
+def _reject_plugin_path_symlinks(cand_path: Path) -> Path:
+    expanded = cand_path.expanduser()
+    cur = Path(expanded.anchor) if expanded.is_absolute() else Path.cwd()
+    parts = expanded.parts[1:] if expanded.is_absolute() else expanded.parts
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ValueError(f"Parent traversal ('..') is forbidden in plugin path '{cand_path}'.")
+        cur = cur / part
+        if cur.is_symlink():
+            raise ValueError(f"Local plugin path '{cand_path}' traverses symlink component '{cur}'.")
+    if not cur.is_file():
+        raise ValueError(f"Local plugin file '{cand_path}' must be a regular non-symlink .py file.")
+    return cur.resolve()
+
+
+def _wythe_backend_dir() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _wythe_plugins_dir() -> Path | None:
+    cand = Path(__file__).resolve().parents[3] / "plugins"
+    return cand.resolve() if cand.is_dir() else None
+
+
+def _is_os_root_alias(path: Path) -> bool:
+    return path.parent == Path(path.anchor) and path.name in _OS_ROOT_SYMLINK_DIRS
+
+
+def _trusted_symlink_prefix_ancestors(*, repo_root: Path | None = None) -> frozenset[Path]:
+    import site
+
+    wythe_repo_root = _wythe_backend_dir().parent
+    repo_res: Path | None = None
+    if repo_root is not None:
+        try:
+            cand_repo_res = repo_root.resolve()
+            if cand_repo_res != wythe_repo_root:
+                repo_res = cand_repo_res
+        except OSError:
+            repo_res = None
+
+    raw_roots: list[Path] = [Path(sys.prefix), Path(sys.base_prefix)]
+    for base in (Path(sys.prefix), Path(sys.base_prefix)):
+        for sub in ("lib", "lib64", "Lib"):
+            raw_roots.append(base / sub)
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+        raw_p = sysconfig.get_path(key)
+        if raw_p:
+            raw_roots.append(Path(raw_p))
+    for getter_name in ("getsitepackages", "getusersitepackages"):
+        getter = getattr(site, getter_name, None)
+        if not callable(getter):
+            continue
+        try:
+            vals = getter()
+        except (AttributeError, OSError):
+            vals = ()
+        items = [vals] if isinstance(vals, str) else list(vals or ())
+        for item in items:
+            if item:
+                raw_roots.append(Path(item))
+
+    allowed: set[Path] = set()
+    for root in raw_roots:
+        try:
+            if not root.exists():
+                continue
+            root_res = root.resolve()
+        except OSError:
+            continue
+        if repo_res is not None and (
+            root.is_relative_to(repo_res) or root_res.is_relative_to(repo_res)
+        ):
+            continue
+        cur = Path(root.anchor) if root.is_absolute() else Path.cwd()
+        parts = root.parts[1:] if root.is_absolute() else root.parts
+        for part in parts:
+            if part in ("", "."):
+                continue
+            cur = cur / part
+            allowed.add(cur)
+            if cur.is_symlink():
+                try:
+                    cur = cur.resolve()
+                    allowed.add(cur)
+                except OSError:
+                    break
+        for anc in (root, *root.parents, root_res, *root_res.parents):
+            allowed.add(anc)
+    return frozenset(allowed)
+
+
+def _reject_untrusted_symlinks_before_resolve(
+    raw_path: str | Path,
+    *,
+    label: str,
+    repo_root: Path | None = None,
+    allow_leaf_prefix_symlink: bool = False,
+) -> Path:
+    cand = Path(raw_path)
+    if "\x00" in str(cand) or ".." in cand.parts:
+        raise PermissionError(f"Unsafe plugin {label} path: {cand}")
+    trusted_ancestors = _trusted_symlink_prefix_ancestors(repo_root=repo_root)
+    if (
+        cand.is_symlink()
+        and not _is_os_root_alias(cand)
+        and not (allow_leaf_prefix_symlink and cand in trusted_ancestors)
+    ):
+        raise PermissionError(f"Symlinked plugin {label}: {cand}")
+    cur = Path(cand.anchor) if cand.is_absolute() else Path.cwd().resolve()
+    parts = cand.parts[1:] if cand.is_absolute() else cand.parts
+    last_idx = len(parts) - 1
+    for idx, part in enumerate(parts):
+        if part in ("", "."):
+            continue
+        cur = cur / part
+        if cur.is_symlink():
+            is_leaf = idx == last_idx
+            if _is_os_root_alias(cur) or (
+                cur in trusted_ancestors and (not is_leaf or allow_leaf_prefix_symlink)
+            ):
+                cur = cur.resolve()
+            else:
+                raise PermissionError(f"Plugin {label} traverses symlink '{cur}'.")
+    return cur.resolve()
+
+
+def _trusted_plugin_install_roots(*, repo_root: Path | None = None) -> tuple[Path, ...]:
+    import site
+
+    repo_res = repo_root.resolve() if repo_root is not None else None
+    cwd_res: Path | None
+    try:
+        cwd_res = Path.cwd().resolve()
+    except OSError:
+        cwd_res = None
+    prefix_roots = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()}
+
+    roots: list[Path] = []
+    for base in (Path(sys.prefix), Path(sys.base_prefix)):
+        for sub in ("lib", "Lib"):
+            cand = base / sub
+            if cand.exists():
+                roots.append(cand.resolve())
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+        raw_path = sysconfig.get_path(key)
+        if raw_path and Path(raw_path).exists():
+            roots.append(Path(raw_path).resolve())
+    for getter_name in ("getsitepackages", "getusersitepackages"):
+        getter = getattr(site, getter_name, None)
+        if not callable(getter):
+            continue
+        try:
+            raw_paths = getter()
+        except (AttributeError, OSError):
+            raw_paths = ()
+        items = [raw_paths] if isinstance(raw_paths, str) else list(raw_paths or ())
+        for item in items:
+            if not item or not Path(item).exists():
+                continue
+            item_res = Path(item).resolve()
+            in_prefix = any(item_res.is_relative_to(pr) for pr in prefix_roots)
+            if not in_prefix:
+                if repo_res is not None and item_res.is_relative_to(repo_res):
+                    continue
+                if cwd_res is not None and item_res.is_relative_to(cwd_res):
+                    continue
+            roots.append(item_res)
+    wythe_plugins_dir = _wythe_plugins_dir()
+    if wythe_plugins_dir is not None:
+        roots.append(wythe_plugins_dir)
+    return tuple(dict.fromkeys(roots))
+
+
+def _pep660_editable_roots_for_dist(
+    dist: object | None, *, repo_root: Path | None = None
+) -> tuple[Path, ...]:
+    if dist is None:
+        return ()
+    raw_dist_path = getattr(dist, "_path", None)
+    if raw_dist_path is None:
+        return ()
+    try:
+        dist_dir = _reject_untrusted_symlinks_before_resolve(
+            raw_dist_path, label="dist-info", repo_root=repo_root
+        )
+    except (OSError, PermissionError):
+        return ()
+    if not dist_dir.is_dir():
+        return ()
+
+    plugins_dir = _wythe_plugins_dir()
+    repo_res = repo_root.resolve() if repo_root is not None else None
+    found: list[Path] = []
+
+    def _accept_dir(cand: Path) -> None:
+        try:
+            res = _reject_untrusted_symlinks_before_resolve(
+                cand, label="editable root", repo_root=repo_root
+            )
+        except (OSError, PermissionError):
+            return
+        if not res.is_dir():
+            return
+        if (
+            repo_res is not None
+            and res.is_relative_to(repo_res)
+            and (plugins_dir is None or not res.is_relative_to(plugins_dir))
+        ):
+            return
+        if res not in found:
+            found.append(res)
+
+    direct_url_file = dist_dir / "direct_url.json"
+    if direct_url_file.is_file() and not direct_url_file.is_symlink():
+        try:
+            du = json.loads(direct_url_file.read_text(encoding="utf-8"))
+            if isinstance(du, dict) and isinstance(du.get("dir_info"), dict) and du["dir_info"].get("editable") is True:
+                parsed_u = urllib.parse.urlparse(str(du.get("url") or ""))
+                if parsed_u.scheme == "file" and parsed_u.path:
+                    ed_base = Path(urllib.request.url2pathname(parsed_u.path))
+                    _accept_dir(ed_base / "src")
+                    _accept_dir(ed_base)
+        except (OSError, ValueError):
+            pass
+
+    record_file = dist_dir / "RECORD"
+    site_parent = dist_dir.parent
+    if record_file.is_file() and not record_file.is_symlink():
+        try:
+            for rec_line in record_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                rel_entry = rec_line.split(",", 1)[0].strip()
+                if not rel_entry or "/" in rel_entry or "\\" in rel_entry or ".." in rel_entry:
+                    continue
+                target_f = site_parent / rel_entry
+                if target_f.is_symlink() or not target_f.is_file():
+                    continue
+                if rel_entry.endswith(".pth"):
+                    for pth_ln in target_f.read_text(encoding="utf-8", errors="replace").splitlines():
+                        s_ln = pth_ln.strip()
+                        if s_ln and not s_ln.startswith(("#", "import ", "import\t")):
+                            _accept_dir(Path(s_ln) if Path(s_ln).is_absolute() else site_parent / s_ln)
+                elif rel_entry.startswith("__editable___") and rel_entry.endswith("_finder.py"):
+                    tree = ast.parse(target_f.read_text(encoding="utf-8"))
+                    for stmt in tree.body:
+                        t_names: list[str] = []
+                        val_expr: ast.AST | None = None
+                        if isinstance(stmt, ast.Assign):
+                            t_names = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+                            val_expr = stmt.value
+                        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                            t_names = [stmt.target.id]
+                            val_expr = stmt.value
+                        if val_expr is None:
+                            continue
+                        if "MAPPING" in t_names:
+                            mapping_val = ast.literal_eval(val_expr)
+                            if isinstance(mapping_val, dict):
+                                for mapped_p in mapping_val.values():
+                                    if isinstance(mapped_p, str) and mapped_p:
+                                        mp = Path(mapped_p)
+                                        _accept_dir(
+                                            mp.parent.parent if mp.name == "__init__.py" else mp.parent
+                                        )
+                        elif "NAMESPACES" in t_names:
+                            ns_val = ast.literal_eval(val_expr)
+                            if isinstance(ns_val, dict):
+                                for ns_list in ns_val.values():
+                                    if isinstance(ns_list, (list, tuple)):
+                                        for ns_p in ns_list:
+                                            if isinstance(ns_p, str) and ns_p:
+                                                _accept_dir(Path(ns_p).parent)
+        except (OSError, SyntaxError, ValueError):
+            pass
+    return tuple(found)
+
+
+def _entry_point_is_trusted_install(ep: object, *, repo_root: Path | None) -> tuple[bool, str]:
+    is_mock_ep = getattr(type(ep), "load", None) is not importlib.metadata.EntryPoint.load
+    dist = getattr(ep, "dist", None)
+    if dist is None:
+        if is_mock_ep:
+            return True, ""
+        return False, "missing distribution metadata"
+    raw_dist_path = getattr(dist, "_path", None)
+    has_locate = callable(getattr(dist, "locate_file", None))
+    if raw_dist_path is None and not has_locate:
+        if is_mock_ep:
+            return True, ""
+        return False, "missing distribution metadata path"
+
+    candidates: list[Path] = []
+    if raw_dist_path is not None:
+        candidates.append(Path(raw_dist_path))
+    if has_locate:
+        try:
+            located = dist.locate_file("")
+        except OSError:
+            return False, "unresolvable distribution path"
+        if located is not None:
+            candidates.append(Path(located))
+    if not candidates:
+        if is_mock_ep:
+            return True, ""
+        return False, "missing distribution metadata path"
+
+    trusted_roots = _trusted_plugin_install_roots(repo_root=repo_root)
+    repo_res: Path | None = None
+    if repo_root is not None:
+        try:
+            repo_res = repo_root.resolve()
+        except OSError:
+            repo_res = None
+
+    for cand in candidates:
+        if "\x00" in str(cand) or ".." in cand.parts:
+            return False, f"unsafe distribution metadata path '{cand}'"
+        if cand.is_symlink():
+            return False, f"symlinked distribution metadata path '{cand}'"
+        try:
+            resolved_cand = _reject_untrusted_symlinks_before_resolve(
+                cand, label="distribution metadata", repo_root=repo_root
+            )
+        except PermissionError as exc:
+            return False, str(exc)
+        except OSError:
+            return False, "unresolvable distribution path"
+
+        if repo_root is not None and (
+            cand.is_relative_to(repo_root)
+            or (
+                repo_res is not None
+                and (cand.is_relative_to(repo_res) or resolved_cand.is_relative_to(repo_res))
+            )
+        ):
+            return False, f"distribution '{resolved_cand}' resides inside scanned repository"
+
+        matching_root = next((tr for tr in trusted_roots if resolved_cand.is_relative_to(tr)), None)
+        if matching_root is None:
+            return False, f"distribution '{resolved_cand}' is outside trusted site-packages prefixes"
+    return True, ""
+
+
+def _sanitized_plugin_sys_path(
+    repo_root: Path | None,
+    *,
+    extra_editable_roots: Sequence[Path] = (),
+) -> list[str]:
+    with _PLUGIN_IMPORT_LOCK:
+        plugins_dir = _wythe_plugins_dir()
+        backend_dir = _wythe_backend_dir()
+        wythe_repo_root = backend_dir.parent
+        trusted_roots = _trusted_plugin_install_roots(repo_root=repo_root)
+        try:
+            repo_res: Path | None = repo_root.resolve() if repo_root is not None else None
+        except OSError:
+            repo_res = None
+
+        allowlisted_exact: set[Path] = {backend_dir}
+        for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+            raw_p = sysconfig.get_path(key)
+            if raw_p and Path(raw_p).exists():
+                p_resolved = Path(raw_p).resolve()
+                allowlisted_exact.add(p_resolved)
+                dynload = p_resolved / "lib-dynload"
+                if dynload.exists():
+                    allowlisted_exact.add(dynload.resolve())
+                zip_cand = p_resolved.parent / f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+                allowlisted_exact.add(zip_cand)
+        for tr in trusted_roots:
+            if plugins_dir is not None and tr == plugins_dir:
+                for src_dir in sorted(plugins_dir.glob("wythe-plugin-*/src")):
+                    if src_dir.is_dir() and not src_dir.is_symlink():
+                        allowlisted_exact.add(src_dir.resolve())
+            else:
+                allowlisted_exact.add(tr)
+        for ed_root in extra_editable_roots:
+            allowlisted_exact.add(ed_root.resolve())
+
+        cleaned: list[str] = []
+        seen_resolved: set[Path] = set()
+        for entry in sys.path:
+            if entry in ("", "."):
+                continue
+            try:
+                p_res = _reject_untrusted_symlinks_before_resolve(
+                    entry,
+                    label="sys.path entry",
+                    repo_root=repo_root,
+                    allow_leaf_prefix_symlink=True,
+                )
+            except (OSError, PermissionError):
+                continue
+            if (
+                repo_res is not None
+                and repo_res != wythe_repo_root
+                and p_res.is_relative_to(repo_res)
+            ):
+                continue
+            if (
+                p_res in allowlisted_exact
+                or (plugins_dir is not None and p_res.is_relative_to(plugins_dir))
+            ) and p_res not in seen_resolved:
+                seen_resolved.add(p_res)
+                cleaned.append(str(p_res))
+        for ed_root in extra_editable_roots:
+            ed_res = ed_root.resolve()
+            if ed_res not in seen_resolved:
+                seen_resolved.add(ed_res)
+                cleaned.append(str(ed_res))
+        return cleaned
+
+
+def _verify_entry_point_module_origin(
+    ep: object,
+    search_sys_path: Sequence[str],
+    *,
+    repo_root: Path | None,
+    extra_trusted_roots: Sequence[Path] = (),
+) -> None:
+    if getattr(type(ep), "load", None) is not importlib.metadata.EntryPoint.load:
+        return
+    mod_name = str(getattr(ep, "value", "")).split(":", 1)[0].strip()
+    if not mod_name:
+        raise ImportError("Empty entry point module specification.")
+    parts = mod_name.split(".")
+    trusted_roots = (*_trusted_plugin_install_roots(repo_root=repo_root), *extra_trusted_roots)
+    plugins_dir = _wythe_plugins_dir()
+    repo_res = repo_root.resolve() if repo_root is not None else None
+
+    def _check_origin_path(raw_path: str, label: str) -> None:
+        p_res = _reject_untrusted_symlinks_before_resolve(
+            raw_path, label=label, repo_root=repo_root
+        )
+        if (
+            repo_res is not None
+            and p_res.is_relative_to(repo_res)
+            and (plugins_dir is None or not p_res.is_relative_to(plugins_dir))
+        ):
+            raise PermissionError(
+                f"Plugin {label} '{p_res}' resides inside scanned repository."
+            )
+        matching_root = next((tr for tr in trusted_roots if p_res.is_relative_to(tr)), None)
+        if matching_root is None:
+            raise PermissionError(
+                f"Plugin {label} '{p_res}' is outside trusted install roots."
+            )
+
+    search_locs: list[str] | None = list(search_sys_path)
+    for idx in range(len(parts)):
+        fullname = ".".join(parts[: idx + 1])
+        existing_mod = sys.modules.get(fullname)
+        if existing_mod is not None:
+            existing_file = getattr(existing_mod, "__file__", None)
+            existing_paths = getattr(existing_mod, "__path__", None)
+            existing_spec = getattr(existing_mod, "__spec__", None)
+            ex_origin = getattr(existing_spec, "origin", None) if existing_spec is not None else None
+            if existing_file:
+                _check_origin_path(str(existing_file), "preloaded module __file__")
+            if existing_paths:
+                for p_entry in existing_paths:
+                    _check_origin_path(str(p_entry), "preloaded package __path__")
+            if ex_origin and ex_origin not in ("namespace", "built-in", "frozen"):
+                _check_origin_path(str(ex_origin), "preloaded module spec origin")
+            if (
+                not existing_file
+                and not existing_paths
+                and ex_origin not in ("namespace", "built-in", "frozen")
+            ):
+                raise PermissionError(
+                    f"Preloaded module '{fullname}' in sys.modules lacks verifiable origin."
+                )
+
+        spec = importlib.machinery.PathFinder.find_spec(fullname, search_locs)
+        if spec is None and idx == 0:
+            spec = importlib.util.find_spec(fullname)
+        if spec is None and existing_mod is not None:
+            spec = getattr(existing_mod, "__spec__", None)
+        if spec is None:
+            raise ImportError(
+                f"Entry point module '{fullname}' not found in trusted install roots."
+            )
+        origin = getattr(spec, "origin", None)
+        if origin and origin not in ("namespace", "built-in", "frozen"):
+            _check_origin_path(str(origin), "module origin")
+        sub_locs = getattr(spec, "submodule_search_locations", None)
+        if sub_locs:
+            loc_strs = [str(loc) for loc in sub_locs]
+            for loc_str in loc_strs:
+                _check_origin_path(loc_str, "package location")
+            search_locs = loc_strs
+        elif idx < len(parts) - 1:
+            raise ImportError(f"'{fullname}' is not a package while resolving '{mod_name}'.")
+
+
 def _load_local_plugin_target(target_spec: str) -> tuple[str, object]:
     raw = target_spec.strip()
     if not raw:
@@ -762,9 +1268,7 @@ def _load_local_plugin_target(target_spec: str) -> tuple[str, object]:
     mod_part, sep, attr_part = raw.partition(":")
     cand_path = Path(mod_part)
     if mod_part.endswith(".py") or "/" in mod_part or "\\" in mod_part:
-        if cand_path.is_symlink() or not cand_path.is_file():
-            raise ValueError(f"Local plugin file '{mod_part}' must be a regular non-symlink .py file.")
-        resolved = cand_path.resolve()
+        resolved = _reject_plugin_path_symlinks(cand_path)
         synthetic_mod_name = f"_wythe_optin_plugin_{abs(hash(str(resolved)))}"
         spec = importlib.util.spec_from_file_location(synthetic_mod_name, resolved)
         if spec is None or spec.loader is None:
@@ -790,13 +1294,13 @@ def discover_plugins(
     local_plugin_modules: Sequence[str] | None = None,
     strict_plugins: bool = False,
     notes_out: list[str] | None = None,
+    failures_out: list[str] | None = None,
 ) -> list[WythePluginSpec]:
     """Discover built-in, installed `entry_points`, and explicit opt-in local plugins.
 
-    Note: `repo_root` is accepted so callers can pass scan context uniformly, but Wythe
-    NEVER scans or imports Python files from `repo_root` automatically.
+    Note: `repo_root` is accepted so callers can quarantine untrusted `.dist-info` metadata
+    inside `repo_root` or CWD whenever `allow_local_plugins=False`.
     """
-    _ = repo_root  # Never auto-imported; untrusted repo code is strictly non-executable.
     if local_plugin_modules and not allow_local_plugins:
         raise PermissionError(
             "Refusing to load local_plugin_modules without allow_local_plugins=True; "
@@ -826,9 +1330,42 @@ def discover_plugins(
         raw_eps.sort(key=lambda ep: (ep.name, ep.value))
         ep_specs: list[WythePluginSpec] = []
         for ep in raw_eps:
-            dist_ver = getattr(getattr(ep, "dist", None), "version", None) or "unknown"
+            if not allow_local_plugins:
+                trusted_ok, untrusted_reason = _entry_point_is_trusted_install(
+                    ep, repo_root=repo_root
+                )
+                if not trusted_ok:
+                    if notes_out is not None:
+                        notes_out.append(
+                            f"Plugin '{ep.name}' (entry_point) blocked under allow_local_plugins=False: "
+                            f"{untrusted_reason}."
+                        )
+                    continue
+            dist_obj = getattr(ep, "dist", None)
+            dist_ver = getattr(dist_obj, "version", None) or "unknown"
             try:
-                loaded_ep = ep.load()
+                if not allow_local_plugins:
+                    with _PLUGIN_IMPORT_LOCK:
+                        editable_roots = _pep660_editable_roots_for_dist(
+                            dist_obj, repo_root=repo_root
+                        )
+                        sanitized_path = _sanitized_plugin_sys_path(
+                            repo_root, extra_editable_roots=editable_roots
+                        )
+                        orig_sys_path = list(sys.path)
+                        sys.path[:] = sanitized_path
+                        try:
+                            _verify_entry_point_module_origin(
+                                ep,
+                                sanitized_path,
+                                repo_root=repo_root,
+                                extra_trusted_roots=editable_roots,
+                            )
+                            loaded_ep = ep.load()
+                        finally:
+                            sys.path[:] = orig_sys_path
+                else:
+                    loaded_ep = ep.load()
                 ep_specs.extend(
                     _coerce_plugin_specs(
                         loaded_ep,
@@ -840,11 +1377,14 @@ def discover_plugins(
             except Exception as exc:
                 if strict_plugins:
                     raise
+                msg = (
+                    f"Plugin '{ep.name}' (entry_point) failed to load and was isolated: "
+                    f"{type(exc).__name__}: {exc}"
+                )
                 if notes_out is not None:
-                    notes_out.append(
-                        f"Plugin '{ep.name}' (entry_point) failed to load and was isolated: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
+                    notes_out.append(msg)
+                if failures_out is not None:
+                    failures_out.append(msg)
         ep_specs.sort(key=lambda s: s.name)
         _register_batch(ep_specs)
 
@@ -864,11 +1404,14 @@ def discover_plugins(
             except Exception as exc:
                 if strict_plugins:
                     raise
+                msg = (
+                    f"Plugin '{target_str}' (local_opt_in) failed to load and was isolated: "
+                    f"{type(exc).__name__}: {exc}"
+                )
                 if notes_out is not None:
-                    notes_out.append(
-                        f"Plugin '{target_str}' (local_opt_in) failed to load and was isolated: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
+                    notes_out.append(msg)
+                if failures_out is not None:
+                    failures_out.append(msg)
         _register_batch(local_specs)
 
     collected.sort(key=lambda s: (_ORIGIN_ORDER.get(s.origin, 99), s.name))
@@ -918,6 +1461,7 @@ def run_manipulator_plugins(
     strict_plugins: bool = False,
 ) -> list[str]:
     """Execute enabled Tier-2 manipulator plugins with deterministic ordering & isolation."""
+    disc_failures: list[str] = []
     specs = (
         list(plugins)
         if plugins is not None
@@ -927,16 +1471,19 @@ def run_manipulator_plugins(
             local_plugin_modules=local_plugin_modules,
             strict_plugins=strict_plugins,
             notes_out=result.notes,
+            failures_out=disc_failures,
         )
     )
+    if disc_failures:
+        object.__setattr__(result, "coverage_complete", False)
     executed: list[str] = []
     for spec in specs:
         if spec.manipulator_hook is None:
             continue
         if not _is_spec_enabled(spec, enabled_names, disabled_names):
             continue
-        snap_nodes = list(result.nodes)
-        snap_edges = list(result.edges)
+        snap_nodes = [n.model_copy(deep=True) for n in result.nodes]
+        snap_edges = [e.model_copy(deep=True) for e in result.edges]
         snap_routes = list(result.routes)
         snap_findings = list(result.findings)
         snap_notes = list(result.notes)
@@ -951,6 +1498,7 @@ def run_manipulator_plugins(
             result.routes[:] = snap_routes
             result.findings[:] = snap_findings
             result.notes[:] = snap_notes
+            object.__setattr__(result, "coverage_complete", False)
             result.notes.append(
                 f"Plugin '{spec.name}' ({spec.origin}) failed during manipulator augmentation "
                 f"and was isolated: {type(exc).__name__}: {exc}"
@@ -968,6 +1516,14 @@ def _coerce_raw_finding(item: object) -> RawCandidateFinding | None:
     return None
 
 
+def _mark_report_plugin_incomplete(report: TruthAtlasReport) -> None:
+    report.coverage_complete = False
+    if report.gate is not None:
+        report.gate.coverage_complete = False
+        if report.gate.verdict in ("PASS", "RATCHET_PASS"):
+            report.gate.verdict = "INCOMPLETE"
+
+
 def run_post_scan_plugins(
     repo_root: Path,
     report: TruthAtlasReport,
@@ -979,8 +1535,9 @@ def run_post_scan_plugins(
     local_plugin_modules: Sequence[str] | None = None,
     strict_plugins: bool = False,
 ) -> PostScanPluginExecution:
-    """Execute enabled post-scan check plugins with error isolation."""
+    """Execute enabled post-scan check plugins with atomic staging & error isolation."""
     exec_notes: list[str] = []
+    disc_failures: list[str] = []
     specs = (
         list(plugins)
         if plugins is not None
@@ -990,8 +1547,11 @@ def run_post_scan_plugins(
             local_plugin_modules=local_plugin_modules,
             strict_plugins=strict_plugins,
             notes_out=exec_notes,
+            failures_out=disc_failures,
         )
     )
+    if disc_failures:
+        _mark_report_plugin_incomplete(report)
     executed: list[str] = []
     collected_findings: list[RawCandidateFinding] = []
 
@@ -1002,32 +1562,37 @@ def run_post_scan_plugins(
             continue
         try:
             outcome = spec.post_scan_hook(repo_root, report.model_copy(deep=True))
-            executed.append(spec.name)
+            staged_findings: list[RawCandidateFinding] = []
+            staged_notes: list[str] = []
             if isinstance(outcome, PostScanPluginExecution):
-                collected_findings.extend(outcome.findings)
-                exec_notes.extend(outcome.notes)
+                staged_findings.extend(outcome.findings)
+                staged_notes.extend(outcome.notes)
             elif isinstance(outcome, dict):
                 raw_f = outcome.get("findings")
                 if isinstance(raw_f, (list, tuple)):
                     for f_item in raw_f:
                         coerced_f = _coerce_raw_finding(f_item)
                         if coerced_f is not None:
-                            collected_findings.append(coerced_f)
+                            staged_findings.append(coerced_f)
                 raw_n = outcome.get("notes")
                 if isinstance(raw_n, (list, tuple)):
-                    exec_notes.extend(str(n) for n in raw_n if isinstance(n, str) and n)
+                    staged_notes.extend(str(n) for n in raw_n if isinstance(n, str) and n)
                 elif isinstance(raw_n, str) and raw_n:
-                    exec_notes.append(raw_n)
+                    staged_notes.append(raw_n)
             elif isinstance(outcome, (list, tuple)):
                 for item in outcome:
                     coerced_f = _coerce_raw_finding(item)
                     if coerced_f is not None:
-                        collected_findings.append(coerced_f)
+                        staged_findings.append(coerced_f)
                     elif isinstance(item, str):
-                        exec_notes.append(item)
+                        staged_notes.append(item)
+            executed.append(spec.name)
+            collected_findings.extend(staged_findings)
+            exec_notes.extend(staged_notes)
         except Exception as exc:
             if strict_plugins:
                 raise
+            _mark_report_plugin_incomplete(report)
             exec_notes.append(
                 f"Plugin '{spec.name}' ({spec.origin}) failed during post-scan check and was "
                 f"isolated: {type(exc).__name__}: {exc}"
@@ -1086,6 +1651,7 @@ def run_stratum_badge_plugins(
 ) -> StratumBadgePluginExecution:
     """Collect compact Zoom-1 badges from enabled `StratumPlugin`s with fault & mutation isolation."""
     exec_notes: list[str] = []
+    disc_failures: list[str] = []
     specs = (
         list(plugins)
         if plugins is not None
@@ -1095,8 +1661,11 @@ def run_stratum_badge_plugins(
             local_plugin_modules=local_plugin_modules,
             strict_plugins=strict_plugins,
             notes_out=exec_notes,
+            failures_out=disc_failures,
         )
     )
+    if disc_failures:
+        _mark_report_plugin_incomplete(report)
     executed: list[str] = []
     merged: dict[str, list[StratumSummaryBadge]] = {}
 
@@ -1108,24 +1677,32 @@ def run_stratum_badge_plugins(
         try:
             isolated_report = report.model_copy(deep=True)
             raw_badges = spec.stratum_badge_hook(repo_root, isolated_report)
-            executed.append(spec.name)
+            staged_badges: dict[str, list[StratumSummaryBadge]] = {}
             if isinstance(raw_badges, dict):
                 for nid, badge_list in raw_badges.items():
                     if not isinstance(nid, str) or not isinstance(badge_list, (list, tuple)):
                         continue
-                    dest = merged.setdefault(nid, [])
+                    dest = staged_badges.setdefault(nid, [])
                     for badge in badge_list:
                         if isinstance(badge, StratumSummaryBadge):
                             dest.append(badge)
                         elif isinstance(badge, dict):
                             dest.append(StratumSummaryBadge.model_validate(badge))
+            executed.append(spec.name)
+            for nid, b_items in staged_badges.items():
+                merged.setdefault(nid, []).extend(b_items)
         except Exception as exc:
             if strict_plugins:
                 raise
+            _mark_report_plugin_incomplete(report)
             exec_notes.append(
                 f"Plugin '{spec.name}' ({spec.origin}) failed during Zoom-1 stratum badge "
                 f"summary and was isolated: {type(exc).__name__}: {exc}"
             )
+
+    for note in exec_notes:
+        if note not in report.scan_notes:
+            report.scan_notes.append(note)
 
     return StratumBadgePluginExecution(
         executed_plugins=executed,
@@ -1149,6 +1726,7 @@ def run_stratum_expand_plugins(
 ) -> StratumExpandPluginExecution:
     """Execute enabled `StratumPlugin.expand_node_stratum` hooks with fault & mutation isolation."""
     exec_notes: list[str] = []
+    disc_failures: list[str] = []
     specs = (
         list(plugins)
         if plugins is not None
@@ -1158,8 +1736,11 @@ def run_stratum_expand_plugins(
             local_plugin_modules=local_plugin_modules,
             strict_plugins=strict_plugins,
             notes_out=exec_notes,
+            failures_out=disc_failures,
         )
     )
+    if disc_failures:
+        _mark_report_plugin_incomplete(report)
     executed: list[str] = []
     expansions: list[StratumExpansionResult] = []
 
@@ -1174,18 +1755,26 @@ def run_stratum_expand_plugins(
         try:
             isolated_report = report.model_copy(deep=True)
             res = spec.stratum_expand_hook(repo_root, isolated_report, node_id, zoom)
-            executed.append(spec.name)
+            coerced_exp: StratumExpansionResult | None = None
             if isinstance(res, StratumExpansionResult):
-                expansions.append(res)
+                coerced_exp = res
             elif isinstance(res, dict):
-                expansions.append(StratumExpansionResult.model_validate(res))
+                coerced_exp = StratumExpansionResult.model_validate(res)
+            executed.append(spec.name)
+            if coerced_exp is not None:
+                expansions.append(coerced_exp)
         except Exception as exc:
             if strict_plugins:
                 raise
+            _mark_report_plugin_incomplete(report)
             exec_notes.append(
                 f"Plugin '{spec.name}' ({spec.origin}) failed during Zoom-{zoom} stratum "
                 f"expansion for '{node_id}' and was isolated: {type(exc).__name__}: {exc}"
             )
+
+    for note in exec_notes:
+        if note not in report.scan_notes:
+            report.scan_notes.append(note)
 
     return StratumExpandPluginExecution(
         executed_plugins=executed,
@@ -1305,6 +1894,7 @@ def register_plugin_tier_adapters(
     local_plugin_modules: Sequence[str] | None = None,
     strict_plugins: bool = False,
     notes_out: list[str] | None = None,
+    failures_out: list[str] | None = None,
 ) -> list[str]:
     """Register Truth, Manipulate, and Display tier adapters from enabled `wythe.plugins`."""
     specs = (
@@ -1316,6 +1906,7 @@ def register_plugin_tier_adapters(
             local_plugin_modules=local_plugin_modules,
             strict_plugins=strict_plugins,
             notes_out=notes_out,
+            failures_out=failures_out,
         )
     )
     registered: list[str] = []
@@ -1338,11 +1929,14 @@ def register_plugin_tier_adapters(
         except Exception as exc:
             if strict_plugins:
                 raise
+            msg = (
+                f"Plugin '{spec.name}' ({spec.origin}) tier adapter registration failed "
+                f"and was isolated: {type(exc).__name__}: {exc}"
+            )
             if notes_out is not None:
-                notes_out.append(
-                    f"Plugin '{spec.name}' ({spec.origin}) tier adapter registration failed "
-                    f"and was isolated: {type(exc).__name__}: {exc}"
-                )
+                notes_out.append(msg)
+            if failures_out is not None:
+                failures_out.append(msg)
     return registered
 
 

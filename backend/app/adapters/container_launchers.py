@@ -27,8 +27,16 @@ from app.adapters.dockerfile_sources import (
     ParsedDockerfile,
     StageCopyMapping,
     _exec_invokes_shell,
+    _has_safe_path_segments,
     _is_within_root,
     _norm_container_path,
+    _safe_contained_dir,
+    _safe_contained_file,
+    _safe_exists,
+    _safe_is_dir,
+    _safe_is_file,
+    _safe_is_symlink,
+    _safe_resolve,
     discover_dockerfiles,
     effective_node_symbol_links,
     ensure_repo_target_nodes,
@@ -39,6 +47,7 @@ from app.adapters.dockerfile_sources import (
     parse_dockerfile,
     resolve_command_targets_with_symbols,
 )
+from app.adapters.launchd_sources import parse_safe_plist_bytes, read_bounded_regular_bytes
 from app.adapters.plist_locations import command_locations, env_locations
 from app.adapters.service_sources import EXCLUDED_PARTS, source_reference
 from app.core.policy_context import get_active_policy_tokens
@@ -1093,18 +1102,26 @@ def parse_systemd_unit(
     notes_out: list[str] | None = None,
 ) -> ParsedSystemdUnit | None:
     """Statically parse a `.service` unit file without invoking `systemctl`."""
-    real_root = repo_root.resolve()
-    if unit_path.is_symlink() or not unit_path.is_file() or not _is_within_root(unit_path, real_root):
+    real_root = _safe_resolve(repo_root)
+    rel_path = _safe_contained_file(unit_path, real_root) if real_root is not None else None
+    if rel_path is None:
+        if notes_out is not None:
+            try:
+                safe_rel = unit_path.relative_to(repo_root).as_posix()
+            except ValueError:
+                safe_rel = unit_path.name
+            note = f"Skipped symlink or out-of-root systemd unit {safe_rel}; unit command evidence absent."
+            if note not in notes_out:
+                notes_out.append(note)
         return None
-    rel_path = unit_path.resolve().relative_to(real_root).as_posix()
     try:
-        if unit_path.stat().st_size > MAX_UNIT_FILE_BYTES:
-            if notes_out is not None:
-                note = f"Skipped systemd unit {rel_path} (exceeds {MAX_UNIT_FILE_BYTES} bytes); unit command evidence absent."
-                if note not in notes_out:
-                    notes_out.append(note)
-            return None
-        text = unit_path.read_text(encoding="utf-8")
+        text = read_bounded_regular_bytes(unit_path, max_bytes=MAX_UNIT_FILE_BYTES).decode("utf-8")
+    except ValueError:
+        if notes_out is not None:
+            note = f"Skipped systemd unit {rel_path} (exceeds {MAX_UNIT_FILE_BYTES} bytes); unit command evidence absent."
+            if note not in notes_out:
+                notes_out.append(note)
+        return None
     except (OSError, UnicodeError):
         if notes_out is not None:
             note = f"Skipped systemd unit {rel_path} (unreadable or non-UTF-8); unit command evidence absent."
@@ -1190,23 +1207,33 @@ def parse_launchd_plist(
     repo_root: Path,
 ) -> tuple[ParsedLaunchdUnit | None, str | None]:
     """Statically parse a `launchd` `.plist` command declaration without `launchctl`."""
-    real_root = repo_root.resolve()
-    if plist_path.is_symlink() or not plist_path.is_file() or not _is_within_root(plist_path, real_root):
-        return None, None
-    rel_path = plist_path.resolve().relative_to(real_root).as_posix()
+    real_root = _safe_resolve(repo_root)
+    rel_path = _safe_contained_file(plist_path, real_root) if real_root is not None else None
+    if rel_path is None:
+        try:
+            safe_rel = plist_path.relative_to(repo_root).as_posix()
+        except ValueError:
+            safe_rel = plist_path.name
+        return None, f"Skipped symlink or non-regular launchd source {safe_rel}; command evidence absent."
     try:
-        if plist_path.stat().st_size > MAX_UNIT_FILE_BYTES:
-            return None, f"Skipped launchd source {rel_path} (exceeds {MAX_UNIT_FILE_BYTES} bytes); command evidence absent."
-        raw = plist_path.read_bytes()
-        data = plistlib.loads(raw)
-    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError):
+        raw = read_bounded_regular_bytes(plist_path, max_bytes=MAX_UNIT_FILE_BYTES)
+    except ValueError:
+        return None, f"Skipped launchd source {rel_path} (exceeds {MAX_UNIT_FILE_BYTES} bytes); command evidence absent."
+    except OSError:
+        return None, f"Could not parse launchd source {rel_path}; command evidence absent."
+    try:
+        data = parse_safe_plist_bytes(raw, max_bytes=MAX_UNIT_FILE_BYTES)
+    except (OSError, UnicodeError, ValueError, plistlib.InvalidFileException, ExpatError, RecursionError):
         return None, f"Could not parse launchd source {rel_path}; command evidence absent."
 
     if not isinstance(data, dict) or not ({"Program", "ProgramArguments"} & data.keys()):
         return None, None
 
-    fields, arg_lines = command_locations(raw)
-    env_lines = env_locations(raw)
+    if raw.startswith(b"bplist"):
+        fields, arg_lines, env_lines = {}, [], {}
+    else:
+        fields, arg_lines = command_locations(raw)
+        env_lines = env_locations(raw)
     prog_raw = data.get("Program")
     args_raw = data.get("ProgramArguments", [])
     prog_line = fields.get("Program", 1)
@@ -1241,10 +1268,26 @@ def parse_launchd_plist(
     env_list: list[EnvAssignment] = []
     raw_env = data.get("EnvironmentVariables")
     if isinstance(raw_env, dict):
-        for ek, ev in raw_env.items():
-            if isinstance(ek, str) and ek.strip() and isinstance(ev, (str, int, float)) and not isinstance(ev, bool):
-                clean_ek = ek.strip()
-                env_list.append(EnvAssignment(clean_ek, str(ev), env_lines.get(clean_ek, env_lines.get(ek, 1))))
+        try:
+            for ek, ev in raw_env.items():
+                if (
+                    isinstance(ek, str)
+                    and ek.strip()
+                    and isinstance(ev, (str, int, float))
+                    and not isinstance(ev, bool)
+                ):
+                    if isinstance(ev, int) and ev.bit_length() > 128:
+                        raise ValueError("Plist integer exceeds 128-bit limit.")
+                    clean_ek = ek.strip()
+                    env_list.append(
+                        EnvAssignment(
+                            clean_ek,
+                            str(ev),
+                            env_lines.get(clean_ek, env_lines.get(ek, 1)),
+                        )
+                    )
+        except ValueError:
+            return None, f"Could not parse launchd source {rel_path}; command evidence absent."
 
     return (
         ParsedLaunchdUnit(
@@ -1275,26 +1318,34 @@ def _resolve_contained_repo_path(
 ) -> Path | None:
     """Resolve an in-repo file or directory without following symlinks or `..` escaping `real_root`."""
     cleaned = raw_path.strip().replace("\\", "/")
-    if not cleaned or "\x00" in cleaned or cleaned.startswith("~") or _VAR_TOKEN_RE.search(cleaned):
+    if (
+        not cleaned
+        or "\x00" in cleaned
+        or cleaned.startswith("~")
+        or _VAR_TOKEN_RE.search(cleaned)
+        or not _has_safe_path_segments(cleaned)
+    ):
         return None
     p = PurePosixPath(cleaned)
     if p.is_absolute():
         try:
             cand = Path(cleaned)
-            if cand.is_symlink() or not _is_within_root(cand, real_root):
+            if _safe_is_symlink(cand) or not _is_within_root(cand, real_root):
                 return None
             rel_parts = cand.relative_to(real_root).parts
-        except ValueError:
+        except (OSError, ValueError):
             return None
         cur = real_root
         for part in rel_parts:
-            cur = cur / part
-            if cur.is_symlink() or not _is_within_root(cur, real_root):
+            if not _has_safe_path_segments(part):
                 return None
-        return cur if cur.exists() else None
+            cur = cur / part
+            if _safe_is_symlink(cur) or not _is_within_root(cur, real_root):
+                return None
+        return cur if _safe_exists(cur) else None
 
     for bdir in search_dirs:
-        if bdir.is_symlink() or not _is_within_root(bdir, real_root):
+        if _safe_is_symlink(bdir) or not _is_within_root(bdir, real_root):
             continue
         cur = bdir
         valid = True
@@ -1307,11 +1358,14 @@ def _resolve_contained_repo_path(
                     valid = False
                     break
             else:
-                cur = cur / part
-                if cur.is_symlink() or not _is_within_root(cur, real_root):
+                if not _has_safe_path_segments(part):
                     valid = False
                     break
-        if valid and not cur.is_symlink() and _is_within_root(cur, real_root) and cur.exists():
+                cur = cur / part
+                if _safe_is_symlink(cur) or not _is_within_root(cur, real_root):
+                    valid = False
+                    break
+        if valid and not _safe_is_symlink(cur) and _is_within_root(cur, real_root) and _safe_exists(cur):
             return cur
     return None
 
@@ -1353,17 +1407,31 @@ def _parse_and_audit_env_file(
 ) -> dict[str, str]:
     """Read a containment-checked in-repo env file and audit non-template policy literals."""
     resolved = _resolve_contained_repo_path(raw_env_path, search_dirs, real_root)
-    if resolved is None or not resolved.is_file():
+    if resolved is None or not _safe_is_file(resolved):
+        if notes_out is not None and _has_safe_path_segments(raw_env_path):
+            for bdir in search_dirs:
+                cand = bdir / raw_env_path
+                if _safe_is_symlink(cand) or (_safe_exists(cand) and not _safe_is_file(cand)):
+                    note = f"Skipped symlink or non-regular env file {raw_env_path}; env policy/binding evidence absent."
+                    if note not in notes_out:
+                        notes_out.append(note)
+                    break
         return {}
-    env_rel = resolved.resolve().relative_to(real_root).as_posix()
+    res_path = _safe_resolve(resolved)
+    if res_path is None:
+        return {}
     try:
-        if resolved.stat().st_size > MAX_ENV_FILE_BYTES:
-            if notes_out is not None:
-                note = f"Skipped env file {env_rel} (exceeds {MAX_ENV_FILE_BYTES} bytes); env policy/binding evidence absent."
-                if note not in notes_out:
-                    notes_out.append(note)
-            return {}
-        text = resolved.read_text(encoding="utf-8")
+        env_rel = res_path.relative_to(real_root).as_posix()
+    except ValueError:
+        return {}
+    try:
+        text = read_bounded_regular_bytes(resolved, max_bytes=MAX_ENV_FILE_BYTES).decode("utf-8")
+    except ValueError:
+        if notes_out is not None:
+            note = f"Skipped env file {env_rel} (exceeds {MAX_ENV_FILE_BYTES} bytes); env policy/binding evidence absent."
+            if note not in notes_out:
+                notes_out.append(note)
+        return {}
     except (OSError, UnicodeError):
         if notes_out is not None:
             note = f"Skipped env file {env_rel} (unreadable or non-UTF-8); env policy/binding evidence absent."
@@ -1730,32 +1798,64 @@ def _match_dockerfile_for_run(
     return None, None, dyn_note, ext_note
 
 
-def discover_launcher_files(repo_root: Path) -> tuple[list[Path], list[Path], list[Path]]:
+def discover_launcher_files(
+    repo_root: Path,
+    *,
+    skipped_notes: list[str] | None = None,
+) -> tuple[list[Path], list[Path], list[Path]]:
     """Discover `.plist`, `.service`, and `.sh` files without following symlinks."""
-    if repo_root.is_symlink():
+    if not _has_safe_path_segments(repo_root) or _safe_is_symlink(repo_root):
+        if skipped_notes is not None:
+            skipped_notes.append(
+                "Skipped symlink or unsafe repository root; launcher command evidence absent."
+            )
         return [], [], []
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        if skipped_notes is not None:
+            skipped_notes.append(
+                "Skipped unreadable repository root; launcher command evidence absent."
+            )
+        return [], [], []
     plists: list[Path] = []
     services: list[Path] = []
     shells: list[Path] = []
+    walk_errors: list[OSError] = []
 
-    for parent, dirs, names in os.walk(repo_root, followlinks=False):
+    for parent, dirs, names in os.walk(repo_root, followlinks=False, onerror=walk_errors.append):
         keep: list[str] = []
         for dname in sorted(dirs):
             dpath = Path(parent) / dname
-            if (
-                dname in EXCLUDED_PARTS
-                or (dname.startswith(".") and dname not in ALLOWED_CONTAINER_DOT_DIRS)
-                or dpath.is_symlink()
-                or not _is_within_root(dpath, real_root)
+            if dname in EXCLUDED_PARTS or (
+                dname.startswith(".") and dname not in ALLOWED_CONTAINER_DOT_DIRS
             ):
+                continue
+            if _safe_contained_dir(dpath, real_root) is None:
+                if skipped_notes is not None:
+                    try:
+                        rel_d = dpath.relative_to(repo_root).as_posix()
+                    except ValueError:
+                        rel_d = dname
+                    skipped_notes.append(
+                        f"Skipped symlink or out-of-root directory {rel_d}; launcher command evidence absent."
+                    )
                 continue
             keep.append(dname)
         dirs[:] = keep
 
         for fname in sorted(names):
+            if not fname.endswith((".plist", ".service", ".sh")):
+                continue
             fpath = Path(parent) / fname
-            if fpath.is_symlink() or not fpath.is_file() or not _is_within_root(fpath, real_root):
+            if _safe_contained_file(fpath, real_root) is None:
+                if skipped_notes is not None:
+                    try:
+                        rel_f = fpath.relative_to(repo_root).as_posix()
+                    except ValueError:
+                        rel_f = fname
+                    skipped_notes.append(
+                        f"Skipped symlink or non-regular launcher file {rel_f}; launcher command evidence absent."
+                    )
                 continue
             if fname.endswith(".plist"):
                 plists.append(fpath)
@@ -1763,6 +1863,10 @@ def discover_launcher_files(repo_root: Path) -> tuple[list[Path], list[Path], li
                 services.append(fpath)
             elif fname.endswith(".sh"):
                 shells.append(fpath)
+    if walk_errors and skipped_notes is not None:
+        skipped_notes.append(
+            "Skipped unreadable directory during launcher discovery; launcher command evidence absent."
+        )
     return sorted(plists), sorted(services), sorted(shells)
 
 
@@ -1828,13 +1932,16 @@ def _effective_run_stage(
         eff.workdir = _norm_container_path(inv.workdir, eff.workdir)
     eff.env.update(env_bindings)
     for hpath, cont_tgt in resolved_mounts:
-        repo_rel = "." if hpath.resolve() == real_root else hpath.resolve().relative_to(real_root).as_posix()
+        hres = _safe_resolve(hpath)
+        if hres is None or not _is_within_root(hres, real_root):
+            continue
+        repo_rel = "." if hres == real_root else hres.relative_to(real_root).as_posix()
         c_dest = _norm_container_path(cont_tgt, eff.workdir)
         eff.mappings.append(
             StageCopyMapping(
                 container_path=c_dest,
                 repo_rel=repo_rel,
-                is_dir=hpath.is_dir(),
+                is_dir=_safe_is_dir(hpath),
                 context_rel_root=".",
                 ignore_spec=DockerIgnoreSpec(),
             )
@@ -1914,6 +2021,11 @@ def _emit_helper_edge(
             prev_edge.symbol_links = []
         else:
             prev_edge.symbol_links = sorted(set(prev_edge.symbol_links) | set(sym_links))
+        if (
+            "host_install_path_unverified" in evidence_note
+            and "host_install_path_unverified" not in prev_edge.evidence_note
+        ):
+            prev_edge.evidence_note = f"{prev_edge.evidence_note} (host_install_path_unverified)"
         return
     if eid in seen_edge_ids:
         return
@@ -1947,23 +2059,38 @@ def _extract_shell_body_from_exec(argv: list[str]) -> str | None:
     return None
 
 
-def _discover_all_repo_scripts(real_root: Path) -> set[str]:
+def _discover_all_repo_scripts(
+    real_root: Path,
+    *,
+    skipped_notes: list[str] | None = None,
+) -> set[str]:
     found: set[str] = set()
-    for parent, dirs, names in os.walk(real_root, followlinks=False):
-        dirs[:] = [
-            d
-            for d in sorted(dirs)
-            if d not in EXCLUDED_PARTS
-            and not d.startswith(".")
-            and not (Path(parent) / d).is_symlink()
-            and _is_within_root(Path(parent) / d, real_root)
-        ]
+    walk_errors: list[OSError] = []
+    for parent, dirs, names in os.walk(real_root, followlinks=False, onerror=walk_errors.append):
+        keep_dirs: list[str] = []
+        for d in sorted(dirs):
+            if d in EXCLUDED_PARTS or d.startswith("."):
+                continue
+            dpath = Path(parent) / d
+            if _safe_contained_dir(dpath, real_root) is None:
+                if skipped_notes is not None and not _safe_is_symlink(dpath):
+                    skipped_notes.append(
+                        f"Skipped unreadable or overlong directory {d}; script discovery incomplete."
+                    )
+                continue
+            keep_dirs.append(d)
+        dirs[:] = keep_dirs
         for fname in sorted(names):
             if not fname.endswith((".py", ".sh", ".js", ".ts")):
                 continue
             fp = Path(parent) / fname
-            if not fp.is_symlink() and fp.is_file() and _is_within_root(fp, real_root):
-                found.add(fp.resolve().relative_to(real_root).as_posix())
+            rel = _safe_contained_file(fp, real_root)
+            if rel is not None:
+                found.add(rel)
+    if walk_errors and skipped_notes is not None:
+        skipped_notes.append(
+            "Skipped unreadable directory during repository script discovery."
+        )
     return found
 
 
@@ -1975,18 +2102,40 @@ def _resolve_direct_host_targets(
     real_root: Path,
     by_src: dict[str, list[AtlasNode]],
     all_repo_scripts: set[str],
-) -> list[tuple[str, tuple[str, ...]]]:
+) -> list[tuple[str, tuple[str, ...], bool]]:
+    candidates = set(by_src) | all_repo_scripts
     cmd_targets = extract_command_targets_from_argv(argv, env_bindings, None)
     triples = resolve_command_targets_with_symbols(
-        cmd_targets, real_root, None, search_roots, set(by_src) | all_repo_scripts
+        cmd_targets, real_root, None, search_roots, candidates
     )
-    resolved_map: dict[str, tuple[str, ...]] = {rel: syms for rel, _, syms in triples}
+    resolved_map: dict[str, tuple[tuple[str, ...], bool]] = {
+        rel: (syms, False) for rel, _, syms in triples
+    }
     for ct in cmd_targets:
-        if ct.kind in ("file", "node_script"):
-            sref = source_reference(ct.value, owner_rel, set(by_src) | all_repo_scripts)
-            if sref and sref not in resolved_map:
-                resolved_map[sref] = ()
-    return [(k, resolved_map[k]) for k in sorted(resolved_map)]
+        if ct.kind not in ("file", "node_script"):
+            continue
+        raw_val = ct.value.strip().replace("\\", "/")
+        norm_val = raw_val.removeprefix("./")
+        sib_val = str(PurePosixPath(owner_rel).parent / norm_val)
+        sref = source_reference(ct.value, owner_rel, candidates)
+        if sref is not None:
+            if sref not in resolved_map:
+                is_suffix = norm_val not in candidates and sib_val not in candidates
+                resolved_map[sref] = ((), is_suffix)
+            continue
+        if (
+            norm_val.startswith("/")
+            and "\x00" not in norm_val
+            and "://" not in norm_val
+            and ".." not in PurePosixPath(norm_val).parts
+            and not re.search(r"[$~{}]", norm_val)
+        ):
+            leaf = PurePosixPath(norm_val).name
+            if leaf != "__init__.py" and leaf.endswith((".py", ".sh", ".js", ".ts", ".mjs")):
+                b_matches = sorted(p for p in candidates if p == leaf or p.endswith("/" + leaf))
+                if len(b_matches) == 1 and b_matches[0] not in resolved_map:
+                    resolved_map[b_matches[0]] = ((), True)
+    return [(k, resolved_map[k][0], resolved_map[k][1]) for k in sorted(resolved_map)]
 
 
 def augment_container_launchers(
@@ -2003,11 +2152,22 @@ def augment_container_launchers(
         policy_literal_sample,
     )
 
-    plist_paths, systemd_paths, shell_paths = discover_launcher_files(repo_root)
+    skipped_launchers: list[str] = []
+    plist_paths, systemd_paths, shell_paths = discover_launcher_files(
+        repo_root, skipped_notes=skipped_launchers
+    )
+    if skipped_launchers:
+        object.__setattr__(result, "coverage_complete", False)
+        for sn in skipped_launchers:
+            if sn not in result.notes:
+                result.notes.append(sn)
     if not plist_paths and not systemd_paths and not shell_paths:
         return
 
-    real_root = repo_root.resolve()
+    real_root = _safe_resolve(repo_root)
+    if real_root is None:
+        object.__setattr__(result, "coverage_complete", False)
+        return
     if dockerfiles is not None:
         df_cache: dict[str, ParsedDockerfile] = {
             k: v for k, v in dockerfiles.items() if isinstance(v, ParsedDockerfile)
@@ -2026,17 +2186,26 @@ def augment_container_launchers(
         pcf, _ = parse_compose_file(cpath, repo_root)
         if pcf is None:
             continue
-        cdir = cpath.parent.resolve()
+        cdir = _safe_resolve(cpath.parent) or real_root
         for svc in pcf.services:
             if svc.build_context is None:
                 continue
-            ctx_dir = (cdir / svc.build_context).resolve()
-            if not _is_within_root(ctx_dir, real_root) or not ctx_dir.is_dir():
+            ctx_dir = (
+                _safe_contained_dir(cdir / svc.build_context, real_root)
+                if _has_safe_path_segments(svc.build_context)
+                else None
+            )
+            if ctx_dir is None:
                 continue
             df_name = svc.build_dockerfile or "Dockerfile"
-            df_cand = ctx_dir / df_name if (ctx_dir / df_name).is_file() else cdir / df_name
-            if not df_cand.is_symlink() and df_cand.is_file() and _is_within_root(df_cand, real_root):
-                drel = df_cand.resolve().relative_to(real_root).as_posix()
+            if not _has_safe_path_segments(df_name):
+                continue
+            df_cand = ctx_dir / df_name
+            drel = _safe_contained_file(df_cand, real_root)
+            if drel is None:
+                df_cand = cdir / df_name
+                drel = _safe_contained_file(df_cand, real_root)
+            if drel is not None:
                 compose_svc_to_df.setdefault(svc.name.lower(), drel)
                 irepo, _ = _normalize_image_repo(svc.image)
                 if irepo:
@@ -2050,11 +2219,21 @@ def augment_container_launchers(
     }
     seen_env_findings: set[tuple[str, int, str]] = set()
     active_tokens = get_active_policy_tokens()
-    all_repo_scripts = _discover_all_repo_scripts(real_root)
+    script_notes: list[str] = []
+    all_repo_scripts = _discover_all_repo_scripts(real_root, skipped_notes=script_notes)
+    if script_notes:
+        object.__setattr__(result, "coverage_complete", False)
+        for sn in script_notes:
+            if sn not in result.notes:
+                result.notes.append(sn)
 
-    bdir = (repo_root / backend_subdir).resolve() if backend_subdir else real_root
+    bdir = (
+        _safe_contained_dir(repo_root / backend_subdir, real_root)
+        if backend_subdir
+        else real_root
+    )
     base_fallbacks: list[Path] = [real_root]
-    if _is_within_root(bdir, real_root) and bdir.is_dir() and bdir not in base_fallbacks:
+    if bdir is not None and bdir not in base_fallbacks:
         base_fallbacks.append(bdir)
 
     run_count = 0
@@ -2069,38 +2248,41 @@ def augment_container_launchers(
         btag: str, bdf_raw: str, bctx_raw: str, search_dirs: list[Path], out_map: dict[str, str]
     ) -> None:
         bctx_fs = _resolve_contained_repo_path(bctx_raw, search_dirs, real_root)
-        df_dirs = [bctx_fs, *search_dirs] if bctx_fs is not None and bctx_fs.is_dir() else search_dirs
+        df_dirs = [bctx_fs, *search_dirs] if bctx_fs is not None and _safe_is_dir(bctx_fs) else search_dirs
         bdf_fs = _resolve_contained_repo_path(bdf_raw, df_dirs, real_root)
-        if bdf_fs is not None and bdf_fs.is_file():
-            drel = bdf_fs.resolve().relative_to(real_root).as_posix()
-            irepo, _ = _normalize_image_repo(btag)
-            if irepo:
-                out_map.setdefault(irepo, drel)
-            if drel not in df_cache:
-                pdf = parse_dockerfile(bdf_fs, repo_root)
-                if pdf is not None:
-                    df_cache[drel] = pdf
+        if bdf_fs is not None:
+            drel = _safe_contained_file(bdf_fs, real_root)
+            if drel is not None:
+                irepo, _ = _normalize_image_repo(btag)
+                if irepo:
+                    out_map.setdefault(irepo, drel)
+                if drel not in df_cache:
+                    pdf = parse_dockerfile(bdf_fs, repo_root)
+                    if pdf is not None:
+                        df_cache[drel] = pdf
 
     repo_build_img_to_df: dict[str, str] = {}
     for sh_cand in shell_paths:
         try:
-            if sh_cand.stat().st_size > MAX_UNIT_FILE_BYTES:
-                continue
-            sh_src = sh_cand.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+            sh_src = read_bounded_regular_bytes(
+                sh_cand, max_bytes=MAX_UNIT_FILE_BYTES
+            ).decode("utf-8")
+        except (OSError, UnicodeError, ValueError):
             continue
         _, b_hints, _ = extract_shell_container_runs(sh_src)
-        sh_dirs = list(dict.fromkeys([sh_cand.parent.resolve(), *base_fallbacks]))
+        sh_parent = _safe_resolve(sh_cand.parent) or real_root
+        sh_dirs = list(dict.fromkeys([sh_parent, *base_fallbacks]))
         for btag, bdf_raw, bctx_raw in b_hints:
             _register_build_hint(btag, bdf_raw, bctx_raw, sh_dirs, repo_build_img_to_df)
     for sys_cand in systemd_paths:
         s_pre = parse_systemd_unit(sys_cand, repo_root)
         if s_pre is None:
             continue
-        s_dirs = [sys_cand.parent.resolve()]
+        sys_parent = _safe_resolve(sys_cand.parent) or real_root
+        s_dirs = [sys_parent]
         if s_pre.working_dir:
-            wd_pre = _resolve_contained_repo_path(s_pre.working_dir, [sys_cand.parent.resolve(), real_root], real_root)
-            if wd_pre is not None and wd_pre.is_dir():
+            wd_pre = _resolve_contained_repo_path(s_pre.working_dir, [sys_parent, real_root], real_root)
+            if wd_pre is not None and _safe_is_dir(wd_pre):
                 s_dirs.insert(0, wd_pre)
         for bf in base_fallbacks:
             if bf not in s_dirs:
@@ -2131,6 +2313,7 @@ def augment_container_launchers(
             return False
 
         merged_env = dict(unit_env)
+        env_notes: list[str] = []
         for ef_raw, _ in inv.env_files:
             ef_bindings = _parse_and_audit_env_file(
                 ef_raw,
@@ -2141,9 +2324,14 @@ def augment_container_launchers(
                 policy_literal_sample,
                 seen_env_findings,
                 result.findings,
-                notes_out=result.notes,
+                notes_out=env_notes,
             )
             merged_env.update(ef_bindings)
+        if env_notes:
+            object.__setattr__(result, "coverage_complete", False)
+            for en in env_notes:
+                if en not in result.notes:
+                    result.notes.append(en)
 
         inline_bindings = _audit_inline_env_assignments(
             inv.env,
@@ -2255,8 +2443,10 @@ def augment_container_launchers(
 
     for ppath in plist_paths:
         punit, err_note = parse_launchd_plist(ppath, repo_root)
-        if err_note and err_note not in result.notes:
-            result.notes.append(err_note)
+        if err_note:
+            object.__setattr__(result, "coverage_complete", False)
+            if err_note not in result.notes:
+                result.notes.append(err_note)
         if punit is None:
             continue
         rel = punit.rel_path
@@ -2334,7 +2524,8 @@ def augment_container_launchers(
             punit, nid, already_had_node, bool(plist_runs), result.findings
         )
 
-        p_search = list(dict.fromkeys([ppath.parent.resolve(), *base_fallbacks]))
+        p_parent = _safe_resolve(ppath.parent) or real_root
+        p_search = list(dict.fromkeys([p_parent, *base_fallbacks]))
         p_linked = False
         if plist_runs:
             for rinv in plist_runs:
@@ -2345,7 +2536,7 @@ def augment_container_launchers(
         elif not already_had_node and eff_argv:
             unwrapped = _unwrap_host_prefix(eff_argv)
             if unwrapped and PurePosixPath(unwrapped[0]).name not in CONTAINER_CLI_BINARIES:
-                for repo_rel, syms in _resolve_direct_host_targets(
+                for repo_rel, syms, via_suffix in _resolve_direct_host_targets(
                     eff_argv, p_env, rel, p_search, real_root, by_src, all_repo_scripts
                 ):
                     for tnode in ensure_repo_target_nodes(
@@ -2353,13 +2544,19 @@ def augment_container_launchers(
                     ):
                         node_by_id.setdefault(tnode.id, tnode)
                         p_linked = True
+                        l_note = (
+                            f"Launchd command suffix-matches `{repo_rel}` (`host_install_path_unverified`); "
+                            "host installation path, launchd admission, and execution are not observed."
+                            if via_suffix
+                            else "Launchd command resolves to this repository source; host admission and execution are not observed."
+                        )
                         _emit_helper_edge(
                             f"e:launchd:{rel}->{tnode.id}",
                             nid,
                             tnode,
                             syms,
                             f"{rel}:{cmd_line}",
-                            "Launchd command resolves to this repository source; host admission and execution are not observed.",
+                            l_note,
                             seen_edge_ids,
                             existing_pairs,
                             result,
@@ -2375,7 +2572,13 @@ def augment_container_launchers(
     systemd_unresolved = 0
 
     for spath in systemd_paths:
-        sunit = parse_systemd_unit(spath, repo_root, notes_out=result.notes)
+        sys_notes: list[str] = []
+        sunit = parse_systemd_unit(spath, repo_root, notes_out=sys_notes)
+        if sys_notes:
+            object.__setattr__(result, "coverage_complete", False)
+            for sn in sys_notes:
+                if sn not in result.notes:
+                    result.notes.append(sn)
         if sunit is None:
             continue
         systemd_count += 1
@@ -2401,18 +2604,20 @@ def augment_container_launchers(
             result.nodes.append(snode)
             node_by_id[nid] = snode
 
-        s_search: list[Path] = [spath.parent.resolve()]
+        s_parent = _safe_resolve(spath.parent) or real_root
+        s_search: list[Path] = [s_parent]
         if sunit.working_dir:
             wd_fs = _resolve_contained_repo_path(
-                sunit.working_dir, [spath.parent.resolve(), real_root], real_root
+                sunit.working_dir, [s_parent, real_root], real_root
             )
-            if wd_fs is not None and wd_fs.is_dir() and wd_fs not in s_search:
+            if wd_fs is not None and _safe_is_dir(wd_fs) and wd_fs not in s_search:
                 s_search.insert(0, wd_fs)
         for bf in base_fallbacks:
             if bf not in s_search:
                 s_search.append(bf)
 
         s_env: dict[str, str] = {}
+        sys_env_notes: list[str] = []
         for ef_raw, _, _ in sunit.env_files:
             s_env.update(
                 _parse_and_audit_env_file(
@@ -2424,9 +2629,14 @@ def augment_container_launchers(
                     policy_literal_sample,
                     seen_env_findings,
                     result.findings,
-                    notes_out=result.notes,
+                    notes_out=sys_env_notes,
                 )
             )
+        if sys_env_notes:
+            object.__setattr__(result, "coverage_complete", False)
+            for en in sys_env_notes:
+                if en not in result.notes:
+                    result.notes.append(en)
         s_env.update(
             _audit_inline_env_assignments(
                 sunit.environment,
@@ -2476,7 +2686,7 @@ def augment_container_launchers(
             unwrapped = _unwrap_host_prefix(argv_list)
             if unwrapped and PurePosixPath(unwrapped[0]).name in CONTAINER_CLI_BINARIES:
                 continue
-            for repo_rel, syms in _resolve_direct_host_targets(
+            for repo_rel, syms, via_suffix in _resolve_direct_host_targets(
                 argv_list, s_env, rel, s_search, real_root, by_src, all_repo_scripts
             ):
                 if repo_rel == rel:
@@ -2486,13 +2696,19 @@ def augment_container_launchers(
                 ):
                     node_by_id.setdefault(tnode.id, tnode)
                     s_linked = True
+                    s_note = (
+                        f"Systemd `{espec.directive}` suffix-matches `{repo_rel}` (`host_install_path_unverified`); "
+                        "host installation path, systemd admission, and service liveness are not observed."
+                        if via_suffix
+                        else f"Systemd `{espec.directive}` resolves to `{repo_rel}`; host admission and service liveness are not observed."
+                    )
                     _emit_helper_edge(
                         f"e:systemd:{rel}->{tnode.id}",
                         nid,
                         tnode,
                         syms,
                         f"{rel}:{espec.line}",
-                        f"Systemd `{espec.directive}` resolves to `{repo_rel}`; host admission and service liveness are not observed.",
+                        s_note,
                         seen_edge_ids,
                         existing_pairs,
                         result,
@@ -2503,18 +2719,25 @@ def augment_container_launchers(
             systemd_unresolved += 1
 
     for sh_path in shell_paths:
-        sh_rel = sh_path.resolve().relative_to(real_root).as_posix()
+        sh_rel = _safe_contained_file(sh_path, real_root)
+        if sh_rel is None:
+            object.__setattr__(result, "coverage_complete", False)
+            continue
         try:
-            if sh_path.stat().st_size > MAX_UNIT_FILE_BYTES:
-                skip_note = (
-                    f"Skipped shell script {sh_rel} (exceeds {MAX_UNIT_FILE_BYTES} bytes); "
-                    "container launcher command evidence absent."
-                )
-                if skip_note not in result.notes:
-                    result.notes.append(skip_note)
-                continue
-            sh_text = sh_path.read_text(encoding="utf-8")
+            sh_text = read_bounded_regular_bytes(
+                sh_path, max_bytes=MAX_UNIT_FILE_BYTES
+            ).decode("utf-8")
+        except ValueError:
+            object.__setattr__(result, "coverage_complete", False)
+            skip_note = (
+                f"Skipped shell script {sh_rel} (exceeds {MAX_UNIT_FILE_BYTES} bytes); "
+                "container launcher command evidence absent."
+            )
+            if skip_note not in result.notes:
+                result.notes.append(skip_note)
+            continue
         except (OSError, UnicodeError):
+            object.__setattr__(result, "coverage_complete", False)
             skip_note = f"Skipped shell script {sh_rel} (unreadable or non-UTF-8); container launcher command evidence absent."
             if skip_note not in result.notes:
                 result.notes.append(skip_note)
@@ -2529,23 +2752,24 @@ def augment_container_launchers(
                 result.notes.append(unparsed_note)
         if not invocations:
             continue
-        sh_dir = sh_path.parent.resolve()
+        sh_dir = _safe_resolve(sh_path.parent) or real_root
         sh_search = list(dict.fromkeys([sh_dir, *base_fallbacks]))
 
         build_img_to_df: dict[str, str] = {}
         for btag, bdf_raw, bctx_raw in build_hints:
             bctx_fs = _resolve_contained_repo_path(bctx_raw, sh_search, real_root)
-            df_dirs = [bctx_fs, *sh_search] if bctx_fs is not None and bctx_fs.is_dir() else sh_search
+            df_dirs = [bctx_fs, *sh_search] if bctx_fs is not None and _safe_is_dir(bctx_fs) else sh_search
             bdf_fs = _resolve_contained_repo_path(bdf_raw, df_dirs, real_root)
-            if bdf_fs is not None and bdf_fs.is_file():
-                drel = bdf_fs.resolve().relative_to(real_root).as_posix()
-                irepo, _ = _normalize_image_repo(btag)
-                if irepo:
-                    build_img_to_df.setdefault(irepo, drel)
-                if drel not in df_cache:
-                    pdf = parse_dockerfile(bdf_fs, repo_root)
-                    if pdf is not None:
-                        df_cache[drel] = pdf
+            if bdf_fs is not None:
+                drel = _safe_contained_file(bdf_fs, real_root)
+                if drel is not None:
+                    irepo, _ = _normalize_image_repo(btag)
+                    if irepo:
+                        build_img_to_df.setdefault(irepo, drel)
+                    if drel not in df_cache:
+                        pdf = parse_dockerfile(bdf_fs, repo_root)
+                        if pdf is not None:
+                            df_cache[drel] = pdf
 
         existing_sh_nodes = by_src.get(sh_rel)
         sh_nid = f"m:script:{sh_rel}"

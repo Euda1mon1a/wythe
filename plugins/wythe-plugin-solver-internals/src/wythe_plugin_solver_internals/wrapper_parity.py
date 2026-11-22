@@ -273,7 +273,9 @@ def check_host_wrapper_parity(
     for rel_posix, abs_p in iter_safe_repo_files(repo_root, suffixes=_PY_SUFFIXES):
         if not (rel_posix.endswith(("cp_model.py", "cp_model_helper.py")) or "sat" in rel_posix.lower()):
             continue
-        _, src = read_safe_artifact_text(abs_p, repo_root=repo_root, max_bytes=max_bytes)
+        _, src = read_safe_artifact_text(
+            abs_p, repo_root=repo_root, max_bytes=max_bytes, errors="replace"
+        )
         if "CpModel" not in src and "CpSolver" not in src:
             continue
         is_wrap, f_cases, f_params, f_depr = _inspect_python_wrapper_ast(
@@ -291,7 +293,9 @@ def check_host_wrapper_parity(
         is_swig = rel_posix.endswith((".i", ".swig"))
         if not is_swig and not any(tok in rel_posix.lower() for tok in ("python", "pybind", "nanobind", "wrap", "swig", "helper")):
             continue
-        _, raw_txt = read_safe_artifact_text(abs_p, repo_root=repo_root, max_bytes=max_bytes)
+        _, raw_txt = read_safe_artifact_text(
+            abs_p, repo_root=repo_root, max_bytes=max_bytes, errors="replace"
+        )
         if not is_swig and not any(
             m in raw_txt for m in ("PYBIND11_MODULE", "NB_MODULE", "pybind11", "nanobind", "SWIG")
         ):

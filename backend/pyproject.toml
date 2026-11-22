@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wythe"
-version = "0.2.7"
+version = "0.2.9"
 description = "Wythe — 3-tier truth & lineage verifier: DB holds truth, Backend manipulates truth, UI displays truth."
 license = "MIT"
-authors = [{ name = "Aaron Montgomery" }]
+authors = [{ name = "Euda1mon1a" }]
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115.0",
@@ -57,4 +57,6 @@ pythonpath = [
   "../plugins/wythe-plugin-compiler-ir/src",
   "../plugins/wythe-plugin-solver-internals/src",
   "../plugins/wythe-plugin-binary/src",
+  "../plugins/wythe-plugin-wiretap/src",
+  "../plugins/wythe-plugin-agent-discordance/src",
 ]

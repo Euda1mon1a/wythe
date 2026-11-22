@@ -25,7 +25,7 @@ _SESSION_WRITES = frozenset(
     }
 )
 _CONSTRUCT_WRITES = frozenset({"insert", "update", "delete"})
-_HTTP_DECORATORS = frozenset({"get", "post", "put", "patch", "delete"})
+_HTTP_DECORATORS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
 _GENERIC_ATTR_METHODS = frozenset(
     {
         "add",
@@ -257,6 +257,8 @@ class ParsedPythonModule:
     func_writes: dict[str, frozenset[str]] = field(default_factory=dict)
     func_calls: dict[str, frozenset[str]] = field(default_factory=dict)
     decorated_funcs: frozenset[str] = frozenset()
+    qualified_router_includes: tuple[tuple[str, str], ...] = ()
+    qualified_nested_router_includes: tuple[tuple[str, str], ...] = ()
 
 
 def _dotted(node: ast.AST) -> str | None:
@@ -296,6 +298,29 @@ def _included_router_module(
     if source:
         return source.rsplit(".", 1)[-1]
     return aliases.get(inc_target, inc_target)
+
+
+def _included_router_target(
+    inc_target: str,
+    aliases: dict[str, str],
+    import_sources: dict[str, str],
+    binding_targets: dict[str, str],
+    binding_src_mods: dict[str, str],
+    router_vars: set[str],
+) -> str | None:
+    """Qualified dotted module name of the included router when resolvable, else stem."""
+    if not inc_target:
+        return None
+    if "." in inc_target:
+        owner = inc_target.rsplit(".", 1)[0]
+        head, _, rest = owner.partition(".")
+        resolved = binding_targets.get(head) or aliases.get(head, head)
+        return f"{resolved}.{rest}" if rest else resolved
+    if inc_target in router_vars:
+        return None
+    if inc_target in binding_src_mods:
+        return binding_src_mods[inc_target]
+    return _included_router_module(inc_target, aliases, import_sources, router_vars)
 
 
 def _excluded_ids(tree: ast.AST) -> set[int]:
@@ -1359,7 +1384,7 @@ def _sql_targets(text: str) -> tuple[set[str], set[str], set[str]]:
 def _is_session_receiver(node: ast.AST) -> bool:
     d = _dotted(node) or ""
     tokens = [p for p in d.split(".") if p != "self"]
-    return any(p == "db" or p.endswith("_db") or "session" in p.lower() for p in tokens[:1])
+    return any(p == "db" or p.endswith("_db") or "session" in p.lower() for p in tokens)
 
 
 _ROW_LOAD_TERMINALS = frozenset({"first", "one", "one_or_none", "scalar", "scalar_one", "scalar_one_or_none"})
@@ -2549,8 +2574,12 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                     external_roots.add(alias.asname or alias.name.split(".", 1)[0])
     # All runtime `from ... import` bindings (including `pkg/__init__.py` relative & `from . import x`).
     bindings = _absolute_import_bindings(tree, module_name, rel_path, excluded)
+    binding_targets: dict[str, str] = {}
+    binding_src_mods: dict[str, str] = {}
     for local_name, target, orig_name, src_mod, level in bindings:
         imported_names.setdefault(orig_name, set()).add(src_mod)
+        binding_targets[local_name] = target
+        binding_src_mods[local_name] = src_mod
         if level:
             imported_modules.update((src_mod, target))
             aliases[local_name] = orig_name
@@ -2638,6 +2667,8 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
     router_prefix = ""
     router_includes: list[tuple[str, str]] = []
     nested_router_includes: list[tuple[str, str]] = []
+    qualified_router_includes: list[tuple[str, str]] = []
+    qualified_nested_router_includes: list[tuple[str, str]] = []
     router_vars: set[str] = set()
 
     for stmt in tree.body:
@@ -2666,10 +2697,17 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
                 if kw.arg == "prefix" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
                     inc_prefix = kw.value.value
             child = _included_router_module(inc_target, aliases, import_sources, router_vars)
+            q_child = _included_router_target(
+                inc_target, aliases, import_sources, binding_targets, binding_src_mods, router_vars
+            )
             if child:
                 router_includes.append((child, inc_prefix))
                 if dotted.rsplit(".", 1)[0] in router_vars:
                     nested_router_includes.append((child, inc_prefix))
+            if q_child:
+                qualified_router_includes.append((q_child, inc_prefix))
+                if dotted.rsplit(".", 1)[0] in router_vars:
+                    qualified_nested_router_includes.append((q_child, inc_prefix))
 
         if short:
             resolved_short = resolve(short)
@@ -2700,7 +2738,27 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
             note_write(resolved_short, n.lineno)
             write_only.add(id(target))
 
-        is_construct = isinstance(target, ast.Name) and short in _CONSTRUCT_WRITES
+        is_construct = False
+        if isinstance(target, ast.Name) and resolve(short) in _CONSTRUCT_WRITES:
+            is_construct = True
+        elif isinstance(target, ast.Attribute) and short in _CONSTRUCT_WRITES:
+            recv_d = _dotted(target.value) or ""
+            if recv_d:
+                r_head, _, _ = recv_d.partition(".")
+                qual_recv = resolve_qual(recv_d)
+                src_mod = import_sources.get(r_head, "")
+                if (
+                    qual_recv == "sqlalchemy"
+                    or qual_recv.startswith(("sqlalchemy.", "sqlmodel."))
+                    or src_mod == "sqlalchemy"
+                    or src_mod.startswith(("sqlalchemy.", "sqlmodel."))
+                    or (
+                        recv_d in {"sa", "sqlalchemy", "sql"}
+                        and r_head not in aliases
+                        and r_head not in import_sources
+                    )
+                ):
+                    is_construct = True
         is_sess = isinstance(target, ast.Attribute) and short in _SESSION_WRITES and _is_session_receiver(target.value)
         if is_construct or (
             isinstance(target, ast.Attribute)
@@ -3078,6 +3136,8 @@ def parse_python_module(source: str, rel_path: str, module_name: str) -> ParsedP
         func_writes={k: frozenset(v) for k, v in raw_func_writes.items()},
         func_calls={k: frozenset(v) for k, v in raw_func_calls.items()},
         decorated_funcs=frozenset(decorated_funcs),
+        qualified_router_includes=tuple(qualified_router_includes),
+        qualified_nested_router_includes=tuple(qualified_nested_router_includes),
     )
 
 

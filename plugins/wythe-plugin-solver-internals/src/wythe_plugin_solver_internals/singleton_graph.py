@@ -171,42 +171,49 @@ def _find_constructor_cycles(
         nodes.add(d.target_type)
         adj.setdefault(d.caller_type, []).append(d)
 
-    index_counter = 0
     indices: dict[str, int] = {}
     lowlink: dict[str, int] = {}
     on_stack: set[str] = set()
-    stack: list[str] = []
+    scc_stack: list[str] = []
     sccs: list[list[str]] = []
 
-    def _strongconnect(v: str) -> None:
-        nonlocal index_counter
-        indices[v] = index_counter
-        lowlink[v] = index_counter
-        index_counter += 1
-        stack.append(v)
-        on_stack.add(v)
+    for root in sorted(nodes):
+        if root in indices:
+            continue
+        call_stack: list[tuple[str, list[SingletonDependencyEdge], int]] = []
+        indices[root] = len(indices)
+        lowlink[root] = indices[root]
+        scc_stack.append(root)
+        on_stack.add(root)
+        call_stack.append((root, list(adj.get(root, ())), 0))
 
-        for edge in adj.get(v, ()):
-            w = edge.target_type
-            if w not in indices:
-                _strongconnect(w)
-                lowlink[v] = min(lowlink[v], lowlink[w])
-            elif w in on_stack:
-                lowlink[v] = min(lowlink[v], indices[w])
-
-        if lowlink[v] == indices[v]:
-            comp: list[str] = []
-            while True:
-                w = stack.pop()
-                on_stack.remove(w)
-                comp.append(w)
-                if w == v:
-                    break
-            sccs.append(sorted(comp))
-
-    for node in sorted(nodes):
-        if node not in indices:
-            _strongconnect(node)
+        while call_stack:
+            v, edges_v, idx_e = call_stack[-1]
+            if idx_e < len(edges_v):
+                call_stack[-1] = (v, edges_v, idx_e + 1)
+                w = edges_v[idx_e].target_type
+                if w not in indices:
+                    indices[w] = len(indices)
+                    lowlink[w] = indices[w]
+                    scc_stack.append(w)
+                    on_stack.add(w)
+                    call_stack.append((w, list(adj.get(w, ())), 0))
+                elif w in on_stack:
+                    lowlink[v] = min(lowlink[v], indices[w])
+            else:
+                call_stack.pop()
+                if call_stack:
+                    parent = call_stack[-1][0]
+                    lowlink[parent] = min(lowlink[parent], lowlink[v])
+                if lowlink[v] == indices[v]:
+                    comp: list[str] = []
+                    while True:
+                        w = scc_stack.pop()
+                        on_stack.remove(w)
+                        comp.append(w)
+                        if w == v:
+                            break
+                    sccs.append(sorted(comp))
 
     cycles: list[SingletonCycle] = []
     for comp in sorted(sccs, key=lambda c: c[0]):
@@ -828,7 +835,9 @@ def extract_singleton_dependency_graph(
 
     parsed_units: list[tuple[str, list[tuple[int, int, str, str]], list[int], bool]] = []
     for rel_posix, abs_p in iter_safe_repo_files(repo_root, suffixes=_CPP_SUFFIXES):
-        _, raw_txt = read_safe_artifact_text(abs_p, repo_root=repo_root, max_bytes=max_bytes)
+        _, raw_txt = read_safe_artifact_text(
+            abs_p, repo_root=repo_root, max_bytes=max_bytes, errors="replace"
+        )
         cleaned = _blank_preprocessor_lines(
             strip_c_comments_and_strings(raw_txt, blank_strings=True)
         )

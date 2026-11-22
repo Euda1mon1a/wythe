@@ -7,6 +7,9 @@ import json
 import os
 import re
 import sqlite3
+import stat
+import subprocess
+import sys
 import threading
 import uuid
 from collections import OrderedDict
@@ -20,9 +23,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.adapters.plugin_registry import discover_plugins, get_active_stratum_artifacts
-from app.core.clock import utc_now
+import app as _app_pkg
+from app.adapters.plugin_registry import (
+    discover_plugins,
+    get_active_stratum_artifacts,
+    run_stratum_expand_plugins,
+)
+from app.core.clock import utc_now, utc_today
 from app.core.config import load_settings
+from app.core.safe_git import SafeGitError, run_safe_git, validate_git_dir_containment
 from app.models import ScanSnapshot, TargetProject
 from app.schemas.atlas import (
     EpistemicKind,
@@ -57,7 +66,12 @@ from app.services.governance_service import (
     list_rulings,
     list_targets,
 )
+from app.services.portable_config_service import (
+    _load_target_governance_extras,
+    load_target_governance_overrides,
+)
 from app.services.scanner_service import run_target_scan
+from app.services.source_peek_service import is_blocked_secret_path
 
 MAX_INVESTIGATION_SESSIONS: Final[int] = 64
 MAX_TURNS_PER_SESSION: Final[int] = 100
@@ -82,6 +96,19 @@ _INVESTIGATION_LOCK = threading.RLock()
 _INITIALIZED_DB_INODES: set[tuple[str, int]] = set()
 _SCAN_REUSE_CACHE: OrderedDict[tuple[object, ...], TruthAtlasReport] = OrderedDict()
 _SCAN_CACHE_STATS: dict[str, int] = {"hits": 0, "misses": 0}
+_ANALYZER_FILE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
+_REPORT_TREE_SHA_BY_DIGEST: OrderedDict[tuple[str, str], str] = OrderedDict()
+
+
+def _record_report_tree_sha(repo_root: Path, content_digest: str, tree_sha: str) -> None:
+    if not content_digest or not tree_sha:
+        return
+    with _INVESTIGATION_LOCK:
+        key = (str(repo_root.resolve()), content_digest)
+        _REPORT_TREE_SHA_BY_DIGEST[key] = tree_sha
+        _REPORT_TREE_SHA_BY_DIGEST.move_to_end(key)
+        while len(_REPORT_TREE_SHA_BY_DIGEST) > 64:
+            _REPORT_TREE_SHA_BY_DIGEST.popitem(last=False)
 
 
 def get_retention_policy() -> RetentionPolicyRead:
@@ -325,56 +352,238 @@ def _init_investigation_tables(conn: sqlite3.Connection) -> None:
         "target_id INTEGER NOT NULL, "
         "content_digest TEXT NOT NULL, "
         "cache_key_sha256 TEXT NOT NULL, "
+        "tree_sha256 TEXT, "
         "recorded_at TEXT NOT NULL, "
         "PRIMARY KEY (db_identity, snapshot_id)"
         ")"
     )
+    _ensure_column(conn, "scan_snapshot_stamps", "tree_sha256", "TEXT")
 
 
-def _read_git_head_identity(git_marker: Path) -> bytes:
-    """Read deterministic Git HEAD/ref bytes without touching `.git/index` stat caches."""
+_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+
+
+def _read_bounded_regular_bytes(path: Path, *, max_bytes: int = 8 * 1024 * 1024) -> bytes | None:
+    if path.is_symlink():
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        if git_marker.is_file():
-            raw_ptr = git_marker.read_text(encoding="utf-8", errors="replace").strip()
-            if raw_ptr.startswith("gitdir:"):
-                git_dir = (git_marker.parent / raw_ptr.split(":", 1)[1].strip()).resolve()
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        chunks: list[bytes] = []
+        rem = max_bytes
+        while rem > 0:
+            blk = os.read(fd, min(65536, rem))
+            if not blk:
+                break
+            chunks.append(blk)
+            rem -= len(blk)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _lookup_packed_ref(packed_path: Path, ref_rel: str) -> str:
+    raw = _read_bounded_regular_bytes(packed_path, max_bytes=8 * 1024 * 1024)
+    if not raw:
+        return ""
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "^")):
+            continue
+        parts = stripped.split()
+        if len(parts) >= 2 and parts[1] == ref_rel and _GIT_SHA_RE.match(parts[0]):
+            return parts[0].lower()
+    return ""
+
+
+def _has_symlink_in_target_expr(base: Path, raw_target: str) -> bool:
+    cand = Path(raw_target)
+    if cand.is_absolute():
+        cur = Path(cand.anchor)
+        parts = cand.parts[1:]
+    else:
+        cur = base
+        parts = cand.parts
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            cur = cur.parent
+            continue
+        cur = cur / part
+        if cur.is_symlink():
+            if cur.parent == Path(cur.anchor) and cur.name in ("tmp", "var", "etc"):
+                cur = cur.resolve()
             else:
-                return raw_ptr[:256].encode()
+                return True
+    return False
+
+
+def _read_git_head_identity(git_marker: Path) -> tuple[str, bytes]:
+    """Read `(head_sha, deterministic_identity_bytes)` without touching `.git/index` stat caches."""
+    try:
+        if not git_marker.exists() or git_marker.is_symlink():
+            return ("", b"")
+        repo_parent = git_marker.parent.resolve()
+        try:
+            validated_git_dir = validate_git_dir_containment(repo_parent)
+        except SafeGitError:
+            return ("", b"")
+        if validated_git_dir is None:
+            return ("", b"")
+
+        is_worktree_file = git_marker.is_file()
+        if is_worktree_file:
+            raw_ptr_bytes = _read_bounded_regular_bytes(git_marker, max_bytes=4096)
+            if raw_ptr_bytes is None:
+                return ("", b"")
+            raw_ptr = raw_ptr_bytes.decode("utf-8", errors="replace").strip()
+            if not raw_ptr.startswith("gitdir:"):
+                return ("", raw_ptr[:256].encode("utf-8", errors="replace"))
+            raw_target = raw_ptr.split(":", 1)[1].strip()
+            if not raw_target or "\x00" in raw_target or "\n" in raw_target or "\r" in raw_target:
+                return ("", b"")
+            if _has_symlink_in_target_expr(repo_parent, raw_target):
+                return ("", b"")
+            cand_dir = Path(raw_target)
+            if not cand_dir.is_absolute():
+                cand_dir = repo_parent / cand_dir
+            if cand_dir.is_symlink():
+                return ("", b"")
+            git_dir = cand_dir.resolve()
+            if not git_dir.is_dir():
+                return ("", b"")
+            if not git_dir.is_relative_to(repo_parent):
+                commondir_f = git_dir / "commondir"
+                back_f = git_dir / "gitdir"
+                if (
+                    commondir_f.is_symlink()
+                    or back_f.is_symlink()
+                    or not commondir_f.is_file()
+                    or not back_f.is_file()
+                    or git_dir.parent.name != "worktrees"
+                ):
+                    return ("", b"")
+                back_bytes = _read_bounded_regular_bytes(back_f, max_bytes=4096)
+                if back_bytes is None:
+                    return ("", b"")
+                back_str = back_bytes.decode("utf-8", errors="replace").strip()
+                if not back_str or _has_symlink_in_target_expr(git_dir, back_str):
+                    return ("", b"")
+                back_path = Path(back_str)
+                if not back_path.is_absolute():
+                    back_path = (git_dir / back_path).resolve()
+                else:
+                    back_path = back_path.resolve()
+                if back_path not in (git_marker.resolve(), repo_parent / ".git"):
+                    return ("", b"")
         else:
             git_dir = git_marker.resolve()
+            if not git_dir.is_dir():
+                return ("", b"")
 
         head_file = git_dir / "HEAD"
-        if not head_file.is_file():
-            return b""
-        head_raw = head_file.read_bytes()[:256].strip()
+        head_bytes = _read_bounded_regular_bytes(head_file, max_bytes=512)
+        if head_bytes is None:
+            return ("", b"")
+        head_raw = head_bytes[:256].strip()
+
+        common_dir = git_dir
+        commondir = git_dir / "commondir"
+        if commondir.is_symlink():
+            return ("", b"")
+        if commondir.exists():
+            if not commondir.is_file():
+                return ("", b"")
+            c_bytes = _read_bounded_regular_bytes(commondir, max_bytes=4096)
+            if c_bytes is None or b"\x00" in c_bytes:
+                return ("", b"")
+            c_rel = c_bytes.decode("utf-8", errors="replace").strip()
+            if not c_rel or "\n" in c_rel or "\r" in c_rel:
+                return ("", b"")
+            if _has_symlink_in_target_expr(git_dir, c_rel):
+                return ("", b"")
+            c_cand = Path(c_rel)
+            if not c_cand.is_absolute():
+                c_cand = git_dir / c_cand
+            if c_cand.is_symlink() or not c_cand.is_dir():
+                return ("", b"")
+            cand_common = c_cand.resolve()
+            if not is_worktree_file:
+                if not cand_common.is_relative_to(repo_parent):
+                    return ("", b"")
+            else:
+                verified_wt_common = (
+                    git_dir.parent.parent.resolve()
+                    if git_dir.parent.name == "worktrees"
+                    else None
+                )
+                if not cand_common.is_relative_to(repo_parent) and cand_common != verified_wt_common:
+                    return ("", b"")
+            common_dir = cand_common
+
+        packed_sig = b""
+        packed_paths: list[Path] = []
+        for pdir in dict.fromkeys((git_dir, common_dir)):
+            if (pdir / "refs").is_symlink():
+                return ("", b"")
+            packed = pdir / "packed-refs"
+            if packed.is_symlink():
+                return ("", b"")
+            if packed.is_file() and packed.resolve().is_relative_to(pdir):
+                pst = packed.stat()
+                packed_sig += f"|PR:{pst.st_mtime_ns}:{pst.st_size}".encode()
+                packed_paths.append(packed)
+
         if head_raw.startswith(b"ref:"):
             ref_rel = head_raw[4:].strip().decode("utf-8", errors="replace")
-            ref_file = (git_dir / ref_rel).resolve()
-            common_file: Path | None = None
-            commondir = git_dir / "commondir"
-            if commondir.is_file():
-                c_rel = commondir.read_text(encoding="utf-8", errors="replace").strip()
-                common_dir = (git_dir / c_rel).resolve()
-                cand = (common_dir / ref_rel).resolve()
-                if cand.is_relative_to(common_dir) and cand.is_file():
-                    common_file = cand
-            if ref_file.is_relative_to(git_dir) and ref_file.is_file():
-                return head_raw + b"|" + ref_file.read_bytes()[:128].strip()
-            if common_file is not None:
-                return head_raw + b"|" + common_file.read_bytes()[:128].strip()
-        return head_raw
+            ref_parts = Path(ref_rel).parts
+            if not ref_rel or Path(ref_rel).is_absolute() or ".." in ref_parts or "\x00" in ref_rel:
+                return ("", head_raw + packed_sig)
+            for base_dir in dict.fromkeys((git_dir, common_dir)):
+                raw_cand = base_dir / ref_rel
+                if raw_cand.is_symlink():
+                    continue
+                res_cand = raw_cand.resolve()
+                if res_cand.is_relative_to(base_dir) and res_cand.is_file():
+                    ref_bytes = _read_bounded_regular_bytes(res_cand, max_bytes=256)
+                    if ref_bytes is not None:
+                        ref_clean = ref_bytes[:128].strip()
+                        sha_cand = ref_clean.decode("utf-8", errors="replace").strip().lower()
+                        head_sha = sha_cand if _GIT_SHA_RE.match(sha_cand) else ""
+                        return (head_sha, head_raw + b"|" + ref_clean + packed_sig)
+            for packed_p in packed_paths:
+                packed_sha = _lookup_packed_ref(packed_p, ref_rel)
+                if packed_sha:
+                    return (
+                        packed_sha,
+                        head_raw + b"|" + packed_sha.encode("utf-8") + packed_sig,
+                    )
+            return ("", head_raw + packed_sig)
+
+        head_text = head_raw.decode("utf-8", errors="replace").strip().lower()
+        head_sha = head_text if _GIT_SHA_RE.match(head_text) else ""
+        return (head_sha, head_raw + packed_sig)
     except OSError:
-        return b""
+        return ("", b"")
 
 
 def _compute_repo_tree_fingerprint_and_mtime(repo_root: Path) -> tuple[str, bool, int]:
-    """Compute SHA-256 content/stat tree fingerprint plus max observed mtime_ns without spawning git."""
+    """Compute SHA-256 content/stat/symlink tree fingerprint plus max observed mtime_ns without spawning git."""
     resolved = repo_root.resolve()
     git_marker = resolved / ".git"
-    is_git = git_marker.exists()
+    is_git = git_marker.exists() and not git_marker.is_symlink()
     hasher = hashlib.sha256()
     if is_git:
-        head_bytes = _read_git_head_identity(git_marker)
+        _, head_bytes = _read_git_head_identity(git_marker)
         if head_bytes:
             hasher.update(b"GIT_HEAD|" + head_bytes + b"\n")
 
@@ -388,6 +597,7 @@ def _compute_repo_tree_fingerprint_and_mtime(repo_root: Path) -> tuple[str, bool
     max_inline_bytes = 2_000_000
     stack: list[Path] = [resolved]
     files: list[tuple[str, Path, os.stat_result]] = []
+    symlinks: list[tuple[str, str]] = []
     while stack:
         cur_dir = stack.pop()
         try:
@@ -396,6 +606,13 @@ def _compute_repo_tree_fingerprint_and_mtime(repo_root: Path) -> tuple[str, bool
             continue
         for entry in entries:
             if entry.is_symlink():
+                try:
+                    lst = entry.stat(follow_symlinks=False)
+                    max_mtime_ns = max(max_mtime_ns, lst.st_mtime_ns)
+                    rel_s = Path(entry.path).relative_to(resolved).as_posix()
+                    symlinks.append((rel_s, os.readlink(entry.path)))
+                except OSError:
+                    pass
                 continue
             if entry.is_dir(follow_symlinks=False):
                 if entry.name not in _SKIP_WALK_DIRS:
@@ -413,6 +630,9 @@ def _compute_repo_tree_fingerprint_and_mtime(repo_root: Path) -> tuple[str, bool
                     files.append((rel, Path(entry.path), st))
                 except OSError:
                     continue
+
+    for rel_s, target_s in sorted(symlinks):
+        hasher.update(f"S|{rel_s}|{target_s}\n".encode("utf-8", errors="replace"))
 
     files.sort(key=lambda item: item[0])
     for rel, fpath, st in files:
@@ -437,25 +657,60 @@ def compute_repo_tree_fingerprint(repo_root: Path) -> tuple[str, bool]:
 
 def _governance_db_signature(session: Session, target_id: int | None) -> tuple[object, ...]:
     rules = tuple(
-        (r.rule_code, r.severity, r.enabled, r.blocks_gate)
-        for r in list_rule_policies(session)
+        (
+            r.rule_code,
+            r.severity,
+            r.enabled,
+            r.blocks_gate,
+            r.effective_from.isoformat(),
+            r.effective_until.isoformat() if r.effective_until else None,
+        )
+        for r in list_rule_policies(session, target_id=target_id)
     )
     vocabs = tuple(
         (v.domain_pack, v.token, v.is_enabled)
-        for v in list_policy_vocabularies(session)
+        for v in list_policy_vocabularies(session, target_id=target_id)
     )
     ruling_sig: tuple[object, ...] = ()
     ratchet_sig: tuple[object, ...] = ()
+    target_ov_sig: tuple[object, ...] = ()
     if target_id:
         ruling_sig = tuple(
-            (r.id, r.node_id, r.disposition, r.summary)
+            (
+                r.id,
+                r.node_id,
+                r.disposition,
+                r.summary,
+                r.audited_commit,
+                r.effective_from.isoformat(),
+                r.effective_until.isoformat() if r.effective_until else None,
+                r.cutover_history or "",
+                json.dumps(r.store_purpose.model_dump(mode="json"), sort_keys=True)
+                if r.store_purpose
+                else "",
+                tuple(r.evidence_scope),
+            )
             for r in list_rulings(session, target_id)
         )
         ratchet_sig = tuple(
             (rb.rule_code, rb.max_allowed_count)
             for rb in list_ratchet_baselines(session, target_id)
         )
-    return (rules, vocabs, ruling_sig, ratchet_sig)
+        rov, vov = load_target_governance_overrides(session, target_id)
+        allowlist_extras, exemplar_extras = _load_target_governance_extras(session, target_id)
+        target_ov_sig = (
+            tuple(
+                (code, o.severity, o.enabled, o.blocks_gate)
+                for code, o in sorted(rov.items())
+            ),
+            tuple((v.domain_pack, v.token, v.is_enabled) for v in vov),
+            tuple(sorted(allowlist_extras)),
+            tuple(
+                json.dumps(ex.model_dump(mode="json"), sort_keys=True)
+                for ex in exemplar_extras
+            ),
+        )
+    return (utc_today().isoformat(), rules, vocabs, ruling_sig, ratchet_sig, target_ov_sig)
 
 
 def _session_db_identity(session: Session) -> str:
@@ -467,6 +722,136 @@ def _session_db_identity(session: Session) -> str:
         return "default_db"
 
 
+def _hash_file_cached(fpath: Path) -> str:
+    try:
+        resolved = fpath.resolve()
+        st = resolved.stat()
+    except OSError:
+        return "missing"
+    key = (str(resolved), st.st_mtime_ns, st.st_size)
+    cached = _ANALYZER_FILE_HASH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except OSError:
+        return "unreadable"
+    with _INVESTIGATION_LOCK:
+        if len(_ANALYZER_FILE_HASH_CACHE) > 512:
+            _ANALYZER_FILE_HASH_CACHE.clear()
+        _ANALYZER_FILE_HASH_CACHE[key] = digest
+    return digest
+
+
+def _compute_analyzer_contract_signature(
+    allow_local_plugins: bool = False,
+    local_plugin_modules: Sequence[str] | None = None,
+    *,
+    repo_root: Path | None = None,
+) -> tuple[object, ...]:
+    app_dir = Path(__file__).resolve().parents[1]
+    labeled_files: dict[str, Path] = {
+        "services/scanner_service.py": app_dir / "services" / "scanner_service.py",
+        "services/governance_service.py": app_dir / "services" / "governance_service.py",
+        "services/gate_service.py": app_dir / "services" / "gate_service.py",
+        "services/ruling_metadata.py": app_dir / "services" / "ruling_metadata.py",
+        "services/stratum_service.py": app_dir / "services" / "stratum_service.py",
+        "services/portable_config_service.py": app_dir / "services" / "portable_config_service.py",
+    }
+    adapters_dir = app_dir / "adapters"
+    if adapters_dir.is_dir():
+        for ap in sorted(adapters_dir.glob("*.py")):
+            labeled_files[f"adapters/{ap.name}"] = ap
+    for lpm in local_plugin_modules or ():
+        mod_part = str(lpm).partition(":")[0].strip()
+        if mod_part.endswith(".py") or "/" in mod_part or "\\" in mod_part:
+            labeled_files[f"local_plugin:{mod_part}"] = Path(mod_part)
+
+    plugins = discover_plugins(
+        repo_root=repo_root,
+        allow_local_plugins=allow_local_plugins,
+        local_plugin_modules=local_plugin_modules,
+    )
+    seen_pkgs: set[str] = set()
+    for p in plugins:
+        objs = (
+            p.manipulator_hook,
+            p.post_scan_hook,
+            p.stratum_badge_hook,
+            p.stratum_expand_hook,
+            *p.companion_handlers.values(),
+            *p.truth_adapters,
+            *p.manipulator_adapters,
+            *p.display_adapters,
+        )
+        for obj in objs:
+            if obj is None:
+                continue
+            mod_name = str(getattr(obj, "__module__", "") or getattr(type(obj), "__module__", ""))
+            if not mod_name or mod_name == "app" or mod_name.startswith("app."):
+                continue
+            top_pkg = mod_name.split(".")[0]
+            pkg_mod = sys.modules.get(top_pkg)
+            pkg_file = getattr(pkg_mod, "__file__", None) if pkg_mod is not None else None
+            if pkg_file and top_pkg not in seen_pkgs:
+                seen_pkgs.add(top_pkg)
+                pkg_dir = Path(pkg_file).resolve().parent
+                if pkg_dir.is_dir():
+                    for pp in sorted(pkg_dir.glob("*.py")):
+                        labeled_files[f"plugin:{top_pkg}/{pp.name}"] = pp
+                    continue
+            mod_obj = sys.modules.get(mod_name)
+            mod_file = getattr(mod_obj, "__file__", None) if mod_obj is not None else None
+            if mod_file and str(mod_file).endswith(".py"):
+                mp = Path(mod_file)
+                labeled_files[f"plugin:{mod_name}/{mp.name}"] = mp
+
+    h = hashlib.sha256()
+    for label in sorted(labeled_files):
+        h.update(f"{label}:{_hash_file_cached(labeled_files[label])}\n".encode())
+    return (
+        str(getattr(_app_pkg, "__version__", "")),
+        h.hexdigest(),
+        tuple((p.name, p.version, p.kind, p.origin) for p in plugins),
+        bool(allow_local_plugins),
+        tuple(local_plugin_modules or ()),
+    )
+
+
+def _stat_artifact_entry(raw_val: str) -> tuple[str, int, int]:
+    cand = Path(raw_val)
+    try:
+        if not cand.is_symlink() and cand.is_file():
+            st = cand.stat()
+            return (raw_val, st.st_mtime_ns, st.st_size)
+    except OSError:
+        pass
+    return (raw_val, -1, -1)
+
+
+def capture_scan_input_state(
+    session: Session,
+    target: TargetProject,
+) -> tuple[Path, str, tuple[object, ...], tuple[object, ...]]:
+    """Capture `(repo_root, tree_sha, gov_sig, active_artifacts)` before/after scanning."""
+    repo_root = Path(target.repo_path).expanduser().resolve()
+    tree_sha, _ = compute_repo_tree_fingerprint(repo_root)
+    gov_sig = _governance_db_signature(session, target.id or None)
+    raw_arts = get_active_stratum_artifacts()
+    active_artifacts = tuple(
+        sorted(
+            (
+                k,
+                tuple(v)
+                if k == "probe_local_ports"
+                else tuple(_stat_artifact_entry(str(item)) for item in v),
+            )
+            for k, v in raw_arts.items()
+        )
+    )
+    return (repo_root, tree_sha, gov_sig, active_artifacts)
+
+
 def _build_scan_cache_key(
     target: TargetProject,
     repo_root: Path,
@@ -474,7 +859,13 @@ def _build_scan_cache_key(
     gov_sig: tuple[object, ...],
     tree_sha: str,
     active_artifacts: tuple[object, ...],
+    analyzer_sig: tuple[object, ...] | None = None,
 ) -> tuple[object, ...]:
+    eff_sig = (
+        analyzer_sig
+        if analyzer_sig is not None
+        else _compute_analyzer_contract_signature(repo_root=repo_root)
+    )
     return (
         target.slug,
         str(repo_root),
@@ -486,6 +877,7 @@ def _build_scan_cache_key(
         gov_sig,
         tree_sha,
         active_artifacts,
+        eff_sig,
     )
 
 
@@ -501,10 +893,17 @@ def _as_utc(dt: datetime) -> datetime:
 def _build_snapshot_state_key(
     target: TargetProject,
     repo_root: Path,
+    strict_gate: bool,
     gov_sig: tuple[object, ...],
     tree_sha: str,
     active_artifacts: tuple[object, ...],
+    analyzer_sig: tuple[object, ...] | None = None,
 ) -> tuple[object, ...]:
+    eff_sig = (
+        analyzer_sig
+        if analyzer_sig is not None
+        else _compute_analyzer_contract_signature(repo_root=repo_root)
+    )
     return (
         target.slug,
         str(repo_root),
@@ -512,9 +911,11 @@ def _build_snapshot_state_key(
         target.backend_subdir,
         target.frontend_subdir,
         target.legacy_snapshot_relpath or "",
+        bool(strict_gate),
         gov_sig,
         tree_sha,
         active_artifacts,
+        eff_sig,
     )
 
 
@@ -564,7 +965,33 @@ def _rebind_persisted_gate_mode(
         rule_counts=new_rows,
         evaluated_at=persisted.gate.evaluated_at,
     )
-    return persisted.model_copy(update={"gate": new_gate})
+    updates: dict[str, Any] = {"gate": new_gate}
+    if new_gate.verdict != persisted.gate.verdict:
+        from app.services.scanner_service import _compute_zoom1_content_digest
+
+        updates["content_digest"] = _compute_zoom1_content_digest(
+            persisted.source_commit,
+            persisted.nodes,
+            persisted.edges,
+            persisted.findings,
+            verdict,
+        )
+    return persisted.model_copy(update=updates)
+
+
+def _delete_snapshot_stamp_row(db_id: str, snapshot_id: int) -> None:
+    try:
+        conn = open_investigation_connection(create=False)
+        if conn is not None:
+            try:
+                conn.execute(
+                    "DELETE FROM scan_snapshot_stamps WHERE db_identity = ? AND snapshot_id = ?",
+                    (db_id, int(snapshot_id)),
+                )
+            finally:
+                conn.close()
+    except (OSError, RuntimeError, sqlite3.Error):
+        return
 
 
 def record_persisted_snapshot_stamp(
@@ -574,42 +1001,62 @@ def record_persisted_snapshot_stamp(
     strict_gate: bool,
     snapshot_id: int,
     report: TruthAtlasReport,
+    pre_scan_state: tuple[Path, str, tuple[object, ...], tuple[object, ...]] | None = None,
+    allow_local_plugins: bool = False,
+    local_plugin_modules: Sequence[str] | None = None,
 ) -> None:
-    """Record exact `(tree_sha, gov_sig)` state stamp for a persisted `ScanSnapshot`."""
-    _ = strict_gate
+    """Record exact `(tree_sha, gov_sig, analyzer_sig, strict_gate)` stamp only when post-scan state matches `pre_scan_state`."""
     if not target.id or snapshot_id <= 0:
         return
+    db_id = _session_db_identity(session)
     try:
-        repo_root = Path(target.repo_path).expanduser().resolve()
-        tree_sha, _ = compute_repo_tree_fingerprint(repo_root)
-        gov_sig = _governance_db_signature(session, target.id)
-        active_artifacts = tuple(
-            sorted((k, tuple(v)) for k, v in get_active_stratum_artifacts().items())
+        post_scan_state = capture_scan_input_state(session, target)
+        if (
+            pre_scan_state is None
+            or post_scan_state != pre_scan_state
+            or report.observation_source != "static_ast"
+            or any(k == "probe_local_ports" for k, _ in post_scan_state[3])
+        ):
+            _delete_snapshot_stamp_row(db_id, int(snapshot_id))
+            return
+        repo_root, tree_sha, gov_sig, active_artifacts = post_scan_state
+        _record_report_tree_sha(repo_root, report.content_digest, tree_sha)
+        analyzer_sig = _compute_analyzer_contract_signature(
+            allow_local_plugins=allow_local_plugins,
+            local_plugin_modules=local_plugin_modules,
+            repo_root=repo_root,
         )
         state_key = _build_snapshot_state_key(
-            target, repo_root, gov_sig, tree_sha, active_artifacts
+            target,
+            repo_root,
+            strict_gate,
+            gov_sig,
+            tree_sha,
+            active_artifacts,
+            analyzer_sig=analyzer_sig,
         )
         key_sha = _hash_scan_cache_key(state_key)
-        db_id = _session_db_identity(session)
         conn = open_investigation_connection(create=True)
         if conn is not None:
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO scan_snapshot_stamps "
-                    "(db_identity, snapshot_id, target_id, content_digest, cache_key_sha256, recorded_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(db_identity, snapshot_id, target_id, content_digest, cache_key_sha256, tree_sha256, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         db_id,
                         int(snapshot_id),
                         int(target.id),
                         report.content_digest,
                         key_sha,
+                        tree_sha,
                         utc_now().isoformat(),
                     ),
                 )
             finally:
                 conn.close()
     except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error, SQLAlchemyError):
+        _delete_snapshot_stamp_row(db_id, int(snapshot_id))
         return
 
 
@@ -619,12 +1066,13 @@ def _try_hydrate_persisted_snapshot(
     *,
     repo_root: Path,
     strict_gate: bool,
-    is_git: bool,
-    max_mtime_ns: int,
-    active_artifacts: tuple[object, ...],
+    is_git: bool = False,
+    max_mtime_ns: int = 0,
+    active_artifacts: tuple[object, ...] = (),
     cache_key: tuple[object, ...],
 ) -> TruthAtlasReport | None:
-    """Hydrate latest SQLite `ScanSnapshot` when gate mode, repo tree, and governance match."""
+    """Hydrate latest SQLite `ScanSnapshot` ONLY when its exact versioned analyzer & input stamp matches."""
+    _ = (is_git, max_mtime_ns, active_artifacts)
     if not target.id or target.id <= 0:
         return None
     snap = session.scalars(
@@ -647,24 +1095,12 @@ def _try_hydrate_persisted_snapshot(
         or persisted.target_slug != target.slug
         or Path(persisted.repo_path).expanduser().resolve() != repo_root
         or persisted.stack_profile != target.stack_profile_slug
-        or "+http_probe" in persisted.observation_source
+        or persisted.observation_source != "static_ast"
+        or any(k == "probe_local_ports" for k, _ in active_artifacts)
     ):
         return None
 
-    db_ratchets = {
-        rb.rule_code: rb.max_allowed_count for rb in list_ratchet_baselines(session, target.id)
-    }
-    state_key = (
-        cache_key[0],
-        cache_key[1],
-        cache_key[2],
-        cache_key[3],
-        cache_key[4],
-        cache_key[5],
-        cache_key[7],
-        cache_key[8],
-        cache_key[9],
-    )
+    state_key = cache_key
     key_sha = _hash_scan_cache_key(state_key)
     db_id = _session_db_identity(session)
     stamp_row: tuple[Any, ...] | None = None
@@ -673,7 +1109,7 @@ def _try_hydrate_persisted_snapshot(
         if conn is not None:
             try:
                 stamp_row = conn.execute(
-                    "SELECT target_id, content_digest, cache_key_sha256 "
+                    "SELECT target_id, content_digest, cache_key_sha256, tree_sha256 "
                     "FROM scan_snapshot_stamps WHERE db_identity = ? AND snapshot_id = ?",
                     (db_id, int(snap.id)),
                 ).fetchone()
@@ -682,55 +1118,18 @@ def _try_hydrate_persisted_snapshot(
     except sqlite3.Error:
         stamp_row = None
 
-    if stamp_row is not None:
-        st_tid, st_digest, st_key_sha = int(stamp_row[0]), str(stamp_row[1]), str(stamp_row[2])
-        if st_tid == target.id and st_digest == snap.content_digest:
-            if st_key_sha != key_sha:
-                return None
-            return _rebind_persisted_gate_mode(
-                persisted, strict_gate=strict_gate, baselines=db_ratchets
-            )
+    if stamp_row is None:
+        return None
 
-    # Fallback validation for pre-existing unstamped `ScanSnapshot` rows in SQLite
-    if active_artifacts or bool(target.legacy_snapshot_relpath) != persisted.legacy_bridge.present:
+    st_tid, st_digest, st_key_sha = int(stamp_row[0]), str(stamp_row[1]), str(stamp_row[2])
+    if st_tid != target.id or st_digest != snap.content_digest or st_key_sha != key_sha:
         return None
-    db_rules = {
-        (r.rule_code, r.severity, r.enabled, r.blocks_gate) for r in list_rule_policies(session)
+
+    st_tree = str(stamp_row[3] or cache_key[8])
+    _record_report_tree_sha(repo_root, persisted.content_digest, st_tree)
+    db_ratchets = {
+        rb.rule_code: rb.max_allowed_count for rb in list_ratchet_baselines(session, target.id)
     }
-    snap_rules = {
-        (rc.rule_code, rc.severity, rc.enabled, rc.blocks_gate)
-        for rc in persisted.gate.rule_counts
-    }
-    if not (db_rules <= snap_rules):
-        return None
-    if persisted.gate.mode == "ratchet":
-        snap_ratchets = {
-            rc.rule_code: rc.baseline_max
-            for rc in persisted.gate.rule_counts
-            if rc.baseline_max is not None
-        }
-        if db_ratchets != snap_ratchets:
-            return None
-    db_rulings = tuple(
-        (r.id, r.node_id, r.disposition, r.summary) for r in list_rulings(session, target.id)
-    )
-    snap_rulings = tuple(
-        (r.id, r.node_id, r.disposition, r.summary) for r in persisted.rulings
-    )
-    if db_rulings != snap_rulings:
-        return None
-    snap_utc = _as_utc(snap.observed_at)
-    for voc in list_policy_vocabularies(session):
-        if _as_utc(voc.created_at) > snap_utc:
-            return None
-    snap_obs_ns = int(snap_utc.timestamp() * 1_000_000_000)
-    if max_mtime_ns > snap_obs_ns:
-        return None
-    if is_git:
-        head_raw = _read_git_head_identity(repo_root / ".git")
-        head_sha = head_raw.split(b"|")[-1].decode("utf-8", errors="replace").strip() if head_raw else ""
-        if head_sha and persisted.source_commit != head_sha:
-            return None
     return _rebind_persisted_gate_mode(
         persisted, strict_gate=strict_gate, baselines=db_ratchets
     )
@@ -743,15 +1142,21 @@ def get_or_run_cached_scan(
     strict_gate: bool = True,
     force_rescan: bool = False,
 ) -> TruthAtlasReport:
-    """Return cached `TruthAtlasReport` when worktree & governance state match (`< 5ms`)."""
-    repo_root = Path(target.repo_path).expanduser().resolve()
-    tree_sha, is_git, max_mtime_ns = _compute_repo_tree_fingerprint_and_mtime(repo_root)
-    gov_sig = _governance_db_signature(session, target.id or None)
-    active_artifacts = tuple(sorted((k, tuple(v)) for k, v in get_active_stratum_artifacts().items()))
+    """Return cached `TruthAtlasReport` when worktree, governance, & analyzer contract match (`< 5ms`)."""
+    pre_state = capture_scan_input_state(session, target)
+    repo_root, tree_sha, gov_sig, active_artifacts = pre_state
+    analyzer_sig = _compute_analyzer_contract_signature(repo_root=repo_root)
     cache_key = _build_scan_cache_key(
-        target, repo_root, strict_gate, gov_sig, tree_sha, active_artifacts
+        target,
+        repo_root,
+        strict_gate,
+        gov_sig,
+        tree_sha,
+        active_artifacts,
+        analyzer_sig=analyzer_sig,
     )
-    if not force_rescan:
+    has_live_port_probe = any(k == "probe_local_ports" for k, _ in active_artifacts)
+    if not force_rescan and not has_live_port_probe:
         with _INVESTIGATION_LOCK:
             hit = _SCAN_REUSE_CACHE.get(cache_key)
             if hit is not None:
@@ -763,8 +1168,6 @@ def get_or_run_cached_scan(
             target,
             repo_root=repo_root,
             strict_gate=strict_gate,
-            is_git=is_git,
-            max_mtime_ns=max_mtime_ns,
             active_artifacts=active_artifacts,
             cache_key=cache_key,
         )
@@ -782,11 +1185,14 @@ def get_or_run_cached_scan(
         strict_gate=strict_gate,
         persist_snapshot=False,
     )
+    post_state = capture_scan_input_state(session, target)
     with _INVESTIGATION_LOCK:
         _SCAN_CACHE_STATS["misses"] += 1
-        _SCAN_REUSE_CACHE[cache_key] = report.model_copy(deep=True)
-        while len(_SCAN_REUSE_CACHE) > _SCAN_CACHE_MAX:
-            _SCAN_REUSE_CACHE.popitem(last=False)
+        if post_state == pre_state and not has_live_port_probe:
+            _record_report_tree_sha(repo_root, report.content_digest, tree_sha)
+            _SCAN_REUSE_CACHE[cache_key] = report.model_copy(deep=True)
+            while len(_SCAN_REUSE_CACHE) > _SCAN_CACHE_MAX:
+                _SCAN_REUSE_CACHE.popitem(last=False)
     return report
 
 
@@ -945,7 +1351,477 @@ def build_pinned_index(report: TruthAtlasReport) -> dict[str, Any]:
 
 
 _BACKTICK_TOKEN_RE = re.compile(r"`([^`\n]{2,180})`")
-_SNIPPET_PTR_RE = re.compile(r"^([A-Za-z0-9_./-]+\.[A-Za-z0-9_+-]+):(\d+)$")
+_SNIPPET_PTR_RE = re.compile(r"^([A-Za-z0-9_./-]+\.[A-Za-z0-9_+-]+):(-?\d+)$")
+_EV_HASH_ID_RE = re.compile(r"^ev_[0-9a-f]{16}$")
+_MAX_SNIPPET_BYTES: Final[int] = 8 * 1024 * 1024
+
+
+def _read_bounded_snippet_file(repo_root: Path, rel_p: str) -> tuple[bytes | None, str]:
+    rel_obj = Path(rel_p)
+    if "\x00" in rel_p or rel_obj.is_absolute() or ".." in rel_obj.parts or repo_root.is_symlink():
+        return None, f"Snippet path `{rel_p}` escapes repository root or traverses symlinks."
+    if is_blocked_secret_path(rel_obj):
+        return None, f"Snippet path `{rel_p}` is blocked by Wythe's sensitive-file policy."
+    cur = repo_root
+    for part in rel_obj.parts:
+        if part in ("", "."):
+            continue
+        cur = cur / part
+        if cur.is_symlink():
+            return None, f"Refusing symlinked snippet path `{rel_p}`."
+    try:
+        resolved_f = cur.resolve()
+        if not resolved_f.is_relative_to(repo_root):
+            return None, f"Snippet path `{rel_p}` escapes repository root."
+        if is_blocked_secret_path(resolved_f.relative_to(repo_root)):
+            return None, f"Snippet path `{rel_p}` is blocked by Wythe's sensitive-file policy."
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(cur, flags)
+    except OSError:
+        return None, f"Referenced file `{rel_p}` does not exist or cannot be opened safely."
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, f"Referenced path `{rel_p}` is not a regular file."
+        if st.st_size > _MAX_SNIPPET_BYTES:
+            return None, f"Referenced file `{rel_p}` exceeds 8 MiB citation verification limit."
+        chunks: list[bytes] = []
+        rem = _MAX_SNIPPET_BYTES + 1
+        while rem > 0:
+            blk = os.read(fd, min(65536, rem))
+            if not blk:
+                break
+            chunks.append(blk)
+            rem -= len(blk)
+        raw = b"".join(chunks)
+        if len(raw) > _MAX_SNIPPET_BYTES:
+            return None, f"Referenced file `{rel_p}` exceeds 8 MiB citation verification limit."
+        return raw, ""
+    finally:
+        os.close(fd)
+
+
+def _check_report_tree_staleness(
+    report: TruthAtlasReport,
+    repo_root: Path,
+    evidence_revision_id: str,
+    session_id: str | None,
+) -> tuple[bool, str]:
+    git_marker = repo_root / ".git"
+    if git_marker.exists() or git_marker.is_symlink():
+        try:
+            validate_git_dir_containment(repo_root)
+        except SafeGitError as exc:
+            return True, f"Unsafe or invalid Git metadata in repository ({exc})."
+    live_tree_sha, is_git = compute_repo_tree_fingerprint(repo_root)
+    with _INVESTIGATION_LOCK:
+        recorded_sha = _REPORT_TREE_SHA_BY_DIGEST.get((str(repo_root), report.content_digest))
+    if recorded_sha is not None and recorded_sha != live_tree_sha:
+        return True, "Repository worktree changed on disk after report content_digest was computed."
+
+    if session_id:
+        try:
+            conn = open_investigation_connection(create=False)
+            if conn is not None:
+                try:
+                    s_row = conn.execute(
+                        "SELECT pinned_evidence_json, latest_evidence_json "
+                        "FROM investigation_sessions WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    if s_row is not None:
+                        for raw_ev in (s_row[0], s_row[1]):
+                            ev_d = json.loads(str(raw_ev or "{}"))
+                            if (
+                                ev_d.get("evidence_revision_id") == evidence_revision_id
+                                and ev_d.get("content_tree_sha256")
+                                and ev_d["content_tree_sha256"] != live_tree_sha
+                            ):
+                                return True, "Worktree drifted from session evidence revision."
+                finally:
+                    conn.close()
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            pass
+
+    if report.snapshot_id:
+        try:
+            conn = open_investigation_connection(create=False)
+            if conn is not None:
+                try:
+                    st_row = conn.execute(
+                        "SELECT tree_sha256 FROM scan_snapshot_stamps "
+                        "WHERE snapshot_id = ? AND content_digest = ? LIMIT 1",
+                        (int(report.snapshot_id), report.content_digest),
+                    ).fetchone()
+                    if st_row is not None and st_row[0] and str(st_row[0]) != live_tree_sha:
+                        return True, "Worktree drifted from persisted snapshot tree fingerprint."
+                finally:
+                    conn.close()
+        except (OSError, RuntimeError, sqlite3.Error):
+            pass
+
+    if _EV_HASH_ID_RE.match(evidence_revision_id):
+        cur_ev = build_evidence_identity(report)
+        if cur_ev.evidence_revision_id != evidence_revision_id:
+            return True, f"Worktree drifted from evidence revision `{evidence_revision_id}`."
+
+    if (
+        is_git
+        and report.source_commit not in ("", "unavailable", "uncommitted", "non_git")
+        and not report.source_commit.startswith("non_git:")
+    ):
+        head_sha, _ = _read_git_head_identity(repo_root / ".git")
+        if head_sha and head_sha != report.source_commit.lower():
+            return True, f"Repository HEAD `{head_sha[:12]}` differs from report `{report.source_commit[:12]}`."
+    return False, ""
+
+
+def _validate_snippet_reference(
+    ref_id: str,
+    rel_p: str,
+    line_s: int,
+    report: TruthAtlasReport | None,
+    repo_root: Path | None,
+    evidence_revision_id: str,
+    tree_stale_info: tuple[bool, str],
+) -> ValidatedReferenceRead:
+    if line_s < 1:
+        return ValidatedReferenceRead(
+            ref_id=ref_id,
+            kind="snippet",
+            label=ref_id,
+            source_file=rel_p,
+            line=line_s,
+            evidence_revision_id=evidence_revision_id,
+            validation_state="unresolved",
+            epistemic_kind="static_inference",
+            note=f"Invalid line number {line_s}; snippet lines are 1-indexed.",
+        )
+    if report is None or repo_root is None:
+        return ValidatedReferenceRead(
+            ref_id=ref_id,
+            kind="snippet",
+            label=ref_id,
+            source_file=rel_p,
+            line=line_s,
+            evidence_revision_id=evidence_revision_id,
+            validation_state="unresolved",
+            epistemic_kind="static_inference",
+            note="No target report available to verify snippet.",
+        )
+    raw_bytes, err_note = _read_bounded_snippet_file(repo_root, rel_p)
+    if raw_bytes is None:
+        return ValidatedReferenceRead(
+            ref_id=ref_id,
+            kind="snippet",
+            label=ref_id,
+            source_file=rel_p,
+            line=line_s,
+            evidence_revision_id=evidence_revision_id,
+            validation_state="unresolved",
+            epistemic_kind="static_inference",
+            note=err_note,
+        )
+    total_lines = len(raw_bytes.decode("utf-8", errors="replace").splitlines())
+    if total_lines == 0 or line_s > total_lines:
+        return ValidatedReferenceRead(
+            ref_id=ref_id,
+            kind="snippet",
+            label=ref_id,
+            source_file=rel_p,
+            line=line_s,
+            evidence_revision_id=evidence_revision_id,
+            validation_state="unresolved",
+            epistemic_kind="static_inference",
+            note=f"Line {line_s} exceeds file bounds (`{rel_p}` has {total_lines} line(s)).",
+        )
+    is_stale, stale_note = tree_stale_info
+    if not is_stale and report.worktree_dirty is False and len(report.source_commit) == 40:
+        try:
+            git_blob = bytes(
+                run_safe_git(
+                    repo_root,
+                    "show",
+                    f"{report.source_commit}:{rel_p}",
+                    text=False,
+                    check=True,
+                    timeout=2.0,
+                ).stdout
+            )
+            if git_blob != raw_bytes:
+                is_stale = True
+                stale_note = f"`{rel_p}` differs from clean pinned commit `{report.source_commit[:12]}`."
+        except SafeGitError as exc:
+            is_stale = True
+            stale_note = (
+                f"Unsafe or invalid Git metadata prevented verifying `{rel_p}` "
+                f"at `{report.source_commit[:12]}` ({exc})."
+            )
+        except (OSError, subprocess.SubprocessError):
+            is_stale = True
+            stale_note = f"`{rel_p}` not present at clean pinned commit `{report.source_commit[:12]}`."
+    if is_stale:
+        return ValidatedReferenceRead(
+            ref_id=ref_id,
+            kind="snippet",
+            label=ref_id,
+            source_file=rel_p,
+            line=line_s,
+            evidence_revision_id=evidence_revision_id,
+            validation_state="unresolved",
+            epistemic_kind="static_inference",
+            note=stale_note,
+        )
+    return ValidatedReferenceRead(
+        ref_id=ref_id,
+        kind="snippet",
+        label=ref_id,
+        source_file=rel_p,
+        line=line_s,
+        evidence_revision_id=evidence_revision_id,
+        validation_state="validated",
+        epistemic_kind="observation",
+    )
+
+
+def _resolve_valid_focus_capture_ids(
+    eff_target_slug: str | None,
+    eff_session_id: str | None,
+    evidence_revision_id: str,
+) -> tuple[set[str], str | None, str]:
+    try:
+        base_dir = resolve_state_base_dir()
+    except (OSError, RuntimeError):
+        return set(), None, "State directory unavailable."
+    real_base = base_dir.resolve()
+    strict_rev = bool(
+        evidence_revision_id
+        and evidence_revision_id != "ev_unknown"
+        and not evidence_revision_id.startswith("ev_unscanned_")
+    )
+
+    if eff_session_id is not None:
+        conn = open_investigation_connection(create=False)
+        if conn is None:
+            return set(), None, "No persisted investigation database found."
+        try:
+            row = conn.execute(
+                "SELECT target_slug, focus_state_json FROM investigation_sessions WHERE session_id = ?",
+                (eff_session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return set(), None, f"Investigation session `{eff_session_id}` not found."
+        sess_slug = str(row[0])
+        if eff_target_slug and sess_slug != eff_target_slug:
+            return set(), None, f"Session `{eff_session_id}` belongs to `{sess_slug}`, not `{eff_target_slug}`."
+        focus_d = json.loads(str(row[1] or "{}"))
+        focus_slug = str(focus_d.get("active_slug") or sess_slug)
+        if eff_target_slug and focus_slug != eff_target_slug:
+            return set(), None, "Focus snapshot belongs to a different target."
+        if bool(focus_d.get("snapshot_stale", False)):
+            return set(), None, "Persisted session focus snapshot is stale."
+        snap_ev = str(focus_d.get("snapshot_evidence_revision") or "")
+        if not snap_ev or (strict_rev and snap_ev != evidence_revision_id):
+            return set(), None, "Focus snapshot evidence revision does not match."
+        tok = sanitize_session_file_token(eff_session_id)
+        expected_prefix = f"ui_focus_session_{tok}."
+        raw_sp = str(focus_d.get("snapshot_path") or "").strip()
+        if not raw_sp:
+            return set(), None, "No persisted focus snapshot recorded for this session."
+        cand = Path(raw_sp)
+        if (
+            cand.is_symlink()
+            or not cand.name.startswith(expected_prefix)
+            or cand.suffix.lower() not in (".webp", ".png", ".jpg")
+        ):
+            return set(), None, "Snapshot path does not match isolated session snapshot naming."
+        safe_cand = real_base / cand.name
+        if safe_cand.is_symlink() or not safe_cand.is_file() or safe_cand.resolve().parent != real_base:
+            return set(), None, "Snapshot file missing from state directory."
+        valid_ids = {
+            safe_cand.name,
+            safe_cand.stem,
+            f"capture:{safe_cand.name}",
+            f"capture:{safe_cand.stem}",
+            f"capture:{eff_session_id}:{snap_ev}",
+        }
+        snap_f_rev = focus_d.get("snapshot_focus_revision")
+        if isinstance(snap_f_rev, int) and not isinstance(snap_f_rev, bool):
+            valid_ids.add(f"capture:{eff_session_id}:{snap_f_rev}")
+            valid_ids.add(f"capture:focus:{eff_session_id}:{snap_f_rev}")
+        return valid_ids, safe_cand.name, ""
+
+    if not eff_target_slug or len(get_active_session_ids_for_target(eff_target_slug)) > 1:
+        return set(), None, "Unscoped capture reference requires unambiguous target/session state."
+    state_file = real_base / "ui_focus_state.json"
+    if state_file.is_symlink() or not state_file.is_file():
+        return set(), None, "No persisted ui_focus_state.json found."
+    try:
+        st_dict = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set(), None, "Unreadable ui_focus_state.json."
+    if not isinstance(st_dict, dict) or st_dict.get("active_slug") != eff_target_slug:
+        return set(), None, "Persisted focus state belongs to a different target."
+    if bool(st_dict.get("snapshot_stale", False)):
+        return set(), None, "Persisted focus snapshot is stale."
+    snap_ev = str(st_dict.get("snapshot_evidence_revision") or "")
+    if not snap_ev or (strict_rev and snap_ev != evidence_revision_id):
+        return set(), None, "Persisted focus snapshot revision mismatch."
+    raw_sp = str(st_dict.get("snapshot_path") or "").strip()
+    if not raw_sp:
+        return set(), None, "No snapshot_path in ui_focus_state.json."
+    cand = Path(raw_sp)
+    safe_cand = real_base / cand.name
+    if (
+        cand.is_symlink()
+        or safe_cand.is_symlink()
+        or cand.suffix.lower() not in (".webp", ".png", ".jpg")
+        or not safe_cand.is_file()
+        or safe_cand.resolve().parent != real_base
+    ):
+        return set(), None, "Persisted focus snapshot file missing."
+    return (
+        {safe_cand.name, safe_cand.stem, f"capture:{safe_cand.name}", f"capture:{safe_cand.stem}"},
+        safe_cand.name,
+        "",
+    )
+
+
+def _resolve_wiretap_or_z3_reference(
+    ref_id: str,
+    report: TruthAtlasReport | None,
+    repo_root: Path | None,
+    nodes_by_id: dict[str, Any],
+    evidence_revision_id: str,
+    eff_target_slug: str | None,
+    wt_cache: dict[str, Any],
+) -> ValidatedReferenceRead:
+    def _unres(msg: str) -> ValidatedReferenceRead:
+        return ValidatedReferenceRead(
+            ref_id=ref_id,
+            kind="capture",
+            label=ref_id,
+            evidence_revision_id=evidence_revision_id,
+            validation_state="unresolved",
+            epistemic_kind="static_inference",
+            producer="wythe-plugin-wiretap",
+            note=msg,
+        )
+
+    if report is None or repo_root is None:
+        return _unres("No target report available to resolve runtime/stratum reference.")
+    if eff_target_slug and report.target_slug != eff_target_slug:
+        return _unres(f"Report target `{report.target_slug}` does not match `{eff_target_slug}`.")
+    if (
+        _EV_HASH_ID_RE.match(evidence_revision_id)
+        and build_evidence_identity(report).evidence_revision_id != evidence_revision_id
+    ):
+        return _unres("Runtime/stratum reference does not match current evidence_revision_id.")
+
+    if "valid_static_wt" not in wt_cache:
+        valid_wt: set[str] = set()
+        port_entries: list[dict[str, Any]] = []
+        has_port_rt = False
+        wt_any_active = False
+        active_arts = get_active_stratum_artifacts()
+        for k in ("otel_traces", "ebpf_flows", "memgraph", "vmmap", "port_listeners"):
+            paths = active_arts.get(k, ())
+            valid_paths = [
+                p for p in paths if not Path(p).is_symlink() and Path(p).is_file()
+            ]
+            if paths and len(valid_paths) == len(paths):
+                valid_wt.add(f"wiretap:{k}")
+                for vp in valid_paths:
+                    valid_wt.add(f"wiretap:{k}:{Path(vp).name}")
+        if active_arts.get("probe_local_ports") and str(active_arts["probe_local_ports"][0]).lower() in ("1", "true", "yes"):
+            valid_wt.add("wiretap:probe_local_ports")
+        try:
+            from wythe_plugin_wiretap.plugin import (
+                correlate_wiretap_companions,
+                expand_wiretap_zoom3_stratum,
+                get_active_wiretap_inputs,
+            )
+
+            wt_inputs = get_active_wiretap_inputs()
+            wt_any_active = wt_inputs.any_active
+            has_port_rt = bool(wt_inputs.port_listeners or wt_inputs.probe_local_ports)
+            if wt_any_active:
+                comp = correlate_wiretap_companions(repo_root, report)
+                for tie in comp.get("wall_ties", ()):  # type: ignore[union-attr]
+                    if isinstance(tie, dict):
+                        if tie.get("id"):
+                            valid_wt.add(str(tie["id"]))
+                        if tie.get("target_node_id"):
+                            valid_wt.add(str(tie["target_node_id"]))
+                p_occ = comp.get("port_occupancy")
+                if isinstance(p_occ, dict) and isinstance(p_occ.get("entries"), list):
+                    port_entries = list(p_occ["entries"])
+            wt_cache["expand_fn"] = expand_wiretap_zoom3_stratum if wt_any_active else None
+        except (ImportError, OSError, ValueError, RuntimeError):
+            wt_cache["expand_fn"] = None
+        wt_cache["valid_static_wt"] = valid_wt
+        wt_cache["port_entries"] = port_entries
+        wt_cache["has_port_rt"] = has_port_rt
+        wt_cache["z3_by_parent"] = {}
+
+    if ref_id in wt_cache["valid_static_wt"]:
+        return ValidatedReferenceRead(
+            ref_id=ref_id,
+            kind="capture",
+            label=ref_id,
+            evidence_revision_id=evidence_revision_id,
+            validation_state="validated",
+            epistemic_kind="runtime_capture",
+            producer="wythe-plugin-wiretap",
+            note="Sampled passive runtime capture reference; unexercised paths are static dark matter.",
+        )
+
+    if ref_id.startswith("z3:"):
+        parent_nid = max(
+            (nid for nid in nodes_by_id if ref_id.startswith(f"z3:{nid}:")),
+            key=len,
+            default=None,
+        )
+        if parent_nid is not None:
+            z3_by_p: dict[str, set[str]] = wt_cache["z3_by_parent"]
+            if parent_nid not in z3_by_p:
+                emitted: set[str] = set()
+                if get_active_stratum_artifacts():
+                    try:
+                        exp_exec = run_stratum_expand_plugins(repo_root, report, parent_nid, 3)
+                        for exp in exp_exec.expansions:
+                            emitted.update(mn.id for mn in exp.nodes)
+                    except (OSError, ValueError, RuntimeError):
+                        pass
+                exp_fn = wt_cache.get("expand_fn")
+                if exp_fn is not None:
+                    try:
+                        wt_exp = exp_fn(repo_root, report, parent_nid, 3)
+                        emitted.update(mn.id for mn in wt_exp.nodes)
+                    except (OSError, ValueError, RuntimeError):
+                        pass
+                if wt_cache.get("has_port_rt") and nodes_by_id[parent_nid].tier == "manipulate":
+                    for idx, p_ent in enumerate(wt_cache.get("port_entries", ())[:32], start=1):
+                        if "port" in p_ent:
+                            emitted.add(f"z3:{parent_nid}:port:{idx}:{p_ent['port']}")
+                z3_by_p[parent_nid] = emitted
+            if ref_id in z3_by_p[parent_nid]:
+                return ValidatedReferenceRead(
+                    ref_id=ref_id,
+                    kind="capture",
+                    label=ref_id,
+                    evidence_revision_id=evidence_revision_id,
+                    validation_state="validated",
+                    epistemic_kind="runtime_capture",
+                    producer="wythe-plugin-wiretap",
+                    note="Sampled passive runtime capture reference; unexercised paths are static dark matter.",
+                )
+
+    return _unres(
+        "Runtime/wiretap reference not found in active artifacts or Z=3 micro-nodes for this target and revision."
+    )
 
 
 def _classify_finding_epistemic(rule_code: str) -> EpistemicKind:
@@ -1021,12 +1897,16 @@ def validate_references_against_report(
     evidence_revision_id: str,
     pinned_index: dict[str, Any] | None = None,
     answer_markdown: str | None = None,
+    target_slug: str | None = None,
+    session_id: str | None = None,
 ) -> list[ValidatedReferenceRead]:
     """Validate explicit IDs & markdown citations against `report` (`validated` vs `text_convenience`)."""
     nodes_by_id = {n.id: n for n in (report.nodes if report else ())}
     edges_by_id = {e.id: e for e in (report.edges if report else ())}
     findings_by_id = {f.id: f for f in (report.findings if report else ())}
     repo_root = Path(report.repo_path).resolve() if report else None
+    eff_target_slug = (target_slug or (report.target_slug if report is not None else "") or "").strip() or None
+    eff_session_id = (session_id or "").strip() or None
 
     pinned_nodes = (pinned_index or {}).get("nodes") or {}
     pinned_edges = (pinned_index or {}).get("edges") or {}
@@ -1043,6 +1923,23 @@ def validate_references_against_report(
         if cleaned and cleaned not in candidate_explicit:
             candidate_explicit.append(cleaned)
 
+    explicit_bounded = candidate_explicit[:64]
+    markdown_candidates: list[str] = []
+    _semantic_id_prefixes = (
+        "t:",
+        "fn:",
+        "m:",
+        "d:",
+        "e:",
+        "f:",
+        "chain:",
+        "z2:",
+        "z3:",
+        "capture:",
+        "ui_focus_",
+        "wiretap:",
+        "wt:wiretap:",
+    )
     if answer_markdown:
         for match in _BACKTICK_TOKEN_RE.finditer(answer_markdown):
             tok = match.group(1).strip()
@@ -1054,14 +1951,22 @@ def validate_references_against_report(
                 or tok in pinned_edges
                 or tok in pinned_findings
                 or _SNIPPET_PTR_RE.match(tok)
-                or tok.startswith("capture:")
-            ) and tok not in candidate_explicit:
-                candidate_explicit.append(tok)
+                or (
+                    tok.startswith(_semantic_id_prefixes)
+                    and " " not in tok
+                    and len(tok) <= 160
+                )
+            ) and tok not in explicit_bounded and tok not in markdown_candidates:
+                markdown_candidates.append(tok)
 
+    combined_candidates = [*explicit_bounded, *markdown_candidates[:32]]
     results: list[ValidatedReferenceRead] = []
     seen_refs: set[str] = set()
+    tree_stale_cache: tuple[bool, str] | None = None
+    focus_cap_cache: tuple[set[str], str | None, str] | None = None
+    wt_cache: dict[str, Any] = {}
 
-    for ref_id in candidate_explicit[:32]:
+    for ref_id in combined_candidates:
         if ref_id in seen_refs:
             continue
         seen_refs.add(ref_id)
@@ -1143,50 +2048,68 @@ def validate_references_against_report(
             )
         elif (m_snip := _SNIPPET_PTR_RE.match(ref_id)) is not None:
             rel_p, line_s = m_snip.group(1), int(m_snip.group(2))
-            is_valid_file = False
-            if repo_root is not None:
-                cand_f = repo_root / rel_p
-                try:
-                    resolved_f = cand_f.resolve()
-                    is_valid_file = (
-                        not cand_f.is_symlink()
-                        and resolved_f.is_relative_to(repo_root)
-                        and resolved_f.is_file()
+            if tree_stale_cache is None:
+                tree_stale_cache = (
+                    _check_report_tree_staleness(
+                        report, repo_root, evidence_revision_id, eff_session_id
                     )
-                except OSError:
-                    is_valid_file = False
+                    if (report is not None and repo_root is not None)
+                    else (False, "")
+                )
             results.append(
-                ValidatedReferenceRead(
-                    ref_id=ref_id,
-                    kind="snippet",
-                    label=ref_id,
-                    source_file=rel_p,
-                    line=line_s,
-                    evidence_revision_id=evidence_revision_id,
-                    validation_state="validated" if is_valid_file else "unresolved",
-                    epistemic_kind="observation" if is_valid_file else "static_inference",
+                _validate_snippet_reference(
+                    ref_id,
+                    rel_p,
+                    line_s,
+                    report,
+                    repo_root,
+                    evidence_revision_id,
+                    tree_stale_cache,
                 )
             )
-        elif ref_id.startswith(("capture:", "ui_focus_", "wiretap:", "wt:wiretap:", "z3:")):
-            is_wiretap_ref = ref_id.startswith(("wiretap:", "wt:wiretap:", "z3:"))
-            active_rt = any(
-                k in get_active_stratum_artifacts()
-                for k in ("otel_traces", "ebpf_flows", "memgraph", "vmmap", "port_listeners", "probe_local_ports")
-            )
+        elif ref_id.startswith(("capture:", "ui_focus_")):
+            if focus_cap_cache is None:
+                focus_cap_cache = _resolve_valid_focus_capture_ids(
+                    eff_target_slug, eff_session_id, evidence_revision_id
+                )
+            valid_cap_ids, cap_file, cap_err = focus_cap_cache
+            if ref_id in valid_cap_ids:
+                results.append(
+                    ValidatedReferenceRead(
+                        ref_id=ref_id,
+                        kind="capture",
+                        label=ref_id,
+                        source_file=cap_file,
+                        evidence_revision_id=evidence_revision_id,
+                        validation_state="validated",
+                        epistemic_kind="runtime_capture",
+                        producer="wythe-ui-focus",
+                        note="Verified persisted viewport focus snapshot.",
+                    )
+                )
+            else:
+                results.append(
+                    ValidatedReferenceRead(
+                        ref_id=ref_id,
+                        kind="capture",
+                        label=ref_id,
+                        evidence_revision_id=evidence_revision_id,
+                        validation_state="unresolved",
+                        epistemic_kind="static_inference",
+                        producer="wythe-ui-focus",
+                        note=cap_err or "Capture reference does not match any persisted snapshot for this session/target/revision.",
+                    )
+                )
+        elif ref_id.startswith(("wiretap:", "wt:wiretap:", "z3:")):
             results.append(
-                ValidatedReferenceRead(
-                    ref_id=ref_id,
-                    kind="capture",
-                    label=ref_id,
-                    evidence_revision_id=evidence_revision_id,
-                    validation_state="validated" if (not is_wiretap_ref or active_rt or ref_id.startswith("wiretap:")) else "text_convenience",
-                    epistemic_kind="runtime_capture",
-                    producer="wythe-plugin-wiretap" if is_wiretap_ref else "wythe-ui-focus",
-                    note=(
-                        "Sampled passive runtime capture reference; unexercised paths are static dark matter."
-                        if is_wiretap_ref
-                        else ""
-                    ),
+                _resolve_wiretap_or_z3_reference(
+                    ref_id,
+                    report,
+                    repo_root,
+                    nodes_by_id,
+                    evidence_revision_id,
+                    eff_target_slug,
+                    wt_cache,
                 )
             )
         elif ref_id in pinned_nodes:
@@ -1275,6 +2198,40 @@ def validate_references_against_report(
                         note="Matched by label text convenience; verify explicit ID.",
                     )
                 )
+    if len(candidate_explicit) > 64:
+        omitted_exp = len(candidate_explicit) - 64
+        sample_exp = ", ".join(f"`{rid}`" for rid in candidate_explicit[64:67])
+        results.append(
+            ValidatedReferenceRead(
+                ref_id="citation:explicit_truncated",
+                kind="finding",
+                label=f"Explicit citations truncated at 64 ({omitted_exp} omitted)",
+                evidence_revision_id=evidence_revision_id,
+                validation_state="unresolved",
+                epistemic_kind="model_interpretation",
+                note=(
+                    f"Only the first 64 explicit citations were validated; "
+                    f"{omitted_exp} explicit citation(s) were omitted (e.g., {sample_exp})."
+                ),
+            )
+        )
+    if len(markdown_candidates) > 32:
+        omitted_md = len(markdown_candidates) - 32
+        sample_md = ", ".join(f"`{rid}`" for rid in markdown_candidates[32:35])
+        results.append(
+            ValidatedReferenceRead(
+                ref_id="citation:truncated",
+                kind="finding",
+                label=f"Markdown citations truncated at 32 ({omitted_md} omitted)",
+                evidence_revision_id=evidence_revision_id,
+                validation_state="unresolved",
+                epistemic_kind="model_interpretation",
+                note=(
+                    f"Only the first 32 markdown backticked citations were validated; "
+                    f"{omitted_md} citation(s) were omitted (e.g., {sample_md})."
+                ),
+            )
+        )
     return results
 
 
@@ -1284,10 +2241,12 @@ def _new_session_id(target_slug: str) -> str:
 
 
 def sanitize_session_file_token(session_id: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", session_id.strip())[:64]
+    raw = session_id.strip()
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", raw)[:48].strip("_")
     if not cleaned:
         raise ValueError("Invalid empty `session_id`.")
-    return cleaned
+    digest8 = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned}_{digest8}"
 
 
 def _append_delta_in_tx(
@@ -1547,7 +2506,11 @@ def _load_receipts_for_session_in_conn(
         "r.client_id, r.outcome, r.delivery_state, r.applied_focus_revision, r.note, r.recorded_at, "
         "COALESCE(e.applied_clients_json, '[]') "
         "FROM viewport_receipts r "
-        "LEFT JOIN viewport_events e ON e.command_id = r.command_id "
+        "LEFT JOIN viewport_events e "
+        "ON e.target_slug = r.target_slug "
+        "AND e.command_id = r.command_id "
+        "AND (r.seq IS NULL OR e.seq = r.seq) "
+        "AND (e.session_id IS NULL OR r.session_id IS NULL OR e.session_id = r.session_id) "
         "WHERE r.target_slug = ? AND (? IS NULL OR r.session_id IS NULL OR r.session_id = ?) "
         "ORDER BY r.id DESC LIMIT ?",
         (target_slug, session_id, session_id, limit),
@@ -1663,8 +2626,9 @@ def get_session_follow_state(target_slug: str, session_id: str | None) -> Follow
     try:
         if session_id and session_id.strip():
             row = conn.execute(
-                "SELECT follow_state FROM investigation_sessions WHERE session_id = ?",
-                (session_id.strip(),),
+                "SELECT follow_state FROM investigation_sessions "
+                "WHERE session_id = ? AND target_slug = ?",
+                (session_id.strip(), target_slug.strip()),
             ).fetchone()
             if row is not None and row[0] in ("following", "paused"):
                 return row[0]
@@ -2249,6 +3213,10 @@ def record_investigation_turn(
     latest_ev_dict = json.loads(str(row[4] or "{}"))
 
     eff_report = report
+    if eff_report is not None and eff_report.target_slug != slug:
+        raise ValueError(
+            f"Report target `{eff_report.target_slug}` does not match session `{sid}` target `{slug}`."
+        )
     if eff_report is None and db_session is not None:
         target = get_target_by_slug(db_session, slug)
         if target is not None:
@@ -2271,6 +3239,8 @@ def record_investigation_turn(
         evidence_revision_id=ev_id,
         pinned_index=pinned_idx,
         answer_markdown=payload.answer_markdown,
+        target_slug=slug,
+        session_id=sid,
     )
     is_answered = bool(payload.answer_markdown and payload.answer_markdown.strip())
     turn_status = "answered" if is_answered else "unresolved"
@@ -2471,7 +3441,8 @@ def compare_investigation_revisions(
         _track(t.selected_edge_id)
         _track(t.selected_finding_id)
         for ref in t.validated_references:
-            _track(ref.ref_id)
+            if not ref.ref_id.startswith("citation:"):
+                _track(ref.ref_id)
     for c in inv.corrections:
         _track(c.target_ref_id)
     for nid in pinned_nodes:
@@ -2591,57 +3562,50 @@ def compare_investigation_revisions(
         elif (m_snip := _SNIPPET_PTR_RE.match(ref_id)) is not None:
             rel_p, line_s = m_snip.group(1), int(m_snip.group(2))
             repo_root = Path(fresh_report.repo_path).resolve()
-            cand_f = repo_root / rel_p
-            is_valid_file = False
-            try:
-                resolved_f = cand_f.resolve()
-                is_valid_file = (
-                    not cand_f.is_symlink()
-                    and resolved_f.is_relative_to(repo_root)
-                    and resolved_f.is_file()
-                )
-            except OSError:
-                is_valid_file = False
-            if is_valid_file:
+            snip_ref = _validate_snippet_reference(
+                ref_id,
+                rel_p,
+                line_s,
+                fresh_report,
+                repo_root,
+                current_ev.evidence_revision_id,
+                (False, ""),
+            )
+            if snip_ref.validation_state == "validated":
                 surviving.append(
-                    ValidatedReferenceRead(
-                        ref_id=ref_id,
-                        kind="snippet",
-                        label=ref_id,
-                        source_file=rel_p,
-                        line=line_s,
-                        evidence_revision_id=current_ev.evidence_revision_id,
-                        validation_state="validated",
-                        epistemic_kind="observation",
-                        note="Referenced file still present in current scan.",
+                    snip_ref.model_copy(update={"note": "Referenced file and line still present in current scan."})
+                )
+            else:
+                vanished.append(
+                    snip_ref.model_copy(
+                        update={
+                            "validation_state": "vanished_in_current_scan",
+                            "note": snip_ref.note or "Referenced source file or line vanished in current scan.",
+                        }
                     )
                 )
+        elif ref_id.startswith(("capture:", "ui_focus_", "wiretap:", "wt:wiretap:", "z3:")):
+            rechecked = validate_references_against_report(
+                [ref_id],
+                fresh_report,
+                evidence_revision_id=current_ev.evidence_revision_id,
+                target_slug=inv.target_slug,
+                session_id=sid,
+            )
+            if rechecked and rechecked[0].validation_state == "validated":
+                surviving.append(rechecked[0])
             else:
                 vanished.append(
                     ValidatedReferenceRead(
                         ref_id=ref_id,
-                        kind="snippet",
+                        kind="capture",
                         label=ref_id,
-                        source_file=rel_p,
-                        line=line_s,
                         evidence_revision_id=current_ev.evidence_revision_id,
                         validation_state="vanished_in_current_scan",
-                        epistemic_kind="observation",
-                        note="Referenced source file vanished in current scan.",
+                        epistemic_kind="static_inference",
+                        note=(rechecked[0].note if rechecked else "Capture/runtime reference unresolved in current scan."),
                     )
                 )
-        elif ref_id.startswith(("capture:", "ui_focus_", "wiretap:", "wt:wiretap:", "z3:")):
-            surviving.append(
-                ValidatedReferenceRead(
-                    ref_id=ref_id,
-                    kind="capture",
-                    label=ref_id,
-                    evidence_revision_id=current_ev.evidence_revision_id,
-                    validation_state="validated",
-                    epistemic_kind="runtime_capture",
-                    note="Captured runtime/viewport artifact reference preserved.",
-                )
-            )
         else:
             old_n = pinned_nodes.get(ref_id)
             old_e = pinned_edges.get(ref_id)
@@ -2853,6 +3817,13 @@ def reset_investigation_session(
             conn.execute("COMMIT")
         finally:
             conn.close()
+    try:
+        base_dir = resolve_state_base_dir()
+        tok = sanitize_session_file_token(sid)
+        for ext in (".webp", ".png", ".jpg"):
+            (base_dir / f"ui_focus_session_{tok}{ext}").unlink(missing_ok=True)
+    except (OSError, ValueError, RuntimeError):
+        pass
     out = get_investigation_session(sid)
     assert out is not None
     return out

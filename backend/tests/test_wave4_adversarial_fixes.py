@@ -26,12 +26,23 @@ from wythe_plugin_solver_internals.proto_descriptor import parse_proto_source_te
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+class _FakeDist:
+    def __init__(self, name: str, version: str = "0.1.0") -> None:
+        import sysconfig
+
+        self.version = version
+        self._path = Path(sysconfig.get_path("purelib")) / f"fake_{name}-{version}.dist-info"
+
+    def locate_file(self, path: str) -> Path:
+        return self._path.parent / path
+
+
 class _FakeEP:
     def __init__(self, name: str, loaded: object) -> None:
         self.name = name
         self.value = f"pkg:{name}"
         self._loaded = loaded
-        self.dist = type("_Dist", (), {"version": "0.1.0"})()
+        self.dist = _FakeDist(name)
 
     def load(self) -> object:
         return self._loaded

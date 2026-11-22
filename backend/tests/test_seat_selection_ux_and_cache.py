@@ -417,7 +417,7 @@ def test_mcp_cached_scan_reuse_and_sqlite_snapshot_hydration_with_staleness_guar
             json={"slug": "cache-lab", "name": "Cache Lab", "repo_path": str(repo_dir)},
         ).status_code in (200, 201)
         # Persist `ScanSnapshot` into SQLite via `/api/v1/scans/{slug}`
-        assert client.post("/api/v1/scans/cache-lab").status_code == 200
+        assert client.post("/api/v1/scans/cache-lab?strict=true").status_code == 200
 
     # Evict in-memory `_SCAN_REUSE_CACHE` so next read must hydrate from SQLite `ScanSnapshot`!
     clear_scan_reuse_cache()

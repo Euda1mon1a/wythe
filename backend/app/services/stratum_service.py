@@ -343,6 +343,7 @@ def compact_stratum_subgraph(
                 hop_labels: set[str] = set()
                 for s_idx in on_path:
                     hop_labels.update(scc_labels[s_idx])
+                    max_path_rank = max(max_path_rank, scc_own_rank[s_idx])
                     if s_idx in ent_map:
                         max_path_rank = max(max_path_rank, ent_map[s_idx])
                     max_path_rank = max(max_path_rank, scc_cycle_edge_rank[s_idx])

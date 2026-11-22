@@ -7,19 +7,13 @@ import os
 import random
 import struct
 import subprocess
-import sys
+import sysconfig
 import time
 import tomllib
 from pathlib import Path
 from typing import Any
 
 import pytest
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-PLUGIN_DIR = REPO_ROOT / "plugins" / "wythe-plugin-binary"
-PLUGIN_SRC = PLUGIN_DIR / "src"
-if str(PLUGIN_SRC) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_SRC))
 
 from app.adapters import plugin_registry
 from app.adapters.plugin_registry import ENTRY_POINT_GROUP, discover_plugins
@@ -43,6 +37,10 @@ from wythe_plugin_binary import (
     parse_recorded_fixture,
     parse_safe_entitlements_xml,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PLUGIN_DIR = REPO_ROOT / "plugins" / "wythe-plugin-binary"
+PLUGIN_SRC = PLUGIN_DIR / "src"
 
 APPLE_CONTAINER_RUNTIME_ENTITLEMENTS = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -68,8 +66,12 @@ APPLE_CONTAINER_VMNET_ENTITLEMENTS = """<?xml version="1.0" encoding="UTF-8"?>
 
 
 class _FakeDist:
-    def __init__(self, version: str = "0.1.0") -> None:
+    def __init__(self, version: str = "0.1.0", name: str = "wythe_plugin_binary") -> None:
         self.version = version
+        self._path = Path(sysconfig.get_path("purelib")) / f"{name}-{version}.dist-info"
+
+    def locate_file(self, path: str | Path) -> Path:
+        return self._path / path
 
 
 class _FakeEntryPoint:
@@ -728,7 +730,7 @@ def test_recorded_passive_fixtures_apple_container_parity() -> None:
     assert cap_elf.binary_format == "elf"
     assert cap_elf.soname == "libguest_agent.so"
     assert cap_elf.runpaths == ("$ORIGIN/../lib",)
-    assert [l.raw_path for l in cap_elf.linked_libraries] == ["libvsock.so.1"]
+    assert [lib.raw_path for lib in cap_elf.linked_libraries] == ["libvsock.so.1"]
 
     assert demangle_symbol_name("_RNvNtCs9_4core3mem4drop", is_macho=False).demangled_name == "core::mem::drop"
     assert demangle_symbol_name("_ZNSt3__16vectorIiEC1Ev", is_macho=True).demangled_name == "std::vector"

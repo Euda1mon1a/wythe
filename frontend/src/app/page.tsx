@@ -49,7 +49,7 @@ import { InvestigationSessionBar } from '@/components/InvestigationCollabControl
 import { LineageExplorer } from '@/components/LineageExplorer';
 import { NodeInspector } from '@/components/NodeInspector';
 import { WhatsThisModal } from '@/components/WhatsThisModal';
-import { WytheAppearanceControl, WytheMark } from '@/components/WytheMark';
+import { WytheAppearanceControl, WytheBrandLockup, WytheMark } from '@/components/WytheMark';
 import {
   useAdapterSlots,
   useCompareSnapshots,
@@ -70,6 +70,7 @@ import {
   useTriggerScan,
   useViewportState,
   useVocabularies,
+  useWytheVersion,
 } from '@/hooks/useAtlas';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { formatObservedInstant } from '@/lib/clock';
@@ -234,6 +235,7 @@ export default function WytheWorkspacePage() {
   const { data: slots = [] } = useAdapterSlots();
   const { data: profiles = [] } = useStackProfiles();
   const { data: govBundle } = useGovernanceBundle(activeSlug);
+  const { data: healthz } = useWytheVersion();
   const triggerScan = useTriggerScan(activeSlug);
   const fetchLlmsBrief = useFetchLlmsBrief(activeSlug);
   const fetchContextCone = useFetchContextCone(activeSlug);
@@ -340,15 +342,21 @@ export default function WytheWorkspacePage() {
   const scopeEpochRef = useRef<number>(0);
   const [scopeEpoch, setScopeEpoch] = useState<number>(0);
   const followReqSeqRef = useRef<number>(0);
+  const lastSeenSeqRef = useRef<number>(0);
+  const targetsRef = useRef(targets);
+  targetsRef.current = targets;
   const bumpScopeEpoch = useCallback(() => {
     scopeEpochRef.current += 1;
     followReqSeqRef.current += 1;
+    lastSeenSeqRef.current = 0;
     setScopeEpoch(scopeEpochRef.current);
   }, []);
 
   const [agentCamState, setAgentCamState] = useState<AgentCameraFollowState>(() =>
     createInitialAgentCameraState('following'),
   );
+  const agentCamStateRef = useRef<AgentCameraFollowState>(agentCamState);
+  agentCamStateRef.current = agentCamState;
   const followModeRef = useRef<FollowState>(agentCamState.followMode);
   useEffect(() => {
     followModeRef.current = agentCamState.followMode;
@@ -450,20 +458,26 @@ export default function WytheWorkspacePage() {
       setZWytheSlice('all');
       setRequestedZoomStratum(1);
       setAgentCameraRequest(null);
+      setWhatsThisSnapshotUrl(null);
+      setWhatsThisExplanation(null);
+      setLiveViewportDigest(null);
+      setSnapBaseId(null);
       const identity = resolveTabInvestigationIdentity({
         targetSlug: cleanedSlug,
         locationHref: '',
       });
       const savedFollow = readPersistedFollowState(identity.sessionId);
       followModeRef.current = savedFollow;
-      setAgentCamState((prev) => ({
-        ...prev,
+      const nextCamState: AgentCameraFollowState = {
+        ...agentCamStateRef.current,
         followMode: savedFollow,
         liveFollowing: savedFollow === 'following',
-        isPlaying: savedFollow === 'paused' ? false : prev.isPlaying,
+        isPlaying: savedFollow === 'paused' ? false : agentCamStateRef.current.isPlaying,
         activeEvent: null,
         pendingEventWhilePaused: null,
-      }));
+      };
+      agentCamStateRef.current = nextCamState;
+      setAgentCamState(nextCamState);
       writePersistedActiveSlug(cleanedSlug);
       activeSlugRef.current = cleanedSlug;
       activeSessionIdRef.current = identity.sessionId;
@@ -493,16 +507,16 @@ export default function WytheWorkspacePage() {
     setSessionScope({ slug: activeSlug, sessionId: identity.sessionId });
     const savedFollow = readPersistedFollowState(identity.sessionId);
     followModeRef.current = savedFollow;
-    setAgentCamState((prev) =>
-      prev.followMode === savedFollow
-        ? prev
-        : {
-            ...prev,
-            followMode: savedFollow,
-            liveFollowing: savedFollow === 'following',
-            isPlaying: savedFollow === 'paused' ? false : prev.isPlaying,
-          },
-    );
+    if (agentCamStateRef.current.followMode !== savedFollow) {
+      const nextCamState: AgentCameraFollowState = {
+        ...agentCamStateRef.current,
+        followMode: savedFollow,
+        liveFollowing: savedFollow === 'following',
+        isPlaying: savedFollow === 'paused' ? false : agentCamStateRef.current.isPlaying,
+      };
+      agentCamStateRef.current = nextCamState;
+      setAgentCamState(nextCamState);
+    }
     ackedCommandIdsRef.current = new Set(
       readAckedCommandIds(activeSlug, identity.sessionId),
     );
@@ -638,6 +652,34 @@ export default function WytheWorkspacePage() {
     },
   );
 
+  const workspaceViewRef = useRef({
+    selectedNodeId,
+    selectedEdgeId,
+    selectedFindingId,
+    sceneLens,
+    sceneLayout,
+    tierFilter,
+    subkindFilter,
+    edgeFilter,
+    onlyFlagged,
+    isolateCone,
+    connectedOnly,
+    neighborhoodHops,
+    searchQuery,
+    blastMode,
+    diffBaseRef,
+    workingSetActive,
+    compactVisible,
+    flatten2D,
+    groupBy,
+    activeTab,
+    zWytheSlice,
+    requestedZoomStratum,
+    framingPreset: 'iso_overview' as FramingPreset,
+    focusNodeIds: [] as string[],
+    highlightEdgeIds: [] as string[],
+  });
+
   const applyBeatToWorkspace = useCallback(
     (beat: {
       focusNodeIds: string[];
@@ -694,7 +736,6 @@ export default function WytheWorkspacePage() {
       if (beat.layoutMode) setSceneLayout(beat.layoutMode);
       if (beat.zWytheSlice) setZWytheSlice(beat.zWytheSlice);
       else if (beat.isTimelineStep) setZWytheSlice('all');
-      if (beat.zoomStratum != null) setRequestedZoomStratum(beat.zoomStratum);
 
       if (beat.tierFilter != null) setTierFilter(beat.tierFilter);
       if (beat.subkindFilter != null) {
@@ -729,11 +770,13 @@ export default function WytheWorkspacePage() {
       if (resolvedFocus.length === 0 && beat.selectedNodeId) {
         resolvedFocus = [beat.selectedNodeId];
       }
+      let resolvedFindingId = beat.findingId ?? null;
       if (beat.findingId && report?.findings) {
         const hitFinding = report.findings.find(
           (f) => f.id === beat.findingId || f.rule_code.toLowerCase() === beat.findingId!.toLowerCase(),
         );
-        setSelectedFindingId(hitFinding?.id ?? beat.findingId);
+        resolvedFindingId = hitFinding?.id ?? beat.findingId;
+        setSelectedFindingId(resolvedFindingId);
         if (resolvedFocus.length === 0 && hitFinding?.node_id) {
           resolvedFocus = [hitFinding.node_id];
         }
@@ -742,6 +785,20 @@ export default function WytheWorkspacePage() {
       }
       if (beat.selectedEdgeId != null) {
         setSelectedEdgeId(beat.selectedEdgeId || null);
+      }
+
+      const isFilterOnlyMove =
+        resolvedFocus.length === 0 &&
+        beat.highlightEdgeIds.length === 0 &&
+        !beat.resetFilters &&
+        !beat.isTimelineStep &&
+        !beat.chronicleTimeline &&
+        beat.framingPreset === 'iso_overview' &&
+        !beat.zWytheSlice &&
+        (beat.zoomStratum == null || beat.zoomStratum === 1);
+
+      if (beat.zoomStratum != null && (!isFilterOnlyMove || beat.zoomStratum !== 1)) {
+        setRequestedZoomStratum(beat.zoomStratum);
       }
 
       if (beat.workingSetOnly === true) {
@@ -801,52 +858,121 @@ export default function WytheWorkspacePage() {
       }
 
       if (typeof window !== 'undefined') {
+        const curView = workspaceViewRef.current;
         const effectiveIsolateCone =
           salience.mode === 'auto_isolate_cone'
             ? true
             : salience.mode === 'auto_working_set_compact'
               ? false
-              : beat.isolateCone ?? undefined;
+              : beat.isolateCone ?? (beat.resetFilters ? undefined : curView.isolateCone ? true : undefined);
         const effectiveWorkingSet =
           salience.mode === 'auto_working_set_compact'
             ? true
             : salience.mode === 'auto_isolate_cone'
               ? false
-              : beat.workingSetOnly ?? undefined;
+              : beat.workingSetOnly ??
+                (beat.resetFilters ? undefined : curView.workingSetActive ? true : undefined);
         const effectiveCompact =
           salience.mode === 'auto_working_set_compact'
             ? true
             : salience.mode === 'auto_isolate_cone'
               ? false
-              : beat.compactVisible ?? undefined;
+              : beat.compactVisible ??
+                (beat.resetFilters ? undefined : curView.compactVisible ? true : undefined);
+        const effBlastMode =
+          beat.blastMode ?? (beat.resetFilters ? 'off' : curView.blastMode);
+        const effFocus =
+          resolvedFocus.length > 0
+            ? resolvedFocus
+            : beat.resetFilters
+              ? []
+              : curView.focusNodeIds.length > 0
+                ? curView.focusNodeIds
+                : curView.selectedNodeId
+                  ? [curView.selectedNodeId]
+                  : [];
+        const effEdges =
+          beat.highlightEdgeIds.length > 0
+            ? beat.highlightEdgeIds
+            : beat.resetFilters
+              ? []
+              : curView.highlightEdgeIds;
+        const effSelectedNode =
+          beat.selectedNodeId ??
+          (resolvedFocus.length > 0
+            ? resolvedFocus[0]
+            : beat.resetFilters
+              ? undefined
+              : curView.selectedNodeId ?? undefined);
+        const effSelectedEdge =
+          beat.selectedEdgeId !== undefined
+            ? beat.selectedEdgeId || undefined
+            : beat.resetFilters
+              ? undefined
+              : curView.selectedEdgeId ?? undefined;
+        const effFinding = beat.findingId
+          ? resolvedFindingId ?? undefined
+          : beat.resetFilters
+            ? undefined
+            : curView.selectedFindingId ?? undefined;
+        const effSearch =
+          beat.searchQuery != null
+            ? beat.searchQuery || undefined
+            : beat.resetFilters
+              ? undefined
+              : curView.searchQuery || undefined;
+
         const hash = buildViewportPermalinkHash({
-          target_slug: beat.targetSlug || activeSlug,
-          session_id: activeSessionId ?? undefined,
-          focus_node_ids: resolvedFocus,
-          highlight_edge_ids: beat.highlightEdgeIds,
-          selected_node_id: beat.selectedNodeId ?? undefined,
-          selected_edge_id: beat.selectedEdgeId ?? undefined,
-          finding_id: beat.findingId ?? undefined,
-          lens: beat.lens ?? undefined,
-          layout_mode: beat.layoutMode ?? undefined,
-          tier_filter: beat.tierFilter ?? undefined,
-          subkind_filter: beat.subkindFilter ?? undefined,
-          edge_filter: beat.edgeFilter ?? undefined,
-          only_flagged: beat.onlyFlagged ?? undefined,
+          target_slug: beat.targetSlug || activeSlugRef.current || activeSlug,
+          session_id: activeSessionIdRef.current ?? activeSessionId ?? undefined,
+          focus_node_ids: effFocus,
+          highlight_edge_ids: effEdges,
+          selected_node_id: effSelectedNode,
+          selected_edge_id: effSelectedEdge,
+          finding_id: effFinding,
+          lens: beat.lens ?? curView.sceneLens,
+          layout_mode: beat.layoutMode ?? curView.sceneLayout,
+          tier_filter:
+            beat.tierFilter ??
+            (beat.resetFilters ? undefined : curView.tierFilter !== 'all' ? curView.tierFilter : undefined),
+          subkind_filter:
+            beat.subkindFilter ??
+            (beat.resetFilters ? undefined : curView.subkindFilter !== 'all' ? curView.subkindFilter : undefined),
+          edge_filter:
+            beat.edgeFilter ??
+            (beat.resetFilters ? undefined : curView.edgeFilter !== 'all' ? curView.edgeFilter : undefined),
+          only_flagged:
+            beat.onlyFlagged ?? (beat.resetFilters ? undefined : curView.onlyFlagged ? true : undefined),
           isolate_cone: effectiveIsolateCone,
-          connected_only: beat.connectedOnly ?? undefined,
-          neighborhood_hops: beat.neighborhoodHops ?? undefined,
-          search_query: beat.searchQuery ?? undefined,
-          blast_mode: beat.blastMode ?? undefined,
-          diff_base_ref: beat.diffBaseRef ?? undefined,
+          connected_only:
+            beat.connectedOnly ?? (beat.resetFilters ? undefined : curView.connectedOnly ? true : undefined),
+          neighborhood_hops:
+            beat.neighborhoodHops ??
+            (beat.resetFilters ? undefined : curView.neighborhoodHops > 0 ? curView.neighborhoodHops : undefined),
+          search_query: effSearch,
+          blast_mode: effBlastMode !== 'off' ? effBlastMode : undefined,
+          diff_base_ref:
+            effBlastMode === 'git' ? beat.diffBaseRef ?? curView.diffBaseRef : undefined,
           working_set_only: effectiveWorkingSet,
           compact_visible: effectiveCompact,
-          flatten_2d: beat.flatten2d ?? undefined,
-          group_by: beat.groupBy ?? undefined,
-          active_tab: beat.activeTab ?? undefined,
-          framing_preset: beat.framingPreset,
-          z_wythe_slice: beat.zWytheSlice ?? undefined,
-          zoom_stratum: beat.zoomStratum,
+          flatten_2d:
+            beat.flatten2d ?? (beat.resetFilters ? undefined : curView.flatten2D ? true : undefined),
+          group_by:
+            beat.groupBy ??
+            (beat.resetFilters ? undefined : curView.groupBy !== 'none' ? curView.groupBy : undefined),
+          active_tab:
+            beat.activeTab ?? (curView.activeTab !== '3d' ? curView.activeTab : undefined),
+          framing_preset: isFilterOnlyMove ? curView.framingPreset : beat.framingPreset,
+          z_wythe_slice:
+            beat.zWytheSlice ??
+            (beat.resetFilters || beat.isTimelineStep
+              ? undefined
+              : curView.zWytheSlice !== 'all'
+                ? curView.zWytheSlice
+                : undefined),
+          zoom_stratum: isFilterOnlyMove
+            ? curView.requestedZoomStratum
+            : beat.zoomStratum ?? (beat.resetFilters ? 1 : curView.requestedZoomStratum),
           chronicle_timeline: beat.chronicleTimeline ?? undefined,
         });
         if (hash.length > 1) {
@@ -854,13 +980,15 @@ export default function WytheWorkspacePage() {
         }
       }
 
-      setAgentCameraRequest((prev) => ({
-        seq: (prev?.seq ?? 0) + 1,
-        preset: beat.framingPreset,
-        focusNodeIds: resolvedFocus,
-        highlightEdgeIds: beat.highlightEdgeIds,
-        caption: sanitizeViewportPlainText(beat.caption),
-      }));
+      if (!isFilterOnlyMove) {
+        setAgentCameraRequest((prev) => ({
+          seq: (prev?.seq ?? 0) + 1,
+          preset: beat.framingPreset,
+          focusNodeIds: resolvedFocus,
+          highlightEdgeIds: beat.highlightEdgeIds,
+          caption: sanitizeViewportPlainText(beat.caption),
+        }));
+      }
     },
     [activeSlug, activeSessionId, report?.nodes.length, report?.edges, report?.findings],
   );
@@ -988,33 +1116,50 @@ export default function WytheWorkspacePage() {
     [activeSlug, activeSessionId, tabClientId],
   );
 
+  const setScopedSessionIdRef = useRef(setScopedSessionId);
+  setScopedSessionIdRef.current = setScopedSessionId;
+  const applyCommandOrFirstStepRef = useRef(applyCommandOrFirstStep);
+  applyCommandOrFirstStepRef.current = applyCommandOrFirstStep;
+  const refreshInvestigationStateRef = useRef(refreshInvestigationState);
+  refreshInvestigationStateRef.current = refreshInvestigationState;
+  const sendViewportReceiptRef = useRef(sendViewportReceipt);
+  sendViewportReceiptRef.current = sendViewportReceipt;
+  const reportContentDigestRef = useRef<string | undefined>(report?.content_digest);
+  reportContentDigestRef.current = report?.content_digest;
+
   // Hydrate cold `#focus=...` / `#session=...` / `#chronicle=...&phase=...` URL permalinks on load and hashchange
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const hydrateFromHash = () => {
+      const currentTargets = targetsRef.current;
+      const currentSlug = activeSlugRef.current;
+      let currentSid = activeSessionIdRef.current;
       const explicitSid = extractExplicitSessionIdFromUrl(window.location.href);
       const urlTarget = extractExplicitTargetFromUrl(window.location.href);
-      if (explicitSid && explicitSid !== activeSessionId) {
-        const effSlug = urlTarget || activeSlug;
+      if (explicitSid && explicitSid !== currentSid) {
+        const effSlug = urlTarget || currentSlug;
         if (effSlug && (!urlTarget || urlTarget === effSlug)) {
-          switchTabSessionId(effSlug, explicitSid);
-          setScopedSessionId(effSlug, explicitSid);
+          const cleanSid = switchTabSessionId(effSlug, explicitSid);
+          setScopedSessionIdRef.current(effSlug, cleanSid);
+          currentSid = cleanSid;
         }
       }
-      const parsed = parseViewportPermalinkHash(window.location.hash, activeSlug || 'wythe');
+      const parsed = parseViewportPermalinkHash(window.location.hash, currentSlug || 'wythe');
       if (!parsed) return;
       coldPermalinkAppliedRef.current = true;
       setColdPermalinkActive(true);
-      const destSlug =
-        parsed.target_slug && targets.some((t) => t.slug === parsed.target_slug)
-          ? parsed.target_slug
-          : activeSlug || 'wythe';
-      if (parsed.target_slug && targets.some((t) => t.slug === parsed.target_slug)) {
+      const hasMatchedTarget = Boolean(
+        parsed.target_slug && currentTargets.some((t) => t.slug === parsed.target_slug),
+      );
+      const destSlug = hasMatchedTarget ? parsed.target_slug : currentSlug || 'wythe';
+      if (hasMatchedTarget && parsed.target_slug) {
+        activeSlugRef.current = parsed.target_slug;
         setActiveSlug(parsed.target_slug);
       }
       if (parsed.session_id) {
-        switchTabSessionId(destSlug, parsed.session_id);
-        setScopedSessionId(destSlug, parsed.session_id);
+        const cleanSid = switchTabSessionId(destSlug, parsed.session_id);
+        setScopedSessionIdRef.current(destSlug, cleanSid);
+        currentSid = cleanSid;
       }
       const syntheticEvent: ViewportCommandEvent = {
         seq: 0,
@@ -1022,20 +1167,23 @@ export default function WytheWorkspacePage() {
         permalink: window.location.hash,
         command: parsed,
       };
-      const savedFollow = readPersistedFollowState(parsed.session_id ?? explicitSid ?? activeSessionId);
-      setAgentCamState((prev) => ({
-        ...prev,
+      const savedFollow = readPersistedFollowState(currentSid);
+      const nextCamState: AgentCameraFollowState = {
+        ...agentCamStateRef.current,
         followMode: savedFollow,
         liveFollowing: savedFollow === 'following',
         haltedReason: null,
         chronicleTimelineId: parsed.chronicle_timeline?.timeline_id ?? null,
-        activeEvent: savedFollow === 'following' ? syntheticEvent : prev.activeEvent,
+        activeEvent: savedFollow === 'following' ? syntheticEvent : agentCamStateRef.current.activeEvent,
         pendingEventWhilePaused: savedFollow === 'paused' ? syntheticEvent : null,
         timelineMode: parsed.chronicle_timeline ? 'chronicle' : 'none',
         stepIndex: parsed.chronicle_timeline?.active_phase_index ?? 0,
-      }));
+      };
+      followModeRef.current = savedFollow;
+      agentCamStateRef.current = nextCamState;
+      setAgentCamState(nextCamState);
       if (savedFollow === 'following') {
-        applyCommandOrFirstStep(parsed);
+        applyCommandOrFirstStepRef.current(parsed);
       } else {
         coldPermalinkAppliedRef.current = false;
         setColdPermalinkActive(false);
@@ -1071,16 +1219,20 @@ export default function WytheWorkspacePage() {
           ...latest.command,
           chronicle_timeline: { ...latestTl, active_phase_index: mergedPhase },
         };
-        setAgentCamState((prev) => ({
-          ...prev,
+        const nextCamState: AgentCameraFollowState = {
+          ...agentCamStateRef.current,
           activeEvent: { ...latest, command: mergedCmd },
           timelineMode: 'chronicle',
           stepIndex: mergedPhase,
           haltedReason: sanitizeViewportPlainText(latestTl.halted_reason, 240) || null,
           liveFollowing: !latestTl.halted_reason && latestTl.live_following !== false,
           followMode:
-            latestTl.halted_reason || latestTl.live_following === false ? 'paused' : prev.followMode,
-        }));
+            latestTl.halted_reason || latestTl.live_following === false
+              ? 'paused'
+              : agentCamStateRef.current.followMode,
+        };
+        agentCamStateRef.current = nextCamState;
+        setAgentCamState(nextCamState);
         applyCommandOrFirstStep(mergedCmd);
       }
       return;
@@ -1101,11 +1253,12 @@ export default function WytheWorkspacePage() {
       ackedCommandIdsRef.current = new Set(updated);
     }
     if (decision.action === 'hold_on_reload') {
-      setAgentCamState((prev) => ({
-        ...prev,
+      const nextCamState: AgentCameraFollowState = {
+        ...agentCamStateRef.current,
         pendingEventWhilePaused: latest,
-        activeEvent: prev.activeEvent ?? latest,
-      }));
+      };
+      agentCamStateRef.current = nextCamState;
+      setAgentCamState(nextCamState);
     }
   }, [
     initialViewportState,
@@ -1204,7 +1357,8 @@ export default function WytheWorkspacePage() {
   ]);
 
   // Subscribe to `/api/v1/viewport/stream?target_slug=...&session_id=...` SSE stream
-  const sseBaselineSeq = initialViewportState?.latest?.seq ?? 0;
+  const sseBaselineSeqRef = useRef<number>(0);
+  sseBaselineSeqRef.current = initialViewportState?.latest?.seq ?? 0;
   useEffect(() => {
     if (
       !activeSlug ||
@@ -1225,7 +1379,7 @@ export default function WytheWorkspacePage() {
           clientId: tabClientId,
           actor: 'human',
           followState: followModeRef.current,
-          sinceSeq: 0,
+          sinceSeq: lastSeenSeqRef.current,
         }),
       );
     } catch {
@@ -1235,7 +1389,10 @@ export default function WytheWorkspacePage() {
       try {
         const parsed = JSON.parse(String(ev.data)) as ViewportCommandEvent;
         if (!parsed || !parsed.command) return;
-        if (coldPermalinkAppliedRef.current && parsed.seq <= sseBaselineSeq) {
+        if (parsed.seq > 0) {
+          lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current, parsed.seq);
+        }
+        if (coldPermalinkAppliedRef.current && parsed.seq <= sseBaselineSeqRef.current) {
           return;
         }
         coldPermalinkAppliedRef.current = false;
@@ -1248,8 +1405,7 @@ export default function WytheWorkspacePage() {
           clientId: tabClientId,
           followState: followModeRef.current,
           currentEvidenceRevisionId:
-            latestEvidenceRevRef.current ??
-            (report?.content_digest ? undefined : null),
+            latestEvidenceRevRef.current ?? reportContentDigestRef.current ?? undefined,
           ackedCommandIds: ackedCommandIdsRef.current,
           pausedNotifiedCommandIds: pausedNotifiedIdsRef.current,
         });
@@ -1270,9 +1426,9 @@ export default function WytheWorkspacePage() {
         const isPureRefresh = isPureDrawerRefreshCommand(parsed.command);
         if (decision.action === 'apply' || decision.action === 'queue_while_paused') {
           if (refreshSid && (!activeSessionId || refreshSid === activeSessionId)) {
-            void refreshInvestigationState(refreshSid);
+            void refreshInvestigationStateRef.current(refreshSid);
           } else if (parsed.command.open_drawer === true && activeSessionId) {
-            void refreshInvestigationState(activeSessionId);
+            void refreshInvestigationStateRef.current(activeSessionId);
           }
           if (parsed.command.open_drawer === true) {
             setAskDrawerOpen(true);
@@ -1285,33 +1441,34 @@ export default function WytheWorkspacePage() {
             );
             ackedCommandIdsRef.current = new Set(updated);
             pausedNotifiedIdsRef.current.delete(decision.commandKey);
-            sendViewportReceipt(parsed, 'applied', 'Refreshed investigation drawer');
+            sendViewportReceiptRef.current(parsed, 'applied', 'Refreshed investigation drawer');
             return;
           }
         }
 
         if (decision.action === 'apply') {
-          setAgentCamState((prev) => {
-            const res = applyIncomingViewportEvent(
-              { ...prev, followMode: 'following', liveFollowing: true },
-              parsed,
-            );
-            if (res.shouldMoveCamera) {
-              applyCommandOrFirstStep(parsed.command);
-            }
-            return res.state;
-          });
+          const res = applyIncomingViewportEvent(
+            { ...agentCamStateRef.current, followMode: 'following', liveFollowing: true },
+            parsed,
+          );
+          followModeRef.current = res.state.followMode;
+          agentCamStateRef.current = res.state;
+          setAgentCamState(res.state);
+          if (res.shouldMoveCamera) {
+            applyCommandOrFirstStepRef.current(parsed.command);
+          }
           if (decision.receiptOutcome) {
-            sendViewportReceipt(parsed, decision.receiptOutcome);
+            sendViewportReceiptRef.current(parsed, decision.receiptOutcome);
           }
         } else if (decision.action === 'queue_while_paused') {
-          setAgentCamState((prev) => ({
-            ...prev,
+          const nextCamState: AgentCameraFollowState = {
+            ...agentCamStateRef.current,
             pendingEventWhilePaused: parsed,
-            activeEvent: prev.activeEvent ?? parsed,
-          }));
+          };
+          agentCamStateRef.current = nextCamState;
+          setAgentCamState(nextCamState);
           if (decision.receiptOutcome) {
-            sendViewportReceipt(
+            sendViewportReceiptRef.current(
               parsed,
               decision.receiptOutcome,
               'Human camera follow is paused',
@@ -1322,7 +1479,7 @@ export default function WytheWorkspacePage() {
           decision.action === 'reject'
         ) {
           if (decision.receiptOutcome) {
-            sendViewportReceipt(parsed, decision.receiptOutcome, decision.reason);
+            sendViewportReceiptRef.current(parsed, decision.receiptOutcome, decision.reason);
           }
         }
       } catch {
@@ -1334,17 +1491,7 @@ export default function WytheWorkspacePage() {
     return () => {
       es?.close();
     };
-  }, [
-    activeSlug,
-    activeSessionId,
-    tabClientId,
-    viewportStateFetched,
-    sseBaselineSeq,
-    report?.content_digest,
-    applyCommandOrFirstStep,
-    refreshInvestigationState,
-    sendViewportReceipt,
-  ]);
+  }, [activeSlug, activeSessionId, tabClientId, viewportStateFetched]);
 
   const activeTimelineItems = useMemo(
     () => normalizeViewportTimeline(agentCamState.activeEvent?.command),
@@ -1451,6 +1598,34 @@ export default function WytheWorkspacePage() {
     ],
   );
 
+  workspaceViewRef.current = {
+    selectedNodeId,
+    selectedEdgeId,
+    selectedFindingId,
+    sceneLens,
+    sceneLayout,
+    tierFilter,
+    subkindFilter,
+    edgeFilter,
+    onlyFlagged,
+    isolateCone,
+    connectedOnly,
+    neighborhoodHops,
+    searchQuery,
+    blastMode,
+    diffBaseRef,
+    workingSetActive,
+    compactVisible,
+    flatten2D,
+    groupBy,
+    activeTab,
+    zWytheSlice,
+    requestedZoomStratum,
+    framingPreset: currentAgentBeat?.framingPreset ?? 'iso_overview',
+    focusNodeIds: currentAgentBeat?.focusNodeIds ?? [],
+    highlightEdgeIds: currentAgentBeat?.highlightEdgeIds ?? [],
+  };
+
   const syncFollowStateToBackend = useCallback(
     (nextFollow: FollowState, reason: string) => {
       const sidAtCall = activeSessionIdRef.current;
@@ -1485,26 +1660,88 @@ export default function WytheWorkspacePage() {
 
   const handleHumanYield = useCallback(
     (reason: HumanInputInterruptKind) => {
-      setAgentCamState((prev) => {
-        const next = yieldAgentCameraOnHumanInput(prev, reason);
-        if (prev.followMode !== 'paused') {
-          syncFollowStateToBackend('paused', `human_input:${reason}`);
-        }
-        return next;
-      });
+      const prev = agentCamStateRef.current;
+      const next = yieldAgentCameraOnHumanInput(prev, reason);
+      followModeRef.current = next.followMode;
+      agentCamStateRef.current = next;
+      setAgentCamState(next);
+      if (prev.followMode !== 'paused') {
+        syncFollowStateToBackend('paused', `human_input:${reason}`);
+      }
     },
     [syncFollowStateToBackend],
   );
 
-  const handleToggleAgentFollow = useCallback(() => {
-    setAgentCamState((prev) => {
-      if (prev.followMode === 'following') {
-        syncFollowStateToBackend('paused', 'manual_pause_button');
-        return yieldAgentCameraOnHumanInput(prev, 'pointerdown');
-      }
-      syncFollowStateToBackend('following', 'manual_resume_button');
+  const resumeFollowFromPaused = useCallback(
+    (reason: string) => {
+      const prev = agentCamStateRef.current;
+      syncFollowStateToBackend('following', reason);
+      const nowMs = Date.now();
+      const currentEvidenceRev =
+        latestEvidenceRevRef.current ?? report?.content_digest ?? undefined;
       const pendingEvt = prev.pendingEventWhilePaused;
-      const resumed = resumeAgentCameraFollow(prev);
+      const resumeDecision =
+        pendingEvt && activeSlug
+          ? evaluateIncomingViewportCommand({
+              event: pendingEvt,
+              source: 'resume',
+              activeTargetSlug: activeSlug,
+              activeSessionId,
+              clientId: tabClientId,
+              followState: 'following',
+              currentEvidenceRevisionId: currentEvidenceRev,
+              ackedCommandIds: ackedCommandIdsRef.current,
+              pausedNotifiedCommandIds: pausedNotifiedIdsRef.current,
+              nowMs,
+            })
+          : null;
+      const resumed = resumeAgentCameraFollow(prev, {
+        nowMs,
+        currentEvidenceRevisionId: currentEvidenceRev,
+        activeTargetSlug: activeSlug || undefined,
+        activeSessionId,
+        clientId: tabClientId || undefined,
+      });
+      followModeRef.current = resumed.followMode;
+      agentCamStateRef.current = resumed;
+      setAgentCamState(resumed);
+
+      if (pendingEvt) {
+        const cmdKey = resumeDecision?.commandKey ?? getViewportCommandKey(pendingEvt);
+        pausedNotifiedIdsRef.current.delete(cmdKey);
+        if (resumeDecision && resumeDecision.action !== 'apply') {
+          if (resumeDecision.markAcked && pendingEvt.seq > 0 && activeSlug) {
+            const updated = recordAckedCommandId(activeSlug, activeSessionId, cmdKey);
+            ackedCommandIdsRef.current = new Set(updated);
+          }
+          if (resumeDecision.receiptOutcome && pendingEvt.seq > 0 && activeSlug) {
+            sendViewportReceipt(
+              pendingEvt,
+              resumeDecision.receiptOutcome,
+              resumeDecision.reason,
+            );
+          }
+          return;
+        }
+        if (isPureDrawerRefreshCommand(pendingEvt.command)) {
+          const refreshSid = pendingEvt.command.refresh_session_id;
+          if (refreshSid && (!activeSessionId || refreshSid === activeSessionId)) {
+            void refreshInvestigationState(refreshSid);
+          } else if (pendingEvt.command.open_drawer === true && activeSessionId) {
+            void refreshInvestigationState(activeSessionId);
+          }
+          if (pendingEvt.command.open_drawer === true) {
+            setAskDrawerOpen(true);
+          }
+          if (pendingEvt.seq > 0 && activeSlug && !ackedCommandIdsRef.current.has(cmdKey)) {
+            const updated = recordAckedCommandId(activeSlug, activeSessionId, cmdKey);
+            ackedCommandIdsRef.current = new Set(updated);
+            sendViewportReceipt(pendingEvt, 'applied', 'Refreshed investigation drawer');
+          }
+          return;
+        }
+      }
+
       if (resumed.activeEvent?.command) {
         const items = normalizeViewportTimeline(resumed.activeEvent.command);
         if (items.length > 0) {
@@ -1550,83 +1787,106 @@ export default function WytheWorkspacePage() {
         }
       }
       if (pendingEvt && pendingEvt.seq > 0 && activeSlug) {
-        const key = getViewportCommandKey(pendingEvt);
+        const key = resumeDecision?.commandKey ?? getViewportCommandKey(pendingEvt);
         if (!ackedCommandIdsRef.current.has(key)) {
           const updated = recordAckedCommandId(activeSlug, activeSessionId, key);
           ackedCommandIdsRef.current = new Set(updated);
           sendViewportReceipt(pendingEvt, 'applied', 'Applied on explicit human resume');
         }
       }
-      return resumed;
-    });
-  }, [
-    activeSlug,
-    activeSessionId,
-    applyBeatToWorkspace,
-    applyCommandOrFirstStep,
-    sendViewportReceipt,
-    syncFollowStateToBackend,
-  ]);
+    },
+    [
+      activeSlug,
+      activeSessionId,
+      tabClientId,
+      report?.content_digest,
+      applyBeatToWorkspace,
+      applyCommandOrFirstStep,
+      refreshInvestigationState,
+      sendViewportReceipt,
+      syncFollowStateToBackend,
+    ],
+  );
+
+  const handleToggleAgentFollow = useCallback(() => {
+    const prev = agentCamStateRef.current;
+    if (prev.followMode === 'following') {
+      const next = yieldAgentCameraOnHumanInput(prev, 'pointerdown');
+      followModeRef.current = next.followMode;
+      agentCamStateRef.current = next;
+      setAgentCamState(next);
+      syncFollowStateToBackend('paused', 'manual_pause_button');
+      return;
+    }
+    resumeFollowFromPaused('manual_resume_button');
+  }, [resumeFollowFromPaused, syncFollowStateToBackend]);
 
   const handleRejectPendingAgentCommand = useCallback(() => {
-    setAgentCamState((prev) => {
-      const pendingEvt = prev.pendingEventWhilePaused;
-      if (pendingEvt && pendingEvt.seq > 0 && activeSlug) {
-        const key = getViewportCommandKey(pendingEvt);
-        const updated = recordAckedCommandId(activeSlug, activeSessionId, key);
-        ackedCommandIdsRef.current = new Set(updated);
-        sendViewportReceipt(pendingEvt, 'rejected', 'Rejected by human while follow paused');
-      }
-      return { ...prev, pendingEventWhilePaused: null };
-    });
+    const prev = agentCamStateRef.current;
+    const pendingEvt = prev.pendingEventWhilePaused;
+    const next: AgentCameraFollowState = { ...prev, pendingEventWhilePaused: null };
+    agentCamStateRef.current = next;
+    setAgentCamState(next);
+    if (pendingEvt && pendingEvt.seq > 0 && activeSlug) {
+      const key = getViewportCommandKey(pendingEvt);
+      const updated = recordAckedCommandId(activeSlug, activeSessionId, key);
+      ackedCommandIdsRef.current = new Set(updated);
+      sendViewportReceipt(pendingEvt, 'rejected', 'Rejected by human while follow paused');
+    }
   }, [activeSlug, activeSessionId, sendViewportReceipt]);
 
   const handleStepAgentTimeline = useCallback(
     (delta: -1 | 1 | { index: number }) => {
-      setAgentCamState((prev) => {
-        const next = stepTimelineFrame(prev, delta);
-        const items = normalizeViewportTimeline(next.activeEvent?.command);
-        if (items.length > 0) {
-          const idx = Math.min(next.stepIndex, items.length - 1);
-          const item = items[idx];
-          applyBeatToWorkspace({
-            targetSlug: next.activeEvent?.command.target_slug,
-            focusNodeIds: item.focusNodeIds,
-            highlightEdgeIds: item.highlightEdgeIds,
-            selectedNodeId: item.selectedNodeId,
-            selectedEdgeId: item.selectedEdgeId,
-            findingId: item.findingId,
-            lens: item.lens,
-            layoutMode: item.layoutMode,
-            tierFilter: item.tierFilter,
-            subkindFilter: item.subkindFilter,
-            edgeFilter: item.edgeFilter,
-            onlyFlagged: item.onlyFlagged,
-            isolateCone: item.isolateCone,
-            connectedOnly: item.connectedOnly,
-            neighborhoodHops: item.neighborhoodHops,
-            searchQuery: item.searchQuery,
-            blastMode: item.blastMode,
-            diffBaseRef: item.diffBaseRef,
-            workingSetOnly: item.workingSetOnly,
-            compactVisible: item.compactVisible,
-            flatten2d: item.flatten2d,
-            groupBy: item.groupBy,
-            activeTab: item.activeTab,
-            openDrawer: item.openDrawer,
-            resetFilters: item.resetFilters,
-            isTimelineStep: true,
-            zWytheSlice: item.zWytheSlice,
-            zoomStratum: item.zoomStratum,
-            framingPreset: item.framingPreset,
-            caption: item.caption,
-            chronicleTimeline: next.activeEvent?.command.chronicle_timeline
-              ? { ...next.activeEvent.command.chronicle_timeline, active_phase_index: idx }
-              : null,
-          });
-        }
-        return { ...next, followMode: 'following', liveFollowing: true };
-      });
+      const prev = agentCamStateRef.current;
+      const stepped = stepTimelineFrame(prev, delta);
+      const next: AgentCameraFollowState = {
+        ...stepped,
+        followMode: 'following',
+        liveFollowing: true,
+      };
+      followModeRef.current = 'following';
+      agentCamStateRef.current = next;
+      setAgentCamState(next);
+      const items = normalizeViewportTimeline(next.activeEvent?.command);
+      if (items.length > 0) {
+        const idx = Math.min(next.stepIndex, items.length - 1);
+        const item = items[idx];
+        applyBeatToWorkspace({
+          targetSlug: next.activeEvent?.command.target_slug,
+          focusNodeIds: item.focusNodeIds,
+          highlightEdgeIds: item.highlightEdgeIds,
+          selectedNodeId: item.selectedNodeId,
+          selectedEdgeId: item.selectedEdgeId,
+          findingId: item.findingId,
+          lens: item.lens,
+          layoutMode: item.layoutMode,
+          tierFilter: item.tierFilter,
+          subkindFilter: item.subkindFilter,
+          edgeFilter: item.edgeFilter,
+          onlyFlagged: item.onlyFlagged,
+          isolateCone: item.isolateCone,
+          connectedOnly: item.connectedOnly,
+          neighborhoodHops: item.neighborhoodHops,
+          searchQuery: item.searchQuery,
+          blastMode: item.blastMode,
+          diffBaseRef: item.diffBaseRef,
+          workingSetOnly: item.workingSetOnly,
+          compactVisible: item.compactVisible,
+          flatten2d: item.flatten2d,
+          groupBy: item.groupBy,
+          activeTab: item.activeTab,
+          openDrawer: item.openDrawer,
+          resetFilters: item.resetFilters,
+          isTimelineStep: true,
+          zWytheSlice: item.zWytheSlice,
+          zoomStratum: item.zoomStratum,
+          framingPreset: item.framingPreset,
+          caption: item.caption,
+          chronicleTimeline: next.activeEvent?.command.chronicle_timeline
+            ? { ...next.activeEvent.command.chronicle_timeline, active_phase_index: idx }
+            : null,
+        });
+      }
     },
     [applyBeatToWorkspace],
   );
@@ -2171,12 +2431,15 @@ export default function WytheWorkspacePage() {
         return created;
       },
       setFollowState: async (state) => {
-        setAgentCamState((prev) =>
-          state === 'paused'
-            ? yieldAgentCameraOnHumanInput(prev, 'pointerdown')
-            : resumeAgentCameraFollow(prev),
-        );
-        syncFollowStateToBackend(state, 'window_wythe_bridge');
+        if (state === 'paused') {
+          const next = yieldAgentCameraOnHumanInput(agentCamStateRef.current, 'pointerdown');
+          followModeRef.current = next.followMode;
+          agentCamStateRef.current = next;
+          setAgentCamState(next);
+          syncFollowStateToBackend('paused', 'window_wythe_bridge');
+        } else {
+          resumeFollowFromPaused('window_wythe_bridge');
+        }
         return { session_id: activeSessionId, follow_state: state };
       },
       compareRevisions: async () => {
@@ -2203,6 +2466,7 @@ export default function WytheWorkspacePage() {
     selectedFindingId,
     openAskWytheDrawer,
     refreshInvestigationState,
+    resumeFollowFromPaused,
     syncFollowStateToBackend,
   ]);
 
@@ -3161,17 +3425,11 @@ export default function WytheWorkspacePage() {
       <header className="relative z-40 border-b border-slate-800 bg-slate-950/90 px-5 py-3 backdrop-blur">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-4">
-            <div>
-              <div className="flex items-center gap-2.5">
-                <WytheMark palette={wytheTheme.palette} size={28} />
-                <span className="font-mono text-sm font-bold tracking-wider text-slate-100">
-                  WYTHE
-                </span>
-                <span className="hidden border border-slate-800 bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-slate-300 2xl:inline-block">
-                  Why · ∴ · 3-Tier
-                </span>
-              </div>
-            </div>
+            <WytheBrandLockup
+              palette={wytheTheme.palette}
+              version={healthz?.version}
+              size={28}
+            />
 
             {/* Target Repository Switcher */}
             <div className="flex items-center gap-1.5">

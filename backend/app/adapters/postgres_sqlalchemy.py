@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import configparser
 import copy
+import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -17,6 +19,12 @@ from app.adapters.db_catalog_probe import (
     probe_live_catalog_tables,
 )
 from app.adapters.python_layout import discover_python_app
+from app.adapters.ts_workspace import (
+    MAX_FRONTEND_FILE_BYTES,
+    safe_read_repo_bytes,
+    safe_read_repo_text,
+    safe_resolve_contained_path,
+)
 from app.schemas.atlas import AtlasNode
 
 _IDENT = r'(?<![\w"\x00])(?:"[A-Za-z_]\w*"|[A-Za-z_]\w*)(?![\w"\x00])'
@@ -131,12 +139,59 @@ def _is_classvar_annotation(ann: ast.expr | None) -> bool:
     return ann is not None and _expr_name(ann) == "ClassVar"
 
 
-def _scan_model_module(py_file: Path, rel_path: str) -> _ModelScan:
+def _check_dir_accessible(path: Path) -> None:
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise PermissionError(f"Directory is not readable/traversable: {path}")
+    with os.scandir(path) as it:
+        next(it, None)
+
+
+def _read_regular_text_bounded(path: Path, *, max_bytes: int = MAX_FRONTEND_FILE_BYTES) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"Refusing non-regular file: {path}")
+        if st.st_size > max_bytes:
+            raise OSError(f"File exceeds {max_bytes} byte cap: {path}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            rem = max_bytes + 1 - total
+            if rem <= 0:
+                break
+            chunk = os.read(fd, min(65536, rem))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise OSError(f"File exceeds {max_bytes} byte cap: {path}")
+        return b"".join(chunks).decode("utf-8")
+    finally:
+        os.close(fd)
+
+
+def _scan_model_module(
+    py_file: Path,
+    rel_path: str,
+    *,
+    repo_root: Path | None = None,
+    failed_out: list[str] | None = None,
+) -> _ModelScan:
     """Return models as (class, table, lineno, columns, summary, base names) plus base metadata."""
     scan = _ModelScan()
     try:
-        tree = ast.parse(py_file.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, SyntaxError):
+        text = (
+            safe_read_repo_text(py_file, repo_root, encoding="utf-8")
+            if repo_root is not None
+            else _read_regular_text_bounded(py_file)
+        )
+        tree = ast.parse(text)
+    except (OSError, UnicodeError, SyntaxError, ValueError):
+        if failed_out is not None:
+            failed_out.append(rel_path)
         return scan
 
     # Module-level string constants, so `{"schema": AUDIT_SCHEMA}` resolves.
@@ -640,6 +695,12 @@ def _sql_table_events(sql_text: str) -> list[tuple[int, str, str, str | None, in
     return events
 
 
+_CREATE_SCHEMA_RE = re.compile(
+    r"""\bCREATE\s+SCHEMA\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<schema>"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)""",
+    re.IGNORECASE,
+)
+
+
 @dataclass
 class _MigrationEffects:
     revision: str | None = None
@@ -651,6 +712,9 @@ class _MigrationEffects:
     dropped_functions: set[str] = field(default_factory=set)
     creates_all_metadata: bool = False
     touches_ddl: bool = False
+    create_all_order: tuple | None = None
+    last_incremental_ddl_order: tuple | None = None
+    declared_schemas: set[str] = field(default_factory=set)
     function_reads: dict[str, set[str]] = field(default_factory=dict)
     fk_refs: set[tuple[str, str]] = field(default_factory=set)
 
@@ -1431,17 +1495,31 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
     module_env = _MigrationEnv(scope_id=0)
     suppress_ddl = False
 
+    def note_ddl_order(order: tuple) -> None:
+        if suppress_ddl:
+            return
+        if (
+            effects.last_incremental_ddl_order is None
+            or order > effects.last_incremental_ddl_order
+        ):
+            effects.last_incremental_ddl_order = order
+
     def add_event(
         order: tuple, kind: str, table: str, new_table: str | None, lineno: int, cols: list[str] | None = None
     ) -> None:
         if suppress_ddl:
             return
+        note_ddl_order(order)
         effects.table_events.append((order, kind, table, new_table, lineno, list(cols or [])))
 
     def absorb_sql(sql_text: str, lineno: int, order: tuple) -> None:
         if suppress_ddl:
             return
         cleaned = _blank_sql_comments(sql_text)
+        for sch_m in _CREATE_SCHEMA_RE.finditer(cleaned):
+            sch_name = _clean_sql_name(sch_m.group("schema"))
+            if sch_name:
+                effects.declared_schemas.add(sch_name)
         _, funcs = _parse_sql_objects(sql_text)
         for offset, kind, table, new_table, line_offset, cols in _sql_table_events(sql_text):
             add_event((*order, (offset,)), kind, table, new_table, lineno + line_offset, cols)
@@ -2743,6 +2821,9 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                         effects.fk_refs |= {(key, dst) for dst in fk_targets_in(sub, env) if dst != key}
                 return
             if callee == "create_foreign_key" and len(sub.args) >= 3:
+                if not suppress_ddl:
+                    effects.touches_ddl = True
+                    note_ddl_order(order)
                 srcs = [s for s, _ in _eval_str_variants(sub.args[1], env) if s]
                 dsts = [d for d, _ in _eval_str_variants(sub.args[2], env) if d]
                 kw = {
@@ -2771,9 +2852,11 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             if callee == "create_all":
                 if not suppress_ddl:
                     effects.creates_all_metadata = True
+                    effects.create_all_order = order
             elif callee in ("add_column", "drop_column", "alter_column"):
                 if not suppress_ddl:
                     effects.touches_ddl = True
+                    note_ddl_order(order)
             else:
                 handled_call, _c_fns, _c_tup = eval_call_fns(
                     sub, ctx, env, in_sql_exec=in_sql_exec, in_non_exec=in_non_exec
@@ -2854,6 +2937,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                                 if in_sql_exec or "TABLE" in cleaned_p or "FUNCTION" in cleaned_p:
                                     if "ALTER TABLE" in cleaned_p:
                                         effects.touches_ddl = True
+                                        note_ddl_order((*order, (idx_p,)))
                                     absorb_sql(p_sql, getattr(sub, "lineno", p_ln), (*order, (idx_p,)))
                         return
                 if callee == "setdefault" and recv_name in env.dicts and len(sub.args) == 2 and not sub.keywords:
@@ -2929,6 +3013,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                             if in_sql_exec or "TABLE" in cleaned_g or "FUNCTION" in cleaned_g:
                                 if "ALTER TABLE" in cleaned_g:
                                     effects.touches_ddl = True
+                                    note_ddl_order((*order, (idx_g,)))
                                 absorb_sql(g_sql, getattr(sub, "lineno", g_ln), (*order, (idx_g,)))
                         return
             next_exec = in_sql_exec or callee in sql_exec_calls
@@ -2950,6 +3035,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 cleaned_u = _blank_sql_comments(sql_val).upper()
                 if "ALTER TABLE" in cleaned_u:
                     effects.touches_ddl = True
+                    note_ddl_order((*order, (idx_s,)))
                 absorb_sql(sql_val, sql_ln, (*order, (idx_s,)))
             return
         elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in env.consts:
@@ -2961,6 +3047,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
             cleaned_u = _blank_sql_comments(sql_val).upper()
             if "ALTER TABLE" in cleaned_u:
                 effects.touches_ddl = True
+                note_ddl_order(order)
             absorb_sql(sql_val, env.lines.get(sub.id, sub.lineno), order)
             return
         elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in env.alts:
@@ -2974,6 +3061,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                 cleaned_u = _blank_sql_comments(sql_val).upper()
                 if "ALTER TABLE" in cleaned_u:
                     effects.touches_ddl = True
+                    note_ddl_order((*order, (idx_a,)))
                 absorb_sql(sql_val, sql_ln, (*order, (idx_a,)))
             return
         elif isinstance(sub, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Subscript)):
@@ -3002,6 +3090,7 @@ def _collect_migration_effects(tree: ast.Module) -> _MigrationEffects:
                             matched_any = True
                             if "ALTER TABLE" in cleaned_u:
                                 effects.touches_ddl = True
+                                note_ddl_order((*order, (idx_v,)))
                             absorb_sql(text, getattr(sub, "lineno", v_ln), (*order, (idx_v,)))
                     if matched_any:
                         absorbed_consts.update(ref_pairs)
@@ -3752,32 +3841,193 @@ def _is_migration_subpath(rel_parts: tuple[str, ...]) -> bool:
     return "migrations" in rel_parts[:-1] and ("versions" in rel_parts or rel_parts[-1] == "env.py")
 
 
-def _discover_alembic_versions_dir(backend_dir: Path, app_dir: Path | None) -> Path:
+def _check_contained_dir(
+    cand: Path,
+    root_bound: Path,
+    issues_out: list[str] | None,
+    label: str,
+    *,
+    must_exist: bool = False,
+) -> Path | None:
+    try:
+        rel_parts = cand.relative_to(root_bound).parts
+    except ValueError:
+        if issues_out is not None:
+            issues_out.append(f"Rejected out-of-repo {label} `{cand}`.")
+        return None
+    cur = root_bound
+    for idx, part in enumerate(rel_parts):
+        if part in ("", "."):
+            continue
+        cur = cur / part
+        try:
+            st = cur.lstat()
+        except FileNotFoundError:
+            if must_exist and idx == len(rel_parts) - 1:
+                return None
+            return None
+        except OSError as exc:
+            if issues_out is not None:
+                issues_out.append(f"Unreadable {label} `{cur}` ({exc}).")
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            if issues_out is not None:
+                issues_out.append(f"Skipped symlink {label} `{cur}`.")
+            return None
+        if stat.S_ISDIR(st.st_mode):
+            if not os.access(cur, os.R_OK | os.X_OK):
+                if issues_out is not None:
+                    issues_out.append(f"Unreadable {label} `{cur}`.")
+                return None
+        elif idx == len(rel_parts) - 1:
+            if issues_out is not None:
+                issues_out.append(f"Skipped non-directory {label} `{cur}`.")
+            return None
+    safe_cand = safe_resolve_contained_path(cand, root_bound)
+    if safe_cand is None:
+        if issues_out is not None:
+            issues_out.append(f"Rejected out-of-repo or symlink {label} `{cand}`.")
+        return None
+    try:
+        if not safe_cand.is_dir():
+            return None
+        _check_dir_accessible(safe_cand)
+    except OSError as exc:
+        if issues_out is not None:
+            issues_out.append(f"Unreadable {label} `{safe_cand}` ({exc}).")
+        return None
+    return safe_cand
+
+
+def _preflight_python_layout(backend_dir: Path, notes: list[str]) -> tuple[bool, bool]:
+    """Verify `discover_python_app` will not crash on 0o000 dirs or hang on FIFOs."""
+    app_path = backend_dir / "app"
+    try:
+        app_st = app_path.lstat()
+    except FileNotFoundError:
+        app_st = None
+    except OSError as exc:
+        notes.append(f"Unreadable `app/` directory `{app_path}` ({exc}); Python backend coverage is incomplete.")
+        return False, False
+
+    coverage_ok = True
+    if app_st is not None:
+        if stat.S_ISLNK(app_st.st_mode):
+            coverage_ok = False
+            notes.append(f"Skipped symlink `app/` directory `{app_path}`; Python backend coverage is incomplete.")
+        elif stat.S_ISDIR(app_st.st_mode):
+            try:
+                _check_dir_accessible(app_path)
+            except OSError as exc:
+                notes.append(f"Unreadable `app/` directory `{app_path}` ({exc}); Python backend coverage is incomplete.")
+                return False, False
+            return True, True
+
+    safe_to_discover = True
+    try:
+        with os.scandir(backend_dir) as it:
+            entries = sorted(it, key=lambda e: e.name)
+    except OSError as exc:
+        notes.append(f"Unreadable backend directory `{backend_dir}` ({exc}); Python backend coverage is incomplete.")
+        return False, False
+
+    for entry in entries:
+        if not entry.name.isidentifier() or entry.name in {"tests", "test", "__pycache__"}:
+            continue
+        pkg_path = Path(entry.path)
+        try:
+            pkg_st = pkg_path.lstat()
+        except OSError as exc:
+            notes.append(f"Unreadable package candidate `{pkg_path}` ({exc}); Python backend coverage is incomplete.")
+            coverage_ok = False
+            safe_to_discover = False
+            continue
+        if stat.S_ISLNK(pkg_st.st_mode):
+            notes.append(f"Skipped symlink package candidate `{pkg_path}`; Python backend coverage is incomplete.")
+            coverage_ok = False
+            continue
+        if not stat.S_ISDIR(pkg_st.st_mode):
+            continue
+        try:
+            _check_dir_accessible(pkg_path)
+        except OSError as exc:
+            notes.append(f"Unreadable package directory `{pkg_path}` ({exc}); Python backend coverage is incomplete.")
+            coverage_ok = False
+            safe_to_discover = False
+            continue
+        for fname in ("__init__.py", "main.py", "app.py"):
+            fpath = pkg_path / fname
+            try:
+                fst = fpath.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                notes.append(f"Unreadable package file `{fpath}` ({exc}); Python backend coverage is incomplete.")
+                coverage_ok = False
+                safe_to_discover = False
+                continue
+            if stat.S_ISLNK(fst.st_mode):
+                notes.append(f"Skipped symlink package file `{fpath}`; Python backend coverage is incomplete.")
+                coverage_ok = False
+                continue
+            if not stat.S_ISREG(fst.st_mode):
+                notes.append(f"Skipped non-regular package file `{fpath}`; Python backend coverage is incomplete.")
+                coverage_ok = False
+                safe_to_discover = False
+                continue
+            if not os.access(fpath, os.R_OK):
+                notes.append(f"Unreadable package file `{fpath}`; Python backend coverage is incomplete.")
+                coverage_ok = False
+    return safe_to_discover, coverage_ok
+
+
+def _discover_alembic_versions_dir(
+    backend_dir: Path,
+    app_dir: Path | None,
+    *,
+    repo_root: Path | None = None,
+    issues_out: list[str] | None = None,
+) -> Path | None:
     """Resolve Alembic `versions/` directory from `alembic.ini` `script_location` or nested fallbacks."""
-    backend_resolved = backend_dir.resolve()
+    root_bound = repo_root if repo_root is not None else backend_dir
+    backend_resolved = safe_resolve_contained_path(backend_dir, root_bound) or backend_dir.resolve()
     ini_candidates = [backend_dir / "alembic.ini"]
     if app_dir is not None and app_dir.parent != backend_dir:
         ini_candidates.append(app_dir.parent / "alembic.ini")
     for ini_path in ini_candidates:
-        if not ini_path.is_file() or ini_path.is_symlink():
+        try:
+            ini_st = ini_path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            if issues_out is not None:
+                issues_out.append(f"Unreadable Alembic config `{ini_path}` ({exc}).")
+            continue
+        if stat.S_ISLNK(ini_st.st_mode):
+            if issues_out is not None:
+                issues_out.append(f"Skipped symlink Alembic config `{ini_path}`.")
+            continue
+        if not stat.S_ISREG(ini_st.st_mode):
+            if issues_out is not None:
+                issues_out.append(f"Skipped non-regular Alembic config `{ini_path}`.")
             continue
         parser = configparser.ConfigParser(defaults={"here": str(ini_path.parent)})
         try:
-            parser.read(ini_path, encoding="utf-8")
+            ini_text = safe_read_repo_text(ini_path, root_bound, encoding="utf-8")
+            parser.read_string(ini_text)
             script_loc = parser.get("alembic", "script_location", fallback="").strip()
-        except (configparser.Error, OSError, UnicodeError):
+        except (configparser.Error, OSError, UnicodeError, ValueError) as exc:
+            if issues_out is not None:
+                issues_out.append(f"Unreadable or invalid Alembic config `{ini_path}` ({exc}).")
             script_loc = ""
         if script_loc:
             cand = Path(script_loc)
             if not cand.is_absolute():
                 cand = ini_path.parent / cand
             versions = cand / "versions"
-            try:
-                versions_resolved = versions.resolve()
-            except OSError:
-                versions_resolved = versions
-            if versions_resolved.is_relative_to(backend_resolved) and versions.is_dir() and not versions.is_symlink():
-                return versions
+            safe_versions = _check_contained_dir(versions, backend_resolved, issues_out, "Alembic versions directory")
+            if safe_versions is not None:
+                return safe_versions
     candidates = [
         backend_dir / "alembic" / "versions",
         backend_dir / "migrations" / "versions",
@@ -3785,9 +4035,10 @@ def _discover_alembic_versions_dir(backend_dir: Path, app_dir: Path | None) -> P
     if app_dir is not None:
         candidates.extend([app_dir / "alembic" / "versions", app_dir / "migrations" / "versions"])
     for cand in candidates:
-        if cand.is_dir() and not cand.is_symlink():
-            return cand
-    return backend_dir / "alembic" / "versions"
+        safe_cand = _check_contained_dir(cand, root_bound, issues_out, "Alembic versions directory")
+        if safe_cand is not None:
+            return safe_cand
+    return None
 
 
 def _resolve_class_columns(
@@ -3815,41 +4066,115 @@ def _resolve_class_columns(
     return merged
 
 
-def _model_source_files(app_dir: Path, models_dir: Path) -> list[Path]:
+def _walk_python_files_safe(
+    root_dir: Path,
+    root_bound: Path,
+    *,
+    skip_parts: frozenset[str],
+    issues_out: list[str] | None,
+) -> list[Path]:
+    safe_root = _check_contained_dir(root_dir, root_bound, issues_out, "Python source directory")
+    if safe_root is None:
+        return []
+    found: list[Path] = []
+
+    def _on_walk_err(exc: OSError) -> None:
+        if issues_out is not None:
+            issues_out.append(f"Unreadable Python source directory `{exc.filename or safe_root}` ({exc}).")
+
+    for parent, dirs, names in os.walk(safe_root, followlinks=False, onerror=_on_walk_err):
+        parent_p = Path(parent)
+        kept_dirs: list[str] = []
+        for d in sorted(dirs):
+            dp = parent_p / d
+            rel_parts = dp.relative_to(safe_root).parts
+            if d in skip_parts or _is_migration_subpath(rel_parts):
+                continue
+            try:
+                dst = dp.lstat()
+            except OSError as exc:
+                if issues_out is not None:
+                    issues_out.append(f"Unreadable Python directory `{dp}` ({exc}).")
+                continue
+            if stat.S_ISLNK(dst.st_mode):
+                if issues_out is not None:
+                    issues_out.append(f"Skipped symlink Python directory `{dp}`.")
+                continue
+            if stat.S_ISDIR(dst.st_mode):
+                if not os.access(dp, os.R_OK | os.X_OK):
+                    if issues_out is not None:
+                        issues_out.append(f"Unreadable Python directory `{dp}`.")
+                    continue
+                kept_dirs.append(d)
+        dirs[:] = kept_dirs
+
+        for name in sorted(names):
+            if not name.endswith(".py"):
+                continue
+            pf = parent_p / name
+            rel_parts = pf.relative_to(safe_root).parts
+            if _is_migration_subpath(rel_parts):
+                continue
+            try:
+                fst = pf.lstat()
+            except OSError as exc:
+                if issues_out is not None:
+                    issues_out.append(f"Unreadable Python file `{pf}` ({exc}).")
+                continue
+            if stat.S_ISLNK(fst.st_mode):
+                if issues_out is not None:
+                    issues_out.append(f"Skipped symlink Python file `{pf}`.")
+                continue
+            if not stat.S_ISREG(fst.st_mode):
+                if issues_out is not None:
+                    issues_out.append(f"Skipped non-regular Python file `{pf}`.")
+                continue
+            safe_pf = safe_resolve_contained_path(pf, root_bound)
+            if safe_pf is None:
+                if issues_out is not None:
+                    issues_out.append(f"Rejected out-of-repo Python file `{pf}`.")
+                continue
+            found.append(safe_pf)
+    return found
+
+
+def _model_source_files(
+    app_dir: Path,
+    models_dir: Path,
+    *,
+    repo_root: Path | None = None,
+    issues_out: list[str] | None = None,
+) -> list[Path]:
     """Python files that may declare ORM models or declarative bases.
 
     Every file under `app/models`, then any other file in the app package whose text declares
     a `__tablename__`, `SQLModel`, or a declarative base (models and bases also live in `db/`,
     `models.py`, feature packages, and so on).
     """
-    files = (
-        [
-            p
-            for p in sorted(models_dir.rglob("*.py"))
-            if "__pycache__" not in p.parts
-            and not p.is_symlink()
-            and not _is_migration_subpath(p.relative_to(models_dir).parts)
-        ]
-        if models_dir.is_dir()
-        else []
+    root_bound = repo_root if repo_root is not None else app_dir.parent
+    files = _walk_python_files_safe(
+        models_dir,
+        root_bound,
+        skip_parts=frozenset({"__pycache__"}),
+        issues_out=issues_out,
     )
     seen = set(files)
-    if app_dir.is_dir():
-        for py_file in sorted(app_dir.rglob("*.py")):
-            rel_parts = py_file.relative_to(app_dir).parts
-            if (
-                py_file in seen
-                or py_file.is_symlink()
-                or _MODEL_SCAN_SKIP_PARTS.intersection(rel_parts)
-                or _is_migration_subpath(rel_parts)
-            ):
-                continue
-            try:
-                text = py_file.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                continue
-            if "__tablename__" in text or "SQLModel" in text or "declarative" in text.lower():
-                files.append(py_file)
+    for py_file in _walk_python_files_safe(
+        app_dir,
+        root_bound,
+        skip_parts=_MODEL_SCAN_SKIP_PARTS,
+        issues_out=issues_out,
+    ):
+        if py_file in seen:
+            continue
+        try:
+            text = safe_read_repo_text(py_file, root_bound, encoding="utf-8")
+        except (OSError, UnicodeError, ValueError) as exc:
+            if issues_out is not None:
+                issues_out.append(f"Unreadable Python file `{py_file}` ({exc}).")
+            continue
+        if "__tablename__" in text or "SQLModel" in text or "declarative" in text.lower():
+            files.append(py_file)
     return files
 
 
@@ -3865,18 +4190,23 @@ def _dotted_module(app_dir: Path, py_file: Path) -> str:
 
 
 def _git_last_commit_epoch(repo_root: Path, rel_path: str) -> int | None:
+    from app.core.safe_git import SafeGitError, run_safe_git
+
     try:
-        res = subprocess.run(
-            ["git", "log", "-1", "--format=%ct", "--", rel_path],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
+        res = run_safe_git(
+            repo_root,
+            "log",
+            "-1",
+            "--format=%ct",
+            "--",
+            rel_path,
             text=True,
-            timeout=10,
+            check=True,
+            timeout=10.0,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, SafeGitError):
         return None
-    out = res.stdout.strip()
+    out = str(res.stdout).strip()
     return int(out) if out.isdigit() else None
 
 
@@ -3891,18 +4221,106 @@ class PostgresSqlAlchemyAdapter:
         backend_subdir: str,
         pg_dsn: str | None = None,
     ) -> TruthExtractionResult:
-        backend_dir = repo_root / backend_subdir
-        app_dir, layout_notes = discover_python_app(backend_dir)
+        try:
+            if repo_root.is_symlink():
+                return TruthExtractionResult(
+                    nodes=[],
+                    table_symbol_map={},
+                    function_symbol_map={},
+                    coverage_complete=False,
+                    notes=[f"Repository root `{repo_root}` is a symlink; PostgreSQL/SQLAlchemy truth coverage is incomplete."],
+                )
+            repo_res = repo_root.resolve(strict=True)
+            if not repo_res.is_dir():
+                return TruthExtractionResult(
+                    nodes=[],
+                    table_symbol_map={},
+                    function_symbol_map={},
+                    coverage_complete=False,
+                    notes=[f"Repository root `{repo_root}` is not a directory; PostgreSQL/SQLAlchemy truth coverage is incomplete."],
+                )
+            _check_dir_accessible(repo_res)
+        except OSError as exc:
+            return TruthExtractionResult(
+                nodes=[],
+                table_symbol_map={},
+                function_symbol_map={},
+                coverage_complete=False,
+                notes=[f"Repository root `{repo_root}` is unreadable ({exc}); PostgreSQL/SQLAlchemy truth coverage is incomplete."],
+            )
+
+        if backend_subdir in ("", "."):
+            backend_dir = repo_res
+        else:
+            sub_p = Path(backend_subdir)
+            if sub_p.is_absolute() or ".." in sub_p.parts or "\x00" in backend_subdir:
+                return TruthExtractionResult(
+                    nodes=[],
+                    table_symbol_map={},
+                    function_symbol_map={},
+                    coverage_complete=False,
+                    notes=[f"Backend directory `{backend_subdir}` is invalid or outside the repository; PostgreSQL/SQLAlchemy truth coverage is incomplete."],
+                )
+            be_issues: list[str] = []
+            checked_be = _check_contained_dir(
+                repo_res / sub_p,
+                repo_res,
+                be_issues,
+                "backend directory",
+                must_exist=True,
+            )
+            if checked_be is None:
+                return TruthExtractionResult(
+                    nodes=[],
+                    table_symbol_map={},
+                    function_symbol_map={},
+                    coverage_complete=False,
+                    notes=be_issues or [f"Backend directory `{backend_subdir}` is absent, symlinked, or unreadable; PostgreSQL/SQLAlchemy truth coverage is incomplete."],
+                )
+            backend_dir = checked_be
+
+        coverage_complete = True
+        preflight_notes: list[str] = []
+        safe_to_discover, preflight_cov = _preflight_python_layout(backend_dir, preflight_notes)
+        if not preflight_cov:
+            coverage_complete = False
+        app_dir: Path | None = None
+        layout_notes: list[str] = []
+        if safe_to_discover:
+            try:
+                app_dir, layout_notes = discover_python_app(backend_dir)
+            except OSError as exc:
+                coverage_complete = False
+                preflight_notes.append(f"Python package discovery failed ({exc}); PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                app_dir = None
+        if app_dir is not None:
+            app_issues: list[str] = []
+            safe_app = _check_contained_dir(app_dir, repo_res, app_issues, "Python app directory", must_exist=True)
+            if safe_app is None:
+                coverage_complete = False
+                preflight_notes.extend(app_issues or [f"Python app directory `{app_dir}` is unreadable or symlinked."])
+                app_dir = None
+            else:
+                app_dir = safe_app
+
         models_dir = app_dir / "models" if app_dir else backend_dir / "app" / "models"
         schema_sql_path = backend_dir / "schema.sql"
-        alembic_dir = _discover_alembic_versions_dir(backend_dir, app_dir)
+        alembic_issues: list[str] = []
+        alembic_dir = _discover_alembic_versions_dir(
+            backend_dir,
+            app_dir,
+            repo_root=repo_res,
+            issues_out=alembic_issues,
+        )
+        if alembic_issues:
+            coverage_complete = False
 
         nodes: list[AtlasNode] = []
         table_symbol_map: dict[str, str] = {}
         function_symbol_map: dict[str, str] = {}
         findings: list[RawCandidateFinding] = []
-        notes: list[str] = list(layout_notes)
-        if app_dir and app_dir.name != "app" and not alembic_dir.is_dir():
+        notes: list[str] = [*preflight_notes, *layout_notes, *alembic_issues]
+        if app_dir and app_dir.name != "app" and alembic_dir is None:
             notes.append(
                 f"SQLAlchemy models use the {app_dir.name}/ package. Migration discovery checks "
                 "`alembic.ini` (`script_location`), `backend/alembic/versions`, and package-internal "
@@ -3918,11 +4336,19 @@ class PostgresSqlAlchemyAdapter:
         model_modules: set[str] = set()
         model_fk_refs: list[tuple[str, str, str, str]] = []  # (src table, kind, target, evidence path)
         roots: set[str] = set()
-        for py_file in _model_source_files(app_dir, models_dir) if app_dir else []:
-            if py_file.is_symlink():
-                continue
-            rel_path = py_file.relative_to(repo_root).as_posix()
-            scan = _scan_model_module(py_file, rel_path)
+        model_issues: list[str] = []
+        failed_models: list[str] = []
+        model_files = (
+            _model_source_files(app_dir, models_dir, repo_root=repo_res, issues_out=model_issues)
+            if app_dir
+            else []
+        )
+        if model_issues:
+            coverage_complete = False
+            notes.extend(model_issues)
+        for py_file in model_files:
+            rel_path = py_file.relative_to(repo_res).as_posix()
+            scan = _scan_model_module(py_file, rel_path, repo_root=repo_res, failed_out=failed_models)
             class_bases.update(scan.class_bases)
             class_columns.update(scan.class_columns)
             roots |= scan.roots
@@ -3938,6 +4364,11 @@ class PostgresSqlAlchemyAdapter:
                     model_bases[key] = bases
                 else:
                     orm_tables[key][4].append(cls_name)
+        if failed_models:
+            coverage_complete = False
+            notes.append(
+                f"Unreadable or unparseable model file(s): {', '.join(failed_models[:8])}; PostgreSQL/SQLAlchemy truth coverage is incomplete."
+            )
         for key, (_rel, _ln, cols, _sum, cls_names) in orm_tables.items():
             resolved_cols: list[str] = []
             for cname in cls_names:
@@ -3950,11 +4381,175 @@ class PostgresSqlAlchemyAdapter:
         table_group = {
             key: _model_group(model_bases.get(key, []), class_bases, roots) for key in orm_tables
         }
+
+        # 2. DDL sources: schema.sql and Alembic upgrade() bodies.
+        sql_tables: set[str] = set()
+        declared_schemas: set[str] = set()
+        sql_functions: dict[str, tuple[str, int]] = {}
+        function_reads: dict[str, set[str]] = {}
+        fk_refs: dict[tuple[str, str], str] = {}  # (referencing, referenced) -> evidence path
+        # Where each DDL-only table is defined, so its node points at the CREATE TABLE.
+        table_origin: dict[str, tuple[str, int, list[str]]] = {}
+        has_schema_sql = False
+        try:
+            schema_st = schema_sql_path.lstat()
+        except FileNotFoundError:
+            schema_st = None
+        except OSError as exc:
+            schema_st = None
+            coverage_complete = False
+            notes.append(f"Unreadable `schema.sql` (`{schema_sql_path}`: {exc}); PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+
+        if schema_st is not None:
+            if stat.S_ISLNK(schema_st.st_mode):
+                coverage_complete = False
+                notes.append(f"Skipped symlink `{schema_sql_path}`; PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+            elif not stat.S_ISREG(schema_st.st_mode):
+                coverage_complete = False
+                notes.append(f"Skipped non-regular `{schema_sql_path}`; PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+            else:
+                safe_schema = safe_resolve_contained_path(schema_sql_path, repo_res)
+                if safe_schema is None:
+                    coverage_complete = False
+                    notes.append(f"Rejected out-of-repo `{schema_sql_path}`; PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                else:
+                    rel_schema = safe_schema.relative_to(repo_res).as_posix()
+                    try:
+                        raw_schema_bytes = safe_read_repo_bytes(safe_schema, repo_res)
+                    except OSError as exc:
+                        coverage_complete = False
+                        notes.append(f"Unreadable `{rel_schema}` ({exc}); PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                        raw_schema_bytes = None
+                    if raw_schema_bytes is not None:
+                        has_schema_sql = True
+                        try:
+                            text = raw_schema_bytes.decode("utf-8")
+                        except UnicodeDecodeError as exc:
+                            coverage_complete = False
+                            notes.append(f"Invalid UTF-8 in `{rel_schema}` ({exc}); PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                            text = raw_schema_bytes.decode("utf-8", errors="replace")
+                        for sch_m in _CREATE_SCHEMA_RE.finditer(_blank_sql_comments(text)):
+                            sch_name = _clean_sql_name(sch_m.group("schema"))
+                            if sch_name:
+                                declared_schemas.add(sch_name)
+                        parsed_tables, parsed_funcs = _parse_sql_objects(text)
+                        sql_tables |= parsed_tables
+                        for fn_name, fn_line in parsed_funcs.items():
+                            sql_functions[fn_name] = (rel_schema, fn_line)
+                        schema_fn_reads, schema_fks = _parse_sql_lineage(text)
+                        function_reads.update(schema_fn_reads)
+                        for pair in schema_fks:
+                            fk_refs.setdefault(pair, rel_schema)
+                        ddl_detail, _ = parse_sql_ddl_objects(_blank_sql_comments(text))
+                        for _offset, kind, tbl, _new, line_offset, ev_cols in _sql_table_events(text):
+                            if kind == "create" and tbl in parsed_tables and tbl not in table_origin:
+                                cols = ev_cols or ddl_detail.get(tbl, (0, []))[1]
+                                table_origin[tbl] = (rel_schema, line_offset + 1, cols)
+
+        migration_entries: list[tuple[Path, _MigrationEffects]] = []
+        if alembic_dir is not None:
+            try:
+                with os.scandir(alembic_dir) as it:
+                    mig_entries = sorted(it, key=lambda e: e.name)
+            except OSError as exc:
+                coverage_complete = False
+                notes.append(f"Unreadable Alembic migrations directory `{alembic_dir}` ({exc}); PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                mig_entries = []
+            for entry in mig_entries:
+                if not entry.name.endswith(".py"):
+                    continue
+                mig_file = Path(entry.path)
+                try:
+                    mig_st = mig_file.lstat()
+                except OSError as exc:
+                    coverage_complete = False
+                    notes.append(f"Unreadable migration `{mig_file}` ({exc}); PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                    continue
+                if stat.S_ISLNK(mig_st.st_mode):
+                    coverage_complete = False
+                    notes.append(f"Skipped symlink migration `{mig_file}`; PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                    continue
+                if not stat.S_ISREG(mig_st.st_mode):
+                    coverage_complete = False
+                    notes.append(f"Skipped non-regular migration `{mig_file}`; PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                    continue
+                safe_mig = safe_resolve_contained_path(mig_file, repo_res)
+                if safe_mig is None:
+                    coverage_complete = False
+                    notes.append(f"Rejected out-of-repo migration `{mig_file}`; PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                    continue
+                try:
+                    mig_text = safe_read_repo_text(safe_mig, repo_res, encoding="utf-8")
+                    tree = ast.parse(mig_text)
+                except (OSError, UnicodeError, SyntaxError, ValueError) as exc:
+                    coverage_complete = False
+                    notes.append(f"Unreadable or unparseable migration `{safe_mig.relative_to(repo_res).as_posix()}` ({exc}); PostgreSQL/SQLAlchemy truth coverage is incomplete.")
+                    continue
+                migration_entries.append((safe_mig, _collect_migration_effects(tree)))
+
+        migrated_tables: set[str] = set()
+        mig_origin: dict[str, tuple[str, int, list[str]]] = {}
+        metadata_create_all = False
+        saw_incremental_ddl_after_create_all = False
+        for mig_file, effects in _order_migrations(migration_entries):
+            rel_mig = mig_file.relative_to(repo_res).as_posix()
+            declared_schemas |= effects.declared_schemas
+            # Replay in the order the revision runs them: drop-then-recreate keeps a table,
+            # and `ALTER TABLE a RENAME TO b` / `op.rename_table(a, b)` retires `a`.
+            for _order, kind, tbl, new_tbl, line, ev_cols in sorted(effects.table_events, key=lambda e: e[0]):
+                if metadata_create_all:
+                    saw_incremental_ddl_after_create_all = True
+                if kind == "create":
+                    migrated_tables.add(tbl)
+                    mig_origin[tbl] = (rel_mig, line, ev_cols)
+                elif kind == "drop":
+                    migrated_tables.discard(tbl)
+                    mig_origin.pop(tbl, None)
+                elif new_tbl:
+                    migrated_tables.discard(tbl)
+                    migrated_tables.add(new_tbl)
+                    prior = mig_origin.pop(tbl, None)
+                    mig_origin[new_tbl] = (rel_mig, line, prior[2] if prior else [])
+            if effects.creates_all_metadata:
+                metadata_create_all = True
+                saw_incremental_ddl_after_create_all = bool(
+                    effects.last_incremental_ddl_order is not None
+                    and effects.create_all_order is not None
+                    and effects.last_incremental_ddl_order > effects.create_all_order
+                )
+            elif metadata_create_all and (effects.table_events or effects.touches_ddl):
+                saw_incremental_ddl_after_create_all = True
+            for fn_name, fn_line in effects.created_functions.items():
+                sql_functions[fn_name] = (rel_mig, fn_line)
+                if fn_name in effects.function_reads:
+                    function_reads[fn_name] = set(effects.function_reads[fn_name])
+            for fn_name in effects.dropped_functions - set(effects.created_functions):
+                sql_functions.pop(fn_name, None)
+                function_reads.pop(fn_name, None)
+            for pair in effects.fk_refs:
+                fk_refs.setdefault(pair, rel_mig)
+        sql_tables |= migrated_tables
+        for tbl in migrated_tables:
+            if tbl not in table_origin and tbl in mig_origin:
+                table_origin[tbl] = mig_origin[tbl]
+
         group_sizes: dict[str, int] = {}
-        for grp in table_group.values():
+        ddl_group_sizes: dict[str, int] = {}
+        for tbl_k, grp in table_group.items():
             group_sizes[grp] = group_sizes.get(grp, 0) + 1
+            if tbl_k in sql_tables:
+                ddl_group_sizes[grp] = ddl_group_sizes.get(grp, 0) + 1
         primary_group = (
-            max(group_sizes, key=lambda g: (group_sizes[g], g == _DEFAULT_GROUP, g == "Base", g))
+            max(
+                group_sizes,
+                key=lambda g: (
+                    ddl_group_sizes.get(g, 0),
+                    group_sizes[g],
+                    g == _DEFAULT_GROUP,
+                    g == "Base",
+                    g,
+                ),
+            )
             if group_sizes
             else _DEFAULT_GROUP
         )
@@ -3967,91 +4562,19 @@ class PostgresSqlAlchemyAdapter:
                 "their own metadata, often for another database or schema."
             )
 
-        # 2. DDL sources: schema.sql and Alembic upgrade() bodies.
-        sql_tables: set[str] = set()
-        sql_functions: dict[str, tuple[str, int]] = {}
-        function_reads: dict[str, set[str]] = {}
-        fk_refs: dict[tuple[str, str], str] = {}  # (referencing, referenced) -> evidence path
-        # Where each DDL-only table is defined, so its node points at the CREATE TABLE.
-        table_origin: dict[str, tuple[str, int, list[str]]] = {}
-        if schema_sql_path.is_file():
-            rel_schema = schema_sql_path.relative_to(repo_root).as_posix()
-            text = schema_sql_path.read_text(encoding="utf-8", errors="replace")
-            parsed_tables, parsed_funcs = _parse_sql_objects(text)
-            sql_tables |= parsed_tables
-            for fn_name, fn_line in parsed_funcs.items():
-                sql_functions[fn_name] = (rel_schema, fn_line)
-            schema_fn_reads, schema_fks = _parse_sql_lineage(text)
-            function_reads.update(schema_fn_reads)
-            for pair in schema_fks:
-                fk_refs.setdefault(pair, rel_schema)
-            ddl_detail, _ = parse_sql_ddl_objects(_blank_sql_comments(text))
-            for _offset, kind, tbl, _new, line_offset, ev_cols in _sql_table_events(text):
-                if kind == "create" and tbl in parsed_tables and tbl not in table_origin:
-                    cols = ev_cols or ddl_detail.get(tbl, (0, []))[1]
-                    table_origin[tbl] = (rel_schema, line_offset + 1, cols)
-
-        migration_entries: list[tuple[Path, _MigrationEffects]] = []
-        if alembic_dir.is_dir():
-            for mig_file in sorted(alembic_dir.glob("*.py")):
-                if mig_file.is_symlink():
-                    continue
-                try:
-                    tree = ast.parse(mig_file.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError, SyntaxError):
-                    continue
-                migration_entries.append((mig_file, _collect_migration_effects(tree)))
-
-        migrated_tables: set[str] = set()
-        mig_origin: dict[str, tuple[str, int, list[str]]] = {}
-        metadata_create_all = False
-        for mig_file, effects in _order_migrations(migration_entries):
-            rel_mig = mig_file.relative_to(repo_root).as_posix()
-            # Replay in the order the revision runs them: drop-then-recreate keeps a table,
-            # and `ALTER TABLE a RENAME TO b` / `op.rename_table(a, b)` retires `a`.
-            for _order, kind, tbl, new_tbl, line, ev_cols in sorted(effects.table_events, key=lambda e: e[0]):
-                if kind == "create":
-                    migrated_tables.add(tbl)
-                    mig_origin[tbl] = (rel_mig, line, ev_cols)
-                elif kind == "drop":
-                    migrated_tables.discard(tbl)
-                    mig_origin.pop(tbl, None)
-                elif new_tbl:
-                    migrated_tables.discard(tbl)
-                    migrated_tables.add(new_tbl)
-                    prior = mig_origin.pop(tbl, None)
-                    mig_origin[new_tbl] = (rel_mig, line, prior[2] if prior else [])
-            metadata_create_all |= effects.creates_all_metadata
-            for fn_name, fn_line in effects.created_functions.items():
-                sql_functions[fn_name] = (rel_mig, fn_line)
-                # A (re)definition with a readable body replaces what the function reads. A header
-                # without a parsable body (e.g. text spliced into a fetched definition) leaves the
-                # last known body in place.
-                if fn_name in effects.function_reads:
-                    function_reads[fn_name] = set(effects.function_reads[fn_name])
-            for fn_name in effects.dropped_functions - set(effects.created_functions):
-                sql_functions.pop(fn_name, None)
-                function_reads.pop(fn_name, None)
-            for pair in effects.fk_refs:
-                fk_refs.setdefault(pair, rel_mig)
-        sql_tables |= migrated_tables
-        for tbl in migrated_tables:
-            if tbl not in table_origin and tbl in mig_origin:
-                table_origin[tbl] = mig_origin[tbl]
-        if metadata_create_all:
-            # A revision runs `metadata.create_all()`: every primary-base model is created by it.
+        if metadata_create_all and not saw_incremental_ddl_after_create_all:
+            # Terminal `metadata.create_all()` with no subsequent incremental DDL migrations covers primary models.
             sql_tables |= {k for k in orm_tables if k not in separate}
 
-        has_schema_sql = schema_sql_path.is_file()
         has_migrations = bool(migration_entries)
         ddl_mig_files = [mf for mf, eff in migration_entries if eff.touches_ddl]
         stale_note = ""
         if has_schema_sql and ddl_mig_files:
-            sql_epoch = _git_last_commit_epoch(repo_root, schema_sql_path.relative_to(repo_root).as_posix())
+            sql_epoch = _git_last_commit_epoch(repo_res, schema_sql_path.relative_to(repo_res).as_posix())
             ddl_epochs = [
                 ep
                 for mf in ddl_mig_files
-                if (ep := _git_last_commit_epoch(repo_root, mf.relative_to(repo_root).as_posix())) is not None
+                if (ep := _git_last_commit_epoch(repo_res, mf.relative_to(repo_res).as_posix())) is not None
             ]
             mig_epoch = max(ddl_epochs) if ddl_epochs else None
             if sql_epoch is not None and mig_epoch is not None and mig_epoch > sql_epoch:
@@ -4085,7 +4608,7 @@ class PostgresSqlAlchemyAdapter:
                 summary = f"SQL-defined table `{tbl_key}`."
             else:
                 src_file = (
-                    schema_sql_path.relative_to(repo_root).as_posix()
+                    schema_sql_path.relative_to(repo_res).as_posix()
                     if has_schema_sql
                     else f"{backend_subdir}/schema.sql"
                 )
@@ -4161,16 +4684,36 @@ class PostgresSqlAlchemyAdapter:
 
         # 4. Drift: primary-base models with no DDL, and (with --dsn) models absent live.
         checked = {k: v for k, v in orm_tables.items() if k not in separate}
-        ddl_source = "schema.sql or any migration" if has_migrations else "schema.sql"
+        ddl_source = (
+            "schema.sql or any migration"
+            if (has_schema_sql and has_migrations)
+            else ("Alembic migrations" if has_migrations else "schema.sql")
+        )
         static_missing: set[str] = set()
-        # Gated on schema.sql as before: a migrations-only repo whose DDL style is not
-        # recognized would otherwise get new false alarms.
-        if has_schema_sql:
+        if has_schema_sql or bool(migrated_tables) or saw_incremental_ddl_after_create_all:
+            seen_schemas = {t.split(".", 1)[0] for t in sql_tables if "." in t} | declared_schemas
             static_missing = {
                 k
                 for k in checked
-                if "." not in k and k not in sql_tables and not k.endswith("_version")
+                if k not in sql_tables
+                and not is_migration_meta_table(k)
+                and ("." not in k or k.split(".", 1)[0] in seen_schemas)
             }
+            skipped_schema_models = sorted(
+                k
+                for k in checked
+                if k not in sql_tables
+                and not is_migration_meta_table(k)
+                and "." in k
+                and k.split(".", 1)[0] not in seen_schemas
+            )
+            if skipped_schema_models:
+                unseen_schemas = sorted({k.split(".", 1)[0] for k in skipped_schema_models})
+                notes.append(
+                    f"{len(skipped_schema_models)} model(s) in unseen non-public schema(s) "
+                    f"({', '.join(f'`{s}`' for s in unseen_schemas)}) were omitted from static "
+                    "DDL drift checks; declare CREATE SCHEMA or schema-qualified DDL to check them."
+                )
 
         obs_source = "static_ast"
         live_missing: set[str] = set()
@@ -4236,6 +4779,7 @@ class PostgresSqlAlchemyAdapter:
             function_symbol_map=function_symbol_map,
             findings=findings,
             observation_source=obs_source,
+            coverage_complete=coverage_complete,
             notes=notes,
             class_modules=class_modules,
             model_modules=model_modules,

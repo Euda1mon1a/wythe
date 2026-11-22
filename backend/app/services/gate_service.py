@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -19,12 +20,25 @@ from app.schemas.atlas import (
     RuleGateRow,
     ScanSnapshotSummary,
 )
+from app.services.portable_config_service import load_target_governance_overrides
 
-_confirmed_ast_rules = frozenset({"MANIP-001", "MANIP-002", "DISP-001", "DISP-002", "DISP-005"})
-_confirmed_structural_rules = frozenset(
-    {"TRUTH-002", "TRUTH-003", "DISP-003", "DISP-004", "MANIP-004", "MANIP-005", "MANIP-006"}
+_confirmed_ast_rules = frozenset(
+    {"MANIP-001", "MANIP-002", "MANIP-007", "DISP-001", "DISP-002", "DISP-005", "DISP-009", "DISP-010", "DISP-014"}
 )
-_candidate_structural_rules = frozenset({"TRUTH-005", "DISP-007"})
+_confirmed_structural_rules = frozenset(
+    {
+        "TRUTH-002",
+        "TRUTH-003",
+        "DISP-003",
+        "DISP-004",
+        "DISP-011",
+        "DISP-012",
+        "MANIP-004",
+        "MANIP-005",
+        "MANIP-006",
+    }
+)
+_candidate_structural_rules = frozenset({"TRUTH-005", "DISP-007", "DISP-013"})
 _valid_confidences: tuple[FindingConfidence, ...] = ("confirmed", "candidate")
 _valid_strengths: tuple[EvidenceStrength, ...] = ("ast_exact", "structural_match", "heuristic")
 
@@ -79,6 +93,19 @@ def load_effective_rules(session: Session) -> dict[str, RulePolicy]:
     return active
 
 
+_SEVERITY_RANK: dict[str, int] = {"info": 0, "warning": 1, "blocking": 2}
+
+
+@dataclass(frozen=True)
+class _EffectiveRulePolicyView:
+    rule_code: str
+    tier: str
+    title: str
+    severity: str
+    enabled: bool
+    blocks_gate: bool
+
+
 def evaluate_findings_and_gate(
     session: Session,
     raw_findings: list[RawCandidateFinding],
@@ -89,7 +116,39 @@ def evaluate_findings_and_gate(
 ) -> tuple[list[BoundaryFinding], GateEvaluation]:
     """Bind candidate findings to persisted RulePolicy rows (plus enabled plugin rules) and compute gate verdict."""
     rules_by_code = load_effective_rules(session)
-    effective_policies: dict[str, RulePolicy | PluginRuleSpec] = dict(rules_by_code)
+    target_rule_ov, _ = load_target_governance_overrides(session, target_id)
+
+    effective_policies: dict[str, RulePolicy | PluginRuleSpec | _EffectiveRulePolicyView] = {}
+    for code, base_rule in rules_by_code.items():
+        ov = target_rule_ov.get(code)
+        if ov is None:
+            effective_policies[code] = base_rule
+        elif strict:
+            # `--strict` ignores per-target relaxations (`enabled=False`, `blocks_gate=False`,
+            # or severity downgrades) while preserving per-target tightenings.
+            eff_sev = (
+                ov.severity
+                if _SEVERITY_RANK.get(ov.severity, 0) > _SEVERITY_RANK.get(base_rule.severity, 0)
+                else base_rule.severity
+            )
+            effective_policies[code] = _EffectiveRulePolicyView(
+                rule_code=code,
+                tier=base_rule.tier,
+                title=base_rule.title,
+                severity=eff_sev,
+                enabled=bool(base_rule.enabled or ov.enabled),
+                blocks_gate=bool(base_rule.blocks_gate or ov.blocks_gate),
+            )
+        else:
+            effective_policies[code] = _EffectiveRulePolicyView(
+                rule_code=code,
+                tier=base_rule.tier,
+                title=base_rule.title,
+                severity=ov.severity,
+                enabled=ov.enabled,
+                blocks_gate=ov.blocks_gate,
+            )
+
     plugin_rules_by_code: dict[str, PluginRuleSpec] = {}
     for p_rule in extra_plugin_rules:
         if p_rule.rule_code not in plugin_rules_by_code:

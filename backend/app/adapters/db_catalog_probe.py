@@ -145,13 +145,17 @@ def probe_live_catalog_tables(dsn: str) -> tuple[set[str], str]:
     """Perform read-only table-catalog reflection on PostgreSQL, SQLite, or MySQL."""
     lower = dsn.lower()
     if lower.startswith("sqlite:"):
+        from urllib.parse import quote as url_quote
+
         parsed = urlparse(dsn)
         raw_path = dsn.split("sqlite:///", 1)[-1] if "sqlite:///" in dsn else parsed.path
         db_path = Path(raw_path).expanduser().resolve()
-        if not db_path.is_file():
+        if db_path.is_symlink() or not db_path.is_file():
             raise FileNotFoundError(f"SQLite database file not found: {db_path}")
-        uri = f"file:{db_path}?mode=ro"
+        encoded_path = url_quote(db_path.as_posix(), safe="/:")
+        uri = f"file:{encoded_path}?mode=ro"
         with sqlite3.connect(uri, uri=True) as conn:
+            conn.execute("PRAGMA query_only = ON")
             rows = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall()

@@ -227,6 +227,7 @@ def _run_harness_analysis(
     result: ManipulatorExtractionResult,
 ) -> dict[str, object]:
     config = load_harness_config(repo_root)
+    before_errors = 0
     bundle = inspect_python_files(repo_root)
     bundle.merge(inspect_ts_files(repo_root))
 
@@ -235,6 +236,8 @@ def _run_harness_analysis(
     registries, shadow_tools = reconcile_manifests_and_registries(
         repo_root, config, bundle, result
     )
+    if len(bundle.parse_errors) > before_errors:
+        object.__setattr__(result, "coverage_complete", False)
     _evaluate_agent_003(config, bundle, result)
     _wire_harness_helper_edges(bundle, registries, result)
 

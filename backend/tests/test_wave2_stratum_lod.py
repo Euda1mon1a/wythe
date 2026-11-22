@@ -42,7 +42,13 @@ from app.services.stratum_service import (
 
 class _FakeDist:
     def __init__(self, version: str = "0.9.0") -> None:
+        import sysconfig
+
         self.version = version
+        self._path = Path(sysconfig.get_path("purelib")) / f"fake_stratum-{version}.dist-info"
+
+    def locate_file(self, path: str) -> Path:
+        return self._path.parent / path
 
 
 class _FakeEntryPoint:

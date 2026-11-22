@@ -89,7 +89,12 @@ def get_target_by_slug(session: Session, slug: str) -> TargetProject | None:
     return found
 
 
-def register_target(session: Session, payload: TargetProjectCreate) -> TargetProjectRead:
+def register_target(
+    session: Session,
+    payload: TargetProjectCreate,
+    *,
+    allow_rebind_path: bool = False,
+) -> TargetProjectRead:
     resolved_repo = Path(payload.repo_path).expanduser().resolve()
     if not resolved_repo.is_dir():
         raise ValueError(f"Repository path does not exist: {resolved_repo}")
@@ -136,6 +141,12 @@ def register_target(session: Session, payload: TargetProjectCreate) -> TargetPro
     existing = get_target_by_slug(session, payload.slug)
     now = utc_now()
     if existing is not None:
+        existing_repo = Path(existing.repo_path).expanduser().resolve()
+        if existing_repo != resolved_repo and not allow_rebind_path:
+            raise ValueError(
+                f"Target slug '{payload.slug}' is already registered to '{existing_repo}'; "
+                "refusing cross-repository slug hijack."
+            )
         existing.name = payload.name
         existing.repo_path = str(resolved_repo)
         existing.stack_profile_slug = effective_slug
@@ -168,9 +179,35 @@ def register_target(session: Session, payload: TargetProjectCreate) -> TargetPro
     return _to_target_read(created)
 
 
-def list_rule_policies(session: Session) -> list[RulePolicyRead]:
+def list_rule_policies(
+    session: Session,
+    *,
+    target_id: int | None = None,
+) -> list[RulePolicyRead]:
     rows = session.scalars(select(RulePolicy).order_by(RulePolicy.rule_code)).all()
-    return [_to_rule_read(r) for r in rows]
+    if not target_id:
+        return [_to_rule_read(r) for r in rows]
+    from app.services.portable_config_service import load_target_governance_overrides
+
+    rule_ov, _ = load_target_governance_overrides(session, target_id)
+    out: list[RulePolicyRead] = []
+    for r in rows:
+        base = _to_rule_read(r)
+        ov = rule_ov.get(r.rule_code)
+        if ov is None:
+            out.append(base)
+        else:
+            out.append(
+                base.model_copy(
+                    update={
+                        "severity": ov.severity,
+                        "enabled": ov.enabled,
+                        "blocks_gate": ov.blocks_gate,
+                        "updated_by": ov.updated_by,
+                    }
+                )
+            )
+    return out
 
 
 def update_rule_policy(
@@ -290,11 +327,43 @@ def capture_ratchet_baselines(
     return list_ratchet_baselines(session, target_id)
 
 
-def list_policy_vocabularies(session: Session) -> list[PolicyVocabularyRead]:
+def list_policy_vocabularies(
+    session: Session,
+    *,
+    target_id: int | None = None,
+) -> list[PolicyVocabularyRead]:
     rows = session.scalars(
         select(PolicyVocabulary).order_by(PolicyVocabulary.domain_pack, PolicyVocabulary.token)
     ).all()
-    return [_to_vocab_read(r) for r in rows]
+    items = [_to_vocab_read(r) for r in rows]
+    if not target_id:
+        return items
+    from app.services.portable_config_service import load_target_governance_overrides
+
+    _, vocab_ov = load_target_governance_overrides(session, target_id)
+    if not vocab_ov:
+        return items
+    by_key = {(it.domain_pack, it.token): it for it in items}
+    synth_id = -1
+    for tv in vocab_ov:
+        key = (tv.domain_pack.lower(), tv.token.upper())
+        prev = by_key.get(key)
+        if prev is not None:
+            by_key[key] = prev.model_copy(
+                update={"description": tv.description, "is_enabled": tv.is_enabled}
+            )
+        else:
+            by_key[key] = PolicyVocabularyRead(
+                id=synth_id,
+                domain_pack=key[0],
+                token=key[1],
+                description=tv.description,
+                is_enabled=tv.is_enabled,
+                created_by="target-bundle",
+                created_at=utc_now(),
+            )
+            synth_id -= 1
+    return [by_key[k] for k in sorted(by_key)]
 
 
 def create_policy_vocabulary(

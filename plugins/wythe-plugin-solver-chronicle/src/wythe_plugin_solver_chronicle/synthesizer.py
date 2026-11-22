@@ -51,16 +51,43 @@ _UNSAFE_MARKUP_RE = re.compile(
 
 def _clean_plain(raw: str, max_len: int) -> str:
     cur = _CTRL_RE.sub("", raw[:4096])
-    while True:
+    for _ in range(32):
         nxt = _UNSAFE_MARKUP_RE.sub("[redacted]", cur)
         nxt = atlas_schemas._EXECUTABLE_TEXT_RE.sub("[redacted]", nxt)
-        nxt = atlas_schemas._HTML_TAG_RE.sub("", nxt)
-        nxt = atlas_schemas._UNCLOSED_HTML_TAG_RE.sub("", nxt)
+        nxt = atlas_schemas._FORBIDDEN_URI_SCHEME_RE.sub("[redacted]", nxt)
+        spans = atlas_schemas._iter_html_tag_spans(nxt)
+        if spans:
+            if any(atlas_schemas._tag_span_is_executable(nxt[s:e]) for s, e in spans):
+                parts: list[str] = []
+                pos = 0
+                for s, e in spans:
+                    if s > pos:
+                        parts.append(nxt[pos:s])
+                    if atlas_schemas._tag_span_is_executable(nxt[s:e]):
+                        parts.append("[redacted]")
+                    pos = max(pos, e)
+                if pos < len(nxt):
+                    parts.append(nxt[pos:])
+                nxt = "".join(parts)
+            else:
+                nxt = atlas_schemas._strip_html_spans(nxt, spans)
         nxt = _UNSAFE_MARKUP_RE.sub("[redacted]", nxt)
         nxt = atlas_schemas._EXECUTABLE_TEXT_RE.sub("[redacted]", nxt)
+        nxt = atlas_schemas._FORBIDDEN_URI_SCHEME_RE.sub("[redacted]", nxt)
         if nxt == cur:
             break
         cur = nxt
+    if atlas_schemas._contains_executable_markup_or_uri(cur):
+        cur = re.sub(
+            r"(?i)(?:j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t|v\s*b\s*s\s*c\s*r\s*i\s*p\s*t)\s*:|"
+            r"d\s*a\s*t\s*a\s*:\s*t\s*e\s*x\s*t\s*/\s*h\s*t\s*m\s*l",
+            "[redacted]",
+            cur,
+        )
+        cur = _UNSAFE_MARKUP_RE.sub("[redacted]", cur)
+        cur = atlas_schemas._EXECUTABLE_TEXT_RE.sub("[redacted]", cur)
+        if atlas_schemas._contains_executable_markup_or_uri(cur):
+            cur = "[redacted]"
     cleaned = sanitize_viewport_plain_text(cur, field_name="chronicle_text")
     if len(cleaned) <= max_len:
         return cleaned

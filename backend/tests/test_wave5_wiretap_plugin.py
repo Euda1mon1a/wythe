@@ -4,21 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-import sys
+import sysconfig
 import time
 import tomllib
 from pathlib import Path
 
 import pytest
 from sqlalchemy.orm import Session
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-BACKEND_DIR = REPO_ROOT / "backend"
-PLUGIN_DIR = REPO_ROOT / "plugins" / "wythe-plugin-wiretap"
-PLUGIN_SRC = PLUGIN_DIR / "src"
-for p_entry in (BACKEND_DIR, PLUGIN_SRC):
-    if str(p_entry) not in sys.path:
-        sys.path.insert(0, str(p_entry))
 
 from app.adapters.plugin_registry import (
     ENTRY_POINT_GROUP,
@@ -51,10 +43,17 @@ from wythe_plugin_wiretap import (
     wiretap_inspection_scope,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PLUGIN_DIR = REPO_ROOT / "plugins" / "wythe-plugin-wiretap"
+
 
 class _FakeDist:
-    def __init__(self, version: str = "0.1.0") -> None:
+    def __init__(self, version: str = "0.1.0", name: str = "wythe_plugin_wiretap") -> None:
         self.version = version
+        self._path = Path(sysconfig.get_path("purelib")) / f"{name}-{version}.dist-info"
+
+    def locate_file(self, path: str | Path) -> Path:
+        return self._path / path
 
 
 class _FakeEntryPoint:
@@ -132,6 +131,8 @@ def test_otel_ebpf_three_way_partition_redaction_and_zoom1_digest_invariance(
                             {
                                 "spans": [
                                     {
+                                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                        "spanId": "00f067aa0ba902b7",
                                         "name": "GET /api/quotas/validate",
                                         "attributes": [
                                             {"key": "http.request.method", "value": {"stringValue": "GET"}},
@@ -152,6 +153,9 @@ def test_otel_ebpf_three_way_partition_redaction_and_zoom1_digest_invariance(
                                         ],
                                     },
                                     {
+                                        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                                        "spanId": "b7ad6b7169203331",
+                                        "parentSpanId": "00f067aa0ba902b7",
                                         "name": "SELECT batch_quota_policies",
                                         "attributes": [
                                             {"key": "db.system", "value": {"stringValue": "postgresql"}},

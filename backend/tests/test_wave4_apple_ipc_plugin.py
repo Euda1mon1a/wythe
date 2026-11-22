@@ -746,17 +746,27 @@ def test_entry_point_discovery_zero_subprocess_and_db_row_invariance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import subprocess
+    import sysconfig
 
     from sqlalchemy import func, select
 
     from app.adapters.plugin_registry import discover_plugins
     from app.models import RulePolicy, StackProfile
 
+    purelib = Path(sysconfig.get_path("purelib"))
+
+    class _FakeAppleDist:
+        version = "0.1.0"
+        _path = purelib / "wythe_plugin_apple_ipc-0.1.0.dist-info"
+
+        def locate_file(self, path: str) -> Path:
+            return self._path.parent / path
+
     ep = importlib.metadata.EntryPoint(
         name="apple_ipc",
         value="wythe_plugin_apple_ipc.plugin:APPLE_IPC_PLUGIN",
         group="wythe.plugins",
-    )
+    )._for(_FakeAppleDist())
     monkeypatch.setattr(
         importlib.metadata,
         "entry_points",
@@ -811,5 +821,5 @@ def test_entry_point_discovery_zero_subprocess_and_db_row_invariance(
         )
         rep = run_target_scan(session, target, strict_gate=True, persist_snapshot=False)
         assert rep.gate.verdict == "PASS"
-        assert session.scalar(select(func.count()).select_from(RulePolicy)) == rules_before == 19
+        assert session.scalar(select(func.count()).select_from(RulePolicy)) == rules_before == 26
         assert session.scalar(select(func.count()).select_from(StackProfile)) == profs_before

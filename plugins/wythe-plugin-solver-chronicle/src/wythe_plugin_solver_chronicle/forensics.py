@@ -8,6 +8,7 @@ neighborhoods, and upstream `[1.Load]` `Truth` tables without executing target c
 from __future__ import annotations
 
 import ast
+import os
 import re
 import stat
 from dataclasses import dataclass
@@ -182,10 +183,21 @@ def _read_contained_repo_file(real_root: Path, rel_path: str) -> str | None:
         resolved = walk.resolve()
         if not resolved.is_relative_to(real_root):
             return None
-        st = resolved.lstat()
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_size > MAX_SOURCE_BYTES:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(resolved, flags)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_SOURCE_BYTES:
+                return None
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
+                raw = fh.read(MAX_SOURCE_BYTES + 1)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if len(raw) > MAX_SOURCE_BYTES:
             return None
-        return resolved.read_text(encoding="utf-8", errors="replace")
+        return raw.decode("utf-8", errors="replace")
     except OSError:
         return None
 

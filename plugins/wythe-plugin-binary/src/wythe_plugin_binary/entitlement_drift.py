@@ -72,6 +72,7 @@ def validate_non_symlink_path(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
 ) -> Path:
     """Validate every path component before `.resolve()`, rejecting symlinks fail-closed."""
     raw_str = str(raw_path).strip()
@@ -103,6 +104,10 @@ def validate_non_symlink_path(
         _check_absolute_non_symlink_components(cand, str(raw_path))
         if repo_root is not None:
             real_root = repo_root.resolve()
+            if not allow_external and not cand.resolve().is_relative_to(real_root):
+                raise ValueError(
+                    f"Binary artifact path '{raw_path}' escapes repository root."
+                )
             for k in range(1, len(cand.parts) + 1):
                 pref = Path(*cand.parts[:k])
                 if pref.exists() and pref.resolve() == real_root:
@@ -126,10 +131,13 @@ def read_bounded_regular_bytes(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = MAX_BINARY_BYTES,
 ) -> tuple[Path, bytes]:
     """Read `<= max_bytes` from an existing non-symlink regular file via `O_NOFOLLOW`."""
-    cand = validate_non_symlink_path(raw_path, repo_root=repo_root)
+    cand = validate_non_symlink_path(
+        raw_path, repo_root=repo_root, allow_external=allow_external
+    )
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(cand, flags)
@@ -163,10 +171,13 @@ def collect_target_artifact_files(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_files: int = 64,
 ) -> list[Path]:
     """Resolve a regular file, `.app`/`.xpc` bundle, or unpacked ELF directory without symlinks."""
-    cand = validate_non_symlink_path(raw_path, repo_root=repo_root)
+    cand = validate_non_symlink_path(
+        raw_path, repo_root=repo_root, allow_external=allow_external
+    )
     lstat_res = os.lstat(cand)
     if stat.S_ISLNK(lstat_res.st_mode):
         raise ValueError(f"Refusing symlinked artifact '{raw_path}'.")
@@ -411,7 +422,7 @@ class SliceEntitlementDrift:
 
     architecture: str
     has_entitlements_blob: bool
-    drift_status: Literal["clean", "exceeded", "omitted_only", "no_entitlements"]
+    drift_status: Literal["clean", "exceeded", "omitted_only", "no_entitlements", "unverified"]
     undeclared_privileges: tuple[str, ...]
     omitted_capabilities: tuple[str, ...]
 
@@ -421,7 +432,7 @@ class EntitlementDriftResult:
     """Comparison of signed binary entitlements/capabilities against source `.entitlements`."""
 
     matched_source_file: str | None
-    drift_status: Literal["clean", "exceeded", "omitted_only", "no_entitlements"]
+    drift_status: Literal["clean", "exceeded", "omitted_only", "no_entitlements", "unverified"]
     undeclared_privileges: tuple[str, ...]
     omitted_capabilities: tuple[str, ...]
     categorized_privileges: dict[str, list[str]]
@@ -443,7 +454,6 @@ _BENIGN_SIGNING_IDENTITY_KEYS: frozenset[str] = frozenset(
         "application-identifier",
         "com.apple.application-identifier",
         "com.apple.developer.team-identifier",
-        "keychain-access-groups",
     }
 )
 
@@ -565,14 +575,20 @@ def match_source_entitlement_spec(
     for spec in specs:
         if _norm_stem(spec.stem) == norm_bin:
             return spec
+    _plat_suffixes = ("linux", "macos", "darwin", "arm64", "arm64e", "x8664", "x86_64", "universal")
+
+    def _strip_plat(stem_val: str) -> str:
+        cur = stem_val
+        for suf in _plat_suffixes:
+            if cur.endswith(suf) and len(cur) > len(suf) + 2:
+                cur = cur[: -len(suf)]
+        return cur
+
+    stripped_bin = _strip_plat(norm_bin)
     for spec in specs:
-        ns = _norm_stem(spec.stem)
-        if ns and norm_bin and (ns in norm_bin or norm_bin in ns):
+        ns = _strip_plat(_norm_stem(spec.stem))
+        if ns and stripped_bin and ns == stripped_bin:
             return spec
-    if len(specs) == 1 and (
-        binary_format == "macho" or "linux.capabilities" in specs[0].entitlements
-    ):
-        return specs[0]
     return None
 
 
@@ -661,11 +677,13 @@ def evaluate_entitlement_drift(
     binary_format: Literal["macho", "elf"] = "macho",
     slice_entitlements: Mapping[str, Mapping[str, Any]] | None = None,
     slice_has_entitlements_blob: Mapping[str, bool] | None = None,
+    slice_der_only_entitlements: Mapping[str, bool] | None = None,
 ) -> EntitlementDriftResult:
     """Compare embedded `codesign` entitlements & ELF capabilities against source `.entitlements`."""
     matched = match_source_entitlement_spec(
         artifact_name, source_specs, binary_format=binary_format
     )
+    der_flags = slice_der_only_entitlements or {}
 
     if binary_format == "macho" and slice_entitlements:
         ordered_arches = sorted(slice_entitlements)
@@ -676,9 +694,12 @@ def evaluate_entitlement_drift(
             slice_entitlements[a].get("com.apple.security.app-sandbox") is True
             for a in ordered_arches
         )
+        der_only_arches: list[str] = []
 
         for arch in ordered_arches:
             s_ent = slice_entitlements[arch]
+            s_der_only = bool(der_flags.get(arch, False)) and not s_ent
+            s_state: Literal["clean", "exceeded", "omitted_only", "no_entitlements", "unverified"]
             s_state, s_undecl, s_omit, s_toks = _evaluate_single_map_drift(
                 signed_entitlements=s_ent,
                 linux_capabilities=(),
@@ -694,6 +715,10 @@ def evaluate_entitlement_drift(
             ):
                 s_undecl = tuple(sorted({*s_undecl, "com.apple.security.app-sandbox=disabled"}))
                 s_state = "exceeded"
+            if s_der_only:
+                der_only_arches.append(arch)
+                if s_state != "exceeded":
+                    s_state = "unverified"
             has_blob = blob_flags.get(arch, bool(s_ent))
             slice_drift_map[arch] = SliceEntitlementDrift(
                 architecture=arch,
@@ -725,9 +750,18 @@ def evaluate_entitlement_drift(
                 f"BIN-ENT-001 warning: binary '{artifact_name}' omits declared capability "
                 f"key(s) {sorted(omit_acc)} from '{matched.rel_path}'."
             )
+        if der_only_arches:
+            warnings.append(
+                f"BIN-ENT-001 unverified: binary '{artifact_name}' slices {der_only_arches} carry "
+                "DER-only entitlements blobs (0xFADE7172 / CSSLOT_DER_ENTITLEMENTS=7) without an XML "
+                "plist; static privilege claims remain unverified."
+            )
 
+        agg_status: Literal["clean", "exceeded", "omitted_only", "no_entitlements", "unverified"]
         if undecl_acc or any(sd.drift_status == "exceeded" for sd in slice_drift_map.values()):
-            agg_status: Literal["clean", "exceeded", "omitted_only", "no_entitlements"] = "exceeded"
+            agg_status = "exceeded"
+        elif any(sd.drift_status == "unverified" for sd in slice_drift_map.values()):
+            agg_status = "unverified"
         elif omit_acc or any(sd.drift_status == "omitted_only" for sd in slice_drift_map.values()):
             agg_status = "omitted_only"
         elif all(sd.drift_status == "no_entitlements" for sd in slice_drift_map.values()):
@@ -745,12 +779,16 @@ def evaluate_entitlement_drift(
             slice_drift=slice_drift_map,
         )
 
+    drift_state: Literal["clean", "exceeded", "omitted_only", "no_entitlements", "unverified"]
     drift_state, undecl_t, omit_t, bin_tokens = _evaluate_single_map_drift(
         signed_entitlements=signed_entitlements,
         linux_capabilities=linux_capabilities,
         matched=matched,
         binary_format=binary_format,
     )
+    single_der_only = any(der_flags.values()) and not signed_entitlements
+    if single_der_only and drift_state != "exceeded":
+        drift_state = "unverified"
     categorized_single: dict[str, list[str]] = {}
     for tok in sorted(bin_tokens):
         key_head = tok.split("=", 1)[0]
@@ -762,6 +800,11 @@ def evaluate_entitlement_drift(
         warnings_single.append(
             f"BIN-ENT-001 warning: binary '{artifact_name}' omits declared capability "
             f"key(s) {list(omit_t)} from '{matched.rel_path}'."
+        )
+    if single_der_only:
+        warnings_single.append(
+            f"BIN-ENT-001 unverified: binary '{artifact_name}' carries DER-only entitlements "
+            "without an XML plist; static privilege claims remain unverified."
         )
 
     return EntitlementDriftResult(

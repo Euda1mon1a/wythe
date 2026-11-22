@@ -140,6 +140,7 @@ def read_safe_artifact_bytes(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = MAX_SOLVER_FILE_BYTES,
 ) -> tuple[Path, bytes]:
     """Read a regular non-symlink file (`<= 32 MiB`), rejecting symlinks on every path component."""
@@ -180,6 +181,8 @@ def read_safe_artifact_bytes(
                 raise ValueError(f"Refusing symlinked path component in '{raw_path}'.")
         if repo_root is not None:
             real_root = repo_root.resolve()
+            if not allow_external and not cand.resolve().is_relative_to(real_root):
+                raise ValueError(f"Artifact path '{raw_path}' escapes repository root.")
             for k in range(1, len(cand.parts) + 1):
                 pref = Path(*cand.parts[:k])
                 if pref.exists() and pref.resolve() == real_root:
@@ -226,30 +229,39 @@ def read_safe_artifact_text(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = MAX_SOLVER_FILE_BYTES,
+    errors: str = "strict",
 ) -> tuple[Path, str]:
     """Read UTF-8 text safely with symlink rejection and `<= 32 MiB` bound."""
-    resolved, raw = read_safe_artifact_bytes(raw_path, repo_root=repo_root, max_bytes=max_bytes)
+    resolved, raw = read_safe_artifact_bytes(
+        raw_path, repo_root=repo_root, allow_external=allow_external, max_bytes=max_bytes
+    )
     try:
-        return resolved, raw.decode("utf-8-sig")
+        return resolved, raw.decode("utf-8-sig", errors=errors)
     except UnicodeDecodeError as exc:
         raise ValueError(f"Artifact '{raw_path}' is not valid UTF-8 text: {exc}") from exc
 
 
 def check_json_depth(root: Any, *, max_depth: int = MAX_NESTING_DEPTH) -> None:
     """Enforce bounded JSON nesting depth iteratively without Python recursion."""
+    visited: set[int] = set()
     stack: list[tuple[Any, int]] = [(root, 0)]
     while stack:
         cur, depth = stack.pop()
         if depth > max_depth:
             raise ValueError(f"JSON nesting depth exceeds maximum ({max_depth} levels).")
+        oid = id(cur)
+        if oid in visited:
+            continue
+        visited.add(oid)
         if isinstance(cur, dict):
             for val in cur.values():
-                if isinstance(val, (dict, list)):
+                if isinstance(val, (dict, list)) and id(val) not in visited:
                     stack.append((val, depth + 1))
         elif isinstance(cur, list):
             for val in cur:
-                if isinstance(val, (dict, list)):
+                if isinstance(val, (dict, list)) and id(val) not in visited:
                     stack.append((val, depth + 1))
 
 
@@ -257,10 +269,13 @@ def load_safe_json(
     raw_path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = MAX_SOLVER_FILE_BYTES,
 ) -> tuple[Path, Any]:
     """Load JSON artifact with symlink rejection, size cap, and `<= 64` depth check."""
-    resolved, text = read_safe_artifact_text(raw_path, repo_root=repo_root, max_bytes=max_bytes)
+    resolved, text = read_safe_artifact_text(
+        raw_path, repo_root=repo_root, allow_external=allow_external, max_bytes=max_bytes
+    )
     try:
         loaded = json.loads(text)
     except (json.JSONDecodeError, RecursionError) as exc:
@@ -884,10 +899,13 @@ def parse_proto_descriptor_artifact(
     path: Path | str,
     *,
     repo_root: Path | None = None,
+    allow_external: bool = False,
     max_bytes: int = MAX_SOLVER_FILE_BYTES,
 ) -> dict[str, ProtoMessageDef]:
     """Parse a `.pb` binary FileDescriptorSet, `.json` FileDescriptorSet, or `.proto` file."""
-    resolved, raw = read_safe_artifact_bytes(path, repo_root=repo_root, max_bytes=max_bytes)
+    resolved, raw = read_safe_artifact_bytes(
+        path, repo_root=repo_root, allow_external=allow_external, max_bytes=max_bytes
+    )
     suffix = resolved.suffix.lower()
     if suffix == ".proto":
         return parse_proto_source_text(raw.decode("utf-8-sig"), source_file=str(resolved))
@@ -967,7 +985,9 @@ def build_solver_proto_catalog(
             sources.append(rel_posix)
 
     for desc_p in descriptor_paths:
-        parsed_desc = parse_proto_descriptor_artifact(desc_p, repo_root=repo_root, max_bytes=max_bytes)
+        parsed_desc = parse_proto_descriptor_artifact(
+            desc_p, repo_root=repo_root, allow_external=True, max_bytes=max_bytes
+        )
         if parsed_desc:
             _merge_proto_messages(merged_msgs, parsed_desc)
             sources.append(str(desc_p))

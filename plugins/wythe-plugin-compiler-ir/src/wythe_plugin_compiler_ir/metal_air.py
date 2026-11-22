@@ -632,7 +632,7 @@ def parse_metal_file(
     path: str | Path,
     *,
     repo_root: Path | None = None,
-    allow_external: bool = True,
+    allow_external: bool = False,
 ) -> MetalSourceParseResult:
     """Safely read and parse a `.metal` source file."""
     resolved, text = read_safe_text(path, repo_root=repo_root, allow_external=allow_external)
@@ -824,7 +824,7 @@ def parse_metallib_artifact(
     path: str | Path,
     *,
     repo_root: Path | None = None,
-    allow_external: bool = True,
+    allow_external: bool = False,
 ) -> MetallibParseResult:
     """Safely read and parse a `.metallib` `MTLB` binary or `metal-objdump` AIR reflection file."""
     validated = validate_safe_path(
@@ -843,7 +843,11 @@ def parse_metallib_artifact(
         suffixes=(".metallib", ".air", ".txt", ".objdump", ".json", ".ll"),
         max_files=128,
     ):
-        _, raw = read_safe_bytes(fpath, repo_root=None, allow_external=True)
+        _, raw = read_safe_bytes(
+            fpath,
+            repo_root=repo_root if not allow_external else None,
+            allow_external=allow_external,
+        )
         sub = parse_metallib_bytes(raw, format_hint=fpath.name)
         combined.exports.update(sub.exports)
     return combined

@@ -227,7 +227,7 @@ def test_gate_epistemics_and_reference_exemplars_preserved(
                 applies_to_tiers=["manipulate"],
                 applies_to_subkinds=["service"],
                 rationale="Approved transactional pattern.",
-                approved_by="aaron",
+                approved_by="arch-lead",
             )
         ],
     )

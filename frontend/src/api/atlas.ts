@@ -2,8 +2,82 @@
  * Strictly typed API client bound to OpenAPI-generated contracts (`api-generated.ts`).
  */
 
-import { del, get, patch, post } from '@/lib/api';
 import type { components } from '@/types/api-generated';
+
+const DEV_UI_PORTS = new Set(['3000', '3180', '3780']);
+
+function resolveApiBase(): string {
+  if (process.env.NEXT_PUBLIC_WYTHE_API_URL) {
+    return process.env.NEXT_PUBLIC_WYTHE_API_URL;
+  }
+  if (process.env.NEXT_PUBLIC_TRUTH_ATLAS_API_URL) {
+    return process.env.NEXT_PUBLIC_TRUTH_ATLAS_API_URL;
+  }
+  if (typeof window !== 'undefined' && !DEV_UI_PORTS.has(window.location.port)) {
+    return '/api/v1';
+  }
+  return 'http://127.0.0.1:8780/api/v1';
+}
+
+export class ApiRequestError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function parseJsonOrThrow<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = (await res.json()) as { detail?: string };
+      if (body.detail) detail = body.detail;
+    } catch {
+      // keep status fallback
+    }
+    throw new ApiRequestError(res.status, detail);
+  }
+  return (await res.json()) as T;
+}
+
+export async function get<T>(path: string): Promise<T> {
+  const res = await fetch(`${resolveApiBase()}${path}`, { method: 'GET' });
+  return parseJsonOrThrow<T>(res);
+}
+
+async function mutateRequest<T>(
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  path: string,
+  body?: unknown,
+): Promise<T> {
+  const res = await fetch(`${resolveApiBase()}${path}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Wythe-Client': '1',
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  return parseJsonOrThrow<T>(res);
+}
+
+export function post<T>(path: string, body?: unknown): Promise<T> {
+  return mutateRequest<T>('POST', path, body);
+}
+
+export function put<T>(path: string, body?: unknown): Promise<T> {
+  return mutateRequest<T>('PUT', path, body);
+}
+
+export function patch<T>(path: string, body: unknown): Promise<T> {
+  return mutateRequest<T>('PATCH', path, body);
+}
+
+export function del<T>(path: string): Promise<T> {
+  return mutateRequest<T>('DELETE', path);
+}
 
 export type TruthAtlasReport = components['schemas']['TruthAtlasReport'];
 export type AtlasNode = components['schemas']['AtlasNode'];
@@ -33,11 +107,28 @@ export type SnapshotComparisonReport = components['schemas']['SnapshotComparison
 export type PortableGovernanceBundle = components['schemas']['PortableGovernanceBundle'];
 export type PortableReferenceExemplar = components['schemas']['PortableReferenceExemplar'];
 export type GovernanceSyncReceipt = components['schemas']['GovernanceSyncReceipt'];
-export type LlmBriefRead = components['schemas']['LlmBriefRead'];
+export type LlmBriefRead = components['schemas']['LlmBriefRead'] & {
+  source_observed_at?: string | null;
+  valid_until?: string | null;
+  observation_source?: string | null;
+  coverage_complete?: boolean | null;
+  unobserved_tiers?: string[];
+};
 export type ConeEdgeSummary = components['schemas']['ConeEdgeSummary'];
 export type ConeSectionCount = components['schemas']['ConeSectionCount'];
 export type ConeCompleteness = components['schemas']['ConeCompleteness'];
-export type LlmContextConeReport = components['schemas']['LlmContextConeReport'];
+export type LlmContextConeReport = components['schemas']['LlmContextConeReport'] & {
+  source_observed_at?: string | null;
+  valid_until?: string | null;
+  observation_source?: string | null;
+  coverage_complete?: boolean | null;
+  unobserved_tiers?: string[];
+};
+export type AskExecutionOrigin = 'browser_client' | 'wythe_server';
+export interface HealthzResponse {
+  status: string;
+  version?: string;
+}
 export type SourceSnippetRead = components['schemas']['SourceSnippetRead'];
 export type DistrictXraySummary = components['schemas']['DistrictXraySummary'];
 export type OnDeviceEngineStatus = components['schemas']['OnDeviceEngineStatus'];
@@ -285,6 +376,11 @@ export type AskWytheResponse = Omit<
   authored_by?: 'model' | 'scanner_brief';
   image_supplied?: boolean;
   fallback_reason?: string | null;
+  execution_origin?: AskExecutionOrigin | null;
+  endpoint_origin?: string | null;
+  requested_model_id?: string | null;
+  resolved_model_id?: string | null;
+  fallback_from?: string | null;
   executed_tools?: string[];
   validated_references?: ValidatedReferenceRead[];
   evidence_identity?: EvidenceIdentityRead | null;
@@ -564,22 +660,23 @@ export interface InvestigationExportBundle {
   comparison?: InvestigationRevisionComparisonRead | null;
 }
 
-const SSE_DEV_UI_PORTS = new Set(['3000', '3180', '3780']);
-
-function resolveSseApiBase(): string {
-  if (process.env.NEXT_PUBLIC_WYTHE_API_URL) {
-    return process.env.NEXT_PUBLIC_WYTHE_API_URL;
-  }
-  if (process.env.NEXT_PUBLIC_TRUTH_ATLAS_API_URL) {
-    return process.env.NEXT_PUBLIC_TRUTH_ATLAS_API_URL;
-  }
-  if (typeof window !== 'undefined' && !SSE_DEV_UI_PORTS.has(window.location.port)) {
-    return '/api/v1';
-  }
-  return 'http://127.0.0.1:8780/api/v1';
+async function requestDevRoot(rootPath: string): Promise<Response> {
+  const devOrigin = new URL(resolveApiBase(), window.location.origin).origin;
+  return fetch(`${devOrigin}${rootPath}`, { method: 'GET' });
 }
 
 export const atlasApi = {
+  getHealthz: async (): Promise<HealthzResponse> => {
+    const isDevUi =
+      typeof window !== 'undefined' && DEV_UI_PORTS.has(window.location.port);
+    const res = isDevUi
+      ? await requestDevRoot('/healthz')
+      : await fetch('/healthz', { method: 'GET' });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return (await res.json()) as HealthzResponse;
+  },
   listTargets: () => get<TargetProjectRead[]>('/targets'),
   registerTarget: (payload: TargetProjectCreate) =>
     post<TargetProjectRead>('/targets', payload),
@@ -821,7 +918,7 @@ export const atlasApi = {
     if (options?.selectedFindingId) params.set('selected_finding_id', options.selectedFindingId);
     if (options?.followState) params.set('follow_state', options.followState);
     if (options?.sinceSeq !== undefined) params.set('since_seq', String(options.sinceSeq));
-    return `${resolveSseApiBase()}/viewport/stream?${params.toString()}`;
+    return `${resolveApiBase()}/viewport/stream?${params.toString()}`;
   },
 
   getUnderstandingExplain: (params: {

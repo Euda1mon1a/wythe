@@ -195,31 +195,44 @@ def infer_sql_file_engine(rel_path: str, sql_text: str) -> str:
     return "sql"
 
 
+_MAX_EVAL_STR_LEN = 4096
+
+
 def _eval_str_expr(node: ast.AST | None, str_env: dict[str, str], depth: int = 0) -> str | None:
     if node is None or depth > 6:
         return None
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
+        return node.value if len(node.value) <= _MAX_EVAL_STR_LEN else None
     if isinstance(node, ast.Name) and node.id in str_env:
-        return str_env[node.id]
+        bound = str_env[node.id]
+        return bound if len(bound) <= _MAX_EVAL_STR_LEN else None
     if isinstance(node, ast.JoinedStr):
         parts: list[str] = []
+        total = 0
         for val in node.values:
             if isinstance(val, ast.Constant) and isinstance(val.value, str):
-                parts.append(val.value)
+                piece = val.value
             elif isinstance(val, ast.FormattedValue):
                 resolved = _eval_str_expr(val.value, str_env, depth + 1)
-                parts.append(resolved if resolved is not None else "__dyn__")
+                piece = resolved if resolved is not None else "__dyn__"
             else:
-                parts.append("__dyn__")
+                piece = "__dyn__"
+            total += len(piece)
+            if total > _MAX_EVAL_STR_LEN:
+                return None
+            parts.append(piece)
         return "".join(parts)
     if isinstance(node, ast.BinOp):
         left = _eval_str_expr(node.left, str_env, depth + 1)
         right = _eval_str_expr(node.right, str_env, depth + 1)
         if isinstance(node.op, ast.Add) and left is not None and right is not None:
+            if len(left) + len(right) > _MAX_EVAL_STR_LEN:
+                return None
             return left + right
         if isinstance(node.op, ast.Div) and right is not None:
             prefix = left if left is not None else "__dyn__"
+            if len(prefix) + len(right) + 1 > _MAX_EVAL_STR_LEN:
+                return None
             return f"{prefix.rstrip('/')}/{right.lstrip('/')}"
     if isinstance(node, ast.Call):
         fn_name = (
@@ -234,14 +247,27 @@ def _eval_str_expr(node: ast.AST | None, str_env: dict[str, str], depth: int = 0
         if fn_name == "join" and isinstance(node.func, ast.Attribute):
             if isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str):
                 sep = node.func.value.value
+                if len(sep) > _MAX_EVAL_STR_LEN:
+                    return None
                 if node.args and isinstance(node.args[0], (ast.List, ast.Tuple)):
-                    items = [_eval_str_expr(e, str_env, depth + 1) for e in node.args[0].elts]
-                    if all(x is not None for x in items):
-                        return sep.join(x for x in items if x is not None)
+                    items: list[str] = []
+                    total = 0
+                    for idx_e, e in enumerate(node.args[0].elts):
+                        ev = _eval_str_expr(e, str_env, depth + 1)
+                        if ev is None:
+                            return None
+                        total += len(ev) + (len(sep) if idx_e else 0)
+                        if total > _MAX_EVAL_STR_LEN:
+                            return None
+                        items.append(ev)
+                    return sep.join(items)
             else:
                 segs = [_eval_str_expr(a, str_env, depth + 1) for a in node.args]
                 if segs and segs[-1] is not None:
-                    return "/".join(s if s is not None else "__dyn__" for s in segs)
+                    norm_segs = [s if s is not None else "__dyn__" for s in segs]
+                    if sum(len(s) for s in norm_segs) + len(norm_segs) > _MAX_EVAL_STR_LEN:
+                        return None
+                    return "/".join(norm_segs)
     return None
 
 
@@ -368,9 +394,12 @@ def scan_inline_stores(repo_root: Path, backend_subdir: str) -> list[InlineStore
             continue
         found, _ = source_files(root, {".py"})
         for pf in found:
-            pf_real = pf.resolve()
-            if pf_real.is_relative_to(real_root) and pf_real not in py_files:
-                py_files.append(pf_real)
+            try:
+                pf_real = pf.resolve()
+                if pf_real.is_relative_to(real_root) and pf_real not in py_files:
+                    py_files.append(pf_real)
+            except (OSError, ValueError):
+                continue
 
     stores: list[InlineStoreObject] = []
     for pf in py_files:

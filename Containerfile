@@ -9,10 +9,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     WYTHE_STATE_DIR=/tmp/wythe-state
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /opt/wythe
 COPY backend /opt/wythe/backend
 
-RUN pip install --no-cache-dir /opt/wythe/backend \
+RUN pip install --no-cache-dir "/opt/wythe/backend[treesitter]" \
     && useradd --uid 10001 --create-home --shell /usr/sbin/nologin wythe
 
 USER 10001:10001

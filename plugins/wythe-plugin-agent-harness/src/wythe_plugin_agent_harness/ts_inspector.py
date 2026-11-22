@@ -41,11 +41,11 @@ _TS_VOLATILE_RE = re.compile(
 )
 _TS_TEMPLATE_EXPR_RE = re.compile(r"\$\{([^}]{1,200})\}")
 _TS_FN_DECL_RE = re.compile(
-    r"(?:export\s+)?(?:async\s+)?function\s+(?P<fn>[A-Za-z_$][\w$]*)\s*(?:<[^>]{0,120}>)?\s*\([^)]*\)\s*(?::\s*[^{=]+)?\{"
-    r"|(?:export\s+)?(?:const|let)\s+(?P<arrow>[A-Za-z_$][\w$]*)\s*(?::\s*[^=]+)?=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=]+)?=>\s*\{"
+    r"(?:export\s+)?(?:async\s+)?function\s+(?P<fn>[A-Za-z_$][\w$]*)\s*(?:<[^>]{0,120}>)?\s*\([^()\n]{0,400}\)\s*(?::\s*[^{=;\n]{0,200})?\{"
+    r"|(?:export\s+)?(?:const|let)\s+(?P<arrow>[A-Za-z_$][\w$]*)\s*(?::\s*[^=;\n]{0,200})?=\s*(?:async\s*)?(?:\([^()\n]{0,400}\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;\n]{0,200})?=>\s*\{"
 )
 _TS_CONST_STR_RE = re.compile(
-    r"(?:export\s+)?(?:const|let)\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*[^=]+)?=\s*(?P<rhs>`(?:\\.|[^`\\])*`|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")"
+    r"(?:export\s+)?(?:const|let)\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*[^=;\n]{0,200})?=\s*(?P<rhs>`(?:\\.|[^`\\])*`|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")"
 )
 _TS_CONST_INT_RE = re.compile(
     r"(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*number\s*)?=\s*(?P<val>\d+)\b"
@@ -54,11 +54,17 @@ _TS_SERVER_TOOL_RE = re.compile(
     r"\b(?:server|mcp)\.tool\(\s*['\"](?P<name>[A-Za-z0-9_.:-]+)['\"]"
 )
 _TS_ARRAY_DECL_RE = re.compile(
-    r"(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*[^=]+)?=\s*\["
+    r"(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*[^=;\n]{0,200})?=\s*\["
 )
 _TS_ARRAY_FROM_RE = re.compile(
-    r"(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*[^=]+)?=\s*Array\.from\(\s*\{\s*length\s*:\s*(?P<len>\d+)\s*\}"
+    r"(?:export\s+)?const\s+(?P<name>[A-Za-z_$][\w$]*)\s*(?::\s*[^=;\n]{0,200})?=\s*Array\.from\(\s*\{\s*length\s*:\s*(?P<len>\d+)\s*\}"
 )
+
+
+def _safe_ts_int(raw: str) -> int | None:
+    if not raw or len(raw) > 18 or not raw.isascii() or not raw.isdigit():
+        return None
+    return int(raw)
 _TS_RAW_FETCH_RE = re.compile(
     r"\b(?P<callee>fetch|axios\.post|axios\.request|undici\.request)\s*\(\s*(?P<arg>`(?:\\.|[^`\\])*`|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|[A-Za-z_$][\w$]*)"
 )
@@ -140,9 +146,21 @@ def _find_balanced_end(text: str, open_idx: int, open_ch: str, close_ch: str) ->
     return -1
 
 
-def _ts_volatile_reasons(expr_src: str, str_bindings: dict[str, str], depth: int = 0) -> list[str]:
-    if depth > 4:
+def _ts_volatile_reasons(
+    expr_src: str,
+    str_bindings: dict[str, str],
+    depth: int = 0,
+    *,
+    _memo: dict[str, tuple[str, ...]] | None = None,
+    _steps: list[int] | None = None,
+) -> list[str]:
+    memo = _memo if _memo is not None else {}
+    steps = _steps if _steps is not None else [64]
+    if depth > 4 or steps[0] <= 0 or len(expr_src) > 16384:
         return []
+    if expr_src in memo:
+        return list(memo[expr_src])
+    steps[0] -= 1
     reasons: list[str] = []
     for m in _TS_VOLATILE_RE.finditer(expr_src):
         tok = re.sub(r"\s+", " ", m.group(0).rstrip("(")).strip()
@@ -150,15 +168,21 @@ def _ts_volatile_reasons(expr_src: str, str_bindings: dict[str, str], depth: int
             reasons.append(tok)
 
     for tm in _TS_TEMPLATE_EXPR_RE.finditer(expr_src):
+        if steps[0] <= 0:
+            break
         inner = tm.group(1).strip()
-        for sub_r in _ts_volatile_reasons(inner, str_bindings, depth + 1):
+        for sub_r in _ts_volatile_reasons(
+            inner, str_bindings, depth + 1, _memo=memo, _steps=steps
+        ):
             if sub_r not in reasons:
                 reasons.append(sub_r)
         if re.fullmatch(r"[A-Za-z_$][\w$]*", inner):
             if inner.isupper():
                 continue
             if inner in str_bindings:
-                for sub_r in _ts_volatile_reasons(str_bindings[inner], str_bindings, depth + 1):
+                for sub_r in _ts_volatile_reasons(
+                    str_bindings[inner], str_bindings, depth + 1, _memo=memo, _steps=steps
+                ):
                     if sub_r not in reasons:
                         reasons.append(sub_r)
                 continue
@@ -183,9 +207,13 @@ def _ts_volatile_reasons(expr_src: str, str_bindings: dict[str, str], depth: int
 
     ident = expr_src.strip()
     if re.fullmatch(r"[A-Za-z_$][\w$]*", ident) and not ident.isupper() and ident in str_bindings:
-        for sub_r in _ts_volatile_reasons(str_bindings[ident], str_bindings, depth + 1):
+        for sub_r in _ts_volatile_reasons(
+            str_bindings[ident], str_bindings, depth + 1, _memo=memo, _steps=steps
+        ):
             if sub_r not in reasons:
                 reasons.append(sub_r)
+    if len(memo) < 256:
+        memo[expr_src] = tuple(reasons)
     return reasons
 
 
@@ -255,7 +283,9 @@ def _extract_ts_tool_manifests(
     # 2. `Array.from({ length: N }, ...)` tool schema generators
     for af in _TS_ARRAY_FROM_RE.finditer(cleaned):
         vname = af.group("name")
-        count = int(af.group("len"))
+        count = _safe_ts_int(af.group("len"))
+        if count is None:
+            continue
         call_open = cleaned.find("(", af.start())
         call_close = _find_balanced_end(cleaned, call_open, "(", ")") if call_open != -1 else -1
         span_src = cleaned[af.start() : (call_close + 1 if call_close != -1 else min(len(cleaned), af.end() + 400))]
@@ -358,14 +388,14 @@ def _inspect_ts_loop_span(
         )
         if m_guard:
             b_tok = m_guard.group("bound")
-            max_rounds = int(b_tok) if b_tok.isdigit() else int_env.get(b_tok)
+            max_rounds = _safe_ts_int(b_tok) if b_tok.isdigit() else int_env.get(b_tok)
         else:
             is_unbounded = True
     else:
         m_lt = re.search(r"(?:<=|<)\s*(?P<bound>\d+|[A-Za-z_$][\w$]*)", cond_clean)
         if m_lt:
             b_tok = m_lt.group("bound")
-            max_rounds = int(b_tok) if b_tok.isdigit() else int_env.get(b_tok)
+            max_rounds = _safe_ts_int(b_tok) if b_tok.isdigit() else int_env.get(b_tok)
 
     has_timeout = bool(
         re.search(r"\b(?:timeout|timeoutMs|AbortSignal\.timeout|AbortController|signal\s*:)\b", body_src)
@@ -444,7 +474,9 @@ def inspect_ts_source(rel_path: str, source_text: str) -> HarnessInspectionBundl
         m.group("name"): m.group("rhs") for m in _TS_CONST_STR_RE.finditer(cleaned)
     }
     mod_ints: dict[str, int] = {
-        m.group("name"): int(m.group("val")) for m in _TS_CONST_INT_RE.finditer(cleaned)
+        m.group("name"): v
+        for m in _TS_CONST_INT_RE.finditer(cleaned)
+        if (v := _safe_ts_int(m.group("val"))) is not None
     }
 
     # Partition into named function scopes + remaining top-level spans
@@ -483,7 +515,11 @@ def inspect_ts_source(rel_path: str, source_text: str) -> HarnessInspectionBundl
         }
         loc_ints = {
             **mod_ints,
-            **{m.group("name"): int(m.group("val")) for m in _TS_CONST_INT_RE.finditer(sc_text)},
+            **{
+                m.group("name"): v
+                for m in _TS_CONST_INT_RE.finditer(sc_text)
+                if (v := _safe_ts_int(m.group("val"))) is not None
+            },
         }
 
         role_objs = list(_TS_ROLE_OBJ_RE.finditer(sc_text))
